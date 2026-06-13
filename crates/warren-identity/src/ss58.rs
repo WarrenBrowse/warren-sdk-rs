@@ -89,6 +89,10 @@ pub enum Ss58Error {
 /// Encodes the two-byte SS58 prefix for a 14-bit network ident in the
 /// `64..=16383` range, per the Substrate spec.
 fn encode_prefix(prefix: u16) -> [u8; PREFIX_LEN] {
+    // `ident` is masked to 14 bits, so every `as u8` below operates on a value
+    // already known to fit in a byte: `first` takes bits 2..=7 (6 bits) ORed
+    // with the 0x40 tag, `second` takes the high byte (bits 8..=13, 6 bits) ORed
+    // with bits 0..=1 shifted into the top. No cast can truncate a live bit.
     let ident = prefix & 0b0011_1111_1111_1111;
     let first = ((ident & 0b0000_0000_1111_1100) >> 2) as u8 | 0b0100_0000;
     let second = ((ident >> 8) as u8) | (((ident & 0b0000_0000_0000_0011) << 6) as u8);
