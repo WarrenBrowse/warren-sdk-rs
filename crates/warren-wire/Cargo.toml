@@ -1,6 +1,6 @@
 [package]
 name = "warren-wire"
-description = "Pure Warren wire codecs: Setup/SetupAck handshake frames, NAT-PMP, and the multihop HPKE frame. No I/O. (Phase P2, not yet implemented.)"
+description = "Pure Warren wire codecs: Setup/SetupAck handshake frames (postcard). NAT-PMP and the multihop HPKE frame land with their consuming phases. No I/O."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,13 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+serde = { workspace = true }
+postcard = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+hex = { workspace = true }
 
 [lints]
 workspace = true

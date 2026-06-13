@@ -1,17 +1,16 @@
-//! Pure Warren wire codecs (Phase P2, not yet implemented).
+//! Pure Warren wire codecs.
 //!
-//! Planned surface, ported wire-compatibly from warren-core:
-//! - `Setup` / `SetupAck` handshake frames (postcard, `PROTOCOL_VERSION = 4`,
-//!   16-byte `device_id`, feature bitmask MULTIPATH/PORT_FORWARD/IPV6/PAD_TO_MTU).
-//! - NAT-PMP request/response (RFC 6886 plus the Warren rate-limit trailer).
-//! - The multihop HPKE frame (X25519 + HKDF-SHA256 + ChaCha20Poly1305, frame v1).
+//! Implemented: the tunnel handshake frames ([`handshake::Setup`] /
+//! [`handshake::SetupAck`], postcard, wire-compatible with warren-core).
 //!
-//! Every codec will be pinned by golden vectors under `vectors/` extracted from
-//! warren-core so all sibling-language SDKs stay byte-compatible.
+//! Landing with their consuming phases: the NAT-PMP codec (RFC 6886 plus the
+//! Warren rate-limit trailer) with port forwarding (P7), and the multihop HPKE
+//! frame (X25519 + HKDF-SHA256 + ChaCha20Poly1305, frame v1) with the transport
+//! multihop path. All codecs are pinned by golden vectors under `vectors/`.
 
-#[cfg(test)]
-mod roadmap {
-    #[test]
-    #[ignore = "P2: implement Setup/SetupAck + NAT-PMP + multihop codecs with golden vectors"]
-    fn placeholder() {}
-}
+pub mod handshake;
+
+pub use handshake::{
+    DEVICE_ID_LEN, DaitaConfig, MAX_SETUP_FRAME_BYTES, PROTOCOL_VERSION, ProtocolError, Setup,
+    SetupAck, decode_setup, decode_setup_ack, encode_setup, encode_setup_ack, features,
+};

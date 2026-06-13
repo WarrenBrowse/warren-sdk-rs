@@ -69,6 +69,4 @@ pinned by golden vectors where a wire format is involved. warren-core
 - Keep the public surface FFI-friendly from P2 onward (no exported generics,
   serializable errors, narrow async seams).
 - Keep coverage at or above 80% on library code.
-- Decision to confirm: final license and whether a more permissive license than
-  GPL-3.0-or-later is wanted, given the SDK is standalone and meant for broad
-  embedding.
+- License: AGPL-3.0-or-later (confirmed).

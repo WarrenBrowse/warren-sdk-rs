@@ -1,0 +1,42 @@
+{
+  "_comment": "Frozen cross-implementation golden vectors for the Warren tunnel handshake (postcard). Every language SDK must reproduce these bytes. Any change is a wire break and requires bumping PROTOCOL_VERSION.",
+  "protocol_version": 4,
+  "device_id_len": 16,
+  "setup": {
+    "_comment": "postcard layout: protocol_version u8, features u32 varint, connection_index u8, total_connections u8, daita_support bool, device_id [u8;16] raw (no length prefix).",
+    "vectors": [
+      {
+        "protocol_version": 4,
+        "features": 3,
+        "connection_index": 0,
+        "total_connections": 1,
+        "daita_support": false,
+        "device_id_hex": "abababababababababababababababab",
+        "bytes_hex": "0403000100abababababababababababababababab"
+      },
+      {
+        "protocol_version": 4,
+        "features": 0,
+        "connection_index": 2,
+        "total_connections": 4,
+        "daita_support": true,
+        "device_id_hex": "00000000000000000000000000000000",
+        "bytes_hex": "040002040100000000000000000000000000000000"
+      }
+    ]
+  },
+  "setup_ack": {
+    "_comment": "postcard layout: protocol_version u8, tunnel_ipv4 [u8;4], tunnel_ipv6 Option (0x00 None / 0x01 + 16 bytes Some), exit_pubkey [u8;32], max_mtu u16 varint, multiconn_attached bool, daita_spec Option (0x00 None).",
+    "vectors": [
+      {
+        "protocol_version": 4,
+        "tunnel_ipv4": [10, 66, 42, 7],
+        "tunnel_ipv6_hex": null,
+        "exit_pubkey_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+        "max_mtu": 1350,
+        "multiconn_attached": true,
+        "bytes_hex": "040a422a07000000000000000000000000000000000000000000000000000000000000000000c60a0100"
+      }
+    ]
+  }
+}
