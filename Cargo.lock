@@ -1688,6 +1688,8 @@ dependencies = [
 name = "warren-sdk-ffi"
 version = "0.0.1"
 dependencies = [
+ "hex",
+ "thiserror 2.0.18",
  "warren-sdk",
 ]
 

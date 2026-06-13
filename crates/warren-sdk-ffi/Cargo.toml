@@ -1,6 +1,6 @@
 [package]
 name = "warren-sdk-ffi"
-description = "FFI surface for the Warren SDK (uniffi pressenti), powering Dart/Flutter, Kotlin, Swift, Python and Java bindings. Boundary designed now; implementation in Phase P9."
+description = "FFI-ready surface for the Warren SDK: plain, owned, generic-free types and serializable errors, shaped for uniffi (Swift/Kotlin/Python/Java) and flutter_rust_bridge (Dart). Binding codegen is wired in a later phase."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,9 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
-warren-sdk = { path = "../warren-sdk" }
+warren-sdk = { path = "../warren-sdk", default-features = false }
+hex = { workspace = true }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
