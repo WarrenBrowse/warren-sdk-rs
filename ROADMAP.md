@@ -101,23 +101,25 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
      server-pin -> envelope sig -> operational cert -> exit descriptor v2/v1,
      byte-exact canonical preimage. VALIDATED against a captured real production
      directory (envelope + all exit sigs verify; yields trusted x25519 keys).
-  3. HPKE session (spec extracted, turnkey): deps `hpke = "=0.13.0"` (features
-     `alloc`,`x25519`), `chacha20poly1305 = "=0.10.1"`, `rand_core 0.9` +
-     `rand_chacha 0.9` (hpke 0.13 needs the rand_core 0.9 trait surface; NOT
-     `hpke-rs`). Suite `X25519HkdfSha256`/`HkdfSha256`/`ChaCha20Poly1305`.
-     `setup_sender(OpModeS::Base, exit_x25519, info=b"warren/multihop/v1/hpke-info")`
-     once -> `(encapsulated_key, ctx)`. Per packet: `key32 = ctx.export(info)`,
-     forward `info = b"warren/multihop/v1/aad"(22)||epoch_be(4)||seq_be(8)`
-     (reverse appends `0x02`); then
-     `ChaCha20Poly1305::new(key32).encrypt_in_place_detached(nonce=[0;12], aad, payload)`,
-     `aad = b"warren/multihop/v1/aad"||exit_id(16)||epoch_be(4)||seq_be(8)` ->
-     `WarrenMultihopFrame`. Zero nonce safe (key unique per `(epoch,seq)`).
-     Generate cross-language HPKE vectors from warren-core to pin it.
-  4. Datapath: ride per-packet sealed `WarrenMultihopFrame`s on the datagram
-     plane; replace the current raw-`Setup` handshake in `warren-transport`.
-  5. Live-validate a real single-hop tunnel against an exit; freeze shared
-     vectors. Until then the in-process datapath tests use a non-production
-     fake handshake.
+  3. DONE: client HPKE session (`warren-multihop` crate): `hpke =0.13.0` +
+     `chacha20poly1305 =0.10.1` + `rand_core 0.9`. `setup_sender(Base, exit_x25519,
+     info="warren/multihop/v1/hpke-info")`; per-packet `key = ctx.export(AAD_V1||
+     epoch_be||seq_be[||0x02 reverse])`; ChaCha20Poly1305 detached, zero nonce;
+     `aad = AAD_V1||exit_id||epoch_be||seq_be`. `seal`/`open_response` with a
+     crypto round-trip test (exit-side `setup_receiver` recovers; tampered AAD
+     rejected). TODO: cross-language HPKE vectors generated from warren-core.
+  4. Datapath integration: the first sealed frame's INNER payload is a control
+     message, not a bare `Setup` (warren-core uses an `IpRequest`/`IpAssign`
+     control layer for the multihop path, distinct from single-hop Setup/SetupAck
+     - see `warren-multihop::control` + `warren-tunnel real_tun` `IpAssign`).
+     Port the control codec, build the sealed first frame, send on the bi-stream,
+     open the sealed response; then ride per-packet sealed `WarrenMultihopFrame`s
+     on the datagram plane (replace the raw-`Setup` handshake in
+     `warren-transport`).
+  5. Live-validate a real single-hop tunnel against an exit (routing needs a
+     SUBSCRIBED wallet: the exit enforces an allowlist of active pubkeys +
+     `/v1/session/open` device cap). Freeze shared vectors. Until then the
+     in-process datapath tests use a non-production fake handshake.
 
 ## Cross-cutting
 
