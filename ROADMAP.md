@@ -97,14 +97,22 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
   all keys/contexts are identified, no account needed):
   1. DONE: `WarrenMultihopFrame` wire codec, byte-exact + frozen vector
      (`warren-wire::multihop`), with the v1 version/AAD/PKI constants.
-  2. Directory: fetch `GET /v1/multihop/directory` (v2: `nodes[]` with
-     `exit_x25519_multihop_pubkey` + per-descriptor Ed25519 signatures) and
-     verify the chain server-key (pinned `4c2c…`) -> operational key
-     (`WARREN_PKI_ROOT_OPERATIONAL_V1`) -> exit descriptor
-     (`WARREN_PKI_OPERATIONAL_EXIT_V2`, binds the x25519 key + dns attestation).
-  3. HPKE session: X25519 / HKDF-SHA256 / ChaCha20Poly1305 (RFC 9180), seal/open
-     with AAD `WARREN_HPKE_AAD_V1 || exit_id || epoch_be || seq_be`, epoch/seq
-     replay state; inner control messages (`IpRequest`) + the sealed `Setup`.
+  2. DONE: directory verification (`warren-discovery::multihop_directory`):
+     server-pin -> envelope sig -> operational cert -> exit descriptor v2/v1,
+     byte-exact canonical preimage. VALIDATED against a captured real production
+     directory (envelope + all exit sigs verify; yields trusted x25519 keys).
+  3. HPKE session (spec extracted, turnkey): deps `hpke = "=0.13.0"` (features
+     `alloc`,`x25519`), `chacha20poly1305 = "=0.10.1"`, `rand_core 0.9` +
+     `rand_chacha 0.9` (hpke 0.13 needs the rand_core 0.9 trait surface; NOT
+     `hpke-rs`). Suite `X25519HkdfSha256`/`HkdfSha256`/`ChaCha20Poly1305`.
+     `setup_sender(OpModeS::Base, exit_x25519, info=b"warren/multihop/v1/hpke-info")`
+     once -> `(encapsulated_key, ctx)`. Per packet: `key32 = ctx.export(info)`,
+     forward `info = b"warren/multihop/v1/aad"(22)||epoch_be(4)||seq_be(8)`
+     (reverse appends `0x02`); then
+     `ChaCha20Poly1305::new(key32).encrypt_in_place_detached(nonce=[0;12], aad, payload)`,
+     `aad = b"warren/multihop/v1/aad"||exit_id(16)||epoch_be(4)||seq_be(8)` ->
+     `WarrenMultihopFrame`. Zero nonce safe (key unique per `(epoch,seq)`).
+     Generate cross-language HPKE vectors from warren-core to pin it.
   4. Datapath: ride per-packet sealed `WarrenMultihopFrame`s on the datagram
      plane; replace the current raw-`Setup` handshake in `warren-transport`.
   5. Live-validate a real single-hop tunnel against an exit; freeze shared
