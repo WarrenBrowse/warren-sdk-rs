@@ -157,3 +157,33 @@ that the happy-path in-process tests masked. All are now fixed.
 After this pass: `cargo fmt --all -- --check`, `cargo clippy --workspace
 --all-targets --all-features -- -D warnings`, `cargo test --workspace`, `cargo
 deny check` all green; 28 test binaries pass.
+
+## Live validation against the production API and a real exit
+
+Run via `cargo run -p warren-sdk --example live_exit` against
+`https://api.warrenbrowse.com` with the production pin. This is the real-exit
+validation CLAUDE.md mandates, and it immediately found what no fake-device test
+could.
+
+What it PROVED works end to end against production:
+
+- The signed exit list fetch and verification against the pinned server key
+  (`4c2c9253…`), freshness and anti-rollback enforcement, and weighted selection.
+- The QUIC connection and the RFC 7250 raw-public-key TLS 1.3 handshake to a real
+  exit (`204.168.207.130:443`, DE/Kassel).
+
+What it FOUND:
+
+| Sev | Finding | Status |
+|---|---|---|
+| HIGH (wire bug) | `endpoint_id` in the live `/v1/exits` is a Warren **SS58 (`wb…`) address**, but the SDK decoded it as hex only, so `fetch_exits` failed on the real list. The golden vector used hex, hiding it. | FIXED. `decode_endpoint_id` is SS58-first / hex-fallback (matches warren-core `json_io`); locked by `endpoint_id_accepts_ss58_and_hex`. Real fetch now verifies. |
+| HIGH (architecture/blocking) | The real exit rejected our `Setup` frame with `malformed setup frame`. Production exits at `:443` read a **`WarrenMultihopFrame`** (HPKE-sealed, cleartext `exit_id` for routing) as the FIRST frame on EVERY connection (single-hop included; the dual-role node terminates locally when the `exit_id` is its own), then open the sealed inner `Setup`/control. The SDK's raw `Setup`-first handshake does NOT match the production wire protocol. | OPEN, blocking. The multihop HPKE layer (`warren-multihop`: X25519/HKDF-SHA256/ChaCha20Poly1305, `WarrenMultihopFrame` wire format, the operational-exit X25519 PKI descriptor which is NOT in `/v1/exits`, control messages, epoch/seq replay) is required for any real tunnel. It was tracked as an optional future phase; it is in fact mandatory. |
+
+Correction to earlier framing: the prior "P6 datapath validated in-process" is
+accurate only against the SDK's own fake exit, which speaks the SDK's
+(non-production) `Setup`-first handshake. The userspace netstack, proxy front
+ends, backpressure, MTU and routing fixes are real and sound, but the **handshake
+the datapath rides on is not yet the production one**. No real tunnel is possible
+until the multihop frame lands. ROADMAP is updated to make multihop a required,
+blocking phase rather than an optional one, and to note the exit X25519 descriptor
+must be sourced (separate endpoint) for HPKE.

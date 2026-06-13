@@ -28,11 +28,11 @@ for the remaining work.
 | Handshake + NAT-PMP wire codecs | `warren-wire` | done, golden vectors |
 | Signed account API client (transport-agnostic) | `warren-api` | done; anti-censorship host fallback pending |
 | Signed relay list verify (v5) + weighted selector | `warren-discovery` | done, golden vector |
-| QUIC transport (RFC 7250 raw-public-key TLS 1.3) | `warren-transport` | done, in-process e2e |
+| QUIC transport (RFC 7250 raw-public-key TLS 1.3) | `warren-transport` | done; QUIC+RPK handshake validated against a real exit. The app-layer handshake is blocked on multihop (see note) |
 | Non-root proxy datapath (SOCKS5 + HTTP CONNECT + smoltcp userspace netstack over the tunnel) | `warren-net` | implemented, e2e in-process; DNS-over-tunnel + per-OS TUN pending |
 | High-level `WarrenClient` facade (incl. `start_proxy` non-root datapath) | `warren-sdk` | done, in-process e2e |
 | FFI identity surface (uniffi/flutter_rust_bridge-shaped) | `warren-sdk-ffi` | identity surface done; tunnel surface + binding codegen pending (P9) |
-| Multihop HPKE frame | `warren-wire` | planned |
+| Multihop HPKE dispatch frame | `warren-multihop` (planned) | **required & blocking** for any real tunnel: live exits read an HPKE `WarrenMultihopFrame` first, not raw `Setup` (found via live-exit validation) |
 
 ## Identity in a few lines
 

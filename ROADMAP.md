@@ -89,7 +89,17 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
     DNS-over-tunnel for domain targets; UDP associate;
     privileged per-OS TUN/routing/DNS/killswitch; GSO/GRO batch syscalls behind
     the `PacketSink` batch seam and `fast-apple-datapath` on macOS.
-- Multihop: port and freeze the HPKE frame (its own wire phase).
+- Multihop HPKE frame (REQUIRED, blocking, discovered via live-exit validation):
+  production exits read a `WarrenMultihopFrame` (HPKE-sealed; cleartext `exit_id`)
+  as the first frame on EVERY connection, single-hop included, then open the
+  sealed inner `Setup`. The current `Setup`-first handshake is rejected by real
+  exits (`malformed setup frame`). Port `warren-multihop` byte-exact:
+  X25519/HKDF-SHA256/ChaCha20Poly1305 HPKE sessions, the `WarrenMultihopFrame`
+  wire format, the operational-exit X25519 PKI descriptor (sourced from a
+  directory endpoint, NOT `/v1/exits`), control messages (`IpRequest`), and
+  epoch/seq replay protection. Freeze shared vectors. This is the gate for any
+  real tunnel; the in-process datapath tests use a non-production fake handshake
+  until it lands.
 
 ## Cross-cutting
 
