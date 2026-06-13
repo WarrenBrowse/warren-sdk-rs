@@ -187,7 +187,10 @@ async fn tofu_pins_the_first_server_key_and_rejects_a_different_one() {
 
     // First fetch: no pin yet, any self-consistent signature is accepted and the
     // key is remembered.
-    client.fetch_exits().await.expect("first use trusts server A");
+    client
+        .fetch_exits()
+        .await
+        .expect("first use trusts server A");
     assert_eq!(
         key_store.load_pin().as_deref(),
         Some(hex::encode(server_a.verifying_key().to_bytes()).as_str())

@@ -25,6 +25,16 @@
         "seed_hex": "0000000000000000000000000000000000000000000000000000000000000000",
         "pubkey_hex": "d9d24d24f77550ec46914c30d83dc973063c759967d03af4efe508fb34ed5308",
         "address": "wbCgHqDAE3CKBuAeSDCC4r9TZtjXveuXNd934zzm7ncceJa6q"
+      },
+      {
+        "seed_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+        "pubkey_hex": "3935573c98dd924c0fc0b360cdbd424a14706081c3c5210c5a5c8cbea992b505",
+        "address": "wb93hYUN8r8Jej8FNpATjb7eEzgg9aZM4LVC65D8ekKhRBC5t"
+      },
+      {
+        "seed_hex": "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe",
+        "pubkey_hex": "ff63118b29fea5dc8d1a510acb1bad004c0c5299777f1fc6bc4a4d211386760a",
+        "address": "wbDXYcFYU13hwwjLEUZDQtwuZAnBQTTZfRrwa1QknBHxKcQdT"
       }
     ]
   },
@@ -36,6 +46,12 @@
         "seed_hex": "408b285c123836004f4b8842c89324c1f01382450c0d439af345ba7fc49acf70",
         "pubkey_hex": "fba874de8721df35921c9999a036c03bb098df35fc21fcbeac98af880ababdb9",
         "address": "wbDSf2fncAfyDQkNbkyqjuhi8kpg3z8kCHqL2TYDSM2F1nVED"
+      },
+      {
+        "mnemonic": "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote",
+        "seed_hex": "e28a37058c7f5112ec9e16a3437cf363a2572d70b6ceb3b6965447623d620f14",
+        "pubkey_hex": "7224baba5fb99465119e47405d043aaefa64a316ddfb6bcd4708bd151c9cc7a7",
+        "address": "wbALMLa9d4esp26T2TvMfjkXPHxyNVxnLFw6Zz7XKAV8dGqSf"
       }
     ]
   },
@@ -49,6 +65,14 @@
         "nonce_hex": "abcd1234",
         "body_hash_hex": "ff00",
         "expected": "GET\n/v1/exits\n42\nabcd1234\nff00"
+      },
+      {
+        "method": "DELETE",
+        "path": "/v1/account",
+        "timestamp": 7,
+        "nonce_hex": "abcd",
+        "body_hash_hex": "00",
+        "expected": "DELETE\n/v1/account\n7\nabcd\n00"
       }
     ]
   },
@@ -64,6 +88,16 @@
         "nonce_hex": "09090909090909090909090909090909",
         "pubkey_ss58": "wbBfa1jcETanWzVVK4Hh166fwo6YSNaarwT2XnDQ1vNdSigx4",
         "signature_hex": "1c3dc33a1bb9fab8809306de8e4d91c88577cfacbe97a844918570139e57ac7ad83f1bc8043fb3985aac57e864c82d3c2e5e213bfe1be38fa2251cc33291860e"
+      },
+      {
+        "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "method": "GET",
+        "path": "/v1/subscription",
+        "body_utf8": "",
+        "timestamp": 1,
+        "nonce_hex": "00000000000000000000000000000000",
+        "pubkey_ss58": "wb85LRUHkyGA6nQVctwU54skKbdnT2jeqfLDSwnZEVmdXeuKd",
+        "signature_hex": "a9251eaa5d3c03884329a29902e9817eb90a3215b912ff5f8e4e0eef7b1220edac73c596a1580cb613c34816f59cbbcac14b1cd471f786e562e22d3b38e1510f"
       }
     ]
   }
