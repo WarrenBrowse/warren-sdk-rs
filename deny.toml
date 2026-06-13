@@ -25,6 +25,8 @@ allow = [
     # Mozilla CA bundle (webpki-roots) pulled by the reqwest transport.
     "CDLA-Permissive-2.0",
     "Zlib",
+    # Public-domain-equivalent license of smoltcp (userspace netstack).
+    "0BSD",
 ]
 confidence-threshold = 0.9
 

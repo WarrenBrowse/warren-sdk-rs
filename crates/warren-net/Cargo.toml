@@ -14,12 +14,21 @@ warren-transport = { path = "../warren-transport" }
 bytes = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+# Userspace TCP/IP for the non-root proxy datapath (Medium::Ip, no Ethernet:
+# the tunnel carries bare IP packets). 0.13 requires rustc 1.91 > our MSRV.
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+], optional = true }
 
 [features]
 # The non-root proxy datapath is always available. `tun` and `killswitch` pull
 # in the privileged per-OS back ends (implemented incrementally per platform).
 default = ["proxy"]
-proxy = []
+proxy = ["dep:smoltcp"]
 tun = []
 killswitch = []
 
@@ -27,6 +36,14 @@ killswitch = []
 tokio = { workspace = true }
 ed25519-dalek = { workspace = true }
 warren-test-support = { path = "../warren-test-support" }
+# A second smoltcp stack stands in for the exit's TCP termination in the
+# netstack loopback test.
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+] }
 
 [lints]
 workspace = true

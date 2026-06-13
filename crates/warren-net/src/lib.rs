@@ -27,6 +27,8 @@ pub mod error;
 pub mod killswitch;
 pub mod mode;
 #[cfg(feature = "proxy")]
+pub mod netstack;
+#[cfg(feature = "proxy")]
 pub mod proxy;
 pub mod sink;
 pub mod socks5;
@@ -34,6 +36,8 @@ pub mod socks5;
 pub use error::NetError;
 pub use killswitch::{KillSwitch, KillSwitchLevel, ProxyOnlyKillSwitch};
 pub use mode::{ConnectMode, ProxyConfig, TunConfig};
+#[cfg(feature = "proxy")]
+pub use netstack::{NetstackStream, TunnelConnector, spawn_engine, spawn_over_sink};
 #[cfg(feature = "proxy")]
 pub use proxy::{Connector, DirectConnector, Socks5Proxy};
 pub use sink::{PacketSink, QuicPacketSink};
