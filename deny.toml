@@ -22,6 +22,8 @@ allow = [
     # Public-domain dedication used by the bip39 dependency tree (bip39,
     # bitcoin_hashes, hex-conservative).
     "CC0-1.0",
+    # Mozilla CA bundle (webpki-roots) pulled by the reqwest transport.
+    "CDLA-Permissive-2.0",
     "Zlib",
 ]
 confidence-threshold = 0.9

@@ -244,7 +244,10 @@ mod tests {
 
     #[test]
     fn external_address_request_is_two_bytes() {
-        assert_eq!(serialize_request(&Request::ExternalAddress), vec![0x00, 0x00]);
+        assert_eq!(
+            serialize_request(&Request::ExternalAddress),
+            vec![0x00, 0x00]
+        );
     }
 
     #[test]
@@ -259,7 +262,9 @@ mod tests {
         // 0xabcd, lifetime 7200 = 0x00001c20.
         assert_eq!(
             serialize_request(&req),
-            vec![0x00, 0x02, 0x00, 0x00, 0x12, 0x34, 0xab, 0xcd, 0x00, 0x00, 0x1c, 0x20]
+            vec![
+                0x00, 0x02, 0x00, 0x00, 0x12, 0x34, 0xab, 0xcd, 0x00, 0x00, 0x1c, 0x20
+            ]
         );
     }
 
