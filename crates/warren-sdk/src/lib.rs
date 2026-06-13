@@ -128,6 +128,7 @@ impl GenerationStore for InMemoryGenerationStore {
 pub struct WarrenClientBuilder {
     identity: Option<WarrenIdentity>,
     api_base: String,
+    api_alternative_hosts: Vec<String>,
     server_pubkey_pin: Option<String>,
     allow_any_server_key: bool,
     generation_store: Arc<dyn GenerationStore>,
@@ -145,6 +146,14 @@ impl WarrenClientBuilder {
     #[must_use]
     pub fn api_base(mut self, base: impl Into<String>) -> Self {
         self.api_base = base.into();
+        self
+    }
+
+    /// Sets alternative API hostnames (bare DNS names) tried in order when the
+    /// primary host fails to connect (anti-censorship fallback).
+    #[must_use]
+    pub fn api_alternative_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.api_alternative_hosts = hosts;
         self
     }
 
@@ -212,7 +221,12 @@ impl WarrenClientBuilder {
         // The wallet key doubles as the QUIC tunnel client identity, so keep a
         // copy before the identity moves into the API client.
         let signing = identity.signing_key();
-        let api = WarrenApiClient::new(self.api_base, identity, transport);
+        let api = WarrenApiClient::new_with_fallback(
+            self.api_base,
+            self.api_alternative_hosts,
+            identity,
+            transport,
+        );
         Ok(WarrenClient {
             api,
             signing,
@@ -238,6 +252,7 @@ impl WarrenClient<()> {
         WarrenClientBuilder {
             identity: None,
             api_base: warren_api_default_base(),
+            api_alternative_hosts: Vec::new(),
             server_pubkey_pin: None,
             allow_any_server_key: false,
             generation_store: Arc::new(InMemoryGenerationStore::default()),

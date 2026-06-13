@@ -37,6 +37,11 @@ pub struct HttpRequest {
     pub headers: Vec<(String, String)>,
     /// Request body (empty for bodyless requests).
     pub body: Vec<u8>,
+    /// Whether to send the TLS SNI extension. The anti-censorship fallback
+    /// retries the primary host with this set to `false` so a transport that
+    /// supports it can defeat SNI-based blocking. Transports that cannot toggle
+    /// SNI may ignore it.
+    pub use_sni: bool,
 }
 
 /// An HTTP response.
@@ -54,9 +59,23 @@ pub struct HttpResponse {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransportError {
-    /// The request could not be completed at the network layer.
+    /// The connection could not be established (DNS, TCP or TLS handshake). This
+    /// is the retryable case that drives the anti-censorship host fallback.
+    #[error("transport connect error: {0}")]
+    Connect(String),
+    /// The request failed after connecting (mid-response, timeout, decode). Not
+    /// retried on another host.
     #[error("transport error: {0}")]
     Io(String),
+}
+
+impl TransportError {
+    /// Whether this failure is a connect-establishment error, the only case the
+    /// host fallback retries on another host or without SNI.
+    #[must_use]
+    pub fn is_connect(&self) -> bool {
+        matches!(self, TransportError::Connect(_))
+    }
 }
 
 /// An async HTTP transport. Implemented by the bundled reqwest backend (feature

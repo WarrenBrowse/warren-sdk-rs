@@ -8,8 +8,17 @@ use std::time::Duration;
 use crate::transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 
 /// A reqwest-backed transport.
+///
+/// Holds two clients: one that sends the TLS SNI extension and one that omits it
+/// (`tls_sni(false)`). The fallback sequence in [`WarrenApiClient`] uses the
+/// SNI-less client for its final attempt to defeat SNI-based blocking. The
+/// no-SNI client still verifies the server certificate against the requested
+/// host name (standard verification), so it is no weaker than the default path.
+///
+/// [`WarrenApiClient`]: crate::WarrenApiClient
 pub struct ReqwestTransport {
     client: reqwest::Client,
+    client_no_sni: reqwest::Client,
 }
 
 impl ReqwestTransport {
@@ -21,12 +30,18 @@ impl ReqwestTransport {
     /// a broken build environment rather than a runtime condition.
     #[must_use]
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
-            .build()
-            .expect("reqwest client builds with a working TLS backend");
-        Self { client }
+        let build = |sni: bool| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(15))
+                .tls_sni(sni)
+                .build()
+                .expect("reqwest client builds with a working TLS backend")
+        };
+        Self {
+            client: build(true),
+            client_no_sni: build(false),
+        }
     }
 }
 
@@ -44,26 +59,36 @@ fn to_reqwest_method(method: Method) -> reqwest::Method {
     }
 }
 
+/// Classifies a reqwest error: connect-establishment failures drive the host
+/// fallback; everything else is a non-retryable transport error.
+fn to_transport_error(e: &reqwest::Error) -> TransportError {
+    if e.is_connect() {
+        TransportError::Connect(e.to_string())
+    } else {
+        TransportError::Io(e.to_string())
+    }
+}
+
 impl HttpTransport for ReqwestTransport {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
-        let mut builder = self
-            .client
-            .request(to_reqwest_method(request.method), &request.url);
+        let client = if request.use_sni {
+            &self.client
+        } else {
+            &self.client_no_sni
+        };
+        let mut builder = client.request(to_reqwest_method(request.method), &request.url);
         for (name, value) in &request.headers {
             builder = builder.header(name, value);
         }
         if !request.body.is_empty() {
             builder = builder.body(request.body);
         }
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| TransportError::Io(e.to_string()))?;
+        let resp = builder.send().await.map_err(|e| to_transport_error(&e))?;
         let status = resp.status().as_u16();
         let body = resp
             .bytes()
             .await
-            .map_err(|e| TransportError::Io(e.to_string()))?
+            .map_err(|e| to_transport_error(&e))?
             .to_vec();
         Ok(HttpResponse { status, body })
     }

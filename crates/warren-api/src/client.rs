@@ -35,6 +35,10 @@ pub enum ClientError {
     /// The request body could not be serialized.
     #[error("failed to serialize request")]
     RequestSerialize(#[source] serde_json::Error),
+    /// Every host in the fallback sequence (primary, alternatives, no-SNI)
+    /// failed to connect: the API is likely being blocked.
+    #[error("all API hosts are unreachable (possible censorship)")]
+    AllHostsBlocked,
     /// The system clock is before the Unix epoch.
     #[error("system clock is before the Unix epoch")]
     BadClock,
@@ -46,6 +50,9 @@ pub enum ClientError {
 /// network. The SDK facade pairs it with the bundled reqwest transport.
 pub struct WarrenApiClient<T> {
     api_base: String,
+    /// Alternative hostnames tried, in order, when the primary host fails to
+    /// connect (anti-censorship). Bare DNS names; only the host is swapped.
+    alternative_hosts: Vec<String>,
     identity: WarrenIdentity,
     transport: T,
 }
@@ -54,8 +61,22 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     /// Builds a client. `api_base` must not end with `/`
     /// (e.g. `https://api.warrenbrowse.com`).
     pub fn new(api_base: impl Into<String>, identity: WarrenIdentity, transport: T) -> Self {
+        Self::new_with_fallback(api_base, Vec::new(), identity, transport)
+    }
+
+    /// Builds a client with anti-censorship host fallback. When the primary host
+    /// fails to connect, the request is retried against each of
+    /// `alternative_hosts` in order (with SNI), then against the primary host
+    /// without SNI. A connected response (any status) stops the sequence.
+    pub fn new_with_fallback(
+        api_base: impl Into<String>,
+        alternative_hosts: Vec<String>,
+        identity: WarrenIdentity,
+        transport: T,
+    ) -> Self {
         Self {
             api_base: api_base.into(),
+            alternative_hosts,
             identity,
             transport,
         }
@@ -162,6 +183,7 @@ impl<T: HttpTransport> WarrenApiClient<T> {
             url: format!("{}{path}", self.api_base),
             headers,
             body,
+            use_sni: true,
         }
     }
 
@@ -196,11 +218,62 @@ impl<T: HttpTransport> WarrenApiClient<T> {
             url: format!("{}{path}", self.api_base),
             headers,
             body,
+            use_sni: true,
         })
     }
 
+    /// Sends a request through the anti-censorship fallback sequence: the
+    /// primary host with SNI, then each alternative host with SNI, then the
+    /// primary host without SNI. Only connect failures advance the sequence; a
+    /// connected response (any status) or a non-connect transport error stops
+    /// it. Returns [`ClientError::AllHostsBlocked`] if every attempt fails to
+    /// connect.
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, ClientError> {
-        let resp = self.transport.execute(request).await?;
+        let primary_url = request.url.clone();
+
+        // 1. Primary host, with SNI.
+        match self.attempt(&request).await? {
+            AttemptOutcome::Response(resp) => return self.finish(resp),
+            AttemptOutcome::Blocked => {}
+        }
+
+        // 2. Alternative hosts, with SNI.
+        for host in &self.alternative_hosts {
+            let alt = HttpRequest {
+                url: replace_host(&primary_url, host),
+                ..request.clone()
+            };
+            match self.attempt(&alt).await? {
+                AttemptOutcome::Response(resp) => return self.finish(resp),
+                AttemptOutcome::Blocked => {}
+            }
+        }
+
+        // 3. Primary host, without SNI.
+        let no_sni = HttpRequest {
+            use_sni: false,
+            ..request
+        };
+        match self.attempt(&no_sni).await? {
+            AttemptOutcome::Response(resp) => return self.finish(resp),
+            AttemptOutcome::Blocked => {}
+        }
+
+        Err(ClientError::AllHostsBlocked)
+    }
+
+    /// Runs one attempt. A connect failure becomes `Blocked` (advance the
+    /// sequence); any other transport error propagates immediately.
+    async fn attempt(&self, request: &HttpRequest) -> Result<AttemptOutcome, ClientError> {
+        match self.transport.execute(request.clone()).await {
+            Ok(resp) => Ok(AttemptOutcome::Response(resp)),
+            Err(e) if e.is_connect() => Ok(AttemptOutcome::Blocked),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Maps a connected response to success or a server-status error.
+    fn finish(&self, resp: HttpResponse) -> Result<HttpResponse, ClientError> {
         if !(200..300).contains(&resp.status) {
             return Err(ClientError::ServerStatus {
                 status: resp.status,
@@ -213,6 +286,35 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     async fn send_json<R: DeserializeOwned>(&self, request: HttpRequest) -> Result<R, ClientError> {
         let resp = self.send(request).await?;
         serde_json::from_slice(&resp.body).map_err(ClientError::ResponseJson)
+    }
+}
+
+/// Outcome of a single host attempt in the fallback sequence.
+enum AttemptOutcome {
+    /// The host answered (any HTTP status); stop the fallback.
+    Response(HttpResponse),
+    /// The host failed to connect; advance to the next host.
+    Blocked,
+}
+
+/// Swaps the host of an `http(s)://host[:port]/path` URL, preserving scheme,
+/// port and path. `new_host` is a bare DNS name. Returns the input unchanged if
+/// it has no `://` authority.
+fn replace_host(url: &str, new_host: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    // Preserve a numeric port if present (DNS-name authority, not an IPv6
+    // literal: API hosts are always names).
+    match authority.rsplit_once(':') {
+        Some((_, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("{scheme}://{new_host}:{port}{path}")
+        }
+        _ => format!("{scheme}://{new_host}{path}"),
     }
 }
 
@@ -331,6 +433,129 @@ mod tests {
         assert!(
             header(req, HEADER_PUBKEY).is_none(),
             "list_exits must be unsigned"
+        );
+    }
+
+    type Responder = Box<dyn Fn(&HttpRequest) -> Result<HttpResponse, TransportError> + Send + Sync>;
+
+    /// Records every attempt and returns a programmed outcome per request.
+    struct ScriptedTransport {
+        attempts: Mutex<Vec<HttpRequest>>,
+        respond: Responder,
+    }
+
+    impl ScriptedTransport {
+        fn new(
+            respond: impl Fn(&HttpRequest) -> Result<HttpResponse, TransportError>
+            + Send
+            + Sync
+            + 'static,
+        ) -> Self {
+            Self {
+                attempts: Mutex::new(Vec::new()),
+                respond: Box::new(respond),
+            }
+        }
+    }
+
+    impl HttpTransport for ScriptedTransport {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+            let out = (self.respond)(&request);
+            self.attempts.lock().unwrap().push(request);
+            out
+        }
+    }
+
+    fn ok_200(body: &str) -> Result<HttpResponse, TransportError> {
+        Ok(HttpResponse {
+            status: 200,
+            body: body.as_bytes().to_vec(),
+        })
+    }
+
+    fn connect_fail() -> Result<HttpResponse, TransportError> {
+        Err(TransportError::Connect("blocked".to_owned()))
+    }
+
+    fn fallback_client(t: ScriptedTransport) -> WarrenApiClient<ScriptedTransport> {
+        WarrenApiClient::new_with_fallback(
+            "https://api.example.test",
+            vec!["alt.example.test".to_owned()],
+            WarrenIdentity::from_seed(&[0x11; 32]),
+            t,
+        )
+    }
+
+    #[tokio::test]
+    async fn fallback_retries_alternative_host_on_connect_error() {
+        let c = fallback_client(ScriptedTransport::new(|req| {
+            if req.url.contains("api.example.test") {
+                connect_fail()
+            } else {
+                ok_200(r#"{"ok":true}"#)
+            }
+        }));
+        let body = c.list_exits().await.expect("alternative host answers");
+        assert_eq!(body, r#"{"ok":true}"#);
+        let attempts = c.transport.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].url, "https://api.example.test/v1/exits");
+        assert_eq!(attempts[1].url, "https://alt.example.test/v1/exits");
+        assert!(attempts[1].use_sni);
+    }
+
+    #[tokio::test]
+    async fn fallback_uses_no_sni_as_last_resort() {
+        let c = fallback_client(ScriptedTransport::new(|req| {
+            if req.use_sni {
+                connect_fail()
+            } else {
+                ok_200("{}")
+            }
+        }));
+        c.list_exits().await.expect("no-SNI attempt answers");
+        let attempts = c.transport.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 3, "primary+SNI, alt+SNI, primary no-SNI");
+        assert!(attempts[0].use_sni && attempts[1].use_sni);
+        assert!(!attempts[2].use_sni);
+        assert_eq!(attempts[2].url, "https://api.example.test/v1/exits");
+    }
+
+    #[tokio::test]
+    async fn all_hosts_blocked_when_every_attempt_connect_fails() {
+        let c = fallback_client(ScriptedTransport::new(|_| connect_fail()));
+        let err = c.list_exits().await.expect_err("all blocked");
+        assert!(matches!(err, ClientError::AllHostsBlocked));
+        assert_eq!(c.transport.attempts.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn non_connect_error_does_not_trigger_fallback() {
+        let c = fallback_client(ScriptedTransport::new(|_| {
+            Err(TransportError::Io("mid-response reset".to_owned()))
+        }));
+        let err = c.list_exits().await.expect_err("io error propagates");
+        assert!(matches!(err, ClientError::Transport(_)));
+        assert_eq!(
+            c.transport.attempts.lock().unwrap().len(),
+            1,
+            "a non-connect error must not advance the sequence"
+        );
+    }
+
+    #[test]
+    fn replace_host_swaps_only_the_hostname() {
+        assert_eq!(
+            replace_host("https://api.x.com/v1/exits", "alt.x.com"),
+            "https://alt.x.com/v1/exits"
+        );
+        assert_eq!(
+            replace_host("https://api.x.com:8443/v1/exits", "alt.x.com"),
+            "https://alt.x.com:8443/v1/exits"
+        );
+        assert_eq!(
+            replace_host("https://api.x.com", "alt.x.com"),
+            "https://alt.x.com"
         );
     }
 }
