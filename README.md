@@ -15,20 +15,24 @@ for the engineering rules.
 
 ## Status
 
-Bootstrap phase. The `warren-identity` layer is implemented and fully tested; the
-other layers are scaffolded with their public contracts documented (see the
-roadmap). Applications will depend on a single crate, `warren-sdk`.
+The cryptographic and protocol core is implemented in strict TDD and validated
+end to end in-process (identity to QUIC tunnel to datagram). The per-OS datapath
+(proxy/TUN backends) and the FFI binding codegen are scaffolded behind their
+seams and tracked as the next phases. Applications depend on a single crate,
+`warren-sdk`. See `AUDIT.md` for the post-implementation audit and `ROADMAP.md`
+for the remaining work.
 
 | Capability | Crate | Status |
 |---|---|---|
-| Non-custodial identity (BIP39, SS58 `wb…`, request signing) | `warren-identity` | done |
-| Wire codecs (handshake, NAT-PMP, multihop) | `warren-wire` | planned (P2) |
-| Signed account API client | `warren-api` | planned (P3) |
-| Exit discovery and selection | `warren-discovery` | planned (P4) |
-| QUIC transport | `warren-transport` | planned (P5) |
-| Networking backends (non-root proxy, optional TUN) | `warren-net` | planned (P6) |
-| High-level `WarrenClient` facade | `warren-sdk` | planned (P8) |
-| FFI bindings (Dart, Kotlin, Swift, Python, Java) | `warren-sdk-ffi` | planned (P9) |
+| Non-custodial identity (BIP39, SS58 `wb…`, request signing) | `warren-identity` | done, golden vectors |
+| Handshake + NAT-PMP wire codecs | `warren-wire` | done, golden vectors |
+| Signed account API client (transport-agnostic) | `warren-api` | done |
+| Signed relay list verify (v5) + weighted selector | `warren-discovery` | done, golden vector |
+| QUIC transport (RFC 7250 raw-public-key TLS 1.3) | `warren-transport` | done, in-process e2e |
+| Datapath seams (`PacketSink`, SOCKS5 codec, kill-switch levels) | `warren-net` | seams done; per-OS proxy/TUN backends pending (P6) |
+| High-level `WarrenClient` facade | `warren-sdk` | done, in-process e2e |
+| FFI identity surface (uniffi/flutter_rust_bridge-shaped) | `warren-sdk-ffi` | identity surface done; tunnel surface + binding codegen pending (P9) |
+| Multihop HPKE frame | `warren-wire` | planned |
 
 ## Identity in a few lines
 

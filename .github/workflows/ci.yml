@@ -4,33 +4,71 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  test:
-    name: fmt + clippy + test
+  fmt:
+    name: cargo fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
-        run: rustup show
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS runners cost 10x the per-minute quota; for a private repo
+        # this burns the Free-tier minutes fast. macOS is validated locally
+        # (the maintainer develops on darwin) and can be added to release.yml
+        # later. Linux + Windows already catch the cross-OS divergences that
+        # matter for the per-OS datapath crate (warren-net) once it lands.
+        include:
+          - os: ubuntu-22.04
+          - os: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # --locked refuses to mutate Cargo.lock (CI reproducibility: the frozen
+      # golden vectors must resolve against the exact transitive crates).
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+          - os: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # nextest retries flaky tests up to 2 times: the in-process quinn
+      # loopback tunnel tests can hit a quinn Drop/UDP-bind race on slower
+      # runners. The test job is the correctness gate; real exit validation
+      # is manual against warren-core (cf. CLAUDE.md).
+      - run: cargo nextest run --locked --workspace --all-targets --retries 2
 
   deny:
     name: cargo-deny
@@ -40,3 +78,19 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  coverage:
+    name: cargo llvm-cov
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: measure coverage
+        run: cargo llvm-cov --workspace --locked --summary-only
