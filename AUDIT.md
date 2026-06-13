@@ -128,3 +128,32 @@ and validating it against a real exit).
 | Multihop HPKE frame | PHASE (multihop) | a full frozen wire subsystem; port + freeze vectors as its own phase |
 
 CI is green on every fix above across the three self-hosted OS runners.
+
+## Third audit: independent multi-agent review of the P6 datapath
+
+After the non-root datapath (SOCKS5 + HTTP CONNECT + smoltcp netstack +
+`WarrenClient::start_proxy`) landed, four independent agents re-reviewed the tree
+in parallel (security, architecture/clean-code, datapath correctness, and
+performance/multi-platform). They confirmed the crypto core remains a faithful
+port and the seam design is sound, and surfaced real defects in the new datapath
+that the happy-path in-process tests masked. All are now fixed.
+
+| Sev | Finding | Status |
+|---|---|---|
+| HIGH | Device MTU set to the policy `assigned_max_mtu` (1350) while the QUIC datagram carries ~1200 at `initial_mtu` 1280: full-size packets fail `send_datagram` against a real exit. The outbound pump then `break`s on that error, silently killing all egress ("works in tests, dead in prod"). | FIXED. Device MTU now derives from `PacketSink::max_payload()`; the pump drops-and-continues on a per-packet send error and only tears down when the tunnel read side closes. |
+| HIGH | No backpressure: `poll_write` over an unbounded channel always returned `Ready`, and `pending_out`/`to_app`/`device.rx` were uncapped, so a fast local app or a flooding exit grew the single engine task's heap without bound (remote+local DoS). | FIXED. Per-connection bounded channels with `PollSender` (writer parks via `poll_reserve`); the read side only drains a socket while the app channel has a permit, so the TCP window actually closes; `PENDING_OUT_CAP` bounds per-conn buffering; inbound/outbound frame channels are bounded. |
+| MED | `connector.connect()` hung forever if the exit never answered the SYN (no timeout), hanging the SOCKS5 client. | FIXED. `CONNECT_TIMEOUT` (10s) deadline per pending connect; on expiry the socket is aborted and the connect fails with `NetError::ConnectTimeout`. |
+| MED | Connections keyed by the recyclable smoltcp `SocketHandle`: a late write/shutdown after reap could hit a reused handle and corrupt a different flow. | FIXED. Connections keyed by a monotonic conn-id with per-connection channels; the handle is never used for routing. |
+| MED | No-log regressions reachable from one `fetch_exits()`: `SignedError::ServerPubkeyMismatch` rendered server pubkeys, `SignedError::Relay` rendered endpoint ids / addresses, and `reqwest_transport` stringified the URL/host/IP into `TransportError`, all surfaced via transparent top-level `Display`. | FIXED. Pubkeys/addresses dropped from all three `Display`s (fields kept for inspection); reqwest errors mapped to generic address-free reasons. Locked by `server_pubkey_mismatch_display_omits_the_key`. |
+| MED | Ephemeral local port was a bare wrapping counter (collision after 16k). | FIXED. Free-port tracking via a `used_ports` set, released on reap. |
+| LOW | `SignedRelayList`/`JsonRelay` lacked `deny_unknown_fields`; no bound on the signed validity window (`expires_at - signed_at`). | FIXED. Both added; validity window capped at 7 days (`ValidityTooLong`). Locked by tests. |
+| LOW | IPv6 targets accepted by the connector but unroutable (only an IPv4 default route). | FIXED. `TunnelConnector::connect` rejects IPv6 targets until v6 routing is wired. |
+| LOW | smoltcp ISN `random_seed` was a hardcoded constant (RFC 6528 predictability). | FIXED. Seeded from `rand::random()` at engine start. |
+| LOW | `NetError::Unsupported(&str)` had become a catch-all for five conditions. | FIXED. Split into `ConnectionRefused` / `ConnectTimeout` / `ConnectFailed` / `EngineStopped`. |
+| MED (coverage) | Out-of-subnet routing (the production path via the default route) had no test; same-subnet tests never exercised it. | FIXED. `netstack_routes_out_of_subnet_target_via_default_route` plus a connection-refused test. |
+| PERF | Per-packet copies/allocs (Vec on write, byte-wise `VecDeque<u8>`, `Bytes`->`Vec` on inbound), one engine wakeup per TCP segment. | FIXED. `Bytes` threaded end to end (zero-copy inbound; chunked `VecDeque<Bytes>` send queue); `while iface.poll() != None` drains smoltcp per wake. |
+| n/a | Validate the datapath against a real warren-core exit (`assigned_max_mtu`, FIN/RST under loss, sustained throughput); DNS-over-tunnel for domain targets; HTTP head `BufReader`; shared endpoint/reconnect supervisor; per-OS TUN. | OPEN (tracked in ROADMAP). Requires a real exit / privilege / further phases. |
+
+After this pass: `cargo fmt --all -- --check`, `cargo clippy --workspace
+--all-targets --all-features -- -D warnings`, `cargo test --workspace`, `cargo
+deny check` all green; 28 test binaries pass.
