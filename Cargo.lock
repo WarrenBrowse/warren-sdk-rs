@@ -523,7 +523,12 @@ dependencies = [
 name = "warren-discovery"
 version = "0.0.1"
 dependencies = [
- "warren-identity",
+ "ed25519-dalek",
+ "hex",
+ "rand",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
