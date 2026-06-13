@@ -1,6 +1,6 @@
 [package]
 name = "warren-net"
-description = "Warren networking backends behind a PacketSink seam: a non-root userspace netstack with a local SOCKS5/HTTP proxy (default, Linux/macOS/Windows) and an optional privileged TUN backend with routing, DNS and killswitch. (Phase P6, not yet implemented.)"
+description = "Warren networking backends behind one seam: a non-root userspace proxy (SOCKS5/HTTP CONNECT) datapath (default, all OSes) and an optional privileged TUN datapath with routing, DNS and killswitch. The QUIC packet plane and SOCKS5 codec are implemented and tested; per-OS TUN/killswitch back ends are feature-gated."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,14 +11,22 @@ publish.workspace = true
 
 [dependencies]
 warren-transport = { path = "../warren-transport" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
 
-# Feature gates select which backends compile in. The non-root `netstack`
-# backend is the default, feature-complete mode on every OS; `tun` adds the
-# optional privileged transparent backend.
 [features]
-default = ["netstack"]
-netstack = []
+# The non-root proxy datapath is always available. `tun` and `killswitch` pull
+# in the privileged per-OS back ends (implemented incrementally per platform).
+default = ["proxy"]
+proxy = []
 tun = []
+killswitch = []
+
+[dev-dependencies]
+tokio = { workspace = true }
+ed25519-dalek = { workspace = true }
+warren-wire = { path = "../warren-wire" }
+quinn = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,23 +1,35 @@
-//! Warren networking backends (Phase P6, not yet implemented).
+//! Warren networking backends.
 //!
-//! Two backends sit behind one `PacketSink` seam and share the QUIC core in
-//! [`warren_transport`]:
+//! Two datapaths sit behind one packet-plane seam ([`PacketSink`]) and share the
+//! QUIC core in `warren-transport`:
 //!
-//! 1. `netstack` (default, non-root, feature-complete on Linux, macOS, Windows):
-//!    a userspace TCP/IP stack (smoltcp) that terminates application flows and
-//!    forwards them as QUIC datagrams, exposed through a local SOCKS5 plus HTTP
-//!    CONNECT proxy. No elevated privileges required on any OS.
-//! 2. `tun` (optional, privileged): a real TUN device (Linux `/dev/net/tun`,
-//!    macOS utun, Windows Wintun) with split-default routing, DNS push and a
-//!    killswitch (nft / pf / WFP). Captures all OS traffic transparently.
+//! 1. **Proxy (default, non-root).** A local SOCKS5 (and optional HTTP CONNECT)
+//!    listener terminates application L4 flows and forwards them over the tunnel.
+//!    Feature-complete on Linux, macOS and Windows with no elevated privileges.
+//!    The [`socks5`] codec is implemented and tested here. A userspace netstack
+//!    then synthesizes inner IP packets from those flows and drives them through
+//!    a [`PacketSink`]; that bridge is the next integration step.
+//! 2. **TUN (optional, privileged).** A real TUN device feeds inner IP packets
+//!    straight into a [`PacketSink`], with split-default routing, DNS push and an
+//!    OS-enforced [`killswitch`]. Built per OS behind the `tun` feature. Per the
+//!    datapath research: a non-root TUN mode is only possible on Linux
+//!    (`CAP_NET_ADMIN` or a pre-owned device); macOS and Windows require
+//!    privilege, which is exactly why the proxy datapath is the default.
 //!
-//! The mode is chosen at runtime (`ConnectMode::Proxy` vs `ConnectMode::Tun`),
-//! defaulting to `Proxy`. Per-OS code is `cfg`-gated but pure logic compiles
-//! everywhere so it stays unit-testable without privileges.
+//! What is implemented and tested today: the [`PacketSink`] seam and its QUIC
+//! implementation ([`QuicPacketSink`]), the SOCKS5 wire codec, the leak-level
+//! model ([`KillSwitchLevel`]), and the [`ConnectMode`] selection. The per-OS
+//! TUN devices, routing/DNS plumbing, OS firewall killswitch, and the
+//! smoltcp-based proxy-to-packet bridge are feature-gated work tracked in the
+//! roadmap.
 
-#[cfg(test)]
-mod roadmap {
-    #[test]
-    #[ignore = "P6: implement non-root netstack proxy backend, then privileged TUN backend"]
-    fn placeholder() {}
-}
+pub mod error;
+pub mod killswitch;
+pub mod mode;
+pub mod sink;
+pub mod socks5;
+
+pub use error::NetError;
+pub use killswitch::{KillSwitch, KillSwitchLevel, ProxyOnlyKillSwitch};
+pub use mode::{ConnectMode, ProxyConfig, TunConfig};
+pub use sink::{PacketSink, QuicPacketSink};
