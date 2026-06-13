@@ -12,12 +12,16 @@
 //! Wire-compatible with warren-core (`SignedRelayList` v5).
 
 pub mod exit_id;
+pub mod multihop_directory;
 pub mod query;
 pub mod relay;
 pub mod selector;
 pub mod signed;
 
 pub use exit_id::{EXIT_ID_LEN, ExitId, ExitIdError};
+pub use multihop_directory::{
+    DirectoryError, VerifiedDirectory, VerifiedExit, verify_multihop_directory,
+};
 pub use query::{ExitQuery, IpAvailability, LocationConstraint};
 pub use relay::{Location, Relay, RelayList};
 pub use selector::{ExitSelector, SelectorError};
