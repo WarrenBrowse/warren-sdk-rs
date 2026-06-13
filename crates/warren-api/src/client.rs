@@ -323,8 +323,14 @@ fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, ClientError> {
 }
 
 fn now_secs() -> Result<u64, ClientError> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    unix_secs_from(std::time::SystemTime::now())
+}
+
+/// Seconds since the Unix epoch for `t`, or [`ClientError::BadClock`] if `t`
+/// precedes the epoch. Split out so the bad-clock branch is testable without
+/// waiting for a real clock to misbehave.
+fn unix_secs_from(t: std::time::SystemTime) -> Result<u64, ClientError> {
+    t.duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .map_err(|_| ClientError::BadClock)
 }
@@ -541,6 +547,89 @@ mod tests {
             1,
             "a non-connect error must not advance the sequence"
         );
+    }
+
+    #[tokio::test]
+    async fn register_is_unsigned_post_and_parses() {
+        let c = client(MockTransport::new(200, r#"{"expires_at":123}"#));
+        let req = RegisterAccountRequest {
+            pubkey_ss58: "wbAAA".to_owned(),
+            voucher_secret: "voucher".to_owned(),
+            referral_code: None,
+        };
+        let resp = c.register(&req).await.expect("ok");
+        assert_eq!(resp.expires_at, 123);
+        let g = c.transport.last.lock().unwrap();
+        let r = g.as_ref().unwrap();
+        assert_eq!(r.method, Method::Post);
+        assert_eq!(r.url, "https://api.example.test/v1/register");
+        assert!(header(r, HEADER_PUBKEY).is_none(), "register is unsigned");
+        assert!(!r.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn check_is_signed_get_and_parses() {
+        let c = client(MockTransport::new(200, r#"{"ip":"1.2.3.4","is_exit":false}"#));
+        let resp = c.check().await.expect("ok");
+        assert_eq!(resp.ip, "1.2.3.4");
+        assert!(!resp.is_exit);
+        let g = c.transport.last.lock().unwrap();
+        let r = g.as_ref().unwrap();
+        assert_eq!(r.method, Method::Get);
+        assert_eq!(r.url, "https://api.example.test/v1/check");
+        assert!(header(r, HEADER_PUBKEY).is_some(), "check is signed");
+    }
+
+    #[tokio::test]
+    async fn open_session_is_signed_post_and_parses() {
+        let c = client(MockTransport::new(200, r#"{"admitted":true,"max":5,"current":1}"#));
+        let req = SessionOpenRequest {
+            pubkey_ss58: "wbAAA".to_owned(),
+            device_id_hex: "00".repeat(16),
+            exit_id: "exit".to_owned(),
+            max_devices: None,
+        };
+        let resp = c.open_session(&req).await.expect("ok");
+        assert!(resp.admitted);
+        assert_eq!(resp.max, 5);
+        assert_eq!(resp.current, 1);
+        let g = c.transport.last.lock().unwrap();
+        let r = g.as_ref().unwrap();
+        assert_eq!(r.method, Method::Post);
+        assert_eq!(r.url, "https://api.example.test/v1/session/open");
+        assert!(header(r, HEADER_PUBKEY).is_some(), "open_session is signed");
+    }
+
+    #[tokio::test]
+    async fn close_session_is_signed_post_returning_unit() {
+        let c = client(MockTransport::new(200, ""));
+        let req = SessionCloseRequest {
+            pubkey_ss58: "wbAAA".to_owned(),
+            device_id_hex: "00".repeat(16),
+        };
+        c.close_session(&req).await.expect("ok");
+        let g = c.transport.last.lock().unwrap();
+        let r = g.as_ref().unwrap();
+        assert_eq!(r.method, Method::Post);
+        assert_eq!(r.url, "https://api.example.test/v1/session/close");
+        assert!(header(r, HEADER_PUBKEY).is_some(), "close_session is signed");
+    }
+
+    #[tokio::test]
+    async fn delete_account_is_signed_delete() {
+        let c = client(MockTransport::new(200, ""));
+        c.delete_account().await.expect("ok");
+        let g = c.transport.last.lock().unwrap();
+        let r = g.as_ref().unwrap();
+        assert_eq!(r.method, Method::Delete);
+        assert_eq!(r.url, "https://api.example.test/v1/account");
+        assert!(header(r, HEADER_PUBKEY).is_some(), "delete_account is signed");
+    }
+
+    #[test]
+    fn pre_epoch_clock_is_bad_clock() {
+        let before = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert!(matches!(unix_secs_from(before), Err(ClientError::BadClock)));
     }
 
     #[test]
