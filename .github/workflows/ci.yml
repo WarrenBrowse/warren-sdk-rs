@@ -1,5 +1,12 @@
 name: CI
 
+# Runs exclusively on the WarrenBrowse org self-hosted runners (Default runner
+# group, visibility: all). Label sets are matched against the live runners:
+#   [self-hosted, Linux, X64]    -> macstudio-linux-rosetta / warren-docker-ci
+#   [self-hosted, Windows, X64]  -> win-runner1
+#   [self-hosted, macOS, ARM64]  -> axiomStudio
+# Do not switch any job to a GitHub-hosted runner.
+
 on:
   push:
     branches: [main]
@@ -15,7 +22,7 @@ env:
 jobs:
   fmt:
     name: cargo fmt
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
@@ -24,19 +31,18 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
-    name: cargo clippy
-    runs-on: ${{ matrix.os }}
+    name: cargo clippy (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        # macOS runners cost 10x the per-minute quota; for a private repo
-        # this burns the Free-tier minutes fast. macOS is validated locally
-        # (the maintainer develops on darwin) and can be added to release.yml
-        # later. Linux + Windows already catch the cross-OS divergences that
-        # matter for the per-OS datapath crate (warren-net) once it lands.
         include:
-          - os: ubuntu-22.04
-          - os: windows-2022
+          - name: linux
+            runner: [self-hosted, Linux, X64]
+          - name: windows
+            runner: [self-hosted, Windows, X64]
+          - name: macos
+            runner: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
@@ -48,14 +54,18 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   test:
-    name: cargo test
-    runs-on: ${{ matrix.os }}
+    name: cargo test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
-          - os: windows-2022
+          - name: linux
+            runner: [self-hosted, Linux, X64]
+          - name: windows
+            runner: [self-hosted, Windows, X64]
+          - name: macos
+            runner: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
@@ -72,16 +82,21 @@ jobs:
 
   deny:
     name: cargo-deny
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # Install and run directly rather than the container action: the Linux
+      # runners are not guaranteed to expose a usable Docker daemon to jobs.
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - name: install cargo-deny
+        uses: taiki-e/install-action@v2
         with:
-          command: check
+          tool: cargo-deny
+      - run: cargo deny check
 
   coverage:
     name: cargo llvm-cov
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
