@@ -6,6 +6,7 @@
 //! packets from terminated L4 flows and does the same. [`QuicPacketSink`] is the
 //! tunnel-side implementation over a [`warren_transport::ClientSession`].
 
+use bytes::Bytes;
 use warren_transport::ClientSession;
 
 use crate::error::NetError;
@@ -18,8 +19,9 @@ pub trait PacketSink: Send + Sync {
         packet: &[u8],
     ) -> impl std::future::Future<Output = Result<(), NetError>> + Send;
 
-    /// Awaits the next inner IP packet from the exit.
-    fn recv_packet(&self) -> impl std::future::Future<Output = Result<Vec<u8>, NetError>> + Send;
+    /// Awaits the next inner IP packet from the exit, returned zero-copy as
+    /// [`Bytes`].
+    fn recv_packet(&self) -> impl std::future::Future<Output = Result<Bytes, NetError>> + Send;
 
     /// The largest packet payload the current path can carry.
     fn max_payload(&self) -> usize;
@@ -47,12 +49,13 @@ impl QuicPacketSink {
 
 impl PacketSink for QuicPacketSink {
     async fn send_packet(&self, packet: &[u8]) -> Result<(), NetError> {
+        // One copy into the refcounted Bytes quinn needs; no intermediate Vec.
         self.session
-            .send_datagram(packet.to_vec())
+            .send_datagram(Bytes::copy_from_slice(packet))
             .map_err(|e| NetError::Tunnel(e.to_string()))
     }
 
-    async fn recv_packet(&self) -> Result<Vec<u8>, NetError> {
+    async fn recv_packet(&self) -> Result<Bytes, NetError> {
         self.session
             .read_datagram()
             .await
@@ -60,8 +63,11 @@ impl PacketSink for QuicPacketSink {
     }
 
     fn max_payload(&self) -> usize {
-        // Fall back to the RFC 9000 minimum guarantee when the path MTU is not
-        // yet known.
-        self.session.max_datagram_size().unwrap_or(1200)
+        // Honor both the path MTU (once probed) and the exit's policy MTU from
+        // the handshake; before the first PMTU probe, fall back to the policy.
+        let policy = usize::from(self.session.assigned_max_mtu());
+        self.session
+            .max_datagram_size()
+            .map_or(policy, |path| path.min(policy))
     }
 }

@@ -1066,7 +1066,6 @@ version = "0.23.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
- "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -1660,6 +1659,7 @@ dependencies = [
 name = "warren-net"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "ed25519-dalek",
  "quinn",
  "thiserror 2.0.18",
@@ -1673,7 +1673,9 @@ name = "warren-sdk"
 version = "0.0.1"
 dependencies = [
  "ed25519-dalek",
+ "hex",
  "quinn",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "warren-api",

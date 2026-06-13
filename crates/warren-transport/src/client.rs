@@ -1,6 +1,8 @@
 //! Identity-bound QUIC client tunnel: handshake and datagram session.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use warren_wire::{DEVICE_ID_LEN, MAX_SETUP_FRAME_BYTES, Setup, decode_setup_ack, encode_setup};
@@ -9,6 +11,29 @@ use crate::tls;
 
 /// ALPN offered by the client: IETF HTTP/3, mimicking a casual h3 dial.
 const ALPN_H3: &[u8] = b"h3";
+
+/// Client-side QUIC tuning for a VPN datagram workload. Mirrors warren-core's
+/// pinned constants: large datagram buffers to absorb internet jitter, an idle
+/// timeout and keepalive to detect dead peers and survive NAT expiry, and an
+/// initial MTU of 1280 (IPv6 minimum, safe on every path) to start PMTU
+/// discovery one round trip ahead.
+const DATAGRAM_RECV_BUFFER: usize = 8 * 1024 * 1024;
+const DATAGRAM_SEND_BUFFER: usize = 4 * 1024 * 1024;
+const MAX_IDLE_TIMEOUT_SECS: u64 = 180;
+const KEEP_ALIVE_INTERVAL_SECS: u64 = 20;
+const INITIAL_MTU: u16 = 1280;
+
+fn warren_transport_config() -> quinn::TransportConfig {
+    let mut tc = quinn::TransportConfig::default();
+    tc.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
+    tc.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
+    tc.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_INTERVAL_SECS)));
+    tc.initial_mtu(INITIAL_MTU);
+    if let Ok(idle) = quinn::IdleTimeout::try_from(Duration::from_secs(MAX_IDLE_TIMEOUT_SECS)) {
+        tc.max_idle_timeout(Some(idle));
+    }
+    tc
+}
 
 /// Errors from establishing or driving a tunnel.
 #[derive(Debug, thiserror::Error)]
@@ -120,11 +145,12 @@ impl ClientTunnel {
         exit_pubkey: [u8; 32],
         exit_addr: SocketAddr,
     ) -> Result<ClientSession, TunnelError> {
-        let client_cfg = tls::make_client_config(
+        let mut client_cfg = tls::make_client_config(
             &self.signing_key,
             tls::default_crypto_provider(),
             &[ALPN_H3],
         )?;
+        client_cfg.transport_config(Arc::new(warren_transport_config()));
 
         let bind = self.bind_local_ip.unwrap_or_else(|| {
             if exit_addr.is_ipv6() {
@@ -237,26 +263,29 @@ impl ClientSession {
 
     /// Sends one IP packet as a QUIC datagram (unreliable, unordered).
     ///
+    /// Accepts anything convertible into [`bytes::Bytes`] so the caller can pass
+    /// a `Bytes` slice without an intermediate copy.
+    ///
     /// # Errors
     ///
     /// [`TunnelError::SendDatagram`] if the datagram is too large or the
     /// connection is closing.
-    pub fn send_datagram(&self, payload: Vec<u8>) -> Result<(), TunnelError> {
+    pub fn send_datagram(&self, payload: impl Into<bytes::Bytes>) -> Result<(), TunnelError> {
         self.conn
-            .send_datagram(bytes::Bytes::from(payload))
+            .send_datagram(payload.into())
             .map_err(|e| TunnelError::SendDatagram(e.to_string()))
     }
 
-    /// Awaits the next inbound datagram.
+    /// Awaits the next inbound datagram, returning the zero-copy [`bytes::Bytes`]
+    /// from quinn directly (no per-packet allocation).
     ///
     /// # Errors
     ///
     /// [`TunnelError::ReadDatagram`] if the connection closed.
-    pub async fn read_datagram(&self) -> Result<Vec<u8>, TunnelError> {
+    pub async fn read_datagram(&self) -> Result<bytes::Bytes, TunnelError> {
         self.conn
             .read_datagram()
             .await
-            .map(|b| b.to_vec())
             .map_err(|e| TunnelError::ReadDatagram(e.to_string()))
     }
 

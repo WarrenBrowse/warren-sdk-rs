@@ -82,7 +82,7 @@ async fn handshake_assigns_ip_and_datagram_echoes() {
         .send_datagram(b"warren-hello".to_vec())
         .expect("send");
     let echoed = session.read_datagram().await.expect("read echo");
-    assert_eq!(echoed, b"warren-hello");
+    assert_eq!(echoed[..], b"warren-hello"[..]);
 
     session.disconnect();
 }

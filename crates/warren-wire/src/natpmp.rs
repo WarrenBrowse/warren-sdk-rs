@@ -23,6 +23,7 @@ pub enum MapProto {
 
 /// RFC 6886 result codes plus two Warren extensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResultCode {
     /// Operation succeeded.
     Success,
@@ -315,6 +316,25 @@ mod tests {
                 assert_eq!(rate_limit, None);
             }
             other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_external_address_response() {
+        // version 0, opcode 0|0x80, result 0, epoch 1, external ip 203.0.113.9.
+        let buf = [
+            0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 203, 0, 113, 9,
+        ];
+        match parse_response(&buf).expect("parse") {
+            Response::ExternalAddress {
+                result_code,
+                external_ip,
+                ..
+            } => {
+                assert_eq!(result_code, ResultCode::Success);
+                assert_eq!(external_ip, Ipv4Addr::new(203, 0, 113, 9));
+            }
+            other => panic!("expected ExternalAddress, got {other:?}"),
         }
     }
 

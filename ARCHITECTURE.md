@@ -34,14 +34,19 @@ portable in concept and pinned by shared golden vectors under `vectors/`.
 
 | Crate | Layer | Role | Status |
 |---|---|---|---|
-| `warren-identity` | core | BIP39 mnemonic to Ed25519, SS58 `wb…` address, canonical API request signing | implemented |
-| `warren-wire` | core | Pure codecs: Setup/SetupAck handshake, NAT-PMP, multihop HPKE frame | P2 |
-| `warren-api` | core | Signed HTTP client for the `/v1/*` account API, host fallback | P3 |
-| `warren-discovery` | core | Verify the signed relay list, select an exit | P4 |
-| `warren-transport` | net | QUIC handshake (quinn + rustls raw public keys), datagram pump, backoff | P5 |
-| `warren-net` | net | `PacketSink` seam, non-root netstack proxy backend and privileged TUN backend | P6 |
-| `warren-sdk` | facade | The single crate apps depend on; re-exports the layers and the `WarrenClient` facade | partial |
-| `warren-sdk-ffi` | facade | FFI surface (uniffi) for Dart/Kotlin/Swift/Python/Java bindings | P9 |
+| `warren-identity` | core | BIP39 mnemonic to Ed25519, SS58 `wb…` address, canonical API request signing | done |
+| `warren-wire` | core | Pure codecs: Setup/SetupAck handshake (done), NAT-PMP (done); multihop HPKE frame (todo) | done (multihop todo) |
+| `warren-api` | core | Signed HTTP client for the `/v1/*` account API; transport-agnostic core + optional reqwest | done |
+| `warren-discovery` | core | Verify the signed relay list (v5), weighted exit selection | done |
+| `warren-transport` | net | QUIC handshake (quinn + rustls raw public keys), `ClientSession` datagram plane | done |
+| `warren-net` | net | `PacketSink` seam (done) + QUIC plane (done) + SOCKS5 codec (done) + killswitch levels (done); smoltcp proxy bridge and per-OS TUN/killswitch (todo) | partial |
+| `warren-sdk` | facade | `WarrenClient` composing identity/api/discovery/transport/net | done |
+| `warren-sdk-ffi` | facade | FFI-ready identity surface (done); uniffi/flutter_rust_bridge codegen + async tunnel surface (todo) | partial |
+
+Every "done" crate is implemented in TDD with unit tests, golden vectors where a
+wire format is involved, and in-process end-to-end tests for the QUIC stack. The
+"todo" items are the parts that need real hardware/privilege (per-OS TUN,
+killswitch, real exit e2e) or a per-language build harness (binding codegen).
 
 Applications depend only on `warren-sdk`.
 

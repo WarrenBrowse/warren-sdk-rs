@@ -64,6 +64,21 @@ pinned by golden vectors where a wire format is involved. warren-core
 - uniffi scaffolding and the first Dart/Flutter binding, then Kotlin, Swift,
   Python and Java. Every binding replays the same `vectors/`.
 
+## Audit follow-ups (see AUDIT.md)
+
+Tracked items deferred from the post-implementation audit:
+
+- Typed error sources: replace the `String`-wrapped quinn/reqwest/io errors in
+  `TunnelError`, `TransportError`, `NetError` with `#[source]` variants.
+- Datapath bridge perf: `PacketSink::send_batch`/`recv_batch` (GSO/GRO),
+  `fast-apple-datapath` on macOS, a shared `quinn::Endpoint` in `WarrenClient`,
+  and send backpressure.
+- Test depth: per-endpoint `warren-api` mock tests, injectable clock for
+  `BadClock`, richer golden vectors, a shared `spawn_fake_exit` test helper.
+- Facade: default to weighted exit selection; consider a `DefaultClient` alias
+  and a `Result`-returning builder for the FFI tunnel surface.
+- Discovery: optional trust-on-first-use persistence of the server pubkey.
+
 ## Cross-cutting
 
 - Keep the public surface FFI-friendly from P2 onward (no exported generics,
