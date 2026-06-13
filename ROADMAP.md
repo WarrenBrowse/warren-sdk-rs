@@ -81,9 +81,14 @@ because each requires building code that does not exist yet and validating it
 against a real exit (a shared `quinn::Endpoint`/reconnect supervisor, send
 backpressure, and the smoltcp netstack all belong to that datapath work):
 
-- P6 datapath: non-root proxy (smoltcp + SOCKS5/HTTP CONNECT) then privileged
-  per-OS TUN/routing/DNS/killswitch, with GSO/GRO batch syscalls behind the
-  `PacketSink` batch seam and `fast-apple-datapath` on macOS.
+- P6 datapath:
+  - Done (validated in-process): non-root SOCKS5 proxy + userspace smoltcp
+    netstack over the tunnel, wired through `WarrenClient::start_proxy`; e2e from
+    a SOCKS5 client through a real QUIC tunnel to a netstack-terminating exit.
+  - Pending: validation against a real Warren exit (mandatory before production);
+    HTTP CONNECT front end; DNS-over-tunnel for domain targets; UDP associate;
+    privileged per-OS TUN/routing/DNS/killswitch; GSO/GRO batch syscalls behind
+    the `PacketSink` batch seam and `fast-apple-datapath` on macOS.
 - Multihop: port and freeze the HPKE frame (its own wire phase).
 
 ## Cross-cutting
