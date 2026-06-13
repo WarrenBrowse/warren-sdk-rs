@@ -1,0 +1,16 @@
+[package]
+name = "warren-discovery"
+description = "Warren exit discovery: verify the Ed25519-signed relay list (pinned server pubkey, anti-rollback) and select an exit by geography, weight and IP availability. (Phase P4, not yet implemented.)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+warren-identity = { path = "../warren-identity" }
+
+[lints]
+workspace = true

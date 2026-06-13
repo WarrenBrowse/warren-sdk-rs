@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+.DS_Store
+
+# Local secrets and mnemonics must never be committed.
+*.mnemonic
+*.key
+/.env
+/.warren-secrets
+
+# Editor / tooling noise.
+/.idea
+/.vscode
+*.swp

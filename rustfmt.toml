@@ -1,0 +1,4 @@
+# Stable-only rustfmt options so `cargo fmt` works without nightly.
+edition = "2024"
+use_field_init_shorthand = true
+use_try_shorthand = true

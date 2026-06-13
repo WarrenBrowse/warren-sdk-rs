@@ -1,0 +1,24 @@
+[package]
+name = "warren-net"
+description = "Warren networking backends behind a PacketSink seam: a non-root userspace netstack with a local SOCKS5/HTTP proxy (default, Linux/macOS/Windows) and an optional privileged TUN backend with routing, DNS and killswitch. (Phase P6, not yet implemented.)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+warren-transport = { path = "../warren-transport" }
+
+# Feature gates select which backends compile in. The non-root `netstack`
+# backend is the default, feature-complete mode on every OS; `tun` adds the
+# optional privileged transparent backend.
+[features]
+default = ["netstack"]
+netstack = []
+tun = []
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "warren-wire"
+description = "Pure Warren wire codecs: Setup/SetupAck handshake frames, NAT-PMP, and the multihop HPKE frame. No I/O. (Phase P2, not yet implemented.)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "warren-transport"
+description = "Warren QUIC transport: identity-bound handshake (quinn + rustls raw public keys), ClientSession, RFC 9221 datagram pump, reconnection backoff. (Phase P5, not yet implemented.)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+warren-identity = { path = "../warren-identity" }
+warren-wire = { path = "../warren-wire" }
+
+[lints]
+workspace = true

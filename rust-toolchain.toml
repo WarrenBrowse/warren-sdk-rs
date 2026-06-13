@@ -1,0 +1,8 @@
+[toolchain]
+# Pinned to match warren-core for reproducible builds and to guarantee the
+# wire contracts (BIP39, HKDF, ed25519-dalek 2.x) resolve to the exact same
+# transitive crates that produced the frozen golden vectors. Edition 2024
+# requires >= 1.85; 1.89 is the warren-core baseline.
+channel = "1.89.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

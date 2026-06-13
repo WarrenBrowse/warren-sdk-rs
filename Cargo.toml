@@ -1,0 +1,67 @@
+# Warren SDK (Rust) workspace.
+#
+# Standalone client SDK for the Warren VPN. It does NOT depend on the
+# warren-core monorepo: it is a clean-room reimplementation that stays
+# wire-compatible with warren-core's frozen contracts (identity, SS58,
+# request signing, handshake, signed relay list, NAT-PMP, multihop).
+# The same exercise is meant to be repeated in TypeScript, Dart, Python,
+# Kotlin, Swift and Java, so every layer is kept portable in concept and
+# pinned by shared golden vectors under `vectors/`.
+[workspace]
+resolver = "2"
+members = [
+    "crates/warren-identity",
+    "crates/warren-wire",
+    "crates/warren-api",
+    "crates/warren-discovery",
+    "crates/warren-transport",
+    "crates/warren-net",
+    "crates/warren-sdk",
+    "crates/warren-sdk-ffi",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.89"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/WarrenBrowse/warren-sdk-rs"
+authors = ["WarrenBrowse <hello@warrenbrowse.com>"]
+publish = false
+
+[workspace.dependencies]
+# Identity / crypto. Leaf RustCrypto and ecosystem crates, kept minimal
+# so each can be mapped 1:1 to the other language SDKs.
+ed25519-dalek = { version = "2", features = ["zeroize", "rand_core"] }
+bip39 = { version = "2", features = ["rand"] }
+hkdf = "0.12"
+sha2 = "0.10"
+bs58 = "0.5"
+blake2 = "0.10"
+hex = "0.4"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+# Errors. thiserror for libraries; never a stringly-typed error.
+thiserror = "2"
+
+# Serialization. serde for public DTOs and golden-vector replay.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Test-only helpers.
+tempfile = "3"
+
+# Lints applied to every crate in the workspace via `[lints] workspace = true`.
+# Mirrors warren-core's policy: zero unsafe, deny correctness, document the
+# public surface.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+must_use_candidate = "warn"
+needless_pass_by_value = "warn"

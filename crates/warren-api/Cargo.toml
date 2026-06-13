@@ -1,0 +1,16 @@
+[package]
+name = "warren-api"
+description = "Signed HTTP client for the Warren account API (/v1/*): subscription, voucher redeem, register, session, checkout, with anti-censorship host fallback. (Phase P3, not yet implemented.)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+warren-identity = { path = "../warren-identity" }
+
+[lints]
+workspace = true

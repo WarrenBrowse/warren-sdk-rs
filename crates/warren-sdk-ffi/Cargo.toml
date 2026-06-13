@@ -1,0 +1,16 @@
+[package]
+name = "warren-sdk-ffi"
+description = "FFI surface for the Warren SDK (uniffi pressenti), powering Dart/Flutter, Kotlin, Swift, Python and Java bindings. Boundary designed now; implementation in Phase P9."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+warren-sdk = { path = "../warren-sdk" }
+
+[lints]
+workspace = true

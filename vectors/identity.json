@@ -1,0 +1,70 @@
+{
+  "_comment": "Frozen cross-implementation golden vectors for the Warren identity layer. Every language SDK (Rust, TypeScript, Dart, Python, Kotlin, Swift, Java) MUST reproduce these byte-for-byte. Any change is a wire-format break and requires rotating the schema to identity/v2.",
+  "ss58": {
+    "_comment": "pubkey_hex -> Warren SS58 `wb…` address. Identical to @polkadot/util-crypto encodeAddress(pubkey, 13295).",
+    "prefix": 13295,
+    "vectors": [
+      ["0000000000000000000000000000000000000000000000000000000000000000", "wb7kgy8FF4rx4tamkksPfoymeeeZVXLrnSjbBxCun3XhP9DnB"],
+      ["0707070707070707070707070707070707070707070707070707070707070707", "wb7uuPeV524ZMHaQnrrsgXkRNirw6ntzcMaQ1vgcNsMEMRCDm"],
+      ["abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", "wbBdxLCYEJVa8tMAFTJVYn5tvHX8SUf8SZmSQRqs9ro3EXEkh"],
+      ["000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "wb7khGVR6Ymj2RtPCAgzamtdT5DT6xhM84hfhYkBf3b8ouCzT"],
+      ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "wbDYME7neT9po3eBDfQGhBt35J8hnaXVJdg9KZtZ5WPHsRRhP"]
+    ]
+  },
+  "derivation": {
+    "_comment": "seed32_hex -> { pubkey_hex, address }. HKDF-SHA256 salt=warren/identity/v1 info=vpn-node-key -> Ed25519.",
+    "hkdf_salt": "warren/identity/v1",
+    "hkdf_info": "vpn-node-key",
+    "vectors": [
+      {
+        "seed_hex": "abababababababababababababababababababababababababababababababab",
+        "pubkey_hex": "21e9276da8395d56af5c83c00ffb4afba7ebd337189aeea9136bfc9d3fd44f6b",
+        "address": "wb8X9ovjY66mreUk8qVtmRX5DGP4mkTqoYkUFjU6gbtjp1mUr"
+      },
+      {
+        "seed_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+        "pubkey_hex": "d9d24d24f77550ec46914c30d83dc973063c759967d03af4efe508fb34ed5308",
+        "address": "wbCgHqDAE3CKBuAeSDCC4r9TZtjXveuXNd934zzm7ncceJa6q"
+      }
+    ]
+  },
+  "bip39": {
+    "_comment": "mnemonic -> { seed_hex (first 32 bytes of the 64-byte BIP39 seed, empty passphrase), pubkey_hex, address }.",
+    "vectors": [
+      {
+        "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
+        "seed_hex": "408b285c123836004f4b8842c89324c1f01382450c0d439af345ba7fc49acf70",
+        "pubkey_hex": "fba874de8721df35921c9999a036c03bb098df35fc21fcbeac98af880ababdb9",
+        "address": "wbDSf2fncAfyDQkNbkyqjuhi8kpg3z8kCHqL2TYDSM2F1nVED"
+      }
+    ]
+  },
+  "canonical_message": {
+    "_comment": "(method, path, timestamp, nonce_hex, body_hash_hex) -> canonical string. Separator is LF, never CRLF.",
+    "vectors": [
+      {
+        "method": "GET",
+        "path": "/v1/exits",
+        "timestamp": 42,
+        "nonce_hex": "abcd1234",
+        "body_hash_hex": "ff00",
+        "expected": "GET\n/v1/exits\n42\nabcd1234\nff00"
+      }
+    ]
+  },
+  "request_signature": {
+    "_comment": "Deterministic Ed25519 request signing. seed32_hex derives the key; (method, path, body_utf8, timestamp, nonce_hex16) produce signature_hex. Frozen below after first generation.",
+    "vectors": [
+      {
+        "seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+        "method": "POST",
+        "path": "/v1/register",
+        "body_utf8": "{\"voucher\":\"abc\"}",
+        "timestamp": 1700000000,
+        "nonce_hex": "09090909090909090909090909090909",
+        "pubkey_ss58": "wbBfa1jcETanWzVVK4Hh166fwo6YSNaarwT2XnDQ1vNdSigx4",
+        "signature_hex": "1c3dc33a1bb9fab8809306de8e4d91c88577cfacbe97a844918570139e57ac7ad83f1bc8043fb3985aac57e864c82d3c2e5e213bfe1be38fa2251cc33291860e"
+      }
+    ]
+  }
+}

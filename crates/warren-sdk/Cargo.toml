@@ -1,0 +1,16 @@
+[package]
+name = "warren-sdk"
+description = "Warren VPN client SDK: the single, ergonomic entry point applications depend on. Re-exports the layered crates and (from Phase P8) the high-level WarrenClient facade."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+warren-identity = { path = "../warren-identity" }
+
+[lints]
+workspace = true
