@@ -348,7 +348,10 @@ mod tests {
         let err = verify_signed_relay_list(&json, Some(&pin)).unwrap_err();
         let rendered = err.to_string();
         let actual_key = hex::encode(fixed_server_key().verifying_key().as_bytes());
-        assert!(!rendered.contains(&actual_key), "leaked server key: {rendered}");
+        assert!(
+            !rendered.contains(&actual_key),
+            "leaked server key: {rendered}"
+        );
         assert!(!rendered.contains(&pin), "leaked pin: {rendered}");
     }
 
