@@ -1,6 +1,6 @@
 [package]
 name = "warren-sdk"
-description = "Warren VPN client SDK: the single, ergonomic entry point applications depend on. Re-exports the layered crates and (from Phase P8) the high-level WarrenClient facade."
+description = "Warren VPN client SDK: the single, ergonomic entry point applications depend on. Composes identity, the signed account API, exit discovery, the QUIC transport and the networking backends behind one WarrenClient facade."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,23 @@ publish.workspace = true
 
 [dependencies]
 warren-identity = { path = "../warren-identity" }
+warren-api = { path = "../warren-api" }
+warren-discovery = { path = "../warren-discovery" }
+warren-transport = { path = "../warren-transport" }
+warren-net = { path = "../warren-net" }
+thiserror = { workspace = true }
+
+[features]
+# Bundle the reqwest transport so an app can build a working client with one
+# dependency. Apps that bring their own HttpTransport can disable it.
+default = ["reqwest-transport"]
+reqwest-transport = ["warren-api/reqwest-transport"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+ed25519-dalek = { workspace = true }
+warren-wire = { path = "../warren-wire" }
+quinn = { workspace = true }
 
 [lints]
 workspace = true

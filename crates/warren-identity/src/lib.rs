@@ -27,6 +27,11 @@ use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
+/// Re-export of the exact `ed25519-dalek` the SDK builds against, so dependent
+/// crates can name `SigningKey`/`VerifyingKey` without pinning the version
+/// themselves.
+pub use ed25519_dalek;
+
 pub use mnemonic::{MnemonicError, generate as generate_mnemonic, seed_from_mnemonic};
 pub use signing::{
     HEADER_NONCE, HEADER_PUBKEY, HEADER_SIGNATURE, HEADER_TIMESTAMP, RequestSignature,
@@ -114,6 +119,16 @@ impl WarrenIdentity {
     #[must_use]
     pub fn verifying_key(&self) -> VerifyingKey {
         self.signing.verifying_key()
+    }
+
+    /// Clones the underlying Ed25519 signing key.
+    ///
+    /// The Warren wallet key doubles as the QUIC tunnel client identity (RPK
+    /// handshake), so the transport layer needs it. The returned key zeroizes on
+    /// drop; treat it as secret.
+    #[must_use]
+    pub fn signing_key(&self) -> SigningKey {
+        self.signing.clone()
     }
 
     /// The canonical Warren SS58 address (`wb…`).

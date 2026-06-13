@@ -1672,7 +1672,16 @@ dependencies = [
 name = "warren-sdk"
 version = "0.0.1"
 dependencies = [
+ "ed25519-dalek",
+ "quinn",
+ "thiserror 2.0.18",
+ "tokio",
+ "warren-api",
+ "warren-discovery",
  "warren-identity",
+ "warren-net",
+ "warren-transport",
+ "warren-wire",
 ]
 
 [[package]]

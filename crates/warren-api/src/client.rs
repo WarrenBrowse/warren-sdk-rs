@@ -38,7 +38,7 @@ pub enum ClientError {
 ///
 /// Generic over an [`HttpTransport`] so the request logic is testable without a
 /// network. The SDK facade pairs it with the bundled reqwest transport.
-pub struct WarrenApiClient<T: HttpTransport> {
+pub struct WarrenApiClient<T> {
     api_base: String,
     identity: WarrenIdentity,
     transport: T,
