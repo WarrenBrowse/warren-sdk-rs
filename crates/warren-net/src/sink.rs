@@ -25,6 +25,35 @@ pub trait PacketSink: Send + Sync {
 
     /// The largest packet payload the current path can carry.
     fn max_payload(&self) -> usize;
+
+    /// Sends a batch of packets. The default forwards them one by one; a
+    /// GSO-aware implementation can override this to coalesce the syscall.
+    fn send_batch(
+        &self,
+        packets: &[&[u8]],
+    ) -> impl std::future::Future<Output = Result<(), NetError>> + Send {
+        async move {
+            for packet in packets {
+                self.send_packet(packet).await?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Receives at least one and at most `max` packets, blocking for the first.
+    /// The default returns a single packet; a GRO-aware implementation can
+    /// return several harvested from one syscall.
+    fn recv_batch(
+        &self,
+        max: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<Bytes>, NetError>> + Send {
+        async move {
+            let first = self.recv_packet().await?;
+            let mut out = Vec::with_capacity(max.max(1));
+            out.push(first);
+            Ok(out)
+        }
+    }
 }
 
 /// A [`PacketSink`] backed by a QUIC tunnel session (RFC 9221 datagrams).

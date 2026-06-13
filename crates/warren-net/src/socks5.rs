@@ -25,6 +25,16 @@ pub enum Command {
     UdpAssociate,
 }
 
+impl Command {
+    /// Whether the Warren proxy supports this command. Only `Connect` is
+    /// supported; the server loop must answer `Bind` and `UdpAssociate` with
+    /// [`Reply::CommandNotSupported`] rather than attempting them.
+    #[must_use]
+    pub fn is_supported(self) -> bool {
+        matches!(self, Command::Connect)
+    }
+}
+
 /// Where a SOCKS5 request wants to go. Domain names are preserved so the exit
 /// resolves them, never the local resolver.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +238,27 @@ mod tests {
         let (cmd, target) = parse_request(&buf).expect("parse");
         assert_eq!(cmd, Command::Connect);
         assert_eq!(target, Target::Domain("example.com".to_owned(), 443));
+    }
+
+    #[test]
+    fn only_connect_is_supported() {
+        // VER CMD=BIND RSV ATYP=1 1.2.3.4 :443
+        let bind = [0x05, 0x02, 0x00, 0x01, 1, 2, 3, 4, 0x01, 0xbb];
+        let (cmd, _) = parse_request(&bind).expect("parse");
+        assert_eq!(cmd, Command::Bind);
+        assert!(!cmd.is_supported(), "Bind must be rejected by the server");
+
+        let udp = [0x05, 0x03, 0x00, 0x01, 1, 2, 3, 4, 0x01, 0xbb];
+        let (cmd, _) = parse_request(&udp).expect("parse");
+        assert_eq!(cmd, Command::UdpAssociate);
+        assert!(!cmd.is_supported(), "UdpAssociate must be gated");
+
+        assert!(Command::Connect.is_supported());
+        // The reply the server loop owes an unsupported command.
+        assert_eq!(
+            build_reply(Reply::CommandNotSupported, "0.0.0.0:0".parse().unwrap())[1],
+            0x07
+        );
     }
 
     #[test]
