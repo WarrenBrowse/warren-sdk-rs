@@ -182,3 +182,114 @@ async fn write_reply(client: &mut TcpStream, reply: Reply) -> Result<(), NetErro
         .await
         .map_err(NetError::Io)
 }
+
+/// Largest CONNECT request head (request line plus headers) accepted.
+const MAX_HTTP_HEAD: usize = 8 * 1024;
+
+/// An HTTP CONNECT proxy server over a [`Connector`].
+///
+/// Handles only the `CONNECT host:port` method (the tunneling verb a browser or
+/// HTTP client uses for HTTPS); other methods are refused. Like [`Socks5Proxy`]
+/// it relays through the connector, so the same tunnel datapath backs it.
+pub struct HttpConnectProxy<C> {
+    connector: Arc<C>,
+}
+
+impl<C: Connector> HttpConnectProxy<C> {
+    /// Builds a CONNECT proxy that opens upstream flows through `connector`.
+    pub fn new(connector: C) -> Self {
+        Self {
+            connector: Arc::new(connector),
+        }
+    }
+
+    /// Accepts connections on `listener` until it errors, one task each.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Io`] only if accepting on the listener fails.
+    pub async fn serve(&self, listener: TcpListener) -> Result<(), NetError> {
+        loop {
+            let (client, _peer) = listener.accept().await.map_err(NetError::Io)?;
+            let connector = Arc::clone(&self.connector);
+            tokio::spawn(async move {
+                let _ = handle_connect(client, connector.as_ref()).await;
+            });
+        }
+    }
+}
+
+async fn handle_connect<C: Connector>(
+    mut client: TcpStream,
+    connector: &C,
+) -> Result<(), NetError> {
+    let target = match read_connect_target(&mut client).await? {
+        Some(t) => t,
+        None => {
+            let _ = client
+                .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+                .await;
+            return Ok(());
+        }
+    };
+
+    let mut upstream = match connector.connect(target).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+            return Err(e);
+        }
+    };
+
+    client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await
+        .map_err(NetError::Io)?;
+    tokio::io::copy_bidirectional(&mut client, &mut upstream)
+        .await
+        .map_err(NetError::Io)?;
+    Ok(())
+}
+
+/// Reads the CONNECT request head and returns the target, or `None` if the
+/// method is not CONNECT or the head is malformed.
+async fn read_connect_target(client: &mut TcpStream) -> Result<Option<Target>, NetError> {
+    let mut head = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let n = client.read(&mut byte).await.map_err(NetError::Io)?;
+        if n == 0 {
+            return Ok(None); // connection closed before a full head
+        }
+        head.push(byte[0]);
+        if head.len() > MAX_HTTP_HEAD {
+            return Ok(None);
+        }
+    }
+    let text = match std::str::from_utf8(&head) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    let request_line = text.lines().next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    if parts.next() != Some("CONNECT") {
+        return Ok(None);
+    }
+    let authority = match parts.next() {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    Ok(parse_authority(authority))
+}
+
+/// Parses `host:port` into a [`Target`], keeping domain names for remote
+/// resolution. IPv6 literals use the `[addr]:port` form.
+fn parse_authority(authority: &str) -> Option<Target> {
+    if let Ok(addr) = authority.parse::<std::net::SocketAddr>() {
+        return Some(Target::Ip(addr));
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    Some(Target::Domain(host.to_owned(), port))
+}

@@ -39,5 +39,5 @@ pub use mode::{ConnectMode, ProxyConfig, TunConfig};
 #[cfg(feature = "proxy")]
 pub use netstack::{NetstackStream, TunnelConnector, spawn_engine, spawn_over_sink};
 #[cfg(feature = "proxy")]
-pub use proxy::{Connector, DirectConnector, Socks5Proxy};
+pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy};
 pub use sink::{PacketSink, QuicPacketSink};

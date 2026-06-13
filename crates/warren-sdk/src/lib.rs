@@ -403,15 +403,32 @@ impl<T: HttpTransport> WarrenClient<T> {
             mtu,
         );
 
-        let listener = tokio::net::TcpListener::bind(cfg.socks5)
+        let socks_listener = tokio::net::TcpListener::bind(cfg.socks5)
             .await
             .map_err(SdkError::Proxy)?;
-        let local_addr = listener.local_addr().map_err(SdkError::Proxy)?;
-        let proxy = warren_net::Socks5Proxy::new(connector);
-        let task = tokio::spawn(async move {
-            let _ = proxy.serve(listener).await;
-        });
-        Ok(ProxyHandle { local_addr, task })
+        let local_addr = socks_listener.local_addr().map_err(SdkError::Proxy)?;
+        let socks = warren_net::Socks5Proxy::new(connector.clone());
+        let mut tasks = vec![tokio::spawn(async move {
+            let _ = socks.serve(socks_listener).await;
+        })];
+
+        let mut http_addr = None;
+        if let Some(http_bind) = cfg.http {
+            let http_listener = tokio::net::TcpListener::bind(http_bind)
+                .await
+                .map_err(SdkError::Proxy)?;
+            http_addr = Some(http_listener.local_addr().map_err(SdkError::Proxy)?);
+            let http = warren_net::HttpConnectProxy::new(connector);
+            tasks.push(tokio::spawn(async move {
+                let _ = http.serve(http_listener).await;
+            }));
+        }
+
+        Ok(ProxyHandle {
+            local_addr,
+            http_addr,
+            tasks,
+        })
     }
 }
 
@@ -423,7 +440,8 @@ const TUNNEL_GATEWAY: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 66, 0, 1)
 /// A running non-root proxy datapath. Dropping it stops the proxy.
 pub struct ProxyHandle {
     local_addr: SocketAddr,
-    task: tokio::task::JoinHandle<()>,
+    http_addr: Option<SocketAddr>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl ProxyHandle {
@@ -434,15 +452,25 @@ impl ProxyHandle {
         self.local_addr
     }
 
+    /// The address the HTTP CONNECT listener bound, if one was configured.
+    #[must_use]
+    pub fn http_addr(&self) -> Option<SocketAddr> {
+        self.http_addr
+    }
+
     /// Stops the proxy datapath.
     pub fn shutdown(self) {
-        self.task.abort();
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 
 impl Drop for ProxyHandle {
     fn drop(&mut self) {
-        self.task.abort();
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 

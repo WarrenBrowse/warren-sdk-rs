@@ -29,7 +29,7 @@ for the remaining work.
 | Signed account API client (transport-agnostic) | `warren-api` | done; anti-censorship host fallback pending |
 | Signed relay list verify (v5) + weighted selector | `warren-discovery` | done, golden vector |
 | QUIC transport (RFC 7250 raw-public-key TLS 1.3) | `warren-transport` | done, in-process e2e |
-| Non-root proxy datapath (SOCKS5 + smoltcp userspace netstack over the tunnel) | `warren-net` | implemented, e2e in-process; HTTP CONNECT + per-OS TUN pending |
+| Non-root proxy datapath (SOCKS5 + HTTP CONNECT + smoltcp userspace netstack over the tunnel) | `warren-net` | implemented, e2e in-process; DNS-over-tunnel + per-OS TUN pending |
 | High-level `WarrenClient` facade (incl. `start_proxy` non-root datapath) | `warren-sdk` | done, in-process e2e |
 | FFI identity surface (uniffi/flutter_rust_bridge-shaped) | `warren-sdk-ffi` | identity surface done; tunnel surface + binding codegen pending (P9) |
 | Multihop HPKE frame | `warren-wire` | planned |
