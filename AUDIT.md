@@ -71,3 +71,25 @@ The DEFERRED items are tracked in `ROADMAP.md` under "Audit follow-ups". They ar
 either contained refactors (typed error sources, shared test helper, richer
 vectors, per-endpoint tests) or work that belongs to the not-yet-built datapath
 bridge (batch I/O, shared endpoint, backpressure, smoltcp threading).
+
+## Second independent audit (follow-up pass)
+
+A fresh, independent reviewer re-read the whole tree and cross-checked every
+frozen contract against warren-core line by line. It confirmed the crypto core
+is a byte-exact, faithful port (identity, SS58, signing, Setup/SetupAck, signed
+relay list v5, RFC 7250 TLS, NAT-PMP) and that the first audit was accurate. It
+surfaced two items the first pass had understated, both now addressed.
+
+| Sev | Finding | Status |
+|---|---|---|
+| HIGH | The anti-rollback `generation` floor was in-memory only (`AtomicU64` resetting to 0 each process start), so a replayed older-but-valid list was accepted by any freshly launched client. | FIXED. The floor moved behind a `GenerationStore` trait the builder accepts; the default `InMemoryGenerationStore` keeps the prior (process-scoped) behavior, and an embedder can supply a persistent store so anti-rollback survives restarts. New tests `persisted_floor_rejects_rollback_on_a_fresh_client` and `fetch_advances_the_persistent_floor`. |
+| MED | `WarrenClientBuilder::build*` panicked on a missing identity, an unwind hazard across the FFI boundary. | FIXED. `build`/`build_with_transport` now return `Result<_, BuildError>` (`MissingIdentity`). |
+| MED | Server-key pinning was off by default with no signal, so an unpinned client silently trusted any self-signed list. | FIXED. `build` now returns `BuildError::UnpinnedServerKey` unless a pin is set or `allow_any_server_key()` is called explicitly. |
+| MED | The anti-censorship host fallback (primary / alternatives / no-SNI) is listed under ROADMAP P3 but is not implemented: the API client takes a single `api_base`. | OPEN. Reclassified as a real functional gap, not polish. Tracked as a P3 follow-up; the "done" framing for P3 is corrected to exclude it. |
+| P1/P2 clean-code | `String`-wrapped quinn/io/serde errors in `TunnelError`, `NetError`, `ClientError` lost their `#[source]`, against CLAUDE.md's own rule. | FIXED. Converted to typed `#[source]`/`#[from]` variants across the three crates; `ClientError::Deserialize` split into `ResponseEncoding` / `ResponseJson` / `RequestSerialize`. This also tightens no-log discipline: the address-bearing cause leaves the top-level `Display` and is reachable only via `source()`. New tests assert the chain is preserved and the `Display` omits the cause. |
+| LOW | NAT-PMP `ResultCode::from_raw` folds raw code `3` into the catch-all rather than mirroring warren-core's explicit `3 => NetworkFailure` arm (behavior identical). | OPEN (cosmetic 1:1-fidelity nit). Tracked. |
+
+All gates green after this pass: `cargo fmt --all -- --check`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo deny
+check`. The CI now runs these exclusively on the WarrenBrowse self-hosted runners
+across Linux, Windows and macOS.

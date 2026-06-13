@@ -66,18 +66,28 @@ pinned by golden vectors where a wire format is involved. warren-core
 
 ## Audit follow-ups (see AUDIT.md)
 
-Tracked items deferred from the post-implementation audit:
+Done in the audit passes:
 
-- Typed error sources: replace the `String`-wrapped quinn/reqwest/io errors in
-  `TunnelError`, `TransportError`, `NetError` with `#[source]` variants.
+- Typed error sources: `TunnelError`, `NetError`, `ClientError` now carry
+  `#[source]`/`#[from]` causes instead of `String` (`ClientError::Deserialize`
+  split into `ResponseEncoding` / `ResponseJson` / `RequestSerialize`).
+- Facade: `build` returns `Result` (no panic); server-key pinning is required
+  unless `allow_any_server_key()` is set; anti-rollback floor is persistable via
+  the `GenerationStore` trait.
+
+Still tracked:
+
+- Anti-censorship host fallback (P3): the API client takes a single `api_base`;
+  the primary / alternatives / no-SNI fallback chain is not implemented yet.
 - Datapath bridge perf: `PacketSink::send_batch`/`recv_batch` (GSO/GRO),
   `fast-apple-datapath` on macOS, a shared `quinn::Endpoint` in `WarrenClient`,
   and send backpressure.
 - Test depth: per-endpoint `warren-api` mock tests, injectable clock for
   `BadClock`, richer golden vectors, a shared `spawn_fake_exit` test helper.
-- Facade: default to weighted exit selection; consider a `DefaultClient` alias
-  and a `Result`-returning builder for the FFI tunnel surface.
-- Discovery: optional trust-on-first-use persistence of the server pubkey.
+- Facade: default to weighted exit selection; consider a `DefaultClient` alias.
+- Discovery: trust-on-first-use persistence of the server pubkey (same storage
+  hook as the persisted generation floor).
+- NAT-PMP: mirror warren-core's explicit `3 => NetworkFailure` arm (cosmetic).
 
 ## Cross-cutting
 

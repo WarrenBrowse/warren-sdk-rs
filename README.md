@@ -26,7 +26,7 @@ for the remaining work.
 |---|---|---|
 | Non-custodial identity (BIP39, SS58 `wb…`, request signing) | `warren-identity` | done, golden vectors |
 | Handshake + NAT-PMP wire codecs | `warren-wire` | done, golden vectors |
-| Signed account API client (transport-agnostic) | `warren-api` | done |
+| Signed account API client (transport-agnostic) | `warren-api` | done; anti-censorship host fallback pending |
 | Signed relay list verify (v5) + weighted selector | `warren-discovery` | done, golden vector |
 | QUIC transport (RFC 7250 raw-public-key TLS 1.3) | `warren-transport` | done, in-process e2e |
 | Datapath seams (`PacketSink`, SOCKS5 codec, kill-switch levels) | `warren-net` | seams done; per-OS proxy/TUN backends pending (P6) |
