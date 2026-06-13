@@ -93,13 +93,23 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
   production exits read a `WarrenMultihopFrame` (HPKE-sealed; cleartext `exit_id`)
   as the first frame on EVERY connection, single-hop included, then open the
   sealed inner `Setup`. The current `Setup`-first handshake is rejected by real
-  exits (`malformed setup frame`). Port `warren-multihop` byte-exact:
-  X25519/HKDF-SHA256/ChaCha20Poly1305 HPKE sessions, the `WarrenMultihopFrame`
-  wire format, the operational-exit X25519 PKI descriptor (sourced from a
-  directory endpoint, NOT `/v1/exits`), control messages (`IpRequest`), and
-  epoch/seq replay protection. Freeze shared vectors. This is the gate for any
-  real tunnel; the in-process datapath tests use a non-production fake handshake
-  until it lands.
+  exits (`malformed setup frame`). Slices (all unblocked; the live directory and
+  all keys/contexts are identified, no account needed):
+  1. DONE: `WarrenMultihopFrame` wire codec, byte-exact + frozen vector
+     (`warren-wire::multihop`), with the v1 version/AAD/PKI constants.
+  2. Directory: fetch `GET /v1/multihop/directory` (v2: `nodes[]` with
+     `exit_x25519_multihop_pubkey` + per-descriptor Ed25519 signatures) and
+     verify the chain server-key (pinned `4c2c…`) -> operational key
+     (`WARREN_PKI_ROOT_OPERATIONAL_V1`) -> exit descriptor
+     (`WARREN_PKI_OPERATIONAL_EXIT_V2`, binds the x25519 key + dns attestation).
+  3. HPKE session: X25519 / HKDF-SHA256 / ChaCha20Poly1305 (RFC 9180), seal/open
+     with AAD `WARREN_HPKE_AAD_V1 || exit_id || epoch_be || seq_be`, epoch/seq
+     replay state; inner control messages (`IpRequest`) + the sealed `Setup`.
+  4. Datapath: ride per-packet sealed `WarrenMultihopFrame`s on the datagram
+     plane; replace the current raw-`Setup` handshake in `warren-transport`.
+  5. Live-validate a real single-hop tunnel against an exit; freeze shared
+     vectors. Until then the in-process datapath tests use a non-production
+     fake handshake.
 
 ## Cross-cutting
 
