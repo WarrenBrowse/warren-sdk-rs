@@ -94,6 +94,9 @@ pub struct VerifiedRelayList {
     pub signed_at: u64,
     /// Unix epoch seconds after which the list is stale.
     pub expires_at: u64,
+    /// Hex Ed25519 pubkey that signed (and verified) this list. The facade
+    /// persists this for trust-on-first-use pinning.
+    pub server_pubkey_hex: String,
 }
 
 impl VerifiedRelayList {
@@ -253,6 +256,7 @@ pub fn verify_signed_relay_list_any(
         generation: signed.generation,
         signed_at: signed.signed_at,
         expires_at: signed.expires_at,
+        server_pubkey_hex: signed.server_pubkey_hex,
     })
 }
 

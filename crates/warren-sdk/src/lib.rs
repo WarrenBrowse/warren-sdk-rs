@@ -110,6 +110,21 @@ pub trait GenerationStore: Send + Sync {
     fn store_floor(&self, generation: u64);
 }
 
+/// Persists the trusted server pubkey for trust-on-first-use (TOFU) pinning.
+///
+/// Supplying a store (with [`allow_any_server_key`] or on its own) makes the
+/// client accept any self-consistent signature on the *first* fetch, remember
+/// that server pubkey, and pin every later fetch to it. This upgrades the
+/// unpinned default from trust-on-every-use to trust-on-first-use.
+///
+/// [`allow_any_server_key`]: WarrenClientBuilder::allow_any_server_key
+pub trait ServerKeyStore: Send + Sync {
+    /// The pinned server pubkey hex, if one has been stored.
+    fn load_pin(&self) -> Option<String>;
+    /// Records the server pubkey hex trusted on first use.
+    fn store_pin(&self, server_pubkey_hex: &str);
+}
+
 /// Process-memory [`GenerationStore`]; anti-rollback holds only within one run.
 #[derive(Debug, Default)]
 pub struct InMemoryGenerationStore(AtomicU64);
@@ -132,6 +147,7 @@ pub struct WarrenClientBuilder {
     server_pubkey_pin: Option<String>,
     allow_any_server_key: bool,
     generation_store: Arc<dyn GenerationStore>,
+    server_key_store: Option<Arc<dyn ServerKeyStore>>,
 }
 
 impl WarrenClientBuilder {
@@ -190,6 +206,15 @@ impl WarrenClientBuilder {
         self
     }
 
+    /// Sets a [`ServerKeyStore`] to enable trust-on-first-use pinning of the
+    /// signed-exit-list server key. A TOFU store is itself a valid pinning
+    /// strategy, so setting it satisfies the build-time pin requirement.
+    #[must_use]
+    pub fn server_key_store(mut self, store: Arc<dyn ServerKeyStore>) -> Self {
+        self.server_key_store = Some(store);
+        self
+    }
+
     /// Builds the client with the bundled reqwest transport.
     ///
     /// # Errors
@@ -214,7 +239,12 @@ impl WarrenClientBuilder {
         transport: T,
     ) -> Result<WarrenClient<T>, BuildError> {
         let identity = self.identity.ok_or(BuildError::MissingIdentity)?;
-        if self.server_pubkey_pin.is_none() && !self.allow_any_server_key {
+        // A TOFU store is a deliberate pinning strategy, so it also satisfies
+        // the requirement that an unpinned client be an explicit choice.
+        if self.server_pubkey_pin.is_none()
+            && !self.allow_any_server_key
+            && self.server_key_store.is_none()
+        {
             return Err(BuildError::UnpinnedServerKey);
         }
         let pin = self.server_pubkey_pin.clone();
@@ -232,6 +262,7 @@ impl WarrenClientBuilder {
             signing,
             server_pubkey_pin: pin,
             generation_store: self.generation_store,
+            server_key_store: self.server_key_store,
         })
     }
 }
@@ -248,6 +279,8 @@ pub struct WarrenClient<T> {
     server_pubkey_pin: Option<String>,
     /// Anti-rollback floor: highest signed-list `generation` trusted so far.
     generation_store: Arc<dyn GenerationStore>,
+    /// Trust-on-first-use pin store, when enabled.
+    server_key_store: Option<Arc<dyn ServerKeyStore>>,
 }
 
 impl WarrenClient<()> {
@@ -261,6 +294,7 @@ impl WarrenClient<()> {
             server_pubkey_pin: None,
             allow_any_server_key: false,
             generation_store: Arc::new(InMemoryGenerationStore::default()),
+            server_key_store: None,
         }
     }
 }
@@ -288,7 +322,18 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// [`SdkError::RolledBackRelayList`] if the generation regressed.
     pub async fn fetch_exits(&self) -> Result<ExitSelector, SdkError> {
         let json = self.api.list_exits().await?;
-        let verified = verify_signed_relay_list(&json, self.server_pubkey_pin.as_deref())?;
+
+        // Effective pin: an explicit pin wins; otherwise a TOFU store's
+        // remembered key; otherwise none (first use, accept any self-consistent
+        // signature and remember it below).
+        let tofu_pin = self
+            .server_pubkey_pin
+            .is_none()
+            .then(|| self.server_key_store.as_ref().and_then(|s| s.load_pin()))
+            .flatten();
+        let effective_pin = self.server_pubkey_pin.as_deref().or(tofu_pin.as_deref());
+
+        let verified = verify_signed_relay_list(&json, effective_pin)?;
 
         if verified.is_expired(now_unix_secs()) {
             return Err(SdkError::StaleRelayList);
@@ -301,6 +346,15 @@ impl<T: HttpTransport> WarrenClient<T> {
             });
         }
         self.generation_store.store_floor(verified.generation);
+
+        // Trust-on-first-use: with no explicit pin, remember the verified server
+        // key the first time so later fetches are pinned to it.
+        if self.server_pubkey_pin.is_none()
+            && let Some(store) = &self.server_key_store
+            && store.load_pin().is_none()
+        {
+            store.store_pin(&verified.server_pubkey_hex);
+        }
 
         Ok(ExitSelector::new(verified.relays))
     }

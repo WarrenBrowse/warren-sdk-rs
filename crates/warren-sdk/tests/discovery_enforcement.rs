@@ -10,7 +10,7 @@ use std::sync::Arc;
 use warren_sdk::api::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_sdk::discovery::{ExitId, ExitQuery, JsonRelay, sign_relay_list};
 use warren_sdk::identity::WarrenIdentity;
-use warren_sdk::{GenerationStore, SdkError, WarrenClient};
+use warren_sdk::{GenerationStore, SdkError, ServerKeyStore, WarrenClient};
 
 const FAR_FUTURE: u64 = 4_000_000_000; // year 2096
 const LONG_AGO: u64 = 1_000; // 1970
@@ -148,4 +148,55 @@ async fn fetch_advances_the_persistent_floor() {
     );
     client.fetch_exits().await.expect("fetch ok");
     assert_eq!(store.load_floor(), 12);
+}
+
+/// A TOFU pin store, standing in for persistent storage.
+#[derive(Default)]
+struct KeyStore(Mutex<Option<String>>);
+
+impl ServerKeyStore for KeyStore {
+    fn load_pin(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
+    fn store_pin(&self, server_pubkey_hex: &str) {
+        *self.0.lock().unwrap() = Some(server_pubkey_hex.to_owned());
+    }
+}
+
+#[tokio::test]
+async fn tofu_pins_the_first_server_key_and_rejects_a_different_one() {
+    let server_a = SigningKey::from_bytes(&[0x42; 32]);
+    let server_b = SigningKey::from_bytes(&[0x99; 32]);
+    let key_store = Arc::new(KeyStore::default());
+    let (identity, _m) = WarrenIdentity::generate();
+
+    let client = WarrenClient::builder()
+        .identity(identity)
+        .api_base("https://api.example.test")
+        .server_key_store(key_store.clone())
+        .build_with_transport(QueueTransport {
+            bodies: Mutex::new(
+                vec![
+                    signed_list(&server_a, 5, FAR_FUTURE),
+                    signed_list(&server_b, 6, FAR_FUTURE),
+                ]
+                .into(),
+            ),
+        })
+        .expect("build");
+
+    // First fetch: no pin yet, any self-consistent signature is accepted and the
+    // key is remembered.
+    client.fetch_exits().await.expect("first use trusts server A");
+    assert_eq!(
+        key_store.load_pin().as_deref(),
+        Some(hex::encode(server_a.verifying_key().to_bytes()).as_str())
+    );
+
+    // Second fetch: validly signed by a different server, but we are now pinned
+    // to A, so it must be rejected.
+    assert!(matches!(
+        client.fetch_exits().await,
+        Err(SdkError::Discovery(_))
+    ));
 }
