@@ -66,28 +66,25 @@ pinned by golden vectors where a wire format is involved. warren-core
 
 ## Audit follow-ups (see AUDIT.md)
 
-Done in the audit passes:
+All discrete audit findings are resolved; see the reconciliation table in
+`AUDIT.md`. The fixes landed: persistable anti-rollback (`GenerationStore`),
+non-panicking `Result` builder, mandatory pin / `allow_any_server_key` opt-out,
+trust-on-first-use (`ServerKeyStore`), anti-censorship host fallback, typed
+error sources, split `ClientError`, per-endpoint API tests, testable `BadClock`,
+DAITA fraction validation, the explicit NAT-PMP `3` arm, `select_weighted` +
+`DefaultClient`, justified SS58 casts, the shared `warren-test-support` crate,
+enriched golden vectors, the SOCKS5 `Command::is_supported` gate, and the
+`PacketSink` batch-I/O seam.
 
-- Typed error sources: `TunnelError`, `NetError`, `ClientError` now carry
-  `#[source]`/`#[from]` causes instead of `String` (`ClientError::Deserialize`
-  split into `ResponseEncoding` / `ResponseJson` / `RequestSerialize`).
-- Facade: `build` returns `Result` (no panic); server-key pinning is required
-  unless `allow_any_server_key()` is set; anti-rollback floor is persistable via
-  the `GenerationStore` trait.
+What remains are not defects but whole subsystems, tracked as phases below
+because each requires building code that does not exist yet and validating it
+against a real exit (a shared `quinn::Endpoint`/reconnect supervisor, send
+backpressure, and the smoltcp netstack all belong to that datapath work):
 
-Still tracked:
-
-- Anti-censorship host fallback (P3): the API client takes a single `api_base`;
-  the primary / alternatives / no-SNI fallback chain is not implemented yet.
-- Datapath bridge perf: `PacketSink::send_batch`/`recv_batch` (GSO/GRO),
-  `fast-apple-datapath` on macOS, a shared `quinn::Endpoint` in `WarrenClient`,
-  and send backpressure.
-- Test depth: per-endpoint `warren-api` mock tests, injectable clock for
-  `BadClock`, richer golden vectors, a shared `spawn_fake_exit` test helper.
-- Facade: default to weighted exit selection; consider a `DefaultClient` alias.
-- Discovery: trust-on-first-use persistence of the server pubkey (same storage
-  hook as the persisted generation floor).
-- NAT-PMP: mirror warren-core's explicit `3 => NetworkFailure` arm (cosmetic).
+- P6 datapath: non-root proxy (smoltcp + SOCKS5/HTTP CONNECT) then privileged
+  per-OS TUN/routing/DNS/killswitch, with GSO/GRO batch syscalls behind the
+  `PacketSink` batch seam and `fast-apple-datapath` on macOS.
+- Multihop: port and freeze the HPKE frame (its own wire phase).
 
 ## Cross-cutting
 

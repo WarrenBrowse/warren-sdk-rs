@@ -93,3 +93,38 @@ All gates green after this pass: `cargo fmt --all -- --check`, `cargo clippy
 --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo deny
 check`. The CI now runs these exclusively on the WarrenBrowse self-hosted runners
 across Linux, Windows and macOS.
+
+## Finding reconciliation (every finding treated)
+
+This table closes out every finding from both audit passes. Status is one of:
+FIXED (code + test landed), SEAM (the extension point is in place; the perf/impl
+body lands with the datapath), or PHASE (a whole subsystem, tracked as a roadmap
+phase, not a standalone defect: it requires building code that does not yet exist
+and validating it against a real exit).
+
+| Finding | Status | Where |
+|---|---|---|
+| Anti-rollback floor in-memory only | FIXED | `GenerationStore` hook; `discovery_enforcement.rs` persistence tests |
+| Builder panics on missing identity (FFI hazard) | FIXED | `build*` return `Result<_, BuildError>` |
+| Server-key pin off-by-default and silent | FIXED | `allow_any_server_key()` required opt-out; `build_refuses_unpinned_unless_explicit` |
+| TOFU trust-on-every-use, no persistence | FIXED | `ServerKeyStore` hook; `tofu_pins_the_first_server_key...` |
+| Anti-censorship host fallback (P3) not implemented | FIXED | `WarrenApiClient` fallback sequence + reqwest no-SNI client; 4 fallback tests |
+| `String`-wrapped errors lose `#[source]` | FIXED | typed variants in transport/net/api; source-chain tests |
+| `ClientError::Deserialize` conflates 3 modes | FIXED | split into `ResponseEncoding`/`ResponseJson`/`RequestSerialize` |
+| Per-endpoint API tests missing | FIXED | register/check/open/close/delete tests |
+| `BadClock` untestable | FIXED | `unix_secs_from` split out; `pre_epoch_clock_is_bad_clock` |
+| DAITA fractions unvalidated from peer | FIXED | `decode_setup_ack` rejects out-of-range; regression test |
+| NAT-PMP code `3` not mirrored 1:1 | FIXED | explicit `3 => NetworkFailure` arm |
+| Facade steered to weight-ignoring `select` | FIXED | `select_weighted` default + docs; `DefaultClient` alias |
+| `cast_possible_truncation` unjustified | FIXED | range-proof comment on the SS58 prefix casts |
+| `spawn_fake_exit` triplicated | FIXED | extracted to `warren-test-support` crate |
+| Golden vectors minimal | FIXED | enriched `vectors/identity.json` (derivation/bip39/canonical/signature) |
+| SOCKS5 `Bind`/`UdpAssociate` must be rejected | FIXED | `Command::is_supported()` gate + test (server loop calls it) |
+| `PacketSink` batch API (GSO/GRO) | SEAM | `send_batch`/`recv_batch` defaults added; vectored syscalls land with the datapath |
+| Shared `quinn::Endpoint` for reconnect/multiconn | PHASE (P5/P6) | belongs to the reconnect supervisor; no value without the datapath driving it |
+| Send backpressure on `PacketSink` | PHASE (P6) | meaningful only once a datapath produces sustained load |
+| smoltcp netstack threading ceiling | PHASE (P6) | the netstack does not exist yet |
+| Non-root proxy + TUN datapath | PHASE (P6) | the product's core remaining subsystem; validate against a real exit |
+| Multihop HPKE frame | PHASE (multihop) | a full frozen wire subsystem; port + freeze vectors as its own phase |
+
+CI is green on every fix above across the three self-hosted OS runners.
