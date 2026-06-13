@@ -63,6 +63,9 @@ pub enum SdkError {
     /// The chosen exit has no dialable address.
     #[error("exit has no dialable address")]
     NoExitAddress,
+    /// Binding the local proxy listener failed.
+    #[error("proxy listener bind failed")]
+    Proxy(#[source] std::io::Error),
     /// The signed exit list is past its `expires_at` (anti-freeze / replay).
     #[error("signed exit list is expired")]
     StaleRelayList,
@@ -370,6 +373,76 @@ impl<T: HttpTransport> WarrenClient<T> {
         let tunnel = ClientTunnel::new(self.signing.clone());
         let session = tunnel.connect(exit.endpoint_id(), addr).await?;
         Ok(QuicPacketSink::new(session))
+    }
+
+    /// Starts the non-root proxy datapath against `exit`: connects the tunnel,
+    /// runs a userspace netstack over it, and serves a local SOCKS5 proxy on
+    /// `cfg.socks5`. Application traffic sent through the proxy egresses at the
+    /// exit. Returns a handle whose drop stops the proxy.
+    ///
+    /// This is the feature-complete non-root mode on every OS. Validate against a
+    /// real exit before relying on it (per the engineering rules).
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::NoExitAddress`]/[`SdkError::Tunnel`] from the tunnel, or
+    /// [`SdkError::Proxy`] if the local listener cannot bind.
+    pub async fn start_proxy(
+        &self,
+        exit: &Relay,
+        cfg: &warren_net::ProxyConfig,
+    ) -> Result<ProxyHandle, SdkError> {
+        let sink = self.connect_tunnel(exit).await?;
+        let local_ip = sink.session().assigned_ipv4();
+        let mtu = usize::from(sink.session().assigned_max_mtu());
+        let connector = warren_net::spawn_over_sink(
+            Arc::new(sink),
+            local_ip,
+            TUNNEL_PREFIX,
+            TUNNEL_GATEWAY,
+            mtu,
+        );
+
+        let listener = tokio::net::TcpListener::bind(cfg.socks5)
+            .await
+            .map_err(SdkError::Proxy)?;
+        let local_addr = listener.local_addr().map_err(SdkError::Proxy)?;
+        let proxy = warren_net::Socks5Proxy::new(connector);
+        let task = tokio::spawn(async move {
+            let _ = proxy.serve(listener).await;
+        });
+        Ok(ProxyHandle { local_addr, task })
+    }
+}
+
+/// Tunnel network prefix length (`10.66.0.0/16`), matching warren-core.
+const TUNNEL_PREFIX: u8 = 16;
+/// Tunnel gateway (exit side), matching warren-core's `10.66.0.1`.
+const TUNNEL_GATEWAY: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 66, 0, 1);
+
+/// A running non-root proxy datapath. Dropping it stops the proxy.
+pub struct ProxyHandle {
+    local_addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ProxyHandle {
+    /// The address the SOCKS5 listener actually bound (useful when `cfg.socks5`
+    /// used port 0).
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Stops the proxy datapath.
+    pub fn shutdown(self) {
+        self.task.abort();
+    }
+}
+
+impl Drop for ProxyHandle {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 

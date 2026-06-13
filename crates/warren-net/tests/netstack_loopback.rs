@@ -132,7 +132,14 @@ async fn netstack_tcp_connect_and_echo() {
     let (c2s_tx, c2s_rx) = mpsc::unbounded_channel(); // client -> server
     let (s2c_tx, s2c_rx) = mpsc::unbounded_channel(); // server -> client
 
-    let connector = spawn_engine("10.66.0.2".parse().unwrap(), 24, MTU, s2c_rx, c2s_tx);
+    let connector = spawn_engine(
+        "10.66.0.2".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        MTU,
+        s2c_rx,
+        c2s_tx,
+    );
     tokio::spawn(echo_server(c2s_rx, s2c_tx));
 
     let mut stream = connector
@@ -155,7 +162,14 @@ async fn socks5_proxy_over_netstack_reaches_the_exit() {
     let (c2s_tx, c2s_rx) = mpsc::unbounded_channel();
     let (s2c_tx, s2c_rx) = mpsc::unbounded_channel();
 
-    let connector = spawn_engine("10.66.0.2".parse().unwrap(), 24, MTU, s2c_rx, c2s_tx);
+    let connector = spawn_engine(
+        "10.66.0.2".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        MTU,
+        s2c_rx,
+        c2s_tx,
+    );
     tokio::spawn(echo_server(c2s_rx, s2c_tx));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

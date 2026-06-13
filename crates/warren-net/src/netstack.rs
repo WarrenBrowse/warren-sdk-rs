@@ -209,12 +209,15 @@ impl Connector for TunnelConnector {
 /// Spawns the netstack engine over raw IP-frame channels and returns a connector.
 ///
 /// `local_ip`/`prefix` is the tunnel-assigned client address (for example
-/// `10.66.0.2/16`). `inbound` delivers IP packets arriving from the tunnel;
+/// `10.66.0.2/16`) and `gateway` the exit-side tunnel gateway (for example
+/// `10.66.0.1`), installed as the default route so traffic to public targets is
+/// sent to the exit. `inbound` delivers IP packets arriving from the tunnel;
 /// `outbound` receives IP packets the stack wants to send.
 #[must_use]
 pub fn spawn_engine(
     local_ip: std::net::Ipv4Addr,
     prefix: u8,
+    gateway: std::net::Ipv4Addr,
     mtu: usize,
     inbound: mpsc::UnboundedReceiver<Vec<u8>>,
     outbound: mpsc::UnboundedSender<Vec<u8>>,
@@ -233,6 +236,7 @@ pub fn spawn_engine(
         next_port: EPHEMERAL_BASE,
         local_ip,
         prefix,
+        gateway,
         cmd_rx,
         write_rx,
         write_tx: write_tx.clone(),
@@ -253,6 +257,7 @@ struct Engine {
     next_port: u16,
     local_ip: std::net::Ipv4Addr,
     prefix: u8,
+    gateway: std::net::Ipv4Addr,
     cmd_rx: mpsc::UnboundedReceiver<OpenCommand>,
     write_rx: mpsc::UnboundedReceiver<(smoltcp::iface::SocketHandle, WriteOp)>,
     write_tx: mpsc::UnboundedSender<(smoltcp::iface::SocketHandle, WriteOp)>,
@@ -273,6 +278,9 @@ impl Engine {
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::new(IpAddress::from(self.local_ip), self.prefix));
         });
+        // Default route to the exit gateway so out-of-subnet (public) targets
+        // egress through the tunnel rather than being unroutable.
+        let _ = iface.routes_mut().add_default_ipv4_route(self.gateway);
         let mut sockets = SocketSet::new(Vec::new());
 
         loop {
@@ -443,6 +451,7 @@ pub fn spawn_over_sink<S>(
     sink: Arc<S>,
     local_ip: std::net::Ipv4Addr,
     prefix: u8,
+    gateway: std::net::Ipv4Addr,
     mtu: usize,
 ) -> TunnelConnector
 where
@@ -467,7 +476,7 @@ where
         }
     });
 
-    spawn_engine(local_ip, prefix, mtu, inbound_rx, outbound_tx)
+    spawn_engine(local_ip, prefix, gateway, mtu, inbound_rx, outbound_tx)
 }
 
 /// Converts a std IP address to smoltcp's wire type.

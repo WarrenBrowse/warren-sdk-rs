@@ -16,6 +16,8 @@ warren-discovery = { path = "../warren-discovery" }
 warren-transport = { path = "../warren-transport" }
 warren-net = { path = "../warren-net" }
 thiserror = { workspace = true }
+# Needed to bind the local SOCKS5 listener and spawn the proxy datapath task.
+tokio = { workspace = true }
 
 [features]
 # Bundle the reqwest transport so an app can build a working client with one

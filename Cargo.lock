@@ -1814,6 +1814,7 @@ version = "0.0.1"
 dependencies = [
  "ed25519-dalek",
  "quinn",
+ "smoltcp",
  "tokio",
  "warren-transport",
  "warren-wire",
