@@ -12,7 +12,7 @@
 //!     .identity(identity)
 //!     .api_base("https://api.warrenbrowse.com")
 //!     .server_pubkey_pin("….hex….")
-//!     .build();
+//!     .build()?;
 //!
 //! let selector = client.fetch_exits().await?;        // signed list, verified
 //! let exit = selector.select(&ExitQuery::country("RO"))?.clone();
@@ -32,6 +32,7 @@ pub use warren_net as net;
 pub use warren_transport as transport;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use warren_api::{ClientError, HttpTransport, WarrenApiClient};
@@ -74,6 +75,53 @@ pub enum SdkError {
         /// Highest generation previously trusted.
         floor: u64,
     },
+    /// The client builder was misconfigured.
+    #[error(transparent)]
+    Build(#[from] BuildError),
+}
+
+/// Reasons [`WarrenClientBuilder::build`] can reject a configuration.
+///
+/// Returned instead of panicking so an FFI embedder gets a recoverable error
+/// rather than an unwind across the language boundary.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum BuildError {
+    /// No identity was provided.
+    #[error("a Warren identity is required")]
+    MissingIdentity,
+    /// No server pubkey pin was set and pinning was not explicitly waived.
+    #[error("no server pubkey pin set; call server_pubkey_pin(..) or allow_any_server_key()")]
+    UnpinnedServerKey,
+}
+
+/// Persists the highest trusted signed-list `generation`, the anti-rollback
+/// floor.
+///
+/// The default store ([`InMemoryGenerationStore`]) lives only for the process,
+/// so anti-rollback resets on every restart: an attacker who can serve HTTP can
+/// replay an older but validly signed (and not yet expired) list to a freshly
+/// launched client. Supply a persistent implementation (disk, keychain) to make
+/// anti-rollback survive restarts.
+pub trait GenerationStore: Send + Sync {
+    /// Returns the highest generation trusted so far (`0` if none yet).
+    fn load_floor(&self) -> u64;
+    /// Records `generation` as trusted; implementations keep the maximum seen.
+    fn store_floor(&self, generation: u64);
+}
+
+/// Process-memory [`GenerationStore`]; anti-rollback holds only within one run.
+#[derive(Debug, Default)]
+pub struct InMemoryGenerationStore(AtomicU64);
+
+impl GenerationStore for InMemoryGenerationStore {
+    fn load_floor(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn store_floor(&self, generation: u64) {
+        self.0.fetch_max(generation, Ordering::AcqRel);
+    }
 }
 
 /// Builder for a [`WarrenClient`].
@@ -81,6 +129,8 @@ pub struct WarrenClientBuilder {
     identity: Option<WarrenIdentity>,
     api_base: String,
     server_pubkey_pin: Option<String>,
+    allow_any_server_key: bool,
+    generation_store: Arc<dyn GenerationStore>,
 }
 
 impl WarrenClientBuilder {
@@ -110,38 +160,65 @@ impl WarrenClientBuilder {
         self
     }
 
+    /// Waives server-key pinning: accept any self-consistent signature on the
+    /// signed exit list.
+    ///
+    /// INSECURE. Only for tests or a transport you already trust end to end.
+    /// Without it, [`build`](Self::build) refuses to construct an unpinned
+    /// client rather than silently trusting any self-signed list.
+    #[must_use]
+    pub fn allow_any_server_key(mut self) -> Self {
+        self.allow_any_server_key = true;
+        self
+    }
+
+    /// Sets the anti-rollback [`GenerationStore`]. Defaults to
+    /// [`InMemoryGenerationStore`] (process-scoped); supply a persistent store
+    /// to keep anti-rollback across restarts.
+    #[must_use]
+    pub fn generation_store(mut self, store: Arc<dyn GenerationStore>) -> Self {
+        self.generation_store = store;
+        self
+    }
+
     /// Builds the client with the bundled reqwest transport.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if no identity was set.
+    /// [`BuildError::MissingIdentity`] if no identity was set, or
+    /// [`BuildError::UnpinnedServerKey`] if neither a pin nor
+    /// [`allow_any_server_key`](Self::allow_any_server_key) was set.
     #[cfg(feature = "reqwest-transport")]
-    #[must_use]
-    pub fn build(self) -> WarrenClient<ReqwestTransport> {
+    pub fn build(self) -> Result<WarrenClient<ReqwestTransport>, BuildError> {
         self.build_with_transport(ReqwestTransport::new())
     }
 
     /// Builds the client with a caller-provided transport.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if no identity was set.
-    #[must_use]
-    pub fn build_with_transport<T: HttpTransport>(self, transport: T) -> WarrenClient<T> {
-        let identity = self
-            .identity
-            .expect("WarrenClientBuilder requires an identity");
+    /// [`BuildError::MissingIdentity`] if no identity was set, or
+    /// [`BuildError::UnpinnedServerKey`] if neither a pin nor
+    /// [`allow_any_server_key`](Self::allow_any_server_key) was set.
+    pub fn build_with_transport<T: HttpTransport>(
+        self,
+        transport: T,
+    ) -> Result<WarrenClient<T>, BuildError> {
+        let identity = self.identity.ok_or(BuildError::MissingIdentity)?;
+        if self.server_pubkey_pin.is_none() && !self.allow_any_server_key {
+            return Err(BuildError::UnpinnedServerKey);
+        }
         let pin = self.server_pubkey_pin.clone();
         // The wallet key doubles as the QUIC tunnel client identity, so keep a
         // copy before the identity moves into the API client.
         let signing = identity.signing_key();
         let api = WarrenApiClient::new(self.api_base, identity, transport);
-        WarrenClient {
+        Ok(WarrenClient {
             api,
             signing,
             server_pubkey_pin: pin,
-            generation_floor: AtomicU64::new(0),
-        }
+            generation_store: self.generation_store,
+        })
     }
 }
 
@@ -150,8 +227,8 @@ pub struct WarrenClient<T> {
     api: WarrenApiClient<T>,
     signing: warren_identity::ed25519_dalek::SigningKey,
     server_pubkey_pin: Option<String>,
-    /// Highest signed-list `generation` trusted so far (anti-rollback floor).
-    generation_floor: AtomicU64,
+    /// Anti-rollback floor: highest signed-list `generation` trusted so far.
+    generation_store: Arc<dyn GenerationStore>,
 }
 
 impl WarrenClient<()> {
@@ -162,6 +239,8 @@ impl WarrenClient<()> {
             identity: None,
             api_base: warren_api_default_base(),
             server_pubkey_pin: None,
+            allow_any_server_key: false,
+            generation_store: Arc::new(InMemoryGenerationStore::default()),
         }
     }
 }
@@ -194,15 +273,14 @@ impl<T: HttpTransport> WarrenClient<T> {
         if verified.is_expired(now_unix_secs()) {
             return Err(SdkError::StaleRelayList);
         }
-        let floor = self.generation_floor.load(Ordering::Acquire);
+        let floor = self.generation_store.load_floor();
         if verified.generation < floor {
             return Err(SdkError::RolledBackRelayList {
                 got: verified.generation,
                 floor,
             });
         }
-        self.generation_floor
-            .fetch_max(verified.generation, Ordering::AcqRel);
+        self.generation_store.store_floor(verified.generation);
 
         Ok(ExitSelector::new(verified.relays))
     }
@@ -244,6 +322,16 @@ fn now_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use warren_api::{HttpRequest, HttpResponse, TransportError};
+
+    /// A transport that is never actually called by these builder tests.
+    struct NullTransport;
+
+    impl HttpTransport for NullTransport {
+        async fn execute(&self, _req: HttpRequest) -> Result<HttpResponse, TransportError> {
+            Err(TransportError::Io("unused".into()))
+        }
+    }
 
     #[test]
     fn builder_constructs_with_identity() {
@@ -252,7 +340,28 @@ mod tests {
         let client = WarrenClient::builder()
             .identity(id)
             .api_base("https://api.example.test")
-            .build();
+            .allow_any_server_key()
+            .build()
+            .expect("build");
         assert_eq!(client.api().address(), addr);
+    }
+
+    #[test]
+    fn build_requires_identity() {
+        let result = WarrenClient::builder()
+            .api_base("https://api.example.test")
+            .allow_any_server_key()
+            .build_with_transport(NullTransport);
+        assert!(matches!(result, Err(BuildError::MissingIdentity)));
+    }
+
+    #[test]
+    fn build_refuses_unpinned_unless_explicit() {
+        let (id, _m) = WarrenIdentity::generate();
+        let result = WarrenClient::builder()
+            .identity(id)
+            .api_base("https://api.example.test")
+            .build_with_transport(NullTransport);
+        assert!(matches!(result, Err(BuildError::UnpinnedServerKey)));
     }
 }

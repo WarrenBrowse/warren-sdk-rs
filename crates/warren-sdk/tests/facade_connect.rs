@@ -74,7 +74,9 @@ async fn facade_connects_tunnel_to_exit_and_passes_a_packet() {
     let client = WarrenClient::builder()
         .identity(identity)
         .api_base("https://api.example.test")
-        .build_with_transport(UnusedTransport);
+        .allow_any_server_key()
+        .build_with_transport(UnusedTransport)
+        .expect("build");
 
     // A resolved exit pointing at the in-process server.
     let exit = Relay::new(

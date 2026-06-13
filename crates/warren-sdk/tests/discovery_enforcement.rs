@@ -3,13 +3,14 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::SigningKey;
-use warren_sdk::SdkError;
-use warren_sdk::WarrenClient;
+use std::sync::Arc;
 use warren_sdk::api::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_sdk::discovery::{ExitId, ExitQuery, JsonRelay, sign_relay_list};
 use warren_sdk::identity::WarrenIdentity;
+use warren_sdk::{GenerationStore, SdkError, WarrenClient};
 
 const FAR_FUTURE: u64 = 4_000_000_000; // year 2096
 const LONG_AGO: u64 = 1_000; // 1970
@@ -45,15 +46,39 @@ fn signed_list(server: &SigningKey, generation: u64, expires_at: u64) -> String 
 }
 
 fn client_with(server: &SigningKey, bodies: Vec<String>) -> WarrenClient<QueueTransport> {
+    client_with_store(server, bodies, Arc::new(SeededStore::default()))
+}
+
+fn client_with_store(
+    server: &SigningKey,
+    bodies: Vec<String>,
+    store: Arc<dyn GenerationStore>,
+) -> WarrenClient<QueueTransport> {
     let pin = hex::encode(server.verifying_key().to_bytes());
     let (identity, _m) = WarrenIdentity::generate();
     WarrenClient::builder()
         .identity(identity)
         .api_base("https://api.example.test")
         .server_pubkey_pin(pin)
+        .generation_store(store)
         .build_with_transport(QueueTransport {
             bodies: Mutex::new(bodies.into()),
         })
+        .expect("build")
+}
+
+/// A persistent-style store seeded with a prior high-water mark, standing in for
+/// the cross-restart anti-rollback floor.
+#[derive(Default)]
+struct SeededStore(AtomicU64);
+
+impl GenerationStore for SeededStore {
+    fn load_floor(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+    fn store_floor(&self, generation: u64) {
+        self.0.fetch_max(generation, Ordering::AcqRel);
+    }
 }
 
 #[tokio::test]
@@ -94,4 +119,33 @@ async fn rolled_back_generation_is_rejected() {
         client.fetch_exits().await,
         Err(SdkError::RolledBackRelayList { got: 3, floor: 5 })
     ));
+}
+
+#[tokio::test]
+async fn persisted_floor_rejects_rollback_on_a_fresh_client() {
+    // A persistent store carries the floor across client (restart) boundaries:
+    // a brand-new client whose store already knows generation 9 must reject a
+    // validly signed generation-4 list without ever having fetched a newer one.
+    let server = SigningKey::from_bytes(&[0x42; 32]);
+    let store = Arc::new(SeededStore::default());
+    store.store_floor(9);
+
+    let client = client_with_store(&server, vec![signed_list(&server, 4, FAR_FUTURE)], store);
+    assert!(matches!(
+        client.fetch_exits().await,
+        Err(SdkError::RolledBackRelayList { got: 4, floor: 9 })
+    ));
+}
+
+#[tokio::test]
+async fn fetch_advances_the_persistent_floor() {
+    let server = SigningKey::from_bytes(&[0x42; 32]);
+    let store = Arc::new(SeededStore::default());
+    let client = client_with_store(
+        &server,
+        vec![signed_list(&server, 12, FAR_FUTURE)],
+        store.clone(),
+    );
+    client.fetch_exits().await.expect("fetch ok");
+    assert_eq!(store.load_floor(), 12);
 }
