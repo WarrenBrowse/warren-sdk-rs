@@ -104,9 +104,13 @@ async fn wrong_exit_pubkey_is_rejected() {
         .await
         .expect_err("must reject a pubkey the exit cannot present");
     // The exit cannot present a cert matching the wrong SNI, so the TLS
-    // handshake fails at connect time.
+    // handshake fails during the connect await (a quinn ConnectionError) or the
+    // peer key check rejects it.
     assert!(matches!(
         err,
-        TunnelError::Connect(_) | TunnelError::ExitIdentityMismatch
+        TunnelError::Quic {
+            context: "connect",
+            ..
+        } | TunnelError::ExitIdentityMismatch
     ));
 }

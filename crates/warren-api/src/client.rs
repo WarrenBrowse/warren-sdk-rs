@@ -26,9 +26,15 @@ pub enum ClientError {
         /// Response body (may carry a server error message).
         body: String,
     },
-    /// The response body could not be parsed as the expected type.
-    #[error("failed to parse response: {0}")]
-    Deserialize(String),
+    /// The response body was not valid UTF-8.
+    #[error("response body is not valid UTF-8")]
+    ResponseEncoding(#[source] std::string::FromUtf8Error),
+    /// The response JSON did not match the expected type.
+    #[error("failed to parse response JSON")]
+    ResponseJson(#[source] serde_json::Error),
+    /// The request body could not be serialized.
+    #[error("failed to serialize request")]
+    RequestSerialize(#[source] serde_json::Error),
     /// The system clock is before the Unix epoch.
     #[error("system clock is before the Unix epoch")]
     BadClock,
@@ -70,7 +76,7 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     pub async fn list_exits(&self) -> Result<String, ClientError> {
         let req = self.unsigned_request(Method::Get, "/v1/exits", Vec::new());
         let resp = self.send(req).await?;
-        String::from_utf8(resp.body).map_err(|e| ClientError::Deserialize(e.to_string()))
+        String::from_utf8(resp.body).map_err(ClientError::ResponseEncoding)
     }
 
     /// Unsigned `POST /v1/register`. Redeems a voucher to bind a subscription to
@@ -206,12 +212,12 @@ impl<T: HttpTransport> WarrenApiClient<T> {
 
     async fn send_json<R: DeserializeOwned>(&self, request: HttpRequest) -> Result<R, ClientError> {
         let resp = self.send(request).await?;
-        serde_json::from_slice(&resp.body).map_err(|e| ClientError::Deserialize(e.to_string()))
+        serde_json::from_slice(&resp.body).map_err(ClientError::ResponseJson)
     }
 }
 
 fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, ClientError> {
-    serde_json::to_vec(value).map_err(|e| ClientError::Deserialize(e.to_string()))
+    serde_json::to_vec(value).map_err(ClientError::RequestSerialize)
 }
 
 fn now_secs() -> Result<u64, ClientError> {

@@ -52,14 +52,11 @@ impl PacketSink for QuicPacketSink {
         // One copy into the refcounted Bytes quinn needs; no intermediate Vec.
         self.session
             .send_datagram(Bytes::copy_from_slice(packet))
-            .map_err(|e| NetError::Tunnel(e.to_string()))
+            .map_err(NetError::Tunnel)
     }
 
     async fn recv_packet(&self) -> Result<Bytes, NetError> {
-        self.session
-            .read_datagram()
-            .await
-            .map_err(|e| NetError::Tunnel(e.to_string()))
+        self.session.read_datagram().await.map_err(NetError::Tunnel)
     }
 
     fn max_payload(&self) -> usize {

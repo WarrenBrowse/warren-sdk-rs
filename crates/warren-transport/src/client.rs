@@ -36,20 +36,25 @@ fn warren_transport_config() -> quinn::TransportConfig {
 }
 
 /// Errors from establishing or driving a tunnel.
+///
+/// Underlying causes are attached via [`std::error::Error::source`] rather than
+/// formatted into the message: this keeps the top-level `Display` free of any
+/// address or peer detail (no-log discipline) while preserving the full chain
+/// for callers that opt into deeper diagnostics.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TunnelError {
     /// Building the TLS configuration failed.
-    #[error("tls config error: {0}")]
+    #[error("tls config error")]
     Tls(#[from] tls::WarrenTlsError),
     /// Binding the local UDP socket / endpoint failed.
-    #[error("endpoint bind failed: {0}")]
-    Bind(String),
-    /// The QUIC connection could not be established.
-    #[error("connect failed: {0}")]
-    Connect(String),
+    #[error("endpoint bind failed")]
+    Bind(#[source] std::io::Error),
+    /// The QUIC connection could not be set up (bad address or config).
+    #[error("connect setup failed")]
+    Connect(#[source] quinn::ConnectError),
     /// A QUIC stream or connection error occurred mid-handshake.
-    #[error("quic error: {context}: {source}")]
+    #[error("quic error: {context}")]
     Quic {
         /// Where the error happened.
         context: &'static str,
@@ -57,21 +62,28 @@ pub enum TunnelError {
         #[source]
         source: quinn::ConnectionError,
     },
-    /// Writing or reading the Setup/SetupAck frame failed.
-    #[error("handshake i/o error: {0}")]
-    HandshakeIo(String),
+    /// Writing or reading the Setup/SetupAck frame failed. The source is one of
+    /// quinn's stream error types, kept behind a boxed `dyn Error`.
+    #[error("handshake i/o error: {context}")]
+    HandshakeIo {
+        /// Which handshake step failed.
+        context: &'static str,
+        /// Underlying quinn stream error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// The Setup/SetupAck frame did not decode.
-    #[error("handshake frame error: {0}")]
+    #[error("handshake frame error")]
     Frame(#[from] warren_wire::ProtocolError),
     /// The exit's authenticated pubkey did not match the expected one.
     #[error("exit identity mismatch (possible MITM)")]
     ExitIdentityMismatch,
     /// Sending a datagram failed (too large, or connection closing).
-    #[error("send datagram failed: {0}")]
-    SendDatagram(String),
+    #[error("send datagram failed")]
+    SendDatagram(#[source] quinn::SendDatagramError),
     /// Reading a datagram failed (connection closed).
-    #[error("read datagram failed: {0}")]
-    ReadDatagram(String),
+    #[error("read datagram failed")]
+    ReadDatagram(#[source] quinn::ConnectionError),
 }
 
 /// Builder for an identity-bound client tunnel.
@@ -159,16 +171,18 @@ impl ClientTunnel {
                 SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
             }
         });
-        let mut endpoint =
-            quinn::Endpoint::client(bind).map_err(|e| TunnelError::Bind(e.to_string()))?;
+        let mut endpoint = quinn::Endpoint::client(bind).map_err(TunnelError::Bind)?;
         endpoint.set_default_client_config(client_cfg);
 
         let server_name = tls::name::encode(&exit_pubkey);
         let conn = endpoint
             .connect(exit_addr, &server_name)
-            .map_err(|e| TunnelError::Connect(e.to_string()))?
+            .map_err(TunnelError::Connect)?
             .await
-            .map_err(|e| TunnelError::Connect(e.to_string()))?;
+            .map_err(|e| TunnelError::Quic {
+                context: "connect",
+                source: e,
+            })?;
 
         // Confirm the authenticated peer key matches the expected exit identity.
         match tls::peer_pubkey(&conn) {
@@ -191,14 +205,21 @@ impl ClientTunnel {
         };
         send.write_all(&encode_setup(&setup)?)
             .await
-            .map_err(|e| TunnelError::HandshakeIo(e.to_string()))?;
-        send.finish()
-            .map_err(|e| TunnelError::HandshakeIo(e.to_string()))?;
+            .map_err(|e| TunnelError::HandshakeIo {
+                context: "write setup",
+                source: Box::new(e),
+            })?;
+        send.finish().map_err(|e| TunnelError::HandshakeIo {
+            context: "finish setup",
+            source: Box::new(e),
+        })?;
 
-        let ack_bytes = recv
-            .read_to_end(MAX_SETUP_FRAME_BYTES)
-            .await
-            .map_err(|e| TunnelError::HandshakeIo(e.to_string()))?;
+        let ack_bytes = recv.read_to_end(MAX_SETUP_FRAME_BYTES).await.map_err(|e| {
+            TunnelError::HandshakeIo {
+                context: "read setup_ack",
+                source: Box::new(e),
+            }
+        })?;
         let ack = decode_setup_ack(&ack_bytes)?;
 
         Ok(ClientSession {
@@ -273,7 +294,7 @@ impl ClientSession {
     pub fn send_datagram(&self, payload: impl Into<bytes::Bytes>) -> Result<(), TunnelError> {
         self.conn
             .send_datagram(payload.into())
-            .map_err(|e| TunnelError::SendDatagram(e.to_string()))
+            .map_err(TunnelError::SendDatagram)
     }
 
     /// Awaits the next inbound datagram, returning the zero-copy [`bytes::Bytes`]
@@ -286,11 +307,52 @@ impl ClientSession {
         self.conn
             .read_datagram()
             .await
-            .map_err(|e| TunnelError::ReadDatagram(e.to_string()))
+            .map_err(TunnelError::ReadDatagram)
     }
 
     /// Closes the connection cleanly.
     pub fn disconnect(&self) {
         self.conn.close(0u32.into(), b"client disconnect");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn typed_errors_preserve_their_source() {
+        let bind = TunnelError::Bind(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "addr in use",
+        ));
+        assert!(bind.source().is_some(), "Bind must chain its io::Error");
+
+        let send = TunnelError::SendDatagram(quinn::SendDatagramError::TooLarge);
+        assert!(
+            send.source().is_some(),
+            "SendDatagram must chain its quinn error"
+        );
+
+        let handshake = TunnelError::HandshakeIo {
+            context: "write setup",
+            source: Box::new(std::io::Error::other("stream closed")),
+        };
+        assert!(
+            handshake.source().is_some(),
+            "HandshakeIo must chain its boxed source"
+        );
+    }
+
+    #[test]
+    fn top_level_display_omits_the_underlying_detail() {
+        // No-log discipline: the address-bearing cause stays in source(), not in
+        // the Display the embedder is most likely to log.
+        let bind = TunnelError::Bind(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "198.51.100.7:443 already in use",
+        ));
+        assert!(!bind.to_string().contains("198.51.100.7"));
     }
 }
