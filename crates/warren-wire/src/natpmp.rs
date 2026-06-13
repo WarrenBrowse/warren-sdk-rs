@@ -49,11 +49,12 @@ impl ResultCode {
             0 => ResultCode::Success,
             1 => ResultCode::UnsupportedVersion,
             2 => ResultCode::NotAuthorized,
+            3 => ResultCode::NetworkFailure,
             4 => ResultCode::OutOfResources,
             5 => ResultCode::UnsupportedOpcode,
             6 => ResultCode::SuggestedPortUnavailable,
             7 => ResultCode::RateLimited,
-            // 3 and any unknown future code map to NetworkFailure.
+            // Any unknown future code maps to NetworkFailure.
             _ => ResultCode::NetworkFailure,
         }
     }

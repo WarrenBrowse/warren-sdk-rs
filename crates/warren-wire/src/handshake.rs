@@ -174,6 +174,10 @@ pub enum ProtocolError {
         /// Version announced by the peer.
         got: u8,
     },
+    /// The peer's DAITA config carried out-of-range fractions (not in `0.0..=1.0`).
+    /// The remote controls these, so they are validated before use.
+    #[error("invalid DAITA fractions (must be within 0.0..=1.0)")]
+    InvalidDaita,
 }
 
 /// Encodes a [`Setup`] frame to bytes (postcard).
@@ -235,6 +239,13 @@ pub fn decode_setup_ack(buf: &[u8]) -> Result<SetupAck, ProtocolError> {
             expected: PROTOCOL_VERSION,
             got: a.protocol_version,
         });
+    }
+    // The exit controls the DAITA fractions; reject out-of-range values before
+    // any padding/blocking runtime could act on them.
+    if let Some(spec) = &a.daita_spec
+        && !spec.fractions_valid()
+    {
+        return Err(ProtocolError::InvalidDaita);
     }
     Ok(a)
 }
@@ -378,5 +389,26 @@ mod tests {
     fn multi_conn_helper_panics_on_idx_eq_total() {
         let r = std::panic::catch_unwind(|| Setup::multi_conn(0, 4, 4));
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn decode_rejects_out_of_range_daita_fractions() {
+        // A hostile exit sends absurd fractions; the decoder must reject the
+        // frame rather than hand them to a padding/blocking runtime.
+        let a = SetupAck {
+            daita_spec: Some(DaitaConfig {
+                machine_specs: vec!["02eNpjYEAHjOgCAAA0AAI=".to_owned()],
+                max_padding_frac: 1e9,
+                max_blocking_frac: 0.1,
+            }),
+            ..ack_no_daita(PROTOCOL_VERSION)
+        };
+        // Encode bypasses validation (encoder trusts the local builder); the
+        // decoder is the trust boundary for peer-supplied frames.
+        let bytes = encode_setup_ack(&a).unwrap();
+        assert!(matches!(
+            decode_setup_ack(&bytes).unwrap_err(),
+            ProtocolError::InvalidDaita
+        ));
     }
 }
