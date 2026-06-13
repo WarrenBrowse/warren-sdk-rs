@@ -1,0 +1,20 @@
+[package]
+name = "warren-test-support"
+description = "Test-only helpers shared across the Warren SDK workspace (in-process fake exit). Never published; used as a dev-dependency."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+warren-transport = { path = "../warren-transport" }
+warren-wire = { path = "../warren-wire" }
+ed25519-dalek = { workspace = true }
+quinn = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 ed25519-dalek = { workspace = true }
 warren-wire = { path = "../warren-wire" }
+warren-test-support = { path = "../warren-test-support" }
 
 [lints]
 workspace = true

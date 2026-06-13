@@ -442,7 +442,8 @@ mod tests {
         );
     }
 
-    type Responder = Box<dyn Fn(&HttpRequest) -> Result<HttpResponse, TransportError> + Send + Sync>;
+    type Responder =
+        Box<dyn Fn(&HttpRequest) -> Result<HttpResponse, TransportError> + Send + Sync>;
 
     /// Records every attempt and returns a programmed outcome per request.
     struct ScriptedTransport {
@@ -569,7 +570,10 @@ mod tests {
 
     #[tokio::test]
     async fn check_is_signed_get_and_parses() {
-        let c = client(MockTransport::new(200, r#"{"ip":"1.2.3.4","is_exit":false}"#));
+        let c = client(MockTransport::new(
+            200,
+            r#"{"ip":"1.2.3.4","is_exit":false}"#,
+        ));
         let resp = c.check().await.expect("ok");
         assert_eq!(resp.ip, "1.2.3.4");
         assert!(!resp.is_exit);
@@ -582,7 +586,10 @@ mod tests {
 
     #[tokio::test]
     async fn open_session_is_signed_post_and_parses() {
-        let c = client(MockTransport::new(200, r#"{"admitted":true,"max":5,"current":1}"#));
+        let c = client(MockTransport::new(
+            200,
+            r#"{"admitted":true,"max":5,"current":1}"#,
+        ));
         let req = SessionOpenRequest {
             pubkey_ss58: "wbAAA".to_owned(),
             device_id_hex: "00".repeat(16),
@@ -612,7 +619,10 @@ mod tests {
         let r = g.as_ref().unwrap();
         assert_eq!(r.method, Method::Post);
         assert_eq!(r.url, "https://api.example.test/v1/session/close");
-        assert!(header(r, HEADER_PUBKEY).is_some(), "close_session is signed");
+        assert!(
+            header(r, HEADER_PUBKEY).is_some(),
+            "close_session is signed"
+        );
     }
 
     #[tokio::test]
@@ -623,7 +633,10 @@ mod tests {
         let r = g.as_ref().unwrap();
         assert_eq!(r.method, Method::Delete);
         assert_eq!(r.url, "https://api.example.test/v1/account");
-        assert!(header(r, HEADER_PUBKEY).is_some(), "delete_account is signed");
+        assert!(
+            header(r, HEADER_PUBKEY).is_some(),
+            "delete_account is signed"
+        );
     }
 
     #[test]

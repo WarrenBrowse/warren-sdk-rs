@@ -1661,11 +1661,10 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "ed25519-dalek",
- "quinn",
  "thiserror 2.0.18",
  "tokio",
+ "warren-test-support",
  "warren-transport",
- "warren-wire",
 ]
 
 [[package]]
@@ -1674,7 +1673,6 @@ version = "0.0.1"
 dependencies = [
  "ed25519-dalek",
  "hex",
- "quinn",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -1682,8 +1680,8 @@ dependencies = [
  "warren-discovery",
  "warren-identity",
  "warren-net",
+ "warren-test-support",
  "warren-transport",
- "warren-wire",
 ]
 
 [[package]]
@@ -1693,6 +1691,17 @@ dependencies = [
  "hex",
  "thiserror 2.0.18",
  "warren-sdk",
+]
+
+[[package]]
+name = "warren-test-support"
+version = "0.0.1"
+dependencies = [
+ "ed25519-dalek",
+ "quinn",
+ "tokio",
+ "warren-transport",
+ "warren-wire",
 ]
 
 [[package]]
@@ -1706,6 +1715,7 @@ dependencies = [
  "rustls",
  "thiserror 2.0.18",
  "tokio",
+ "warren-test-support",
  "warren-wire",
 ]
 

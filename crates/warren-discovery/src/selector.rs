@@ -168,7 +168,9 @@ mod tests {
             relay("RO", "Good", 100, true),
         ]);
         let sel = ExitSelector::new(list);
-        let got = sel.select_weighted(&ExitQuery::country("RO")).expect("match");
+        let got = sel
+            .select_weighted(&ExitQuery::country("RO"))
+            .expect("match");
         assert_eq!(got.location().city(), "Good");
     }
 

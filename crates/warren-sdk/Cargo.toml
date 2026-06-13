@@ -26,8 +26,7 @@ reqwest-transport = ["warren-api/reqwest-transport"]
 [dev-dependencies]
 tokio = { workspace = true }
 ed25519-dalek = { workspace = true }
-warren-wire = { path = "../warren-wire" }
-quinn = { workspace = true }
+warren-test-support = { path = "../warren-test-support" }
 serde_json = { workspace = true }
 hex = { workspace = true }
 
