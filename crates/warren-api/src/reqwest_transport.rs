@@ -61,11 +61,17 @@ fn to_reqwest_method(method: Method) -> reqwest::Method {
 
 /// Classifies a reqwest error: connect-establishment failures drive the host
 /// fallback; everything else is a non-retryable transport error.
+///
+/// The reqwest `Display` carries the URL/host/IP, so it is deliberately NOT
+/// propagated: the error is mapped to a generic, address-free reason (no-log
+/// discipline).
 fn to_transport_error(e: &reqwest::Error) -> TransportError {
     if e.is_connect() {
-        TransportError::Connect(e.to_string())
+        TransportError::Connect("connection failed".to_owned())
+    } else if e.is_timeout() {
+        TransportError::Io("request timed out".to_owned())
     } else {
-        TransportError::Io(e.to_string())
+        TransportError::Io("request failed".to_owned())
     }
 }
 

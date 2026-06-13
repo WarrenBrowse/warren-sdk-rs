@@ -394,7 +394,10 @@ impl<T: HttpTransport> WarrenClient<T> {
     ) -> Result<ProxyHandle, SdkError> {
         let sink = self.connect_tunnel(exit).await?;
         let local_ip = sink.session().assigned_ipv4();
-        let mtu = usize::from(sink.session().assigned_max_mtu());
+        // The inner IP MTU must fit one QUIC datagram: use the path/policy-aware
+        // payload size, NOT the raw policy MTU (which can exceed the datagram
+        // capacity and make every full-size packet silently fail to send).
+        let mtu = warren_net::PacketSink::max_payload(&sink);
         let connector = warren_net::spawn_over_sink(
             Arc::new(sink),
             local_ip,

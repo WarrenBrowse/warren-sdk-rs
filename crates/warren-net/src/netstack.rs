@@ -4,49 +4,65 @@
 //! interface over a [`TunnelDevice`] whose frames are bare IP packets (no
 //! Ethernet: `Medium::Ip`) carried in and out over channels. Application TCP
 //! flows accepted by the SOCKS5 proxy become smoltcp TCP sockets; their bytes
-//! are bridged to tokio through per-connection channels exposed as a
+//! are bridged to tokio through per-connection bounded channels exposed as a
 //! [`NetstackStream`] (`AsyncRead`/`AsyncWrite`).
+//!
+//! Flow control is real, not just buffered: the write side uses a bounded
+//! [`PollSender`] so a fast app blocks when the engine is behind, and the read
+//! side only drains a socket's receive buffer when the app channel has capacity,
+//! so the TCP window actually closes. Per-connection state is keyed by a bounded
+//! per-connection channel, never by a recyclable smoltcp handle.
 //!
 //! The same client-side stack runs whether the peer is a real Warren exit or an
 //! in-process test exit: only the frame transport differs. Per CLAUDE.md, the
 //! end-to-end behavior must still be validated against a real exit before this
 //! is relied on in production.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
-use smoltcp::iface::{Config, Interface, SocketSet};
+use bytes::Bytes;
+use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
-use smoltcp::time::Instant as SmolInstant;
+use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc, oneshot};
+use tokio_util::sync::PollSender;
 
 use crate::error::NetError;
 use crate::proxy::Connector;
 use crate::socks5::Target;
 
-/// Per-direction TCP buffer (64 KiB), matching a typical socket window.
+/// Per-direction smoltcp TCP buffer (64 KiB), matching a typical socket window.
 const TCP_BUFFER: usize = 64 * 1024;
 /// First ephemeral local port handed to outbound connects.
 const EPHEMERAL_BASE: u16 = 49152;
+/// Per-connection app<->engine channel depth (chunks); the backpressure point.
+const CONN_CHANNEL_DEPTH: usize = 32;
+/// Frame-channel depth toward/from the tunnel.
+const FRAME_CHANNEL_DEPTH: usize = 1024;
+/// Max buffered app->net bytes per connection before the writer is throttled.
+const PENDING_OUT_CAP: usize = 256 * 1024;
+/// How long to wait for a SYN to complete before failing the connect.
+const CONNECT_TIMEOUT: SmolDuration = SmolDuration::from_secs(10);
 
-/// A smoltcp [`Device`] over IP-packet channels.
+/// A smoltcp [`Device`] over IP-packet channels. Frames are zero-copy [`Bytes`].
 struct TunnelDevice {
-    rx: VecDeque<Vec<u8>>,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    rx: VecDeque<Bytes>,
+    tx: mpsc::Sender<Bytes>,
     mtu: usize,
 }
 
 /// Receives one queued inbound frame.
-struct RxToken(Vec<u8>);
+struct RxToken(Bytes);
 /// Emits one outbound frame to the tunnel.
-struct TxToken(mpsc::UnboundedSender<Vec<u8>>);
+struct TxToken(mpsc::Sender<Bytes>);
 
 impl smoltcp::phy::RxToken for RxToken {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
@@ -58,8 +74,9 @@ impl smoltcp::phy::TxToken for TxToken {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut buf = vec![0u8; len];
         let r = f(&mut buf);
-        // A closed receiver means the tunnel is gone; the engine will exit.
-        let _ = self.0.send(buf);
+        // try_send, not send: if the tunnel writer is behind, drop this IP
+        // packet rather than block the engine; TCP will retransmit.
+        let _ = self.0.try_send(Bytes::from(buf));
         r
     }
 }
@@ -94,19 +111,26 @@ struct OpenCommand {
     reply: oneshot::Sender<Result<NetstackStream, NetError>>,
 }
 
-/// An app->net write addressed to a specific connection.
+/// An app->net write for one connection.
 enum WriteOp {
-    Data(Vec<u8>),
+    Data(Bytes),
     Shutdown,
 }
 
 /// Engine-side state for one connection.
 struct Conn {
-    handle: smoltcp::iface::SocketHandle,
-    to_app: mpsc::UnboundedSender<Vec<u8>>,
-    pending_out: VecDeque<u8>,
+    handle: SocketHandle,
+    local_port: u16,
+    /// net->app (bounded; the read-side backpressure point).
+    to_app: mpsc::Sender<Bytes>,
+    /// app->net (bounded; the write-side backpressure point).
+    from_app: mpsc::Receiver<WriteOp>,
+    pending_out: VecDeque<Bytes>,
+    pending_out_len: usize,
     want_close: bool,
-    /// Set until the socket reaches `Established` (or fails), then taken.
+    /// Deadline for the connect handshake to complete.
+    deadline: SmolInstant,
+    /// Set until the socket reaches `Established` (or fails/times out).
     connect: Option<(
         oneshot::Sender<Result<NetstackStream, NetError>>,
         NetstackStream,
@@ -115,10 +139,9 @@ struct Conn {
 
 /// Handle used to drive a userspace-netstack TCP connection from tokio.
 pub struct NetstackStream {
-    handle: smoltcp::iface::SocketHandle,
-    writes: mpsc::UnboundedSender<(smoltcp::iface::SocketHandle, WriteOp)>,
-    incoming: mpsc::UnboundedReceiver<Vec<u8>>,
-    leftover: Vec<u8>,
+    writes: PollSender<WriteOp>,
+    incoming: mpsc::Receiver<Bytes>,
+    leftover: Bytes,
     read_pos: usize,
     wake: Arc<Notify>,
 }
@@ -150,12 +173,15 @@ impl AsyncRead for NetstackStream {
 
 impl AsyncWrite for NetstackStream {
     fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        // Real backpressure: park the writer until the bounded channel has room.
+        ready!(self.writes.poll_reserve(cx))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "netstack engine stopped"))?;
         self.writes
-            .send((self.handle, WriteOp::Data(buf.to_vec())))
+            .send_item(WriteOp::Data(Bytes::copy_from_slice(buf)))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "netstack engine stopped"))?;
         self.wake.notify_one();
         Poll::Ready(Ok(buf.len()))
@@ -165,8 +191,10 @@ impl AsyncWrite for NetstackStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let _ = self.writes.send((self.handle, WriteOp::Shutdown));
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.writes.poll_reserve(cx))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "netstack engine stopped"))?;
+        let _ = self.writes.send_item(WriteOp::Shutdown);
         self.wake.notify_one();
         Poll::Ready(Ok(()))
     }
@@ -184,7 +212,12 @@ impl Connector for TunnelConnector {
 
     async fn connect(&self, target: Target) -> Result<Self::Stream, NetError> {
         let addr = match target {
-            Target::Ip(addr) => addr,
+            Target::Ip(addr @ SocketAddr::V4(_)) => addr,
+            // IPv6 has no default route wired yet; reject rather than silently
+            // black-hole a v6 target.
+            Target::Ip(SocketAddr::V6(_)) => {
+                return Err(NetError::Unsupported("IPv6 targets not yet routed"));
+            }
             // Names must be resolved at the exit (DNS-over-tunnel); not yet wired.
             Target::Domain(_, _) => {
                 return Err(NetError::Unsupported(
@@ -198,32 +231,31 @@ impl Connector for TunnelConnector {
                 addr,
                 reply: reply_tx,
             })
-            .map_err(|_| NetError::Unsupported("netstack engine stopped"))?;
+            .map_err(|_| NetError::EngineStopped)?;
         self.wake.notify_one();
-        reply_rx
-            .await
-            .map_err(|_| NetError::Unsupported("netstack engine dropped the request"))?
+        reply_rx.await.map_err(|_| NetError::EngineStopped)?
     }
 }
 
-/// Spawns the netstack engine over raw IP-frame channels and returns a connector.
+/// Spawns the netstack engine over IP-frame channels and returns a connector.
 ///
 /// `local_ip`/`prefix` is the tunnel-assigned client address (for example
 /// `10.66.0.2/16`) and `gateway` the exit-side tunnel gateway (for example
 /// `10.66.0.1`), installed as the default route so traffic to public targets is
-/// sent to the exit. `inbound` delivers IP packets arriving from the tunnel;
-/// `outbound` receives IP packets the stack wants to send.
+/// sent to the exit. `mtu` is the inner IP MTU and MUST fit one tunnel frame
+/// (derive it from `PacketSink::max_payload`, never the raw policy MTU).
+/// `inbound` delivers IP packets arriving from the tunnel; `outbound` receives
+/// IP packets the stack wants to send.
 #[must_use]
 pub fn spawn_engine(
     local_ip: std::net::Ipv4Addr,
     prefix: u8,
     gateway: std::net::Ipv4Addr,
     mtu: usize,
-    inbound: mpsc::UnboundedReceiver<Vec<u8>>,
-    outbound: mpsc::UnboundedSender<Vec<u8>>,
+    inbound: mpsc::Receiver<Bytes>,
+    outbound: mpsc::Sender<Bytes>,
 ) -> TunnelConnector {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let (write_tx, write_rx) = mpsc::unbounded_channel();
     let wake = Arc::new(Notify::new());
 
     let engine = Engine {
@@ -232,14 +264,14 @@ pub fn spawn_engine(
             tx: outbound,
             mtu,
         },
-        conns: Vec::new(),
+        conns: HashMap::new(),
+        next_conn_id: 0,
         next_port: EPHEMERAL_BASE,
+        used_ports: HashSet::new(),
         local_ip,
         prefix,
         gateway,
         cmd_rx,
-        write_rx,
-        write_tx: write_tx.clone(),
         inbound,
         wake: Arc::clone(&wake),
     };
@@ -253,15 +285,15 @@ pub fn spawn_engine(
 
 struct Engine {
     device: TunnelDevice,
-    conns: Vec<Conn>,
+    conns: HashMap<u64, Conn>,
+    next_conn_id: u64,
     next_port: u16,
+    used_ports: HashSet<u16>,
     local_ip: std::net::Ipv4Addr,
     prefix: u8,
     gateway: std::net::Ipv4Addr,
     cmd_rx: mpsc::UnboundedReceiver<OpenCommand>,
-    write_rx: mpsc::UnboundedReceiver<(smoltcp::iface::SocketHandle, WriteOp)>,
-    write_tx: mpsc::UnboundedSender<(smoltcp::iface::SocketHandle, WriteOp)>,
-    inbound: mpsc::UnboundedReceiver<Vec<u8>>,
+    inbound: mpsc::Receiver<Bytes>,
     wake: Arc<Notify>,
 }
 
@@ -273,7 +305,8 @@ impl Engine {
         };
 
         let mut config = Config::new(HardwareAddress::Ip);
-        config.random_seed = 0x5741_5252_454e_0001;
+        // Randomize the TCP ISN seed (RFC 6528) rather than a fixed constant.
+        config.random_seed = rand::random();
         let mut iface = Interface::new(config, &mut self.device, now(base));
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::new(IpAddress::from(self.local_ip), self.prefix));
@@ -284,45 +317,30 @@ impl Engine {
         let mut sockets = SocketSet::new(Vec::new());
 
         loop {
-            // 1. New connection requests.
             while let Ok(cmd) = self.cmd_rx.try_recv() {
-                self.open(&mut iface, &mut sockets, cmd);
+                self.open(&mut iface, &mut sockets, cmd, now(base));
             }
-            // 2. App -> net writes.
-            while let Ok((handle, op)) = self.write_rx.try_recv() {
-                if let Some(conn) = self.conns.iter_mut().find(|c| c.handle == handle) {
-                    match op {
-                        WriteOp::Data(bytes) => conn.pending_out.extend(bytes),
-                        WriteOp::Shutdown => conn.want_close = true,
-                    }
-                }
-            }
-            // 3. Inbound frames from the tunnel into the device.
-            let mut tunnel_open = true;
+            self.ingest_writes();
+
+            // Inbound frames from the tunnel into the device.
             loop {
                 match self.inbound.try_recv() {
                     Ok(frame) => self.device.rx.push_back(frame),
                     Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        tunnel_open = false;
-                        break;
-                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => return, // tunnel closed
                 }
             }
-            if !tunnel_open {
-                return;
-            }
 
-            // 4. Push buffered app bytes into sockets, then poll, then drain.
             self.pump_sockets(&mut sockets);
-            let _ = iface.poll(now(base), &mut self.device, &mut sockets);
-            self.drain_sockets(&mut sockets);
+            // Drain smoltcp completely before yielding (canonical poll pattern).
+            while iface.poll(now(base), &mut self.device, &mut sockets) != PollResult::None {}
+            self.drain_sockets(&mut sockets, now(base));
 
-            // 5. Sleep until the next timer or any external event.
             let delay = iface
                 .poll_delay(now(base), &sockets)
-                .map(|d| std::time::Duration::from_micros(d.total_micros()))
-                .unwrap_or_else(|| std::time::Duration::from_secs(3600));
+                .map_or(std::time::Duration::from_secs(30), |d| {
+                    std::time::Duration::from_micros(d.total_micros())
+                });
 
             tokio::select! {
                 _ = self.wake.notified() => {}
@@ -337,55 +355,108 @@ impl Engine {
         }
     }
 
-    fn open(&mut self, iface: &mut Interface, sockets: &mut SocketSet<'_>, cmd: OpenCommand) {
+    /// Picks a free ephemeral local port, skipping ones already in use.
+    fn alloc_port(&mut self) -> u16 {
+        for _ in 0..=(u16::MAX - EPHEMERAL_BASE) {
+            let port = self.next_port;
+            self.next_port = if port == u16::MAX {
+                EPHEMERAL_BASE
+            } else {
+                port + 1
+            };
+            if self.used_ports.insert(port) {
+                return port;
+            }
+        }
+        // All ephemeral ports busy (>16k live conns): reuse anyway.
+        self.next_port
+    }
+
+    fn open(
+        &mut self,
+        iface: &mut Interface,
+        sockets: &mut SocketSet<'_>,
+        cmd: OpenCommand,
+        now: SmolInstant,
+    ) {
         let socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
             tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
         );
         let handle = sockets.add(socket);
-        let local_port = self.next_port;
-        self.next_port = self.next_port.checked_add(1).unwrap_or(EPHEMERAL_BASE);
+        let local_port = self.alloc_port();
 
         let sock = sockets.get_mut::<tcp::Socket<'_>>(handle);
         let remote = (to_smol_ip(cmd.addr.ip()), cmd.addr.port());
         if sock.connect(iface.context(), remote, local_port).is_err() {
-            let _ = cmd
-                .reply
-                .send(Err(NetError::Unsupported("connect rejected locally")));
+            sockets.remove(handle);
+            self.used_ports.remove(&local_port);
+            let _ = cmd.reply.send(Err(NetError::ConnectFailed));
             return;
         }
 
-        let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
+        let (to_app_tx, to_app_rx) = mpsc::channel(CONN_CHANNEL_DEPTH);
+        let (from_app_tx, from_app_rx) = mpsc::channel(CONN_CHANNEL_DEPTH);
         let stream = NetstackStream {
-            handle,
-            writes: self.write_tx.clone(),
+            writes: PollSender::new(from_app_tx),
             incoming: to_app_rx,
-            leftover: Vec::new(),
+            leftover: Bytes::new(),
             read_pos: 0,
             wake: Arc::clone(&self.wake),
         };
-        self.conns.push(Conn {
-            handle,
-            to_app: to_app_tx,
-            pending_out: VecDeque::new(),
-            want_close: false,
-            connect: Some((cmd.reply, stream)),
-        });
+        let id = self.next_conn_id;
+        self.next_conn_id += 1;
+        self.conns.insert(
+            id,
+            Conn {
+                handle,
+                local_port,
+                to_app: to_app_tx,
+                from_app: from_app_rx,
+                pending_out: VecDeque::new(),
+                pending_out_len: 0,
+                want_close: false,
+                deadline: now + CONNECT_TIMEOUT,
+                connect: Some((cmd.reply, stream)),
+            },
+        );
     }
 
-    /// Moves buffered app bytes into socket send buffers and applies closes.
-    fn pump_sockets(&mut self, sockets: &mut SocketSet<'_>) {
-        for conn in &mut self.conns {
-            let sock = sockets.get_mut::<tcp::Socket<'_>>(conn.handle);
-            while sock.can_send() && !conn.pending_out.is_empty() {
-                let (head, _) = conn.pending_out.as_slices();
-                if head.is_empty() {
-                    break;
+    /// Moves app->net writes into per-conn buffers, bounded by `PENDING_OUT_CAP`
+    /// so a slow tunnel exerts backpressure through the bounded `from_app`
+    /// channel rather than growing memory without bound.
+    fn ingest_writes(&mut self) {
+        for conn in self.conns.values_mut() {
+            while conn.pending_out_len < PENDING_OUT_CAP {
+                match conn.from_app.try_recv() {
+                    Ok(WriteOp::Data(bytes)) => {
+                        conn.pending_out_len += bytes.len();
+                        conn.pending_out.push_back(bytes);
+                    }
+                    Ok(WriteOp::Shutdown) => conn.want_close = true,
+                    Err(_) => break,
                 }
-                match sock.send_slice(head) {
+            }
+        }
+    }
+
+    /// Pushes buffered app bytes into socket send buffers and applies closes.
+    fn pump_sockets(&mut self, sockets: &mut SocketSet<'_>) {
+        for conn in self.conns.values_mut() {
+            let sock = sockets.get_mut::<tcp::Socket<'_>>(conn.handle);
+            while sock.can_send() {
+                let Some(chunk) = conn.pending_out.front().cloned() else {
+                    break;
+                };
+                match sock.send_slice(&chunk) {
                     Ok(0) => break,
                     Ok(n) => {
-                        conn.pending_out.drain(..n);
+                        conn.pending_out_len -= n;
+                        if n == chunk.len() {
+                            conn.pending_out.pop_front();
+                        } else {
+                            conn.pending_out[0] = chunk.slice(n..);
+                        }
                     }
                     Err(_) => break,
                 }
@@ -396,10 +467,11 @@ impl Engine {
         }
     }
 
-    /// Delivers established streams, drains socket recv buffers to apps, and
-    /// reaps closed connections.
-    fn drain_sockets(&mut self, sockets: &mut SocketSet<'_>) {
-        for conn in &mut self.conns {
+    /// Delivers established streams, fails timed-out/refused connects, drains
+    /// socket recv buffers to apps (only while the app channel has room, so the
+    /// TCP window closes under a slow reader), and reaps closed connections.
+    fn drain_sockets(&mut self, sockets: &mut SocketSet<'_>, now: SmolInstant) {
+        for conn in self.conns.values_mut() {
             let sock = sockets.get_mut::<tcp::Socket<'_>>(conn.handle);
 
             if let Some((reply, stream)) = conn.connect.take() {
@@ -408,42 +480,57 @@ impl Engine {
                         let _ = reply.send(Ok(stream));
                     }
                     tcp::State::Closed => {
-                        let _ = reply.send(Err(NetError::Unsupported("connection refused")));
+                        let _ = reply.send(Err(NetError::ConnectionRefused));
                     }
-                    // Still handshaking: put it back.
+                    _ if now >= conn.deadline => {
+                        sock.abort();
+                        let _ = reply.send(Err(NetError::ConnectTimeout));
+                    }
+                    // Still handshaking, within deadline: put it back.
                     _ => conn.connect = Some((reply, stream)),
                 }
             }
 
-            let mut buf = [0u8; 4096];
+            // Read backpressure: only pull from smoltcp when the app can take it.
             while sock.can_recv() {
-                match sock.recv_slice(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let _ = conn.to_app.send(buf[..n].to_vec());
+                match conn.to_app.try_reserve() {
+                    Ok(permit) => {
+                        let mut buf = [0u8; 4096];
+                        match sock.recv_slice(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => permit.send(Bytes::copy_from_slice(&buf[..n])),
+                        }
                     }
+                    // App is behind: leave bytes in smoltcp so the window closes.
                     Err(_) => break,
                 }
             }
         }
 
-        // Reap connections whose socket is fully closed and which are not still
-        // mid-connect: dropping `to_app` signals EOF to the reader.
-        self.conns.retain(|conn| {
-            let sock = sockets.get::<tcp::Socket<'_>>(conn.handle);
-            let done = !sock.is_active() && sock.state() == tcp::State::Closed;
-            if done && conn.connect.is_none() {
+        // Reap fully-closed connections (not still mid-connect); dropping
+        // `to_app` signals EOF to the reader.
+        let reapable: Vec<u64> = self
+            .conns
+            .iter()
+            .filter(|(_, conn)| {
+                let sock = sockets.get::<tcp::Socket<'_>>(conn.handle);
+                conn.connect.is_none() && !sock.is_active() && sock.state() == tcp::State::Closed
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in reapable {
+            if let Some(conn) = self.conns.remove(&id) {
                 sockets.remove(conn.handle);
-                false
-            } else {
-                true
+                self.used_ports.remove(&conn.local_port);
             }
-        });
+        }
     }
 }
 
 /// Bridges a [`PacketSink`] to the netstack engine: a reader task feeds inbound
-/// frames and a writer task drains outbound frames.
+/// frames and a writer task drains outbound frames. A transient send failure
+/// (for example a PMTU `TooLarge`) drops that one packet and continues; the
+/// whole datapath only tears down when the tunnel read side closes.
 ///
 /// [`PacketSink`]: crate::PacketSink
 #[must_use]
@@ -457,22 +544,22 @@ pub fn spawn_over_sink<S>(
 where
     S: crate::PacketSink + 'static,
 {
-    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (inbound_tx, inbound_rx) = mpsc::channel(FRAME_CHANNEL_DEPTH);
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(FRAME_CHANNEL_DEPTH);
 
     let reader = Arc::clone(&sink);
     tokio::spawn(async move {
         while let Ok(packet) = reader.recv_packet().await {
-            if inbound_tx.send(packet.to_vec()).is_err() {
+            if inbound_tx.send(packet).await.is_err() {
                 break;
             }
         }
     });
     tokio::spawn(async move {
         while let Some(frame) = outbound_rx.recv().await {
-            if sink.send_packet(&frame).await.is_err() {
-                break;
-            }
+            // Drop-and-continue on a per-packet send error; tunnel teardown is
+            // detected by the reader task closing `inbound`.
+            let _ = sink.send_packet(&frame).await;
         }
     });
 

@@ -32,6 +32,7 @@ pub const SIGNED_VERSION: u32 = 5;
 
 /// Wire representation of one relay in the signed JSON.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct JsonRelay {
     /// 64-char hex of the Ed25519 endpoint pubkey.
     pub endpoint_id: String,
@@ -54,6 +55,7 @@ pub struct JsonRelay {
 
 /// Signed exit list (full wire format).
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignedRelayList {
     /// Must equal [`SIGNED_VERSION`].
     pub version: u32,
@@ -120,14 +122,19 @@ pub enum SignedError {
         /// Version actually received.
         got: u32,
     },
-    /// The declared server pubkey is not in the pinned set.
-    #[error("server pubkey mismatch: got {got}, expected {expected}")]
+    /// The declared server pubkey is not in the pinned set. The keys are kept
+    /// as fields for programmatic inspection but deliberately NOT rendered in
+    /// the message (no-log discipline: a pubkey is identity material).
+    #[error("server pubkey not in the pinned set")]
     ServerPubkeyMismatch {
         /// Pubkey hex announced in the JSON.
         got: String,
         /// Comma-joined pinned set.
         expected: String,
     },
+    /// The signed validity window (`expires_at - signed_at`) is implausibly long.
+    #[error("signed relay list validity window too long")]
+    ValidityTooLong,
     /// Invalid hex for the pubkey or the signature.
     #[error("invalid hex encoding")]
     InvalidHex,
@@ -249,6 +256,14 @@ pub fn verify_signed_relay_list_any(
         .verify(&canonical, &signature)
         .map_err(|_| SignedError::BadSignature)?;
 
+    // Bound the authenticated validity window: a compromised signer cannot mint
+    // a list that anti-rollback can never supersede by setting a decade-long
+    // expiry. Clock-free (relationship between two signed fields).
+    const MAX_VALIDITY_SECS: u64 = 7 * 24 * 60 * 60;
+    if signed.expires_at.saturating_sub(signed.signed_at) > MAX_VALIDITY_SECS {
+        return Err(SignedError::ValidityTooLong);
+    }
+
     let relays: Result<Vec<_>, SignedError> =
         signed.relays.into_iter().map(json_relay_to_relay).collect();
     Ok(VerifiedRelayList {
@@ -262,14 +277,14 @@ pub fn verify_signed_relay_list_any(
 
 fn json_relay_to_relay(r: JsonRelay) -> Result<Relay, SignedError> {
     let endpoint_id: [u8; 32] = hex::decode(&r.endpoint_id)
-        .map_err(|_| SignedError::Relay(format!("invalid endpoint_id hex: {}", r.endpoint_id)))?
+        .map_err(|_| SignedError::Relay("invalid relay endpoint id".to_owned()))?
         .try_into()
-        .map_err(|_| SignedError::Relay("endpoint_id must be 32 bytes".to_owned()))?;
+        .map_err(|_| SignedError::Relay("relay endpoint id must be 32 bytes".to_owned()))?;
     let mut addrs: Vec<SocketAddr> = Vec::with_capacity(r.ip_addrs.len());
     for raw in &r.ip_addrs {
         addrs.push(
             raw.parse()
-                .map_err(|_| SignedError::Relay(format!("invalid socket addr: {raw}")))?,
+                .map_err(|_| SignedError::Relay("invalid relay socket address".to_owned()))?,
         );
     }
     Ok(Relay::new(
@@ -322,6 +337,49 @@ mod tests {
         let json = serde_json::to_string(&signed).unwrap();
         let err = verify_signed_relay_list(&json, Some(&hex::encode([0xff; 32]))).unwrap_err();
         assert!(matches!(err, SignedError::ServerPubkeyMismatch { .. }));
+    }
+
+    #[test]
+    fn server_pubkey_mismatch_display_omits_the_key() {
+        // No-log discipline: the pubkey must not appear in the Display.
+        let signed = sign_relay_list(vec![sample_relay()], &fixed_server_key(), 1, 1, 2);
+        let json = serde_json::to_string(&signed).unwrap();
+        let pin = hex::encode([0xff; 32]);
+        let err = verify_signed_relay_list(&json, Some(&pin)).unwrap_err();
+        let rendered = err.to_string();
+        let actual_key = hex::encode(fixed_server_key().verifying_key().as_bytes());
+        assert!(!rendered.contains(&actual_key), "leaked server key: {rendered}");
+        assert!(!rendered.contains(&pin), "leaked pin: {rendered}");
+    }
+
+    #[test]
+    fn verify_rejects_implausibly_long_validity_window() {
+        // signed_at..expires_at spanning a year exceeds the 7-day cap.
+        let signed = sign_relay_list(
+            vec![sample_relay()],
+            &fixed_server_key(),
+            1,
+            1_700_000_000,
+            1_700_000_000 + 365 * 24 * 60 * 60,
+        );
+        let json = serde_json::to_string(&signed).unwrap();
+        assert!(matches!(
+            verify_signed_relay_list(&json, None).unwrap_err(),
+            SignedError::ValidityTooLong
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_unknown_fields() {
+        // deny_unknown_fields: an injected field fails parsing (fail closed).
+        let signed = sign_relay_list(vec![sample_relay()], &fixed_server_key(), 1, 1, 2);
+        let mut value: serde_json::Value = serde_json::to_value(&signed).unwrap();
+        value["surprise"] = serde_json::json!("x");
+        let json = serde_json::to_string(&value).unwrap();
+        assert!(matches!(
+            verify_signed_relay_list(&json, None).unwrap_err(),
+            SignedError::Json(_)
+        ));
     }
 
     #[test]
@@ -385,7 +443,7 @@ mod tests {
             vec![sample_relay()],
             &fixed_server_key(),
             1,
-            1,
+            1_700_000_000,
             1_700_086_400,
         );
         let json = serde_json::to_string(&signed).unwrap();

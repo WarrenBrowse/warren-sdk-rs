@@ -16,6 +16,18 @@ pub enum NetError {
     /// A SOCKS5 protocol error on the proxy inbound.
     #[error("socks5 error")]
     Socks5(#[from] crate::socks5::Socks5Error),
+    /// The exit refused the connection (RST during handshake).
+    #[error("connection refused by the exit")]
+    ConnectionRefused,
+    /// The connection handshake did not complete in time.
+    #[error("connect timed out")]
+    ConnectTimeout,
+    /// The userspace stack could not initiate the connection.
+    #[error("netstack connect failed")]
+    ConnectFailed,
+    /// The netstack engine task has stopped (tunnel gone).
+    #[error("netstack engine stopped")]
+    EngineStopped,
     /// The requested backend or feature is not available on this build/OS.
     #[error("unsupported: {0}")]
     Unsupported(&'static str),

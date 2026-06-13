@@ -1775,9 +1775,11 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "ed25519-dalek",
+ "rand 0.8.6",
  "smoltcp",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "warren-test-support",
  "warren-transport",
 ]

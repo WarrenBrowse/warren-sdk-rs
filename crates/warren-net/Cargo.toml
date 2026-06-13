@@ -13,6 +13,8 @@ publish.workspace = true
 warren-transport = { path = "../warren-transport" }
 bytes = { workspace = true }
 tokio = { workspace = true }
+tokio-util = "0.7"
+rand = { workspace = true }
 thiserror = { workspace = true }
 # Userspace TCP/IP for the non-root proxy datapath (Medium::Ip, no Ethernet:
 # the tunnel carries bare IP packets). 0.13 requires rustc 1.91 > our MSRV.

@@ -9,6 +9,7 @@
 
 use std::collections::VecDeque;
 
+use bytes::Bytes;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
@@ -24,12 +25,12 @@ const MTU: usize = 1500;
 
 /// A channel-backed smoltcp device for the test-side echo server.
 struct ChanDevice {
-    rx: VecDeque<Vec<u8>>,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    rx: VecDeque<Bytes>,
+    tx: mpsc::Sender<Bytes>,
 }
 
-struct Rx(Vec<u8>);
-struct Tx(mpsc::UnboundedSender<Vec<u8>>);
+struct Rx(Bytes);
+struct Tx(mpsc::Sender<Bytes>);
 
 impl smoltcp::phy::RxToken for Rx {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
@@ -40,7 +41,7 @@ impl smoltcp::phy::TxToken for Tx {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut buf = vec![0u8; len];
         let r = f(&mut buf);
-        let _ = self.0.send(buf);
+        let _ = self.0.try_send(Bytes::from(buf));
         r
     }
 }
@@ -65,10 +66,14 @@ impl Device for ChanDevice {
     }
 }
 
-/// A smoltcp echo server at `10.66.0.1:9`: accepts one connection and echoes.
+/// A smoltcp echo server listening on `:9` at `ip/prefix` with a default route
+/// via `gateway`; accepts one connection and echoes.
 async fn echo_server(
-    mut inbound: mpsc::UnboundedReceiver<Vec<u8>>,
-    outbound: mpsc::UnboundedSender<Vec<u8>>,
+    ip: std::net::Ipv4Addr,
+    prefix: u8,
+    gateway: std::net::Ipv4Addr,
+    mut inbound: mpsc::Receiver<Bytes>,
+    outbound: mpsc::Sender<Bytes>,
 ) {
     let mut device = ChanDevice {
         rx: VecDeque::new(),
@@ -82,8 +87,9 @@ async fn echo_server(
     config.random_seed = 0x5345_5256_0002;
     let mut iface = Interface::new(config, &mut device, now());
     iface.update_ip_addrs(|a| {
-        let _ = a.push(IpCidr::new(IpAddress::v4(10, 66, 0, 1), 24));
+        let _ = a.push(IpCidr::new(IpAddress::from(ip), prefix));
     });
+    let _ = iface.routes_mut().add_default_ipv4_route(gateway);
 
     let mut sockets = SocketSet::new(Vec::new());
     let socket = tcp::Socket::new(
@@ -129,8 +135,8 @@ async fn echo_server(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn netstack_tcp_connect_and_echo() {
-    let (c2s_tx, c2s_rx) = mpsc::unbounded_channel(); // client -> server
-    let (s2c_tx, s2c_rx) = mpsc::unbounded_channel(); // server -> client
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024); // client -> server
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024); // server -> client
 
     let connector = spawn_engine(
         "10.66.0.2".parse().unwrap(),
@@ -140,7 +146,13 @@ async fn netstack_tcp_connect_and_echo() {
         s2c_rx,
         c2s_tx,
     );
-    tokio::spawn(echo_server(c2s_rx, s2c_tx));
+    tokio::spawn(echo_server(
+        "10.66.0.1".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        c2s_rx,
+        s2c_tx,
+    ));
 
     let mut stream = connector
         .connect(Target::Ip("10.66.0.1:9".parse().unwrap()))
@@ -156,11 +168,84 @@ async fn netstack_tcp_connect_and_echo() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn netstack_routes_out_of_subnet_target_via_default_route() {
+    // The client is 10.66.0.2/16; the target 93.184.216.34 is OFF that subnet,
+    // so reaching it MUST go through the installed default route. The exit stack
+    // answers on that public address. This exercises the default route, which
+    // the same-subnet tests never touch.
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+
+    let connector = spawn_engine(
+        "10.66.0.2".parse().unwrap(),
+        16,
+        "10.66.0.1".parse().unwrap(),
+        MTU,
+        s2c_rx,
+        c2s_tx,
+    );
+    // The "exit" terminates the public target address and routes its replies
+    // back out via its own default route.
+    tokio::spawn(echo_server(
+        "93.184.216.34".parse().unwrap(),
+        24,
+        "93.184.216.1".parse().unwrap(),
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let mut stream = connector
+        .connect(Target::Ip("93.184.216.34:9".parse().unwrap()))
+        .await
+        .expect("out-of-subnet connect via default route succeeds");
+    stream.write_all(b"routed").await.expect("write");
+    stream.flush().await.expect("flush");
+    let mut got = [0u8; 6];
+    stream.read_exact(&mut got).await.expect("read echo");
+    assert_eq!(&got, b"routed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn netstack_connect_to_unlistened_port_is_refused() {
+    // The exit stack is up but nothing listens on :7, so the SYN gets a RST and
+    // the connect fails fast (not a hang).
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+    let connector = spawn_engine(
+        "10.66.0.2".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        MTU,
+        s2c_rx,
+        c2s_tx,
+    );
+    tokio::spawn(echo_server(
+        "10.66.0.1".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    // Port 7, not the listened :9.
+    let result = connector
+        .connect(Target::Ip("10.66.0.1:7".parse().unwrap()))
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(warren_net::NetError::ConnectionRefused | warren_net::NetError::ConnectTimeout)
+        ),
+        "connect to a closed port must fail fast"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn socks5_proxy_over_netstack_reaches_the_exit() {
     // Full non-root datapath: a SOCKS5 client -> Socks5Proxy -> TunnelConnector
     // -> userspace netstack -> (channels = tunnel) -> smoltcp "exit" echo.
-    let (c2s_tx, c2s_rx) = mpsc::unbounded_channel();
-    let (s2c_tx, s2c_rx) = mpsc::unbounded_channel();
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
 
     let connector = spawn_engine(
         "10.66.0.2".parse().unwrap(),
@@ -170,7 +255,13 @@ async fn socks5_proxy_over_netstack_reaches_the_exit() {
         s2c_rx,
         c2s_tx,
     );
-    tokio::spawn(echo_server(c2s_rx, s2c_tx));
+    tokio::spawn(echo_server(
+        "10.66.0.1".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        c2s_rx,
+        s2c_tx,
+    ));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();

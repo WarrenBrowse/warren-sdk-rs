@@ -41,7 +41,9 @@ fn signed_list(server: &SigningKey, generation: u64, expires_at: u64) -> String 
         active: true,
         ipv6_egress: false,
     };
-    let signed = sign_relay_list(vec![relay], server, generation, 1, expires_at);
+    // Keep the signed validity window within the verifier's cap (7 days).
+    let signed_at = expires_at.saturating_sub(86_400);
+    let signed = sign_relay_list(vec![relay], server, generation, signed_at, expires_at);
     serde_json::to_string(&signed).unwrap()
 }
 
