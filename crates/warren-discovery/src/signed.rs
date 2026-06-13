@@ -275,11 +275,24 @@ pub fn verify_signed_relay_list_any(
     })
 }
 
+/// Decodes a relay `endpoint_id` into the 32-byte exit pubkey.
+///
+/// warren-api publishes it as a Warren SS58 (`wb…`) address since the SS58
+/// migration; the 64-char hex form is accepted as a fallback for legacy or
+/// locally-authored lists. A hex string is never a valid SS58 address and
+/// vice-versa, so the dispatch is unambiguous (matches warren-core).
+fn decode_endpoint_id(s: &str) -> Result<[u8; 32], SignedError> {
+    if let Ok(bytes) = warren_identity::ss58::decode(s) {
+        return Ok(bytes);
+    }
+    hex::decode(s)
+        .ok()
+        .and_then(|v| <[u8; 32]>::try_from(v).ok())
+        .ok_or_else(|| SignedError::Relay("invalid relay endpoint id".to_owned()))
+}
+
 fn json_relay_to_relay(r: JsonRelay) -> Result<Relay, SignedError> {
-    let endpoint_id: [u8; 32] = hex::decode(&r.endpoint_id)
-        .map_err(|_| SignedError::Relay("invalid relay endpoint id".to_owned()))?
-        .try_into()
-        .map_err(|_| SignedError::Relay("relay endpoint id must be 32 bytes".to_owned()))?;
+    let endpoint_id = decode_endpoint_id(&r.endpoint_id)?;
     let mut addrs: Vec<SocketAddr> = Vec::with_capacity(r.ip_addrs.len());
     for raw in &r.ip_addrs {
         addrs.push(
@@ -370,6 +383,22 @@ mod tests {
             verify_signed_relay_list(&json, None).unwrap_err(),
             SignedError::ValidityTooLong
         ));
+    }
+
+    #[test]
+    fn endpoint_id_accepts_ss58_and_hex() {
+        // Legacy hex form.
+        assert_eq!(
+            decode_endpoint_id(&hex::encode([0xab; 32])).unwrap(),
+            [0xab; 32]
+        );
+        // Production SS58 (`wb…`) form, as warren-api publishes since the SS58
+        // migration. Without this the live exit list fails to parse.
+        let ss58 = warren_identity::ss58::encode(&[0xcd; 32]);
+        assert!(ss58.starts_with("wb"));
+        assert_eq!(decode_endpoint_id(&ss58).unwrap(), [0xcd; 32]);
+        // Neither form.
+        assert!(decode_endpoint_id("not-an-id").is_err());
     }
 
     #[test]
