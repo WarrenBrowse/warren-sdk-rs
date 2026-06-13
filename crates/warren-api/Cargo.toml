@@ -1,6 +1,6 @@
 [package]
 name = "warren-api"
-description = "Signed HTTP client for the Warren account API (/v1/*): subscription, voucher redeem, register, session, checkout, with anti-censorship host fallback. (Phase P3, not yet implemented.)"
+description = "Signed HTTP client for the Warren account API (/v1/*). Transport-agnostic core (testable without a network); an optional reqwest transport ships behind the `reqwest-transport` feature."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,24 @@ publish.workspace = true
 
 [dependencies]
 warren-identity = { path = "../warren-identity" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+
+# Optional batteries-included transport. Off by default so the pure request
+# builder stays cheap to compile and test; the SDK facade enables it.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"], optional = true }
+
+[features]
+default = []
+reqwest-transport = ["dep:reqwest"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

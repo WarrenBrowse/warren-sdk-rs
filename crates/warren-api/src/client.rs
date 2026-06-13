@@ -1,0 +1,330 @@
+//! The signed Warren account API client.
+
+use rand::RngCore;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use warren_identity::WarrenIdentity;
+
+use crate::dto::{
+    CheckResponse, RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest,
+    SessionOpenRequest, SessionOpenResponse, SubscriptionResponse,
+};
+use crate::transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
+
+/// Error from an API call.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ClientError {
+    /// The request failed at the network layer.
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+    /// The server returned a non-2xx status.
+    #[error("server returned status {status}")]
+    ServerStatus {
+        /// HTTP status code.
+        status: u16,
+        /// Response body (may carry a server error message).
+        body: String,
+    },
+    /// The response body could not be parsed as the expected type.
+    #[error("failed to parse response: {0}")]
+    Deserialize(String),
+    /// The system clock is before the Unix epoch.
+    #[error("system clock is before the Unix epoch")]
+    BadClock,
+}
+
+/// Signed HTTP client for the Warren account API.
+///
+/// Generic over an [`HttpTransport`] so the request logic is testable without a
+/// network. The SDK facade pairs it with the bundled reqwest transport.
+pub struct WarrenApiClient<T: HttpTransport> {
+    api_base: String,
+    identity: WarrenIdentity,
+    transport: T,
+}
+
+impl<T: HttpTransport> WarrenApiClient<T> {
+    /// Builds a client. `api_base` must not end with `/`
+    /// (e.g. `https://api.warrenbrowse.com`).
+    pub fn new(api_base: impl Into<String>, identity: WarrenIdentity, transport: T) -> Self {
+        Self {
+            api_base: api_base.into(),
+            identity,
+            transport,
+        }
+    }
+
+    /// The Warren SS58 address of the client identity.
+    #[must_use]
+    pub fn address(&self) -> String {
+        self.identity.address()
+    }
+
+    /// Unsigned `GET /v1/exits`. Returns the raw server-signed relay list JSON
+    /// (verify it with `warren_discovery::verify_signed_relay_list`).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on transport failure or a non-2xx status.
+    pub async fn list_exits(&self) -> Result<String, ClientError> {
+        let req = self.unsigned_request(Method::Get, "/v1/exits", Vec::new());
+        let resp = self.send(req).await?;
+        String::from_utf8(resp.body).map_err(|e| ClientError::Deserialize(e.to_string()))
+    }
+
+    /// Unsigned `POST /v1/register`. Redeems a voucher to bind a subscription to
+    /// the account pubkey.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on transport failure, a non-2xx status, or a malformed
+    /// response.
+    pub async fn register(
+        &self,
+        req: &RegisterAccountRequest,
+    ) -> Result<RegisterAccountResponse, ClientError> {
+        let body = serialize(req)?;
+        let http = self.unsigned_request(Method::Post, "/v1/register", body);
+        self.send_json(http).await
+    }
+
+    /// Signed `GET /v1/subscription`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`].
+    pub async fn subscription(&self) -> Result<SubscriptionResponse, ClientError> {
+        let http = self.signed_request(Method::Get, "/v1/subscription", Vec::new())?;
+        self.send_json(http).await
+    }
+
+    /// Signed `GET /v1/check`. Reports the client's egress IP and whether it is
+    /// an exit (useful to confirm the tunnel is active).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`].
+    pub async fn check(&self) -> Result<CheckResponse, ClientError> {
+        let http = self.signed_request(Method::Get, "/v1/check", Vec::new())?;
+        self.send_json(http).await
+    }
+
+    /// Signed `POST /v1/session/open`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`].
+    pub async fn open_session(
+        &self,
+        req: &SessionOpenRequest,
+    ) -> Result<SessionOpenResponse, ClientError> {
+        let body = serialize(req)?;
+        let http = self.signed_request(Method::Post, "/v1/session/open", body)?;
+        self.send_json(http).await
+    }
+
+    /// Signed `POST /v1/session/close`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`].
+    pub async fn close_session(&self, req: &SessionCloseRequest) -> Result<(), ClientError> {
+        let body = serialize(req)?;
+        let http = self.signed_request(Method::Post, "/v1/session/close", body)?;
+        self.send(http).await.map(|_| ())
+    }
+
+    /// Signed `DELETE /v1/account`. Deletes the account's subscription.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`].
+    pub async fn delete_account(&self) -> Result<(), ClientError> {
+        let http = self.signed_request(Method::Delete, "/v1/account", Vec::new())?;
+        self.send(http).await.map(|_| ())
+    }
+
+    /// Builds an unsigned request (carries only `accept`/`content-type`).
+    fn unsigned_request(&self, method: Method, path: &str, body: Vec<u8>) -> HttpRequest {
+        let mut headers = vec![("accept".to_owned(), "application/json".to_owned())];
+        if !body.is_empty() {
+            headers.push(("content-type".to_owned(), "application/json".to_owned()));
+        }
+        HttpRequest {
+            method,
+            url: format!("{}{path}", self.api_base),
+            headers,
+            body,
+        }
+    }
+
+    /// Builds a signed request, attaching the four `X-Warren-*` headers.
+    ///
+    /// The path (including any query string) is part of the signed canonical
+    /// message, so callers must pass the exact path they send.
+    fn signed_request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<HttpRequest, ClientError> {
+        let timestamp = now_secs()?;
+        let mut nonce = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let sig = self
+            .identity
+            .sign_request(method.as_str(), path, &body, timestamp, nonce);
+
+        let mut headers: Vec<(String, String)> = sig
+            .headers()
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+        headers.push(("accept".to_owned(), "application/json".to_owned()));
+        if !body.is_empty() {
+            headers.push(("content-type".to_owned(), "application/json".to_owned()));
+        }
+        Ok(HttpRequest {
+            method,
+            url: format!("{}{path}", self.api_base),
+            headers,
+            body,
+        })
+    }
+
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, ClientError> {
+        let resp = self.transport.execute(request).await?;
+        if !(200..300).contains(&resp.status) {
+            return Err(ClientError::ServerStatus {
+                status: resp.status,
+                body: String::from_utf8_lossy(&resp.body).into_owned(),
+            });
+        }
+        Ok(resp)
+    }
+
+    async fn send_json<R: DeserializeOwned>(&self, request: HttpRequest) -> Result<R, ClientError> {
+        let resp = self.send(request).await?;
+        serde_json::from_slice(&resp.body).map_err(|e| ClientError::Deserialize(e.to_string()))
+    }
+}
+
+fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, ClientError> {
+    serde_json::to_vec(value).map_err(|e| ClientError::Deserialize(e.to_string()))
+}
+
+fn now_secs() -> Result<u64, ClientError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| ClientError::BadClock)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use warren_identity::{HEADER_NONCE, HEADER_PUBKEY, HEADER_SIGNATURE, HEADER_TIMESTAMP};
+
+    /// A transport that records the last request and returns a canned response.
+    struct MockTransport {
+        last: Mutex<Option<HttpRequest>>,
+        status: u16,
+        body: Vec<u8>,
+    }
+
+    impl MockTransport {
+        fn new(status: u16, body: &str) -> Self {
+            Self {
+                last: Mutex::new(None),
+                status,
+                body: body.as_bytes().to_vec(),
+            }
+        }
+    }
+
+    impl HttpTransport for MockTransport {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+            *self.last.lock().unwrap() = Some(request);
+            Ok(HttpResponse {
+                status: self.status,
+                body: self.body.clone(),
+            })
+        }
+    }
+
+    fn header<'a>(req: &'a HttpRequest, name: &str) -> Option<&'a str> {
+        req.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn client(t: MockTransport) -> WarrenApiClient<MockTransport> {
+        WarrenApiClient::new(
+            "https://api.example.test",
+            WarrenIdentity::from_seed(&[0x11; 32]),
+            t,
+        )
+    }
+
+    #[tokio::test]
+    async fn subscription_parses_body() {
+        let c = client(MockTransport::new(200, r#"{"expires_at":1700000000}"#));
+        let sub = c.subscription().await.expect("ok");
+        assert_eq!(sub.expires_at, 1_700_000_000);
+    }
+
+    #[tokio::test]
+    async fn signed_request_carries_valid_signature() {
+        use ed25519_dalek::{Signature, Verifier};
+        use warren_identity::canonical_message;
+
+        let c = client(MockTransport::new(200, r#"{"expires_at":1}"#));
+        c.subscription().await.expect("ok");
+
+        let guard = c.transport.last.lock().unwrap();
+        let req = guard.as_ref().expect("request captured");
+        assert_eq!(req.url, "https://api.example.test/v1/subscription");
+        assert_eq!(req.method, Method::Get);
+
+        // Reconstruct the canonical message from the headers and verify the
+        // signature against the client identity. This proves the wire contract
+        // without freezing the clock or the nonce.
+        let pubkey_ss58 = header(req, HEADER_PUBKEY).expect("pubkey header");
+        let sig_hex = header(req, HEADER_SIGNATURE).expect("sig header");
+        let ts: u64 = header(req, HEADER_TIMESTAMP).unwrap().parse().unwrap();
+        let nonce_hex = header(req, HEADER_NONCE).unwrap();
+
+        let id = WarrenIdentity::from_seed(&[0x11; 32]);
+        assert_eq!(pubkey_ss58, id.address());
+        let body_hash_hex = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&req.body));
+        let canonical = canonical_message("GET", "/v1/subscription", ts, nonce_hex, &body_hash_hex);
+        let sig_bytes: [u8; 64] = hex::decode(sig_hex).unwrap().try_into().unwrap();
+        id.verifying_key()
+            .verify(canonical.as_bytes(), &Signature::from_bytes(&sig_bytes))
+            .expect("signature must verify");
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn non_2xx_is_server_status_error() {
+        let c = client(MockTransport::new(402, "payment required"));
+        let err = c.subscription().await.expect_err("must error");
+        assert!(matches!(err, ClientError::ServerStatus { status: 402, .. }));
+    }
+
+    #[tokio::test]
+    async fn list_exits_is_unsigned_and_returns_raw_body() {
+        let c = client(MockTransport::new(200, "{\"signed\":true}"));
+        let body = c.list_exits().await.expect("ok");
+        assert_eq!(body, "{\"signed\":true}");
+        let guard = c.transport.last.lock().unwrap();
+        let req = guard.as_ref().unwrap();
+        assert!(
+            header(req, HEADER_PUBKEY).is_none(),
+            "list_exits must be unsigned"
+        );
+    }
+}

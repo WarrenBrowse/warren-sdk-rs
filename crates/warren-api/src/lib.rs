@@ -1,21 +1,23 @@
-//! Signed Warren account API client (Phase P3, not yet implemented).
+//! Signed Warren account API client.
 //!
-//! Planned surface, ported from warren-core `warren-api-client`:
-//! - `WarrenApiClient` over an async HTTP backend, attaching the four
-//!   `X-Warren-*` headers from [`warren_identity::WarrenIdentity::sign_request`].
-//! - Endpoints: `/v1/register`, `/v1/subscription`, `/v1/check`, `/v1/exits`,
-//!   `/v1/session/{open,close}`, `/v1/account` (DELETE), checkout/voucher polling,
-//!   mobile payments (Apple/Google), incident and support reports.
-//! - Anti-censorship fallback: primary host, alternative hosts, no-SNI attempt.
-//! - Pinned API server pubkey passed through to [`warren_discovery`] for the
-//!   signed relay list verification.
+//! [`WarrenApiClient`] builds and signs requests to the Warren API (`/v1/*`),
+//! attaching the four `X-Warren-*` headers from
+//! [`warren_identity::WarrenIdentity`]. The path (including any query) is part
+//! of the signed canonical message, matching warren-core byte-for-byte.
 //!
-//! The HTTP backend will be abstracted behind a trait so the FFI builds and the
-//! sibling-language SDKs can plug their platform HTTP stack.
+//! The client is generic over an [`HttpTransport`] so the request logic is
+//! testable without a network. A batteries-included reqwest transport ships
+//! behind the `reqwest-transport` feature.
 
-#[cfg(test)]
-mod roadmap {
-    #[test]
-    #[ignore = "P3: implement WarrenApiClient signed endpoints + host fallback"]
-    fn placeholder() {}
-}
+pub mod client;
+pub mod dto;
+pub mod transport;
+
+#[cfg(feature = "reqwest-transport")]
+pub mod reqwest_transport;
+
+pub use client::{ClientError, WarrenApiClient};
+pub use transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
+
+#[cfg(feature = "reqwest-transport")]
+pub use reqwest_transport::ReqwestTransport;
