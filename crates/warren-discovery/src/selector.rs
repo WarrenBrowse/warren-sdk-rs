@@ -42,6 +42,21 @@ impl ExitSelector {
             .ok_or(SelectorError::NoRelayMatch)
     }
 
+    /// Selects a weighted-random matching relay using the thread RNG.
+    ///
+    /// This is the recommended default: it honors `weight` and excludes
+    /// zero-weight relays, unlike [`Self::select`] (which returns the first
+    /// match regardless of weight). Use [`Self::select_for_attempt`] when you
+    /// need a deterministic, per-retry choice.
+    ///
+    /// # Errors
+    ///
+    /// [`SelectorError::NoRelayMatch`] if no active, positive-weight relay
+    /// matches.
+    pub fn select_weighted(&self, query: &ExitQuery) -> Result<&Relay, SelectorError> {
+        self.select_with_rng(query, &mut rand::thread_rng())
+    }
+
     /// Selects a relay weighted by `weight`, excluding `weight == 0`.
     ///
     /// # Errors
@@ -143,6 +158,18 @@ mod tests {
                 .unwrap_err(),
             SelectorError::NoRelayMatch
         );
+    }
+
+    #[test]
+    fn select_weighted_excludes_zero_weight_and_matches_query() {
+        let list = RelayList::new(vec![
+            relay("RO", "Zero", 0, true),
+            relay("DE", "Other", 100, true),
+            relay("RO", "Good", 100, true),
+        ]);
+        let sel = ExitSelector::new(list);
+        let got = sel.select_weighted(&ExitQuery::country("RO")).expect("match");
+        assert_eq!(got.location().city(), "Good");
     }
 
     #[test]

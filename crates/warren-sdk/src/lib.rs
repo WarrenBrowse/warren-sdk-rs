@@ -15,7 +15,7 @@
 //!     .build()?;
 //!
 //! let selector = client.fetch_exits().await?;        // signed list, verified
-//! let exit = selector.select(&ExitQuery::country("RO"))?.clone();
+//! let exit = selector.select_weighted(&ExitQuery::country("RO"))?.clone();
 //! let sink = client.connect_tunnel(&exit).await?;    // QUIC packet plane
 //! # let _ = sink; Ok(())
 //! # }
@@ -235,6 +235,11 @@ impl WarrenClientBuilder {
         })
     }
 }
+
+/// The Warren client over the bundled reqwest transport: the type most apps use.
+/// `WarrenClient::builder()...build()` yields one.
+#[cfg(feature = "reqwest-transport")]
+pub type DefaultClient = WarrenClient<ReqwestTransport>;
 
 /// The high-level Warren client.
 pub struct WarrenClient<T> {
