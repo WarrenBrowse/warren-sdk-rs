@@ -221,6 +221,87 @@ fn dns_response(query: &[u8], addr: std::net::Ipv4Addr) -> Vec<u8> {
     r
 }
 
+/// A smoltcp "exit" that actively connects to `target`, sends `probe`, reads the
+/// echo, and reports whether it matched. Models the exit forwarding an inbound
+/// connection to the client's tunnel-side listen port.
+#[allow(clippy::too_many_arguments)]
+async fn exit_connect_and_check(
+    exit_ip: std::net::Ipv4Addr,
+    prefix: u8,
+    gateway: std::net::Ipv4Addr,
+    target: (std::net::Ipv4Addr, u16),
+    probe: &'static [u8],
+    result_tx: tokio::sync::oneshot::Sender<bool>,
+    mut inbound: mpsc::Receiver<Bytes>,
+    outbound: mpsc::Sender<Bytes>,
+) {
+    let mut device = ChanDevice {
+        rx: VecDeque::new(),
+        tx: outbound,
+    };
+    let base = tokio::time::Instant::now();
+    let now =
+        || SmolInstant::from_micros(i64::try_from(base.elapsed().as_micros()).unwrap_or(i64::MAX));
+
+    let mut config = Config::new(HardwareAddress::Ip);
+    config.random_seed = 0x5345_5256_0009;
+    let mut iface = Interface::new(config, &mut device, now());
+    iface.update_ip_addrs(|a| {
+        let _ = a.push(IpCidr::new(IpAddress::from(exit_ip), prefix));
+    });
+    let _ = iface.routes_mut().add_default_ipv4_route(gateway);
+
+    let mut sockets = SocketSet::new(Vec::new());
+    let handle = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+    ));
+    sockets
+        .get_mut::<tcp::Socket<'_>>(handle)
+        .connect(
+            iface.context(),
+            (IpAddress::from(target.0), target.1),
+            49000,
+        )
+        .expect("connect");
+
+    let mut sent = false;
+    let mut result_tx = Some(result_tx);
+    loop {
+        while let Ok(f) = inbound.try_recv() {
+            device.rx.push_back(f);
+        }
+        let _ = iface.poll(now(), &mut device, &mut sockets);
+
+        let sock = sockets.get_mut::<tcp::Socket<'_>>(handle);
+        if !sent && sock.can_send() {
+            let _ = sock.send_slice(probe);
+            sent = true;
+        }
+        if sock.can_recv() {
+            let mut buf = [0u8; 64];
+            if let Ok(n) = sock.recv_slice(&mut buf) {
+                if let Some(tx) = result_tx.take() {
+                    let _ = tx.send(&buf[..n] == probe);
+                }
+                return;
+            }
+        }
+
+        let delay = iface
+            .poll_delay(now(), &sockets)
+            .map(|d| std::time::Duration::from_micros(d.total_micros()))
+            .unwrap_or_else(|| std::time::Duration::from_millis(5));
+        tokio::select! {
+            f = inbound.recv() => match f {
+                Some(f) => device.rx.push_back(f),
+                None => return,
+            },
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
 /// Builds a minimal DNS response for `query` answering with a single AAAA record
 /// for `addr`, echoing the query id and question and appending one compressed
 /// AAAA answer.
@@ -986,6 +1067,57 @@ async fn netstack_rejects_ipv6_target_when_v6_not_assigned() {
     assert!(
         matches!(result, Err(warren_net::NetError::Unsupported(_))),
         "a v6 target without a v6 assignment must be refused"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn netstack_accepts_an_inbound_connection_and_echoes() {
+    // The port-forwarding accept side: the engine listens on a tunnel-side port,
+    // the exit forwards an inbound connection to it, the app accepts the stream
+    // and echoes. This exercises the netstack listen/accept path (inbound), the
+    // mirror of the outbound connect path.
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+
+    let connector = spawn_engine(
+        NetstackConfig::new(
+            "10.66.0.2".parse().unwrap(),
+            24,
+            "10.66.0.1".parse().unwrap(),
+            MTU,
+        ),
+        s2c_rx,
+        c2s_tx,
+    );
+
+    // Bind the listener before the exit dials in, so the SYN has somewhere to land.
+    let mut listener = connector.listen(8080).await.expect("listen on 8080");
+
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(exit_connect_and_check(
+        "10.66.0.1".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        ("10.66.0.2".parse().unwrap(), 8080),
+        b"inbound!",
+        result_tx,
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let mut stream = listener
+        .accept()
+        .await
+        .expect("accept an inbound connection");
+    let mut buf = [0u8; 8];
+    stream.read_exact(&mut buf).await.expect("read probe");
+    stream.write_all(&buf).await.expect("echo");
+    stream.flush().await.expect("flush");
+
+    let matched = result_rx.await.expect("exit reported a result");
+    assert!(
+        matched,
+        "the inbound connection round-tripped through the tunnel"
     );
 }
 

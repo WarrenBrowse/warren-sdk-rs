@@ -62,6 +62,10 @@ const DNS_BUFFER: usize = 2048;
 const UDP_FLOW_BUFFER: usize = 64 * 1024;
 /// Datagrams buffered per direction for a UDP flow before drops (lossy by design).
 const UDP_CHANNEL_DEPTH: usize = 64;
+/// Number of sockets kept in `LISTEN` state per listening port (accept backlog).
+const LISTEN_BACKLOG: usize = 8;
+/// Accepted-connection queue depth per listener before inbound SYNs are refused.
+const ACCEPT_CHANNEL_DEPTH: usize = 32;
 
 /// A smoltcp [`Device`] over IP-packet channels. Frames are zero-copy [`Bytes`].
 struct TunnelDevice {
@@ -126,6 +130,23 @@ enum Command {
     /// Open a UDP flow (an ephemeral local port) for datagrams to arbitrary
     /// targets through the tunnel (the SOCKS5 UDP-associate egress).
     OpenUdp(UdpOpenCommand),
+    /// Listen on a tunnel-side TCP port and deliver inbound connections (the
+    /// port-forwarding accept side).
+    Listen(ListenCommand),
+}
+
+/// Listen on `port`, replying with a [`NetstackListener`] of accepted streams.
+struct ListenCommand {
+    port: u16,
+    reply: oneshot::Sender<Result<NetstackListener, NetError>>,
+}
+
+/// Engine-side state for one listening port: a pool of sockets in `LISTEN` state
+/// (the accept backlog) and the channel that delivers accepted streams.
+struct Listener {
+    port: u16,
+    pending: Vec<SocketHandle>,
+    accept_tx: mpsc::Sender<NetstackStream>,
 }
 
 /// Open a UDP flow, replying with a [`NetstackUdpSocket`] handle.
@@ -203,6 +224,20 @@ pub struct NetstackStream {
     leftover: Bytes,
     read_pos: usize,
     wake: Arc<Notify>,
+}
+
+/// A tunnel-side listening port. Each [`accept`](Self::accept) yields the next
+/// inbound connection (the port-forwarding accept side).
+pub struct NetstackListener {
+    accept_rx: mpsc::Receiver<NetstackStream>,
+}
+
+impl NetstackListener {
+    /// Returns the next accepted inbound connection, or `None` when the engine
+    /// has stopped (the tunnel is gone).
+    pub async fn accept(&mut self) -> Option<NetstackStream> {
+        self.accept_rx.recv().await
+    }
 }
 
 impl AsyncRead for NetstackStream {
@@ -347,6 +382,27 @@ impl TunnelConnector {
         self.commands
             .send(Command::Open(OpenCommand {
                 addr,
+                reply: reply_tx,
+            }))
+            .map_err(|_| NetError::EngineStopped)?;
+        self.wake.notify_one();
+        reply_rx.await.map_err(|_| NetError::EngineStopped)?
+    }
+
+    /// Listens on tunnel-side TCP `port`, returning a [`NetstackListener`] over
+    /// inbound connections (the port-forwarding accept side). Inbound packets
+    /// only reach `port` once the exit forwards them (for example via a NAT-PMP
+    /// mapping created with [`crate::portforward`]).
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::EngineStopped`] if the engine has stopped, or
+    /// [`NetError::ConnectFailed`] if the port cannot be bound.
+    pub async fn listen(&self, port: u16) -> Result<NetstackListener, NetError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(Command::Listen(ListenCommand {
+                port,
                 reply: reply_tx,
             }))
             .map_err(|_| NetError::EngineStopped)?;
@@ -498,6 +554,7 @@ pub fn spawn_engine(
         conns: HashMap::new(),
         resolvers: Vec::new(),
         udp_flows: Vec::new(),
+        listeners: Vec::new(),
         next_conn_id: 0,
         next_port: EPHEMERAL_BASE,
         used_ports: HashSet::new(),
@@ -524,6 +581,7 @@ struct Engine {
     conns: HashMap<u64, Conn>,
     resolvers: Vec<PendingResolve>,
     udp_flows: Vec<UdpFlow>,
+    listeners: Vec<Listener>,
     next_conn_id: u64,
     next_port: u16,
     used_ports: HashSet<u16>,
@@ -570,6 +628,7 @@ impl Engine {
                     Command::Open(c) => self.open(&mut iface, &mut sockets, c, now(base)),
                     Command::Resolve(c) => self.start_resolve(&mut sockets, c, now(base)),
                     Command::OpenUdp(c) => self.start_udp(&mut sockets, c),
+                    Command::Listen(c) => self.start_listen(&mut sockets, c),
                 }
             }
             self.ingest_writes();
@@ -588,6 +647,7 @@ impl Engine {
             // Drain smoltcp completely before yielding (canonical poll pattern).
             while iface.poll(now(base), &mut self.device, &mut sockets) != PollResult::None {}
             self.drain_sockets(&mut sockets, now(base));
+            self.accept_listeners(&mut sockets, now(base));
             self.drain_resolvers(&mut sockets, now(base));
             self.drain_udp(&mut sockets);
 
@@ -686,6 +746,141 @@ impl Engine {
                 connect: Some((cmd.reply, stream)),
             },
         );
+    }
+
+    /// Creates a fresh socket in `LISTEN` state on `port`.
+    fn new_listen_socket(sockets: &mut SocketSet<'_>, port: u16) -> Option<SocketHandle> {
+        let socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
+            tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
+        );
+        let handle = sockets.add(socket);
+        if sockets
+            .get_mut::<tcp::Socket<'_>>(handle)
+            .listen(port)
+            .is_err()
+        {
+            sockets.remove(handle);
+            return None;
+        }
+        Some(handle)
+    }
+
+    /// Binds a pool of listening sockets on `cmd.port` (the accept backlog) and
+    /// returns a [`NetstackListener`] over accepted streams.
+    fn start_listen(&mut self, sockets: &mut SocketSet<'_>, cmd: ListenCommand) {
+        let mut pending = Vec::with_capacity(LISTEN_BACKLOG);
+        for _ in 0..LISTEN_BACKLOG {
+            match Self::new_listen_socket(sockets, cmd.port) {
+                Some(h) => pending.push(h),
+                None => {
+                    for h in pending {
+                        sockets.remove(h);
+                    }
+                    let _ = cmd.reply.send(Err(NetError::ConnectFailed));
+                    return;
+                }
+            }
+        }
+        let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_CHANNEL_DEPTH);
+        self.listeners.push(Listener {
+            port: cmd.port,
+            pending,
+            accept_tx,
+        });
+        let _ = cmd.reply.send(Ok(NetstackListener { accept_rx }));
+    }
+
+    /// Converts listening sockets that received a connection into tracked conns,
+    /// delivers their streams to the app, refills the backlog, and reaps
+    /// listeners whose [`NetstackListener`] was dropped.
+    fn accept_listeners(&mut self, sockets: &mut SocketSet<'_>, now: SmolInstant) {
+        let mut accepted: Vec<(SocketHandle, mpsc::Sender<NetstackStream>)> = Vec::new();
+        let mut refill: Vec<(u16, usize)> = Vec::new();
+        let mut dead: Vec<usize> = Vec::new();
+
+        for (li, listener) in self.listeners.iter_mut().enumerate() {
+            // The app dropped its listener: tear the whole thing down.
+            if listener.accept_tx.is_closed() {
+                dead.push(li);
+                continue;
+            }
+            // Any socket no longer in LISTEN has been engaged by an inbound SYN;
+            // move it out of the backlog and convert it to a connection.
+            let mut engaged = 0usize;
+            listener.pending.retain(|&h| {
+                if sockets.get::<tcp::Socket<'_>>(h).state() == tcp::State::Listen {
+                    true
+                } else {
+                    accepted.push((h, listener.accept_tx.clone()));
+                    engaged += 1;
+                    false
+                }
+            });
+            if engaged > 0 {
+                refill.push((listener.port, engaged));
+            }
+        }
+
+        for (handle, accept_tx) in accepted {
+            let (to_app_tx, to_app_rx) = mpsc::channel(CONN_CHANNEL_DEPTH);
+            let (from_app_tx, from_app_rx) = mpsc::channel(CONN_CHANNEL_DEPTH);
+            let stream = NetstackStream {
+                writes: PollSender::new(from_app_tx),
+                incoming: to_app_rx,
+                leftover: Bytes::new(),
+                read_pos: 0,
+                wake: Arc::clone(&self.wake),
+            };
+            // Deliver to the app; if the accept queue is full or gone, drop the
+            // connection rather than block the engine (backlog backpressure).
+            if accept_tx.try_send(stream).is_err() {
+                let sock = sockets.get_mut::<tcp::Socket<'_>>(handle);
+                sock.abort();
+                sockets.remove(handle);
+                continue;
+            }
+            let id = self.next_conn_id;
+            self.next_conn_id += 1;
+            self.conns.insert(
+                id,
+                Conn {
+                    handle,
+                    // Inbound: the local port is the listen port, not an
+                    // allocated ephemeral, so it is not tracked in `used_ports`.
+                    local_port: 0,
+                    to_app: to_app_tx,
+                    from_app: from_app_rx,
+                    pending_out: VecDeque::new(),
+                    pending_out_len: 0,
+                    want_close: false,
+                    // Unused for accepted conns (`connect` is `None`).
+                    deadline: now,
+                    connect: None,
+                },
+            );
+        }
+
+        // Refill each backlog that lost sockets so the port keeps accepting.
+        for (port, count) in refill {
+            for _ in 0..count {
+                let Some(h) = Self::new_listen_socket(sockets, port) else {
+                    break;
+                };
+                if let Some(listener) = self.listeners.iter_mut().find(|l| l.port == port) {
+                    listener.pending.push(h);
+                } else {
+                    sockets.remove(h);
+                }
+            }
+        }
+
+        for li in dead.into_iter().rev() {
+            let listener = self.listeners.swap_remove(li);
+            for h in listener.pending {
+                sockets.remove(h);
+            }
+        }
     }
 
     /// Starts a DNS `A` resolution: bind a UDP socket, send the query to the
