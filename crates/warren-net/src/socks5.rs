@@ -88,6 +88,9 @@ pub enum Socks5Error {
     /// Domain name was not valid UTF-8.
     #[error("invalid domain name encoding")]
     BadDomain,
+    /// A UDP datagram set a non-zero FRAG byte (fragmentation unsupported).
+    #[error("fragmented UDP datagrams are not supported")]
+    Fragmented,
 }
 
 /// Parses the client greeting (`VER NMETHODS METHODS...`), returning the offered
@@ -172,6 +175,47 @@ fn parse_address(buf: &[u8]) -> Result<(Target, usize), Socks5Error> {
         }
         other => Err(Socks5Error::BadAtyp(other)),
     }
+}
+
+/// Parses a SOCKS5 UDP request datagram (`RSV RSV FRAG ATYP ADDR PORT DATA`),
+/// returning the target and the payload slice.
+///
+/// # Errors
+///
+/// [`Socks5Error::Fragmented`] if the FRAG byte is non-zero (fragmentation is
+/// not supported), [`Socks5Error::Truncated`] on a short buffer, or an
+/// address-type/domain error from the embedded address.
+pub fn parse_udp_datagram(buf: &[u8]) -> Result<(Target, &[u8]), Socks5Error> {
+    // RSV(2) FRAG(1), then the standard ATYP ADDR PORT, then the payload.
+    if buf.len() < 3 {
+        return Err(Socks5Error::Truncated);
+    }
+    if buf[2] != 0x00 {
+        return Err(Socks5Error::Fragmented);
+    }
+    let (target, consumed) = parse_address(&buf[3..])?;
+    Ok((target, &buf[3 + consumed..]))
+}
+
+/// Builds a SOCKS5 UDP reply datagram: header (`RSV RSV FRAG=0 ATYP ADDR PORT`)
+/// for `src` (the datagram's origin) followed by `data`.
+#[must_use]
+pub fn encode_udp_datagram(src: SocketAddr, data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x00, 0x00, 0x00]; // RSV, RSV, FRAG
+    match src {
+        SocketAddr::V4(v4) => {
+            out.push(0x01);
+            out.extend_from_slice(&v4.ip().octets());
+            out.extend_from_slice(&v4.port().to_be_bytes());
+        }
+        SocketAddr::V6(v6) => {
+            out.push(0x04);
+            out.extend_from_slice(&v6.ip().octets());
+            out.extend_from_slice(&v6.port().to_be_bytes());
+        }
+    }
+    out.extend_from_slice(data);
+    out
 }
 
 /// Builds a request reply. `bound` is the server-side bound address echoed back
@@ -283,6 +327,57 @@ mod tests {
             parse_request(&[0x05, 0x01, 0x00, 0x09]),
             Err(Socks5Error::BadAtyp(9))
         );
+    }
+
+    #[test]
+    fn udp_datagram_parses_ipv4_target_and_payload() {
+        // RSV RSV FRAG ATYP=1 1.2.3.4 :53 "hello"
+        let mut buf = vec![0x00, 0x00, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x35];
+        buf.extend_from_slice(b"hello");
+        let (target, data) = parse_udp_datagram(&buf).expect("parse");
+        assert_eq!(target, Target::Ip("1.2.3.4:53".parse().unwrap()));
+        assert_eq!(data, b"hello");
+    }
+
+    #[test]
+    fn udp_datagram_parses_domain_target() {
+        let host = b"example.com";
+        let mut buf = vec![0x00, 0x00, 0x00, 0x03, host.len() as u8];
+        buf.extend_from_slice(host);
+        buf.extend_from_slice(&53u16.to_be_bytes());
+        buf.extend_from_slice(b"q");
+        let (target, data) = parse_udp_datagram(&buf).expect("parse");
+        assert_eq!(target, Target::Domain("example.com".to_owned(), 53));
+        assert_eq!(data, b"q");
+    }
+
+    #[test]
+    fn udp_datagram_rejects_fragmentation() {
+        let buf = [0x00, 0x00, 0x01, 0x01, 1, 2, 3, 4, 0x00, 0x35];
+        assert_eq!(parse_udp_datagram(&buf), Err(Socks5Error::Fragmented));
+    }
+
+    #[test]
+    fn udp_datagram_rejects_truncated() {
+        assert_eq!(
+            parse_udp_datagram(&[0x00, 0x00]),
+            Err(Socks5Error::Truncated)
+        );
+    }
+
+    #[test]
+    fn udp_datagram_encode_is_byte_exact_and_roundtrips() {
+        let src: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let dgram = encode_udp_datagram(src, b"reply");
+        assert_eq!(
+            dgram,
+            vec![
+                0x00, 0x00, 0x00, 0x01, 8, 8, 8, 8, 0x00, 0x35, b'r', b'e', b'p', b'l', b'y'
+            ]
+        );
+        let (target, data) = parse_udp_datagram(&dgram).expect("parse");
+        assert_eq!(target, Target::Ip(src));
+        assert_eq!(data, b"reply");
     }
 
     #[test]
