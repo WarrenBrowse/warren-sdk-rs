@@ -23,7 +23,7 @@ const MAX_IDLE_TIMEOUT_SECS: u64 = 180;
 const KEEP_ALIVE_INTERVAL_SECS: u64 = 20;
 const INITIAL_MTU: u16 = 1280;
 
-fn warren_transport_config() -> quinn::TransportConfig {
+pub(crate) fn warren_transport_config() -> quinn::TransportConfig {
     let mut tc = quinn::TransportConfig::default();
     tc.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
     tc.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);

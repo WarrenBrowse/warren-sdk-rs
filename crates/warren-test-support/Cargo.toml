@@ -12,9 +12,21 @@ publish = false
 [dependencies]
 warren-transport = { path = "../warren-transport" }
 warren-wire = { path = "../warren-wire" }
+warren-multihop = { path = "../warren-multihop" }
 ed25519-dalek = { workspace = true }
 quinn = { workspace = true }
 tokio = { workspace = true }
+# Exit-side HPKE for the fake multihop exit: independently re-derives the
+# per-frame key/AAD (not shared with warren-multihop) so the round-trip proves
+# wire interop, not just internal consistency.
+hpke = { version = "=0.13.0", default-features = false, features = [
+    "alloc",
+    "x25519",
+] }
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = [
+    "alloc",
+] }
+rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
 # A server-side smoltcp stack for the netstack-terminating fake exit, so the
 # full proxy datapath can be exercised in-process.
 smoltcp = { version = "0.12", default-features = false, features = [

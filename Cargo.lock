@@ -1986,10 +1986,14 @@ dependencies = [
 name = "warren-test-support"
 version = "0.0.1"
 dependencies = [
+ "chacha20poly1305",
  "ed25519-dalek",
+ "hpke",
  "quinn",
+ "rand_core 0.9.5",
  "smoltcp",
  "tokio",
+ "warren-multihop",
  "warren-transport",
  "warren-wire",
 ]
@@ -2002,9 +2006,11 @@ dependencies = [
  "data-encoding",
  "ed25519-dalek",
  "quinn",
+ "rand_core 0.9.5",
  "rustls",
  "thiserror 2.0.18",
  "tokio",
+ "warren-multihop",
  "warren-test-support",
  "warren-wire",
 ]

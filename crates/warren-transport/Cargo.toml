@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 warren-wire = { path = "../warren-wire" }
+warren-multihop = { path = "../warren-multihop" }
 ed25519-dalek = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
@@ -18,6 +19,9 @@ data-encoding = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+# rand_core 0.9 OsRng for the per-session HPKE ephemeral keypair (hpke 0.13
+# expects the 0.9 trait surface, matching warren-multihop).
+rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

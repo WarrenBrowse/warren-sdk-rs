@@ -8,7 +8,9 @@
 //! Pure protocol logic: no TUN, routing, DNS or OS coupling here.
 
 pub mod client;
+pub mod multihop;
 pub mod tls;
 
 pub use client::{ClientSession, ClientTunnel, TunnelError};
+pub use multihop::{MultihopClientTunnel, MultihopError, MultihopSession};
 pub use tls::{WarrenTlsError, default_crypto_provider, make_client_config, make_server_config};

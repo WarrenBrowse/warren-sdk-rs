@@ -7,7 +7,13 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use ed25519_dalek::SigningKey;
+use hpke::aead::ChaCha20Poly1305 as HpkeChaCha20Poly1305;
+use hpke::kdf::HkdfSha256;
+use hpke::kem::X25519HkdfSha256;
+use hpke::{Deserializable, Kem as KemTrait, OpModeR, Serializable, setup_receiver};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
@@ -15,8 +21,13 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use tokio::sync::mpsc;
 use warren_transport::{default_crypto_provider, make_server_config};
+use warren_wire::multihop::{EXIT_ID_LEN, WarrenMultihopFrame};
 use warren_wire::{
     MAX_SETUP_FRAME_BYTES, PROTOCOL_VERSION, SetupAck, decode_setup, encode_setup_ack,
+};
+use warren_wire::{
+    WARREN_HPKE_AAD_V1, WARREN_HPKE_VERSION_V1, WarrenControlMessage, encode_control,
+    try_decode_control,
 };
 
 /// ALPN the fake exit accepts, matching the client.
@@ -234,4 +245,219 @@ pub async fn spawn_netstack_exit(exit_key: SigningKey) -> (SocketAddr, [u8; 32])
     });
 
     (addr, exit_pubkey)
+}
+
+// ---- Fake multihop exit ----
+
+const WARREN_HPKE_INFO_V1: &[u8] = b"warren/multihop/v1/hpke-info";
+
+type ExitAead = HpkeChaCha20Poly1305;
+type ExitKdf = HkdfSha256;
+type ExitKem = X25519HkdfSha256;
+
+/// The keys a [`spawn_fake_multihop_exit`] publishes, as a client would read
+/// them from a verified multihop directory.
+pub struct MultihopExitKeys {
+    /// Ed25519 TLS / raw-public-key identity (pinned by the client).
+    pub ed25519_pubkey: [u8; 32],
+    /// X25519 HPKE recipient key the client seals setup + data frames to.
+    pub x25519_pubkey: [u8; 32],
+    /// 16-byte cleartext routing tag.
+    pub exit_id: [u8; EXIT_ID_LEN],
+}
+
+fn exit_aad(exit_id: &[u8; EXIT_ID_LEN], epoch: u32, seq: u64) -> Vec<u8> {
+    let mut a = Vec::with_capacity(WARREN_HPKE_AAD_V1.len() + EXIT_ID_LEN + 4 + 8);
+    a.extend_from_slice(WARREN_HPKE_AAD_V1);
+    a.extend_from_slice(exit_id);
+    a.extend_from_slice(&epoch.to_be_bytes());
+    a.extend_from_slice(&seq.to_be_bytes());
+    a
+}
+
+fn exit_export_info(epoch: u32, seq: u64, reverse: bool) -> Vec<u8> {
+    let mut i = Vec::with_capacity(WARREN_HPKE_AAD_V1.len() + 4 + 8 + 1);
+    i.extend_from_slice(WARREN_HPKE_AAD_V1);
+    i.extend_from_slice(&epoch.to_be_bytes());
+    i.extend_from_slice(&seq.to_be_bytes());
+    if reverse {
+        i.push(0x02);
+    }
+    i
+}
+
+/// Open one client->exit frame with the established HPKE receiver context.
+fn exit_open(
+    ctx: &hpke::aead::AeadCtxR<ExitAead, ExitKdf, ExitKem>,
+    exit_id: &[u8; EXIT_ID_LEN],
+    frame: &WarrenMultihopFrame,
+) -> Option<Vec<u8>> {
+    let mut key = [0u8; 32];
+    ctx.export(&exit_export_info(frame.epoch, frame.seq, false), &mut key)
+        .ok()?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let mut buf = frame.ciphertext.clone();
+    cipher
+        .decrypt_in_place_detached(
+            Nonce::from_slice(&[0u8; 12]),
+            &exit_aad(exit_id, frame.epoch, frame.seq),
+            &mut buf,
+            Tag::from_slice(&frame.aead_tag),
+        )
+        .ok()?;
+    Some(buf)
+}
+
+/// Seal one exit->client reply with the reverse-direction key.
+fn exit_seal(
+    ctx: &hpke::aead::AeadCtxR<ExitAead, ExitKdf, ExitKem>,
+    exit_id: &[u8; EXIT_ID_LEN],
+    encapsulated_key: [u8; 32],
+    plaintext: &[u8],
+    epoch: u32,
+    seq: u64,
+) -> WarrenMultihopFrame {
+    let mut key = [0u8; 32];
+    ctx.export(&exit_export_info(epoch, seq, true), &mut key)
+        .expect("export reverse key");
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let mut buf = plaintext.to_vec();
+    let tag = cipher
+        .encrypt_in_place_detached(
+            Nonce::from_slice(&[0u8; 12]),
+            &exit_aad(exit_id, epoch, seq),
+            &mut buf,
+        )
+        .expect("seal reverse");
+    let mut aead_tag = [0u8; 16];
+    aead_tag.copy_from_slice(tag.as_slice());
+    WarrenMultihopFrame {
+        version: WARREN_HPKE_VERSION_V1,
+        exit_id: *exit_id,
+        epoch,
+        seq,
+        encapsulated_key,
+        aead_tag,
+        ciphertext: buf,
+    }
+}
+
+/// Spawns an in-process QUIC "exit" that speaks the real multihop handshake:
+/// it reads the HPKE-sealed setup frame (inner `IpRequest`) off a bidi stream,
+/// replies with a sealed `IpAssign` (tunnel IPv4 `10.66.0.2`, gateway
+/// `10.66.0.1`), then echoes every sealed data datagram back (opening the
+/// client frame and re-sealing the same IP packet in the reverse direction).
+///
+/// Returns the bound address and the exit's published keys. The exit-side HPKE
+/// is re-implemented independently of `warren-multihop`, so a green round-trip
+/// proves wire interop, not just internal consistency.
+///
+/// # Panics
+///
+/// Panics on any setup failure (test helper).
+pub async fn spawn_fake_multihop_exit(exit_key: SigningKey) -> (SocketAddr, MultihopExitKeys) {
+    let ed25519_pubkey = exit_key.verifying_key().to_bytes();
+    let (recipient_priv, recipient_pub) =
+        ExitKem::gen_keypair(&mut rand_core::UnwrapErr(rand_core::OsRng));
+    let x25519_pubkey: [u8; 32] = recipient_pub.to_bytes().into();
+    let exit_id = [0x11u8; EXIT_ID_LEN];
+
+    let cfg = make_server_config(&exit_key, default_crypto_provider(), &[ALPN_H3])
+        .expect("server config");
+    let endpoint = quinn::Endpoint::server(cfg, "127.0.0.1:0".parse().unwrap())
+        .expect("server endpoint binds");
+    let addr = endpoint.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        let conn = endpoint
+            .accept()
+            .await
+            .expect("incoming")
+            .await
+            .expect("conn");
+        let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
+        let request_bytes = recv.read_to_end(65536).await.expect("read setup request");
+        let request = WarrenMultihopFrame::decode(&request_bytes).expect("decode request frame");
+        assert_eq!(request.exit_id, exit_id, "setup frame exit_id must match");
+
+        let encapped =
+            <ExitKem as KemTrait>::EncappedKey::from_bytes(&request.encapsulated_key).unwrap();
+        let ctx = setup_receiver::<ExitAead, ExitKdf, ExitKem>(
+            &OpModeR::Base,
+            &recipient_priv,
+            &encapped,
+            WARREN_HPKE_INFO_V1,
+        )
+        .expect("setup_receiver");
+
+        let plaintext = exit_open(&ctx, &exit_id, &request).expect("open setup request");
+        match try_decode_control(&plaintext)
+            .expect("decode control")
+            .expect("control present")
+        {
+            WarrenControlMessage::IpRequest { .. } => {}
+            other => panic!("expected an IpRequest, got {other:?}"),
+        }
+
+        let assign = WarrenControlMessage::IpAssign {
+            ipv4: [10, 66, 0, 2],
+            prefix_len: 24,
+            gateway_ipv4: [10, 66, 0, 1],
+            ipv6: None,
+            prefix_len_v6: 0,
+            gateway_ipv6: None,
+        };
+        let reply_plaintext = encode_control(&assign).expect("encode IpAssign");
+        // Reverse seq starts at 0 for the setup reply; data replies use 1, 2, ...
+        let reply_frame = exit_seal(
+            &ctx,
+            &exit_id,
+            request.encapsulated_key,
+            &reply_plaintext,
+            request.epoch,
+            0,
+        );
+        send.write_all(&reply_frame.encode().expect("encode reply"))
+            .await
+            .expect("write reply");
+        send.finish().expect("finish reply");
+
+        let mut reverse_seq: u64 = 1;
+        while let Ok(dg) = conn.read_datagram().await {
+            let Ok(frame) = WarrenMultihopFrame::decode(&dg) else {
+                continue;
+            };
+            if frame.exit_id != exit_id {
+                continue;
+            }
+            let Some(ip_packet) = exit_open(&ctx, &exit_id, &frame) else {
+                continue;
+            };
+            let echo = exit_seal(
+                &ctx,
+                &exit_id,
+                request.encapsulated_key,
+                &ip_packet,
+                frame.epoch,
+                reverse_seq,
+            );
+            reverse_seq += 1;
+            if conn
+                .send_datagram(echo.encode().expect("encode echo").into())
+                .is_err()
+            {
+                break;
+            }
+        }
+        drop(endpoint);
+    });
+
+    (
+        addr,
+        MultihopExitKeys {
+            ed25519_pubkey,
+            x25519_pubkey,
+            exit_id,
+        },
+    )
 }
