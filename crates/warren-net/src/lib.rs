@@ -33,6 +33,8 @@ pub mod mode;
 #[cfg(feature = "proxy")]
 pub mod netstack;
 #[cfg(feature = "proxy")]
+pub mod portforward;
+#[cfg(feature = "proxy")]
 pub mod proxy;
 pub mod sink;
 pub mod socks5;
@@ -47,6 +49,8 @@ pub use netstack::{
     NetstackConfig, NetstackStream, NetstackUdpSocket, TunnelConnector, spawn_engine,
     spawn_over_sink,
 };
+#[cfg(feature = "proxy")]
+pub use portforward::{MapSpec, PortForwardError, PortMapping, run_refresh};
 #[cfg(feature = "proxy")]
 pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy, UdpConnector, UdpFlow};
 pub use sink::{MultihopPacketSink, PacketSink, QuicPacketSink};

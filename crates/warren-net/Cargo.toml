@@ -11,6 +11,8 @@ publish.workspace = true
 
 [dependencies]
 warren-transport = { path = "../warren-transport" }
+# NAT-PMP wire codec for the port-forwarding client (RFC 6886 + Warren trailer).
+warren-wire = { path = "../warren-wire" }
 bytes = { workspace = true }
 tokio = { workspace = true }
 tokio-util = "0.7"
@@ -37,7 +39,8 @@ tun = []
 killswitch = []
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` enables `start_paused` for the NAT-PMP retransmit/refresh tests.
+tokio = { workspace = true, features = ["test-util"] }
 ed25519-dalek = { workspace = true }
 warren-test-support = { path = "../warren-test-support" }
 # Golden-byte assertions for the DNS codec tests.

@@ -66,8 +66,17 @@ pinned by golden vectors where a wire format is involved. warren-core
 
 ## P7: port forwarding
 
-- NAT-PMP client and refresh loop, wired into both backends (in proxy mode a
-  forwarded port maps to a local listener).
+- Client + refresh loop: DONE. `warren-net::portforward` is the RFC 6886 client
+  over the backend-agnostic `UdpFlow` seam (so it runs over the netstack today
+  and a TUN backend later): `exchange` with exponential-backoff retransmission
+  and gateway-source validation (anti-spoof), `map`/`external_address`/`delete`,
+  and `run_refresh` (renew at half the granted lifetime, best-effort delete on
+  shutdown). The wire codec was already in `warren-wire::natpmp`. Validated
+  in-process against a scripted gateway (grant, rejection, timeout, spoofed
+  source, periodic renewal + teardown).
+- Pending: the inbound bridge (a netstack listen socket delivering connections to
+  the mapped internal port up to a local listener; the netstack is connect-only
+  today), facade wiring on `WarrenClient`, and validation against a real exit.
 
 ## P8: warren-sdk facade
 
