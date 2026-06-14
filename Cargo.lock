@@ -2434,6 +2434,7 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "ed25519-dalek",
+ "hex",
  "rand 0.8.6",
  "smoltcp",
  "thiserror 2.0.18",

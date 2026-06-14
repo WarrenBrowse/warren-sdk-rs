@@ -23,6 +23,8 @@
 //! The per-OS TUN devices, routing/DNS plumbing and OS firewall killswitch are
 //! feature-gated work tracked in the roadmap.
 
+#[cfg(feature = "proxy")]
+pub mod dns;
 pub mod error;
 pub mod killswitch;
 pub mod mode;
@@ -33,6 +35,8 @@ pub mod proxy;
 pub mod sink;
 pub mod socks5;
 
+#[cfg(feature = "proxy")]
+pub use dns::{DnsError, encode_query, parse_response};
 pub use error::NetError;
 pub use killswitch::{KillSwitch, KillSwitchLevel, ProxyOnlyKillSwitch};
 pub use mode::{ConnectMode, ProxyConfig, TunConfig};
