@@ -31,6 +31,7 @@ ed25519-dalek = { workspace = true }
 warren-test-support = { path = "../warren-test-support" }
 serde_json = { workspace = true }
 hex = { workspace = true }
+bytes = { workspace = true }
 
 [lints]
 workspace = true

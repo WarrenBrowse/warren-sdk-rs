@@ -2449,6 +2449,7 @@ dependencies = [
 name = "warren-sdk"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "ed25519-dalek",
  "hex",
  "serde_json",

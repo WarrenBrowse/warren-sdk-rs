@@ -12,7 +12,9 @@
 //!
 //! This is the app-driven reconnect pattern: observe `ProxyHandle::state`, and on
 //! `TunnelState::Disconnected` drop the handle and call `start_proxy_multihop`
-//! again. It needs a subscribed wallet (the exit gates the `IpAssign`).
+//! again. For a hands-off equivalent, `start_proxy_multihop_supervised` keeps the
+//! tunnel up automatically behind a stable proxy address. It needs a subscribed
+//! wallet (the exit gates the `IpAssign`).
 
 use std::net::SocketAddr;
 

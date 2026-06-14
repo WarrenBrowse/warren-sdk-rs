@@ -100,18 +100,28 @@ pinned by golden vectors where a wire format is involved. warren-core
   / `watch_state()`), so an app reacts to a dropped tunnel. In-process e2e tested.
 - DONE: one-call port forwarding on the datapath handle
   (`ProxyHandle::forward_port`, see P7).
-- Reconnect: the app-driven pattern is DONE and live-validated. Each
-  `start_proxy_multihop` rebuilds the whole datapath from a freshly fetched
-  `IpAssign` (a new session may carry a different tunnel address/gateway/MTU), so
-  observing `ProxyHandle::state` and re-calling on `Disconnected` reconnects
-  correctly. `cargo run -p warren-sdk --example live_reconnect` proves two
-  independent sessions each rebuild from a fresh assignment and egress against a
-  production exit. The `warren-transport` `connect_with_state` / `Backoff`
-  primitives (unit-tested) back automatic retry.
-- Pending: a fully automatic in-facade supervisor that keeps the local proxy
-  listener address stable across automatic tunnel rebuilds (the rebuild semantics
-  above are validated; only the stable-listener auto-trigger remains), and
-  end-to-end tests against a real exit and the production API.
+- Reconnect: DONE, both modes.
+  - App-driven (live-validated): each `start_proxy_multihop` rebuilds the whole
+    datapath from a freshly fetched `IpAssign` (a new session may carry a
+    different tunnel address/gateway/MTU), so observing `ProxyHandle::state` and
+    re-calling on `Disconnected` reconnects correctly. `cargo run -p warren-sdk
+    --example live_reconnect` proves two independent sessions each rebuild from a
+    fresh assignment and egress against a production exit.
+  - Automatic in-facade supervisor: `start_proxy_multihop_supervised` binds the
+    SOCKS5/HTTP listeners once and keeps the tunnel up across drops, rebuilding
+    the netstack from a fresh `IpAssign` on each reconnect while the app-facing
+    proxy address stays stable. `SupervisedProxyHandle` reports
+    `ConnectionState::{Connecting, Connected, Reconnecting}`; reconnect is
+    immediate after a drop with capped exponential backoff between failed
+    attempts. The `warren-net` proxies grew borrowed-listener `serve_*_until`
+    variants so one bound port survives rebuilds. Unit-tested in-process with a
+    fake sink whose read side closes on demand (asserts auto-reconnect + the
+    listener stays live on the same address across the rebuild).
+- Pending: real-exit validation of the automatic supervisor's drop-triggered
+  reconnect (forcing a mid-session tunnel drop on a production exit is not
+  reliably reproducible from the dev sandbox; the rebuild-from-fresh-`IpAssign`
+  path it reuses is already live-validated), and broader end-to-end tests against
+  a real exit and the production API.
 
 ## P9: warren-sdk-ffi (uniffi scaffolding done)
 

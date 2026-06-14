@@ -52,7 +52,13 @@ use warren_discovery::{
 };
 use warren_identity::WarrenIdentity;
 use warren_net::{MultihopPacketSink, QuicPacketSink};
-use warren_transport::{ClientTunnel, MultihopClientTunnel, MultihopError, TunnelError};
+use warren_transport::{
+    ClientTunnel, MultihopClientTunnel, MultihopError, MultihopSession, TunnelError,
+};
+
+/// Lifecycle state of a supervised connection (`Connecting`, `Connected`,
+/// `Reconnecting`, `Failed`), re-exported for [`SupervisedProxyHandle`].
+pub use warren_transport::ConnectionState;
 
 #[cfg(feature = "reqwest-transport")]
 use warren_api::ReqwestTransport;
@@ -535,28 +541,90 @@ impl<T: HttpTransport> WarrenClient<T> {
         cfg: &warren_net::ProxyConfig,
     ) -> Result<ProxyHandle, SdkError> {
         let sink = self.connect_multihop(exit).await?;
-        // Honor the exit-supplied subnet from the IpAssign instead of assuming
-        // the default /16 + 10.66.0.1: a real exit may assign a different prefix
-        // or gateway, and a wrong default route would black-hole traffic.
-        let assignment = sink.session().assignment();
-        let local_ip = std::net::Ipv4Addr::from(assignment.ipv4);
-        let prefix = assignment.prefix_len;
-        let gateway = std::net::Ipv4Addr::from(assignment.gateway_ipv4);
-        // Enable dual-stack only when the exit granted a v6 address AND its
-        // gateway, with a sane prefix. A missing gateway or an out-of-range
-        // prefix (a misbehaving exit) falls back to v4-only rather than installing
-        // an unroutable or `/0` v6 CIDR. Either way v6 traffic stays in the tunnel.
-        let ipv6 = match (assignment.ipv6, assignment.gateway_ipv6) {
-            (Some(ip), Some(gw)) if (1..=128).contains(&assignment.prefix_len_v6) => {
-                Some(warren_net::Ipv6Addressing {
-                    local_ip: std::net::Ipv6Addr::from(ip),
-                    prefix: assignment.prefix_len_v6,
-                    gateway: std::net::Ipv6Addr::from(gw),
-                })
-            }
-            _ => None,
-        };
+        let (local_ip, prefix, gateway, ipv6) = addressing_from_session(sink.session());
         serve_proxy_over_sink(sink, local_ip, prefix, gateway, ipv6, cfg).await
+    }
+
+    /// Starts a *self-healing* multihop proxy datapath: it binds the local
+    /// SOCKS5 (and optional HTTP CONNECT) listeners once, then keeps a sealed
+    /// tunnel to `exit` up across drops, rebuilding the netstack from a freshly
+    /// fetched `IpAssign` on each reconnect while the app-facing proxy address
+    /// stays stable. Observe progress via [`SupervisedProxyHandle::watch_state`].
+    ///
+    /// Unlike [`Self::start_proxy_multihop`], the returned handle stays valid
+    /// across reconnects: the app keeps pointing at the same proxy address and the
+    /// datapath transparently re-establishes. Reconnection targets the same
+    /// `exit`; the first attempt's failure is surfaced (the handle reports
+    /// [`ConnectionState::Reconnecting`]) but does not error the call.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::Proxy`] if a local listener cannot bind. Tunnel establishment
+    /// happens in the background, so connect failures surface as state, not here.
+    pub async fn start_proxy_multihop_supervised(
+        &self,
+        exit: &VerifiedExit,
+        cfg: &warren_net::ProxyConfig,
+    ) -> Result<SupervisedProxyHandle, SdkError> {
+        let socks_listener = tokio::net::TcpListener::bind(cfg.socks5)
+            .await
+            .map_err(SdkError::Proxy)?;
+        let local_addr = socks_listener.local_addr().map_err(SdkError::Proxy)?;
+        let (http_listener, http_addr) = match cfg.http {
+            Some(bind) => {
+                let l = tokio::net::TcpListener::bind(bind)
+                    .await
+                    .map_err(SdkError::Proxy)?;
+                let a = l.local_addr().map_err(SdkError::Proxy)?;
+                (Some(l), Some(a))
+            }
+            None => (None, None),
+        };
+
+        let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+        let signing = self.signing.clone();
+        let exit = exit.clone();
+        let dns_server = cfg.dns_server;
+        let task = tokio::spawn(async move {
+            supervise_proxy(
+                socks_listener,
+                http_listener,
+                dns_server,
+                state_tx,
+                move || {
+                    let signing = signing.clone();
+                    let exit = exit.clone();
+                    async move {
+                        let session = MultihopClientTunnel::new(signing)
+                            .connect(
+                                exit.exit_ed25519_pubkey,
+                                exit.exit_x25519_multihop_pubkey,
+                                exit.exit_id,
+                                exit.endpoint,
+                            )
+                            .await?;
+                        let sink = MultihopPacketSink::new(session);
+                        let (local_ip, prefix, gateway, ipv6) =
+                            addressing_from_session(sink.session());
+                        Ok::<_, SdkError>(EstablishedTunnel {
+                            sink,
+                            local_ip,
+                            prefix,
+                            gateway,
+                            ipv6,
+                        })
+                    }
+                },
+            )
+            .await;
+        });
+
+        Ok(SupervisedProxyHandle {
+            local_addr,
+            http_addr,
+            state_rx,
+            task,
+        })
     }
 }
 
@@ -637,6 +705,142 @@ where
         gateway,
         tasks,
     })
+}
+
+/// Derives the netstack addressing from a multihop session's `IpAssign`: the v4
+/// CIDR + gateway, and dual-stack v6 only when the exit granted a v6 address, its
+/// gateway and a sane prefix (else v4-only, so a misbehaving exit cannot install
+/// an unroutable or `/0` v6 route; v6 traffic still stays in the tunnel). A real
+/// exit may assign a different prefix or gateway per session, so this is read
+/// fresh on every (re)connect rather than assumed.
+fn addressing_from_session(
+    session: &MultihopSession,
+) -> (
+    std::net::Ipv4Addr,
+    u8,
+    std::net::Ipv4Addr,
+    Option<warren_net::Ipv6Addressing>,
+) {
+    let a = session.assignment();
+    let local_ip = std::net::Ipv4Addr::from(a.ipv4);
+    let prefix = a.prefix_len;
+    let gateway = std::net::Ipv4Addr::from(a.gateway_ipv4);
+    let ipv6 = match (a.ipv6, a.gateway_ipv6) {
+        (Some(ip), Some(gw)) if (1..=128).contains(&a.prefix_len_v6) => {
+            Some(warren_net::Ipv6Addressing {
+                local_ip: std::net::Ipv6Addr::from(ip),
+                prefix: a.prefix_len_v6,
+                gateway: std::net::Ipv6Addr::from(gw),
+            })
+        }
+        _ => None,
+    };
+    (local_ip, prefix, gateway, ipv6)
+}
+
+/// An established tunnel plus the netstack addressing derived from its `IpAssign`.
+/// Generic over the sink so the supervisor loop is unit-testable with a fake sink.
+struct EstablishedTunnel<S> {
+    sink: S,
+    local_ip: std::net::Ipv4Addr,
+    prefix: u8,
+    gateway: std::net::Ipv4Addr,
+    ipv6: Option<warren_net::Ipv6Addressing>,
+}
+
+/// Resolves once the datapath's tunnel read side closes (or the engine is gone),
+/// the signal a supervisor uses to tear the serve loops down and reconnect.
+async fn wait_until_dead(mut alive_rx: tokio::sync::watch::Receiver<bool>) {
+    while *alive_rx.borrow_and_update() {
+        if alive_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Serves SOCKS5 (and optional HTTP CONNECT) on the *borrowed* stable listeners
+/// using `connector`, until the tunnel dies. Returns so the supervisor can
+/// rebuild and resume on the same listeners.
+async fn serve_epoch(
+    socks_listener: &tokio::net::TcpListener,
+    http_listener: Option<&tokio::net::TcpListener>,
+    connector: warren_net::TunnelConnector,
+    alive_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    // `run` gates both accept loops; the bridge flips it off when the tunnel dies.
+    let (run_tx, run_rx) = tokio::sync::watch::channel(true);
+    let bridge = tokio::spawn(async move {
+        wait_until_dead(alive_rx).await;
+        let _ = run_tx.send(false);
+    });
+    let socks = warren_net::Socks5Proxy::new(connector.clone());
+    match http_listener {
+        Some(http_listener) => {
+            let http = warren_net::HttpConnectProxy::new(connector);
+            let _ = tokio::join!(
+                socks.serve_with_udp_until(socks_listener, run_rx.clone()),
+                http.serve_until(http_listener, run_rx),
+            );
+        }
+        None => {
+            let _ = socks.serve_with_udp_until(socks_listener, run_rx).await;
+        }
+    }
+    bridge.abort();
+}
+
+/// Supervises a proxy datapath across tunnel rebuilds, keeping the local
+/// listeners (and thus the app-facing proxy addresses) stable: it establishes a
+/// tunnel, serves until the tunnel dies, then reconnects (immediately after a
+/// drop, with capped exponential backoff between failed attempts), reporting each
+/// [`ConnectionState`] transition. `connect` is the (re)establish closure; it is
+/// generic so the loop is testable with a fake sink and a fake connector.
+async fn supervise_proxy<S, F, Fut>(
+    socks_listener: tokio::net::TcpListener,
+    http_listener: Option<tokio::net::TcpListener>,
+    dns_server: Option<std::net::Ipv4Addr>,
+    state_tx: tokio::sync::watch::Sender<ConnectionState>,
+    mut connect: F,
+) where
+    S: warren_net::PacketSink + 'static,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<EstablishedTunnel<S>, SdkError>>,
+{
+    const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(20);
+    let mut backoff = INITIAL_BACKOFF;
+    let mut first = true;
+    loop {
+        let _ = state_tx.send(if first {
+            ConnectionState::Connecting
+        } else {
+            ConnectionState::Reconnecting
+        });
+        first = false;
+        match connect().await {
+            Ok(est) => {
+                backoff = INITIAL_BACKOFF;
+                let mtu = warren_net::PacketSink::max_payload(&est.sink);
+                let mut config =
+                    warren_net::NetstackConfig::new(est.local_ip, est.prefix, est.gateway, mtu);
+                if let Some(v6) = est.ipv6 {
+                    config = config.with_ipv6(v6.local_ip, v6.prefix, v6.gateway);
+                }
+                if let Some(dns) = dns_server {
+                    config = config.with_dns_server(dns);
+                }
+                let (connector, alive_rx) = warren_net::spawn_over_sink(Arc::new(est.sink), config);
+                let _ = state_tx.send(ConnectionState::Connected);
+                serve_epoch(&socks_listener, http_listener.as_ref(), connector, alive_rx).await;
+                // The tunnel died: loop, report Reconnecting, and re-establish at once.
+            }
+            Err(_) => {
+                // No identity material is logged. Back off before the next attempt.
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+            }
+        }
+    }
 }
 
 /// Tunnel network prefix length (`10.66.0.0/16`), matching warren-core.
@@ -739,6 +943,56 @@ impl Drop for ProxyHandle {
     }
 }
 
+/// A self-healing proxy datapath (see
+/// [`WarrenClient::start_proxy_multihop_supervised`]). The local proxy
+/// address(es) stay stable while the supervisor rebuilds the tunnel across drops.
+/// Dropping the handle stops the supervisor and the datapath.
+pub struct SupervisedProxyHandle {
+    local_addr: SocketAddr,
+    http_addr: Option<SocketAddr>,
+    state_rx: tokio::sync::watch::Receiver<ConnectionState>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SupervisedProxyHandle {
+    /// The stable SOCKS5 listener address the app points at across reconnects.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// The stable HTTP CONNECT listener address, if one was configured.
+    #[must_use]
+    pub fn http_addr(&self) -> Option<SocketAddr> {
+        self.http_addr
+    }
+
+    /// The current connection state ([`ConnectionState::Connecting`] until the
+    /// first tunnel is up, then `Connected`/`Reconnecting` as it heals).
+    #[must_use]
+    pub fn state(&self) -> ConnectionState {
+        *self.state_rx.borrow()
+    }
+
+    /// A watch receiver for state changes, so an app can await transitions
+    /// (`state_rx.changed().await`) rather than poll [`Self::state`].
+    #[must_use]
+    pub fn watch_state(&self) -> tokio::sync::watch::Receiver<ConnectionState> {
+        self.state_rx.clone()
+    }
+
+    /// Stops the supervisor and tears down the datapath.
+    pub fn shutdown(self) {
+        self.task.abort();
+    }
+}
+
+impl Drop for SupervisedProxyHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[cfg(feature = "reqwest-transport")]
 fn warren_api_default_base() -> String {
     "https://api.warrenbrowse.com".to_owned()
@@ -763,6 +1017,100 @@ fn now_unix_secs() -> u64 {
 mod tests {
     use super::*;
     use warren_api::{HttpRequest, HttpResponse, TransportError};
+
+    /// A packet sink whose read side closes on demand, modelling a tunnel that
+    /// dies when its `close` notifier fires (so the supervisor must reconnect).
+    struct ClosableSink {
+        close: Arc<tokio::sync::Notify>,
+    }
+
+    impl warren_net::PacketSink for ClosableSink {
+        async fn send_packet(&self, _packet: &[u8]) -> Result<(), warren_net::NetError> {
+            Ok(())
+        }
+
+        async fn recv_packet(&self) -> Result<bytes::Bytes, warren_net::NetError> {
+            self.close.notified().await;
+            Err(warren_net::NetError::EngineStopped)
+        }
+
+        fn max_payload(&self) -> usize {
+            1280
+        }
+    }
+
+    /// A bare TCP connect to `addr` succeeds within ~2s (the supervisor's accept
+    /// loop is live there). Retried because the serve loop starts asynchronously.
+    async fn proxy_accepts(addr: SocketAddr) -> bool {
+        for _ in 0..40 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stable_addr = socks_listener.local_addr().unwrap();
+
+        let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+        // Each (re)connect publishes its kill notifier so the test can drop that
+        // session; the mpsc (unlike a watch) never coalesces, so every cycle shows.
+        let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cycles = Arc::new(AtomicUsize::new(0));
+
+        let task = {
+            let cycles = Arc::clone(&cycles);
+            tokio::spawn(async move {
+                supervise_proxy(socks_listener, None, None, state_tx, move || {
+                    let kill_tx = kill_tx.clone();
+                    let cycles = Arc::clone(&cycles);
+                    async move {
+                        let close = Arc::new(tokio::sync::Notify::new());
+                        let _ = kill_tx.send(Arc::clone(&close));
+                        cycles.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, SdkError>(EstablishedTunnel {
+                            sink: ClosableSink { close },
+                            local_ip: "10.66.0.2".parse().unwrap(),
+                            prefix: 24,
+                            gateway: "10.66.0.1".parse().unwrap(),
+                            ipv6: None,
+                        })
+                    }
+                })
+                .await;
+            })
+        };
+
+        // Cycle 1 establishes and accepts on the stable address.
+        let kill1 = tokio::time::timeout(std::time::Duration::from_secs(5), kill_rx.recv())
+            .await
+            .expect("first connect happened")
+            .expect("kill handle");
+        assert!(proxy_accepts(stable_addr).await, "listener live in cycle 1");
+
+        // Simulate a tunnel drop: the supervisor must re-establish on its own.
+        kill1.notify_one();
+        let kill2 = tokio::time::timeout(std::time::Duration::from_secs(5), kill_rx.recv())
+            .await
+            .expect("supervisor reconnected after the drop")
+            .expect("kill handle");
+
+        // The SAME bound address still accepts after the automatic reconnect.
+        assert!(
+            proxy_accepts(stable_addr).await,
+            "listener stays stable across the reconnect"
+        );
+        assert_eq!(cycles.load(Ordering::SeqCst), 2, "exactly one reconnect");
+
+        kill2.notify_one();
+        task.abort();
+    }
 
     /// A transport that is never actually called by these builder tests.
     struct NullTransport;

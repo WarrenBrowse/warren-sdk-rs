@@ -194,6 +194,43 @@ impl<C: UdpConnector> Socks5Proxy<C> {
             });
         }
     }
+
+    /// Like [`serve_with_udp`](Self::serve_with_udp) but accepts on a *borrowed*
+    /// listener until `run` goes `false`, then returns. The borrowed listener
+    /// lets a supervisor reuse one stable local address across tunnel rebuilds:
+    /// each reconnect builds a fresh connector and a new proxy over the same
+    /// bound port. `run` starting `false` (or its sender dropped) returns at once.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Io`] only if accepting on the listener fails.
+    pub async fn serve_with_udp_until(
+        &self,
+        listener: &TcpListener,
+        mut run: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), NetError> {
+        loop {
+            if !*run.borrow_and_update() {
+                return Ok(());
+            }
+            tokio::select! {
+                // Prefer the stop signal so a torn-down tunnel halts accepting promptly.
+                biased;
+                changed = run.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                }
+                accepted = listener.accept() => {
+                    let (client, _peer) = accepted.map_err(NetError::Io)?;
+                    let connector = Arc::clone(&self.connector);
+                    tokio::spawn(async move {
+                        let _ = handle_with_udp(client, connector.as_ref()).await;
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// SOCKS5 handler that supports `CONNECT` and `UDP ASSOCIATE`.
@@ -411,6 +448,40 @@ impl<C: Connector> HttpConnectProxy<C> {
             tokio::spawn(async move {
                 let _ = handle_connect(client, connector.as_ref()).await;
             });
+        }
+    }
+
+    /// Like [`serve`](Self::serve) but accepts on a *borrowed* listener until
+    /// `run` goes `false`, so a supervisor can reuse one bound port across tunnel
+    /// rebuilds. `run` starting `false` (or its sender dropped) returns at once.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Io`] only if accepting on the listener fails.
+    pub async fn serve_until(
+        &self,
+        listener: &TcpListener,
+        mut run: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), NetError> {
+        loop {
+            if !*run.borrow_and_update() {
+                return Ok(());
+            }
+            tokio::select! {
+                biased;
+                changed = run.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                }
+                accepted = listener.accept() => {
+                    let (client, _peer) = accepted.map_err(NetError::Io)?;
+                    let connector = Arc::clone(&self.connector);
+                    tokio::spawn(async move {
+                        let _ = handle_connect(client, connector.as_ref()).await;
+                    });
+                }
+            }
         }
     }
 }
