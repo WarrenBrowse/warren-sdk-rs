@@ -29,6 +29,13 @@ impl ExitSelector {
         Self { relays }
     }
 
+    /// All relays in the underlying list (e.g. to cross-check another source,
+    /// such as the multihop directory, against the pinned relay list).
+    #[must_use]
+    pub fn relays(&self) -> &[Relay] {
+        self.relays.relays()
+    }
+
     /// Deterministically selects the first matching relay (ignores weight).
     ///
     /// # Errors

@@ -108,18 +108,27 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
      `aad = AAD_V1||exit_id||epoch_be||seq_be`. `seal`/`open_response` with a
      crypto round-trip test (exit-side `setup_receiver` recovers; tampered AAD
      rejected). TODO: cross-language HPKE vectors generated from warren-core.
-  4. Datapath integration: the first sealed frame's INNER payload is a control
-     message, not a bare `Setup` (warren-core uses an `IpRequest`/`IpAssign`
-     control layer for the multihop path, distinct from single-hop Setup/SetupAck
-     - see `warren-multihop::control` + `warren-tunnel real_tun` `IpAssign`).
-     Port the control codec, build the sealed first frame, send on the bi-stream,
-     open the sealed response; then ride per-packet sealed `WarrenMultihopFrame`s
-     on the datagram plane (replace the raw-`Setup` handshake in
-     `warren-transport`).
-  5. Live-validate a real single-hop tunnel against an exit (routing needs a
-     SUBSCRIBED wallet: the exit enforces an allowlist of active pubkeys +
-     `/v1/session/open` device cap). Freeze shared vectors. Until then the
-     in-process datapath tests use a non-production fake handshake.
+  4. DONE: datapath integration. The first sealed frame's INNER payload is a
+     control message, not a bare `Setup`: ported the `IpRequest`/`IpAssign`
+     control codec (`warren-wire::control`, byte-exact `/v2` vectors), the PoP
+     (`warren-multihop::pop`), the setup exchange (`warren-multihop::setup`:
+     `seal_setup_request`/`open_setup_reply` -> `IpAssignment`), the RFC 6479
+     reverse anti-replay window (`warren-multihop::replay`), the multihop QUIC
+     tunnel (`warren-transport::multihop`: sealed setup over a bidi stream +
+     per-packet sealed datagrams, forward seq from 1), the `MultihopPacketSink`
+     (`warren-net`, with a pinned frame MTU overhead bound), and the facade
+     (`fetch_multihop_directory`/`connect_multihop`/`start_proxy_multihop`).
+     In-process e2e: SOCKS5 -> netstack -> sealed multihop tunnel -> exit echo.
+  5. PARTIALLY DONE (live-validated). `cargo run -p warren-sdk --example
+     live_exit` against production: the signed exit list + signed multihop
+     directory verify under the pinned key, and a real production exit
+     (NL/Amsterdam) OPENS our sealed `IpRequest` and returns a sealed `Rejected`
+     that the client OPENS and decodes. This proves the multihop frame/HPKE/
+     control wire layers byte-for-byte against a real exit; no more "malformed
+     setup frame". The remaining step is a full tunnel with a SUBSCRIBED wallet
+     (the exit gates the `IpAssign` on its allowlist + the `/v1/session/open`
+     device cap): set `WARREN_MNEMONIC` to complete routing. Then freeze shared
+     cross-language vectors (HPKE + control + PoP) generated from warren-core.
 
 ## Cross-cutting
 
