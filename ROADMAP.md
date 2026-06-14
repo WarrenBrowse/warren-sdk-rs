@@ -49,10 +49,13 @@ pinned by golden vectors where a wire format is involved. warren-core
 - QUIC handshake with rustls raw public keys (RFC 7250), ALPN `h3`, 0-RTT off.
 - `ClientTunnel` builder to `ClientSession`, RFC 9221 datagram pump over the
   `PacketSink` seam.
-- Full-jitter reconnection backoff (`Backoff`, AWS pattern) and a retrying
-  connector (`connect_with_retry`) in `warren-transport::reconnect`, generic
-  over the connect closure so the retry policy is unit-tested with `tokio::time`
-  paused (no real sleeps, no network).
+- Full-jitter reconnection backoff (`Backoff`, AWS pattern), a retrying connector
+  (`connect_with_retry`), and a state-emitting supervisor (`connect_with_state` +
+  `ConnectionState::{Connecting, Connected, Reconnecting, Failed}`) in
+  `warren-transport::reconnect`, generic over the connect closure so both the
+  retry policy and the exact state-transition sequence are unit-tested with
+  `tokio::time` paused (no real sleeps, no network). `ConnectionState` is the
+  portable basis for the P9 FFI event stream.
 
 ## P6: warren-net
 

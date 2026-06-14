@@ -145,6 +145,76 @@ pub enum RetryError<E: std::error::Error + 'static> {
     NoAttempts,
 }
 
+/// Lifecycle state of a supervised connection, surfaced to observers (and, via
+/// the FFI layer, to host apps). A plain C-like enum so it maps cleanly to every
+/// sibling-language SDK.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConnectionState {
+    /// The initial connect attempt is in flight.
+    Connecting,
+    /// A connection is established.
+    Connected,
+    /// A previous attempt failed; the next retry is in flight (after backoff).
+    Reconnecting,
+    /// Every attempt failed; the supervisor gave up.
+    Failed,
+}
+
+/// Like [`connect_with_retry`], but reports each [`ConnectionState`] transition
+/// to `on_state` as it happens: `Connecting` for the first attempt,
+/// `Reconnecting` before each retry, then `Connected` on success or `Failed`
+/// once attempts are exhausted.
+///
+/// The observer is a plain `FnMut` so tests can record the exact transition
+/// sequence and the FFI layer can forward it to a uniffi callback interface. It
+/// is invoked between awaits (never held across one).
+///
+/// # Errors
+///
+/// [`RetryError::Exhausted`] with the last error if every attempt fails;
+/// [`RetryError::NoAttempts`] if `attempts` is zero.
+pub async fn connect_with_state<F, Fut, T, E>(
+    backoff: Backoff,
+    attempts: usize,
+    mut on_state: impl FnMut(ConnectionState),
+    mut connect: F,
+) -> Result<T, RetryError<E>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: std::error::Error + 'static,
+{
+    let mut last: Option<E> = None;
+    let mut made = 0usize;
+    for (i, delay) in backoff.take(attempts).enumerate() {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        on_state(if i == 0 {
+            ConnectionState::Connecting
+        } else {
+            ConnectionState::Reconnecting
+        });
+        made += 1;
+        match connect().await {
+            Ok(value) => {
+                on_state(ConnectionState::Connected);
+                return Ok(value);
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    on_state(ConnectionState::Failed);
+    match last {
+        Some(last) => Err(RetryError::Exhausted {
+            attempts: made,
+            last,
+        }),
+        None => Err(RetryError::NoAttempts),
+    }
+}
+
 /// Drives `connect` with full-jitter backoff until it returns `Ok` or
 /// `attempts` is exhausted. The first attempt is immediate; failing attempts
 /// sleep for the next backoff delay before retrying.
@@ -306,6 +376,71 @@ mod tests {
             RetryError::NoAttempts => panic!("attempts were made"),
         }
         assert_eq!(calls.get(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn state_sequence_on_first_try_success() {
+        let states = std::cell::RefCell::new(Vec::new());
+        let out = connect_with_state(
+            Backoff::HANDSHAKE,
+            5,
+            |s| states.borrow_mut().push(s),
+            || async { Ok::<_, FakeErr>(7) },
+        )
+        .await
+        .expect("ok");
+        assert_eq!(out, 7);
+        assert_eq!(
+            *states.borrow(),
+            vec![ConnectionState::Connecting, ConnectionState::Connected]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn state_sequence_reconnects_then_connects() {
+        let states = std::cell::RefCell::new(Vec::new());
+        let calls = Cell::new(0);
+        connect_with_state(
+            Backoff::HANDSHAKE,
+            5,
+            |s| states.borrow_mut().push(s),
+            || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                async move { if n < 3 { Err(FakeErr) } else { Ok(n) } }
+            },
+        )
+        .await
+        .expect("third attempt ok");
+        // First attempt is Connecting, the two retries are Reconnecting, success
+        // is Connected. No Failed when a connection is ultimately established.
+        assert_eq!(
+            *states.borrow(),
+            vec![
+                ConnectionState::Connecting,
+                ConnectionState::Reconnecting,
+                ConnectionState::Reconnecting,
+                ConnectionState::Connected,
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn state_sequence_ends_in_failed_when_exhausted() {
+        let states = std::cell::RefCell::new(Vec::new());
+        let err = connect_with_state(
+            Backoff::HANDSHAKE,
+            3,
+            |s| states.borrow_mut().push(s),
+            || async { Err::<u8, _>(FakeErr) },
+        )
+        .await
+        .expect_err("all fail");
+        assert!(matches!(err, RetryError::Exhausted { attempts: 3, .. }));
+        let s = states.borrow();
+        assert_eq!(s.first(), Some(&ConnectionState::Connecting));
+        assert_eq!(s.last(), Some(&ConnectionState::Failed));
+        assert!(s.contains(&ConnectionState::Reconnecting));
     }
 
     #[tokio::test(start_paused = true)]
