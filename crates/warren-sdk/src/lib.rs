@@ -530,13 +530,17 @@ impl<T: HttpTransport> WarrenClient<T> {
         let prefix = assignment.prefix_len;
         let gateway = std::net::Ipv4Addr::from(assignment.gateway_ipv4);
         // Enable dual-stack only when the exit granted a v6 address AND its
-        // gateway; a v6 address without a gateway would be unroutable.
+        // gateway, with a sane prefix. A missing gateway or an out-of-range
+        // prefix (a misbehaving exit) falls back to v4-only rather than installing
+        // an unroutable or `/0` v6 CIDR. Either way v6 traffic stays in the tunnel.
         let ipv6 = match (assignment.ipv6, assignment.gateway_ipv6) {
-            (Some(ip), Some(gw)) => Some(warren_net::Ipv6Addressing {
-                local_ip: std::net::Ipv6Addr::from(ip),
-                prefix: assignment.prefix_len_v6,
-                gateway: std::net::Ipv6Addr::from(gw),
-            }),
+            (Some(ip), Some(gw)) if (1..=128).contains(&assignment.prefix_len_v6) => {
+                Some(warren_net::Ipv6Addressing {
+                    local_ip: std::net::Ipv6Addr::from(ip),
+                    prefix: assignment.prefix_len_v6,
+                    gateway: std::net::Ipv6Addr::from(gw),
+                })
+            }
             _ => None,
         };
         serve_proxy_over_sink(sink, local_ip, prefix, gateway, ipv6, cfg).await

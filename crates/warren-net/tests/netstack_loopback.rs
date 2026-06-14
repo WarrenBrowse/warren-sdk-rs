@@ -134,10 +134,12 @@ async fn echo_server(
 }
 
 /// An IPv6 smoltcp "exit" echo server: owns `ip/prefix`, listens TCP on `:9`,
-/// and echoes. On-link with the client (same prefix), so no route is needed.
+/// echoes, and installs a default v6 route via `gateway` so it can reply to a
+/// client on a different v6 subnet.
 async fn echo_server_v6(
     ip: std::net::Ipv6Addr,
     prefix: u8,
+    gateway: std::net::Ipv6Addr,
     mut inbound: mpsc::Receiver<Bytes>,
     outbound: mpsc::Sender<Bytes>,
 ) {
@@ -155,6 +157,7 @@ async fn echo_server_v6(
     iface.update_ip_addrs(|a| {
         let _ = a.push(IpCidr::new(IpAddress::from(ip), prefix));
     });
+    let _ = iface.routes_mut().add_default_ipv6_route(gateway);
 
     let mut sockets = SocketSet::new(Vec::new());
     let handle = sockets.add(tcp::Socket::new(
@@ -514,6 +517,7 @@ async fn netstack_connects_to_an_ipv6_target_over_the_tunnel() {
     tokio::spawn(echo_server_v6(
         "fd66::1".parse().unwrap(),
         64,
+        "fd66::2".parse().unwrap(),
         c2s_rx,
         s2c_tx,
     ));
@@ -527,6 +531,45 @@ async fn netstack_connects_to_an_ipv6_target_over_the_tunnel() {
     let mut got = [0u8; 9];
     stream.read_exact(&mut got).await.expect("read echo");
     assert_eq!(&got, b"v6-routed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn netstack_routes_out_of_subnet_ipv6_target_via_default_route() {
+    // The client is fd66::2/64; the target 2001:db8::1 is OFF that subnet, so
+    // reaching it MUST go through the installed default v6 route. This is the v6
+    // analogue of the v4 default-route test: without `add_default_ipv6_route` the
+    // connect cannot route and the test fails.
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+
+    let config = NetstackConfig::new(
+        "10.66.0.2".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        MTU,
+    )
+    .with_ipv6("fd66::2".parse().unwrap(), 64, "fd66::1".parse().unwrap());
+    let connector = spawn_engine(config, s2c_rx, c2s_tx);
+
+    // The exit terminates the off-subnet target and routes replies back out via
+    // its own default v6 route (on its own /64).
+    tokio::spawn(echo_server_v6(
+        "2001:db8::1".parse().unwrap(),
+        64,
+        "2001:db8::ffff".parse().unwrap(),
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let mut stream = connector
+        .connect(Target::Ip("[2001:db8::1]:9".parse().unwrap()))
+        .await
+        .expect("out-of-subnet v6 connect via default route succeeds");
+    stream.write_all(b"v6-default").await.expect("write");
+    stream.flush().await.expect("flush");
+    let mut got = [0u8; 10];
+    stream.read_exact(&mut got).await.expect("read echo");
+    assert_eq!(&got, b"v6-default");
 }
 
 #[tokio::test(flavor = "multi_thread")]
