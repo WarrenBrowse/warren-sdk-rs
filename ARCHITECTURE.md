@@ -37,7 +37,7 @@ portable in concept and pinned by shared golden vectors under `vectors/`.
 | `warren-identity` | core | BIP39 mnemonic to Ed25519, SS58 `wb…` address, canonical API request signing | done |
 | `warren-wire` | core | Pure codecs: Setup/SetupAck handshake, NAT-PMP, multihop HPKE frame, control `/v2`, PoP | done |
 | `warren-api` | core | Signed HTTP client for the `/v1/*` account API (incl. payments, support, incidents) with anti-censorship host fallback; transport-agnostic core + optional reqwest | done |
-| `warren-discovery` | core | Verify the signed relay list (v5) + weighted selection; verify the multihop directory PKI chain | done |
+| `warren-discovery` | core | Verify the signed relay list (v6) + weighted selection; verify the multihop directory PKI chain | done |
 | `warren-multihop` | core | Client HPKE session (X25519 / HKDF-SHA256 / ChaCha20Poly1305), sealed `IpRequest`/`IpAssign`, epoch/seq replay window | done |
 | `warren-transport` | net | QUIC handshake (quinn + rustls raw public keys), single-hop + multihop `ClientSession` datagram plane, reconnect/backoff supervisor | done |
 | `warren-net` | net | `PacketSink` seam + QUIC plane + smoltcp userspace netstack (TCP/UDP, dual-stack IPv6) + SOCKS5/HTTP CONNECT proxy + DNS-over-tunnel + NAT-PMP port-forwarding (client + inbound listen/relay) + killswitch levels; per-OS privileged TUN backend feature-gated (todo) | done (proxy); TUN todo |
@@ -80,7 +80,7 @@ break and requires a schema version bump.
 | Address | SS58 prefix 13295 (`wb…`), Blake2b-512 checksum, base58 |
 | API auth | canonical `METHOD\npath\ntimestamp\nnonce_hex\nsha256_hex(body)`, Ed25519 signature, headers `X-Warren-PubKey` (SS58), `X-Warren-Sig`, `X-Warren-Timestamp`, `X-Warren-Nonce` |
 | Handshake | Setup/SetupAck (postcard), protocol version 4, 16-byte device id, feature bitmask |
-| Discovery | Signed relay list (v5), canonical JSON, Ed25519 over a pinned server pubkey, generation anti-rollback, expiry anti-freeze |
+| Discovery | Signed relay list (v6), canonical JSON, Ed25519 over a pinned server pubkey, generation anti-rollback, expiry anti-freeze |
 | TLS | Raw public keys (RFC 7250), ALPN `h3`, TLS 1.3 only, 0-RTT off |
 | NAT-PMP | RFC 6886 plus Warren rate-limit extensions |
 | Multihop | HPKE (X25519 + HKDF-SHA256 + ChaCha20Poly1305), frame v1 (postcard) |

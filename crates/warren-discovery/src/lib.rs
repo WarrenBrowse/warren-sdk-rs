@@ -9,7 +9,7 @@
 //!   filtered by geography ([`LocationConstraint`]) and IP availability
 //!   ([`IpAvailability`]).
 //!
-//! Wire-compatible with warren-core (`SignedRelayList` v5).
+//! Wire-compatible with warren-core (`SignedRelayList` v6).
 
 pub mod exit_id;
 pub mod multihop_directory;

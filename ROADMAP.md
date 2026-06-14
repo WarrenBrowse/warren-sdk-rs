@@ -39,7 +39,7 @@ pinned by golden vectors where a wire format is involved. warren-core
 
 ## P4: warren-discovery
 
-- Verify the signed relay list (v5): canonical JSON, Ed25519 against the pinned
+- Verify the signed relay list (v6): canonical JSON, Ed25519 against the pinned
   server pubkey, generation anti-rollback, expiry anti-freeze.
 - Weighted relay selector with geography, IP availability and deterministic
   per-attempt failover. Golden vectors for the signed list.
