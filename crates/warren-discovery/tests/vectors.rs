@@ -64,6 +64,32 @@ fn signed_relay_list_vector_verifies_and_resolves() {
 }
 
 #[test]
+fn frozen_vector_listeners_advertise_the_h3_alpn_contract() {
+    // ALPN `h3` over QUIC is a FROZEN wire contract (see ARCHITECTURE.md). The
+    // SDK dials `h3` unconditionally rather than sourcing the per-listener `alpn`
+    // field, so this pins the assumption: a future v6 list whose dialable
+    // listeners diverge from quic/h3 fails here and forces a deliberate decision
+    // instead of a silent ALPN mismatch at TLS time.
+    let v = load();
+    let list: warren_discovery::SignedRelayList =
+        serde_json::from_str(&v.signed_json).expect("parse signed_json");
+    let mut dialable = 0;
+    for node in &list.nodes {
+        for ep in &node.endpoints {
+            for l in &ep.listeners {
+                assert_eq!(l.transport, "quic", "only QUIC listeners are dialable");
+                assert_eq!(l.alpn, "h3", "ALPN h3 is the frozen TLS contract");
+                dialable += 1;
+            }
+        }
+    }
+    assert!(
+        dialable > 0,
+        "vector must exercise at least one dialable listener"
+    );
+}
+
+#[test]
 fn wrong_pin_rejects_the_frozen_vector() {
     let v = load();
     let wrong = "00".repeat(32);

@@ -1489,3 +1489,199 @@ async fn socks5_proxy_over_netstack_reaches_the_exit() {
     client.read_exact(&mut got).await.unwrap();
     assert_eq!(&got, b"through-proxy");
 }
+
+/// Builds an RFC 6886 Map success response: echoes `internal_port`, grants
+/// `external_port` for `lifetime_secs`. The opcode is the TCP map opcode (2) with
+/// the response bit set, matching what `portforward::map` parses.
+fn natpmp_map_reply(internal_port: u16, external_port: u16, lifetime_secs: u32) -> Vec<u8> {
+    let mut r = Vec::with_capacity(16);
+    r.push(0); // version
+    r.push(2 | 0x80); // TCP map opcode | RESPONSE_BIT
+    r.extend_from_slice(&0u16.to_be_bytes()); // result code: success
+    r.extend_from_slice(&1u32.to_be_bytes()); // epoch seconds (arbitrary)
+    r.extend_from_slice(&internal_port.to_be_bytes());
+    r.extend_from_slice(&external_port.to_be_bytes());
+    r.extend_from_slice(&lifetime_secs.to_be_bytes());
+    r
+}
+
+/// A smoltcp "exit" acting as a NAT-PMP gateway: it answers a Map request on
+/// `:5351` granting `external_port`, then dials the client's tunnel-side
+/// `internal_port`, sends `probe`, and reports whether the relayed echo matched.
+/// Models the full `forward_port` round trip: map, then inbound relay.
+#[allow(clippy::too_many_arguments)]
+async fn natpmp_gateway_then_inbound(
+    gateway_ip: std::net::Ipv4Addr,
+    prefix: u8,
+    client_ip: std::net::Ipv4Addr,
+    internal_port: u16,
+    external_port: u16,
+    probe: &'static [u8],
+    result_tx: tokio::sync::oneshot::Sender<bool>,
+    mut inbound: mpsc::Receiver<Bytes>,
+    outbound: mpsc::Sender<Bytes>,
+) {
+    let mut device = ChanDevice {
+        rx: VecDeque::new(),
+        tx: outbound,
+    };
+    let base = tokio::time::Instant::now();
+    let now =
+        || SmolInstant::from_micros(i64::try_from(base.elapsed().as_micros()).unwrap_or(i64::MAX));
+
+    let mut config = Config::new(HardwareAddress::Ip);
+    config.random_seed = 0x5345_5256_000b;
+    let mut iface = Interface::new(config, &mut device, now());
+    iface.update_ip_addrs(|a| {
+        let _ = a.push(IpCidr::new(IpAddress::from(gateway_ip), prefix));
+    });
+
+    let mut sockets = SocketSet::new(Vec::new());
+    let udp_handle = sockets.add(udp::Socket::new(
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]),
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]),
+    ));
+    sockets
+        .get_mut::<udp::Socket<'_>>(udp_handle)
+        .bind(5351)
+        .expect("bind 5351");
+    let tcp_handle = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+    ));
+
+    let mut mapped = false;
+    let mut connecting = false;
+    let mut sent = false;
+    let mut result_tx = Some(result_tx);
+    loop {
+        while let Ok(f) = inbound.try_recv() {
+            device.rx.push_back(f);
+        }
+        let _ = iface.poll(now(), &mut device, &mut sockets);
+
+        // Phase 1: answer the NAT-PMP Map request, echoing the internal port the
+        // client asked for (request bytes [4..6]).
+        if !mapped {
+            let request = {
+                let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
+                match sock.recv() {
+                    Ok((data, meta)) if data.len() >= 12 => Some((data.to_vec(), meta.endpoint)),
+                    _ => None,
+                }
+            };
+            if let Some((req, endpoint)) = request {
+                let echoed = u16::from_be_bytes([req[4], req[5]]);
+                let reply = natpmp_map_reply(echoed, external_port, 60);
+                let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
+                let _ = sock.send_slice(&reply, endpoint);
+                mapped = true;
+            }
+        }
+
+        // Phase 2: once mapped, dial the client's forwarded port like a remote peer.
+        if mapped && !connecting {
+            let _ = sockets.get_mut::<tcp::Socket<'_>>(tcp_handle).connect(
+                iface.context(),
+                (IpAddress::from(client_ip), internal_port),
+                49100,
+            );
+            connecting = true;
+        }
+        if connecting {
+            let sock = sockets.get_mut::<tcp::Socket<'_>>(tcp_handle);
+            if !sent && sock.can_send() {
+                let _ = sock.send_slice(probe);
+                sent = true;
+            }
+            if sock.can_recv() {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = sock.recv_slice(&mut buf) {
+                    if let Some(tx) = result_tx.take() {
+                        let _ = tx.send(&buf[..n] == probe);
+                    }
+                    return;
+                }
+            }
+        }
+
+        let delay = iface
+            .poll_delay(now(), &sockets)
+            .map(|d| std::time::Duration::from_micros(d.total_micros()))
+            .unwrap_or_else(|| std::time::Duration::from_millis(5));
+        tokio::select! {
+            f = inbound.recv() => match f {
+                Some(f) => device.rx.push_back(f),
+                None => return,
+            },
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forward_port_maps_at_the_gateway_and_relays_inbound() {
+    // End-to-end `forward_port`: it maps a tunnel-side port at the exit's NAT-PMP
+    // gateway (learning the allocated external port), then relays a dialed-in
+    // connection to a local app server. The gateway sim grants 40000 and dials
+    // back into the forwarded port; the local echo must round-trip the probe.
+    let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = local.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = local.accept().await {
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        }
+    });
+
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+    let connector = spawn_engine(
+        NetstackConfig::new(
+            "10.66.0.2".parse().unwrap(),
+            24,
+            "10.66.0.1".parse().unwrap(),
+            MTU,
+        ),
+        s2c_rx,
+        c2s_tx,
+    );
+
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(natpmp_gateway_then_inbound(
+        "10.66.0.1".parse().unwrap(),
+        24,
+        "10.66.0.2".parse().unwrap(),
+        8080,
+        40000,
+        b"fwd-roundtrip",
+        result_tx,
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let forwarded = warren_net::forward_port(
+        &connector,
+        "10.66.0.1".parse().unwrap(),
+        warren_net::MapProto::Tcp,
+        8080,
+        local_addr,
+    )
+    .await
+    .expect("forward_port maps at the gateway");
+    assert_eq!(
+        forwarded.external_port(),
+        40000,
+        "the caller learns the gateway-allocated external port"
+    );
+    assert_eq!(forwarded.internal_port(), 8080);
+
+    let matched = tokio::time::timeout(std::time::Duration::from_secs(10), result_rx)
+        .await
+        .expect("gateway sim finished in time")
+        .expect("gateway sim reported a result");
+    assert!(
+        matched,
+        "an inbound connection to the forwarded port was relayed to the local server and echoed"
+    );
+}

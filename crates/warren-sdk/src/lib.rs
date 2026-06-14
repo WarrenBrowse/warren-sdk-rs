@@ -114,6 +114,9 @@ pub enum SdkError {
         /// Highest generation previously trusted.
         floor: u64,
     },
+    /// A port-forwarding (NAT-PMP) operation failed.
+    #[error(transparent)]
+    PortForward(#[from] warren_net::PortForwardError),
     /// The client builder was misconfigured.
     #[error(transparent)]
     Build(#[from] BuildError),
@@ -610,6 +613,10 @@ where
         }
     }));
 
+    // Keep a connector clone for on-demand port forwarding; the HTTP branch below
+    // may move `connector`, so clone before it does.
+    let forward_connector = connector.clone();
+
     let mut http_addr = None;
     if let Some(http_bind) = cfg.http {
         let http_listener = tokio::net::TcpListener::bind(http_bind)
@@ -626,6 +633,8 @@ where
         local_addr,
         http_addr,
         state_rx,
+        forward_connector,
+        gateway,
         tasks,
     })
 }
@@ -651,6 +660,8 @@ pub struct ProxyHandle {
     local_addr: SocketAddr,
     http_addr: Option<SocketAddr>,
     state_rx: tokio::sync::watch::Receiver<TunnelState>,
+    forward_connector: warren_net::TunnelConnector,
+    gateway: std::net::Ipv4Addr,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -680,6 +691,36 @@ impl ProxyHandle {
     #[must_use]
     pub fn watch_state(&self) -> tokio::sync::watch::Receiver<TunnelState> {
         self.state_rx.clone()
+    }
+
+    /// Forwards a tunnel-side port: asks the exit to map `internal_port` via
+    /// NAT-PMP and relays every inbound connection to `local_target` (a TCP
+    /// server the app runs locally), renewing the mapping until the returned
+    /// [`warren_net::ForwardedPort`] is dropped. Resolves once the exit grants
+    /// the mapping, so [`warren_net::ForwardedPort::external_port`] is the port
+    /// remote peers reach the app on.
+    ///
+    /// This needs an exit that runs a NAT-PMP gateway; not every exit does.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::PortForward`] if the engine has stopped, a socket cannot be
+    /// opened, or the exit refuses the mapping.
+    pub async fn forward_port(
+        &self,
+        proto: warren_net::MapProto,
+        internal_port: u16,
+        local_target: SocketAddr,
+    ) -> Result<warren_net::ForwardedPort, SdkError> {
+        warren_net::forward_port(
+            &self.forward_connector,
+            self.gateway,
+            proto,
+            internal_port,
+            local_target,
+        )
+        .await
+        .map_err(SdkError::from)
     }
 
     /// Stops the proxy datapath.

@@ -80,9 +80,16 @@ pinned by golden vectors where a wire format is involved. warren-core
   `relay_to_local` relay each accepted inbound connection to a local listener
   (the app's server). Validated in-process (an exit dials in, the netstack
   accepts, and the connection round-trips to a local echo listener).
-- Pending: a one-call `WarrenClient` convenience composing NAT-PMP map/refresh +
-  `serve_inbound` (the constituent parts are each tested; the composition needs a
-  NAT-PMP-gateway-capable fake exit), and validation against a real exit.
+- One-call convenience: DONE. `warren-net::forward_port` composes
+  `listen` + NAT-PMP `map` + background renewal + `serve_inbound` into a single
+  call returning a `ForwardedPort` (the gateway-allocated `external_port`, with
+  graceful `shutdown` that asks the exit to delete the mapping). The facade
+  surfaces it as `ProxyHandle::forward_port(proto, internal_port, local_target)`,
+  using the datapath's own connector and exit gateway. Validated in-process
+  against a NAT-PMP-gateway exit simulator that grants a mapping and then dials
+  back into the forwarded port, round-tripping to a local server.
+- Pending: validation against a real exit (needs an exit that runs a NAT-PMP
+  gateway and an external peer to dial the forwarded port from the internet).
 
 ## P8: warren-sdk facade
 
@@ -91,11 +98,12 @@ pinned by golden vectors where a wire format is involved. warren-core
   `start_proxy_multihop`). `ProxyHandle` exposes the listener address(es) and the
   tunnel connection state (`TunnelState::{Connected, Disconnected}` via `state()`
   / `watch_state()`), so an app reacts to a dropped tunnel. In-process e2e tested.
+- DONE: one-call port forwarding on the datapath handle
+  (`ProxyHandle::forward_port`, see P7).
 - Pending: auto-reconnect supervisor wired into the facade (the
   `warren-transport` backoff/state primitives exist; reconnect must rebuild the
   netstack from a possibly-changed `IpAssign`, so it needs real-exit validation);
-  a one-call port-forward convenience (primitives done in `warren-net`); and
-  end-to-end tests against a real exit and the production API.
+  and end-to-end tests against a real exit and the production API.
 
 ## P9: warren-sdk-ffi (uniffi scaffolding done)
 

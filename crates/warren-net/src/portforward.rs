@@ -23,7 +23,7 @@ use tokio::sync::Semaphore;
 use warren_wire::natpmp::{self, MapProto, Request, Response, ResultCode};
 
 use crate::error::NetError;
-use crate::netstack::{NetstackListener, NetstackStream};
+use crate::netstack::{NetstackListener, NetstackStream, TunnelConnector};
 use crate::proxy::UdpFlow;
 
 /// Standard NAT-PMP server port on the gateway (RFC 6886).
@@ -322,6 +322,148 @@ pub async fn relay_to_local(mut stream: NetstackStream, target: SocketAddr) {
 /// cannot fan out into unbounded host connects and tasks. At the cap, accepting
 /// pauses, which lets the engine's bounded accept queue shed the excess.
 const MAX_INBOUND_RELAYS: usize = 128;
+
+/// Default lifetime requested for a forwarded-port mapping (RFC 6886 suggests
+/// 7200s). The gateway may grant less; the refresh loop renews at half of the
+/// granted lifetime.
+const DEFAULT_MAP_LIFETIME_SECS: u32 = 7200;
+
+/// A live forwarded port over an established tunnel datapath.
+///
+/// The exit maps [`Self::external_port`] to the tunnel-side
+/// [`Self::internal_port`]; inbound connections are accepted and relayed to a
+/// local target, and the mapping is renewed in the background. Dropping the
+/// handle stops the local tasks and lets the lease lapse at the exit; call
+/// [`Self::shutdown`] to release the mapping promptly instead.
+#[derive(Debug)]
+pub struct ForwardedPort {
+    external_port: u16,
+    internal_port: u16,
+    proto: MapProto,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    refresh: tokio::task::JoinHandle<()>,
+    serve: tokio::task::JoinHandle<()>,
+}
+
+impl ForwardedPort {
+    /// The external port the exit allocated; remote peers reach the app here.
+    #[must_use]
+    pub fn external_port(&self) -> u16 {
+        self.external_port
+    }
+
+    /// The tunnel-side port the exit forwards inbound connections to.
+    #[must_use]
+    pub fn internal_port(&self) -> u16 {
+        self.internal_port
+    }
+
+    /// The mapped transport protocol.
+    #[must_use]
+    pub fn proto(&self) -> MapProto {
+        self.proto
+    }
+
+    /// Releases the forward gracefully: stops accepting inbound connections and
+    /// signals the refresh loop to ask the gateway to delete the mapping, then
+    /// awaits that teardown so the exit reclaims the port before this returns.
+    pub async fn shutdown(mut self) {
+        self.serve.abort();
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        // Move the refresh handle out so `Drop` does not abort the teardown
+        // mid-delete; await it so the gateway delete completes.
+        let refresh = std::mem::replace(&mut self.refresh, tokio::spawn(async {}));
+        let _ = refresh.await;
+    }
+}
+
+impl Drop for ForwardedPort {
+    fn drop(&mut self) {
+        // No graceful signal: the flow lives in the refresh task, so we cannot
+        // delete the mapping here. Stop the local tasks; the exit reclaims the
+        // port when the lease lapses.
+        self.refresh.abort();
+        self.serve.abort();
+    }
+}
+
+/// Opens a forwarded port over an established tunnel datapath: maps
+/// `internal_port` at the exit via NAT-PMP, relays inbound connections to
+/// `local_target` (a local TCP server the app runs), and renews the mapping in
+/// the background until the returned [`ForwardedPort`] is dropped.
+///
+/// The local TCP `listener` is bound before the mapping is requested, so an
+/// inbound connection arriving the instant the exit opens the port is accepted
+/// rather than refused. The initial mapping is awaited so the caller learns the
+/// allocated external port; renewal then tracks the granted lifetime.
+///
+/// # Errors
+///
+/// [`PortForwardError::Transport`] if the engine has stopped or a socket cannot
+/// be opened, [`PortForwardError::Gateway`] if the exit refuses the mapping, and
+/// the remaining [`PortForwardError`] variants from the initial [`map`] exchange.
+pub async fn forward_port(
+    connector: &TunnelConnector,
+    gateway: Ipv4Addr,
+    proto: MapProto,
+    internal_port: u16,
+    local_target: SocketAddr,
+) -> Result<ForwardedPort, PortForwardError> {
+    let listener = connector
+        .listen(internal_port)
+        .await
+        .map_err(PortForwardError::Transport)?;
+    let mut flow = connector
+        .open_udp()
+        .await
+        .map_err(PortForwardError::Transport)?;
+
+    let spec = MapSpec {
+        proto,
+        internal_port,
+        suggested_external_port: 0,
+        lifetime_secs: DEFAULT_MAP_LIFETIME_SECS,
+    };
+    // Map once synchronously: this surfaces a real gateway refusal to the caller
+    // and yields the allocated external port before the handle is returned.
+    let granted = map(&mut flow, gateway, spec).await?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let refresh = tokio::spawn(async move {
+        let mut wait = refresh_after(granted.lifetime_secs);
+        tokio::pin!(shutdown_rx);
+        loop {
+            tokio::select! {
+                // Prefer shutdown so a pending teardown is not skipped by a due renewal.
+                biased;
+                _ = &mut shutdown_rx => {
+                    let _ = delete(&mut flow, gateway, spec.proto, spec.internal_port).await;
+                    return;
+                }
+                () = tokio::time::sleep(wait) => {
+                    match map(&mut flow, gateway, spec).await {
+                        Ok(m) => wait = refresh_after(m.lifetime_secs),
+                        // The gateway went away or refused renewal: stop quietly
+                        // rather than spin; the lease lapses at the exit.
+                        Err(_) => return,
+                    }
+                }
+            }
+        }
+    });
+    let serve = tokio::spawn(serve_inbound(listener, local_target));
+
+    Ok(ForwardedPort {
+        external_port: granted.external_port,
+        internal_port,
+        proto,
+        shutdown: Some(shutdown_tx),
+        refresh,
+        serve,
+    })
+}
 
 /// Accepts inbound connections on `listener` (a tunnel-side forwarded port) and
 /// relays each to the local `target`, one task per connection up to a bounded

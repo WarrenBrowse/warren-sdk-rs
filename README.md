@@ -33,7 +33,7 @@ IPv6, and the port-forwarding primitives. Applications depend on a single crate,
 | QUIC transport (RFC 7250 raw-public-key TLS 1.3) + reconnect/backoff supervisor | `warren-transport` | done; validated against a real exit. The sealed multihop tunnel is the path real exits accept |
 | Multihop HPKE session (X25519 / HKDF-SHA256 / ChaCha20Poly1305, epoch/seq replay) | `warren-multihop` | done; live-validated |
 | Non-root proxy datapath: smoltcp userspace netstack over the tunnel, SOCKS5 + HTTP CONNECT, DNS-over-tunnel (A/AAAA, configurable resolver), UDP associate, dual-stack IPv6, port-forwarding (NAT-PMP client + inbound listen/relay) | `warren-net` | feature-complete, e2e in-process over single-hop and sealed multihop; per-OS privileged TUN backend pending |
-| High-level `WarrenClient` facade (`start_proxy` + `start_proxy_multihop`, discovery, account API) | `warren-sdk` | done, in-process e2e |
+| High-level `WarrenClient` facade (`start_proxy` + `start_proxy_multihop`, discovery, account API); `ProxyHandle` exposes connection state and one-call `forward_port` | `warren-sdk` | done, in-process e2e |
 | FFI surface (uniffi): identity + async client + proxy handle + connection-state events; Python/Kotlin bindings CI-validated | `warren-sdk-ffi` | done |
 
 The full tunnel needs a subscribed wallet (the exit gates the IP assignment on its
