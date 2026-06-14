@@ -53,7 +53,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("signed exit list verified against the pinned server key.");
 
     println!("fetching signed multihop directory ...");
-    let exits = client.fetch_multihop_directory().await?;
+    let exits = match client.fetch_multihop_directory().await {
+        Ok(exits) => exits,
+        Err(warren_sdk::SdkError::NoMultihopDirectory) => {
+            // The server can toggle multihop off (`/v1/multihop/directory` -> 404
+            // "multi-hop directory disabled"). Without the directory's x25519
+            // keys no sealed tunnel can be opened, so stop with a clear message
+            // rather than a cryptic error.
+            println!(
+                "multihop directory is disabled server-side: no sealed tunnel can be \
+                 opened until it is re-enabled. (The SDK handled the 404 correctly.)"
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
     println!(
         "multihop directory verified: {} trusted exits.",
         exits.len()
