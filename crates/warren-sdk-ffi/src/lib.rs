@@ -415,7 +415,11 @@ impl WarrenFfiClient {
         let socks5: SocketAddr = socks5_listen.parse().map_err(|_| FfiError::Client {
             message: "invalid socks5 listen address".to_owned(),
         })?;
-        let cfg = ProxyConfig { socks5, http: None };
+        let cfg = ProxyConfig {
+            socks5,
+            http: None,
+            dns_server: None,
+        };
 
         // Forward each supervisor transition to the foreign observer (if any),
         // ignoring states this binding does not yet model (non_exhaustive).

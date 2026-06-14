@@ -1,7 +1,7 @@
 //! Datapath selection: the non-root proxy mode (default) or the privileged TUN
 //! mode.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 /// How the SDK captures application traffic and feeds it to the tunnel.
 #[derive(Debug, Clone)]
@@ -29,6 +29,11 @@ pub struct ProxyConfig {
     pub socks5: SocketAddr,
     /// Optional local address for an HTTP CONNECT listener.
     pub http: Option<SocketAddr>,
+    /// DNS resolver to query over the tunnel. `None` uses the exit's gateway
+    /// forwarder (the common case). Set this for a `dns_disabled` exit to a
+    /// public resolver; the query still egresses through the tunnel, so it never
+    /// leaks to the host resolver.
+    pub dns_server: Option<Ipv4Addr>,
 }
 
 impl Default for ProxyConfig {
@@ -36,6 +41,7 @@ impl Default for ProxyConfig {
         Self {
             socks5: SocketAddr::from(([127, 0, 0, 1], 1080)),
             http: None,
+            dns_server: None,
         }
     }
 }

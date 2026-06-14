@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use warren_net::socks5::Target;
-use warren_net::{Connector, Socks5Proxy, spawn_engine};
+use warren_net::{Connector, NetstackConfig, Socks5Proxy, spawn_engine};
 
 const MTU: usize = 1500;
 
@@ -321,10 +321,12 @@ async fn netstack_udp_flow_sends_and_receives_through_the_tunnel() {
     let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
 
     let connector = spawn_engine(
-        "10.66.0.2".parse().unwrap(),
-        24,
-        "10.66.0.1".parse().unwrap(),
-        MTU,
+        NetstackConfig::new(
+            "10.66.0.2".parse().unwrap(),
+            24,
+            "10.66.0.1".parse().unwrap(),
+            MTU,
+        ),
         s2c_rx,
         c2s_tx,
     );
@@ -360,10 +362,12 @@ async fn netstack_resolves_a_domain_over_the_tunnel_then_connects() {
     let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
 
     let connector = spawn_engine(
-        "10.66.0.2".parse().unwrap(),
-        24,
-        "10.66.0.1".parse().unwrap(),
-        MTU,
+        NetstackConfig::new(
+            "10.66.0.2".parse().unwrap(),
+            24,
+            "10.66.0.1".parse().unwrap(),
+            MTU,
+        ),
         s2c_rx,
         c2s_tx,
     );
@@ -388,15 +392,56 @@ async fn netstack_resolves_a_domain_over_the_tunnel_then_connects() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn netstack_resolves_via_a_configured_non_gateway_resolver() {
+    // dns_disabled fallback: the exit runs no gateway forwarder, so the resolver
+    // is configured to a distinct in-tunnel address (10.66.0.9). The exit answers
+    // DNS only at .9 and deliberately does NOT own the gateway .1, so resolution
+    // succeeds ONLY if the engine queried the configured resolver rather than the
+    // gateway. Everything is on the /24, so no default route is exercised.
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+
+    let config = NetstackConfig::new(
+        "10.66.0.2".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        MTU,
+    )
+    .with_dns_server("10.66.0.9".parse().unwrap());
+    let connector = spawn_engine(config, s2c_rx, c2s_tx);
+
+    tokio::spawn(dns_and_echo_server(
+        "10.66.0.9".parse().unwrap(),
+        "10.66.0.5".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let mut stream = connector
+        .connect(Target::Domain("example.com".to_owned(), 9))
+        .await
+        .expect("domain resolves via the configured resolver and connects");
+    stream.write_all(b"viadns99").await.expect("write");
+    stream.flush().await.expect("flush");
+    let mut got = [0u8; 8];
+    stream.read_exact(&mut got).await.expect("read echo");
+    assert_eq!(&got, b"viadns99");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn netstack_tcp_connect_and_echo() {
     let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024); // client -> server
     let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024); // server -> client
 
     let connector = spawn_engine(
-        "10.66.0.2".parse().unwrap(),
-        24,
-        "10.66.0.1".parse().unwrap(),
-        MTU,
+        NetstackConfig::new(
+            "10.66.0.2".parse().unwrap(),
+            24,
+            "10.66.0.1".parse().unwrap(),
+            MTU,
+        ),
         s2c_rx,
         c2s_tx,
     );
@@ -431,10 +476,12 @@ async fn netstack_routes_out_of_subnet_target_via_default_route() {
     let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
 
     let connector = spawn_engine(
-        "10.66.0.2".parse().unwrap(),
-        16,
-        "10.66.0.1".parse().unwrap(),
-        MTU,
+        NetstackConfig::new(
+            "10.66.0.2".parse().unwrap(),
+            16,
+            "10.66.0.1".parse().unwrap(),
+            MTU,
+        ),
         s2c_rx,
         c2s_tx,
     );
@@ -466,10 +513,12 @@ async fn netstack_connect_to_unlistened_port_is_refused() {
     let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
     let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
     let connector = spawn_engine(
-        "10.66.0.2".parse().unwrap(),
-        24,
-        "10.66.0.1".parse().unwrap(),
-        MTU,
+        NetstackConfig::new(
+            "10.66.0.2".parse().unwrap(),
+            24,
+            "10.66.0.1".parse().unwrap(),
+            MTU,
+        ),
         s2c_rx,
         c2s_tx,
     );
@@ -502,10 +551,12 @@ async fn socks5_proxy_over_netstack_reaches_the_exit() {
     let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
 
     let connector = spawn_engine(
-        "10.66.0.2".parse().unwrap(),
-        24,
-        "10.66.0.1".parse().unwrap(),
-        MTU,
+        NetstackConfig::new(
+            "10.66.0.2".parse().unwrap(),
+            24,
+            "10.66.0.1".parse().unwrap(),
+            MTU,
+        ),
         s2c_rx,
         c2s_tx,
     );

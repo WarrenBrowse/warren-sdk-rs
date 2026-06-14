@@ -304,8 +304,8 @@ pub struct TunnelConnector {
 
 impl TunnelConnector {
     /// Resolves `host` to an IPv4 address by sending a DNS `A` query over the
-    /// tunnel to the gateway forwarder (never the host resolver, so the lookup
-    /// cannot leak outside the VPN).
+    /// tunnel to the configured resolver (the gateway forwarder by default,
+    /// never the host resolver, so the lookup cannot leak outside the VPN).
     async fn resolve(&self, host: &str) -> Result<Ipv4Addr, NetError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
@@ -370,21 +370,67 @@ impl Connector for TunnelConnector {
     }
 }
 
-/// Spawns the netstack engine over IP-frame channels and returns a connector.
+/// Addressing for the netstack engine: the client's tunnel IP, the routing
+/// gateway, the DNS resolver to query over the tunnel, and the inner MTU.
 ///
 /// `local_ip`/`prefix` is the tunnel-assigned client address (for example
 /// `10.66.0.2/16`) and `gateway` the exit-side tunnel gateway (for example
 /// `10.66.0.1`), installed as the default route so traffic to public targets is
 /// sent to the exit. `mtu` is the inner IP MTU and MUST fit one tunnel frame
 /// (derive it from `PacketSink::max_payload`, never the raw policy MTU).
-/// `inbound` delivers IP packets arriving from the tunnel; `outbound` receives
-/// IP packets the stack wants to send.
+///
+/// `dns_server` is the resolver queried for `A` lookups, reached over the
+/// tunnel. It defaults to `gateway` (the exit's DNS forwarder, the common case).
+/// For a `dns_disabled` exit that runs no forwarder, override it with
+/// [`with_dns_server`](Self::with_dns_server) to a public resolver: the query
+/// still egresses through the tunnel, so the lookup never leaks to the host
+/// resolver.
+///
+/// A plain value type with no generics, so it maps cleanly to the sibling SDKs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetstackConfig {
+    /// Tunnel-assigned client IPv4 address.
+    pub local_ip: Ipv4Addr,
+    /// IPv4 subnet prefix length for `local_ip`.
+    pub prefix: u8,
+    /// Exit-side tunnel gateway, installed as the default route.
+    pub gateway: Ipv4Addr,
+    /// Resolver queried for DNS `A` lookups over the tunnel.
+    pub dns_server: Ipv4Addr,
+    /// Inner IP MTU; MUST fit one tunnel frame.
+    pub mtu: usize,
+}
+
+impl NetstackConfig {
+    /// Builds a config with `dns_server` defaulted to the gateway forwarder.
+    #[must_use]
+    pub fn new(local_ip: Ipv4Addr, prefix: u8, gateway: Ipv4Addr, mtu: usize) -> Self {
+        Self {
+            local_ip,
+            prefix,
+            gateway,
+            dns_server: gateway,
+            mtu,
+        }
+    }
+
+    /// Overrides the DNS resolver (for `dns_disabled` exits). The resolver is
+    /// still reached over the tunnel, never via the host resolver.
+    #[must_use]
+    pub fn with_dns_server(mut self, dns_server: Ipv4Addr) -> Self {
+        self.dns_server = dns_server;
+        self
+    }
+}
+
+/// Spawns the netstack engine over IP-frame channels and returns a connector.
+///
+/// `config` carries the client addressing, routing gateway, DNS resolver and
+/// MTU (see [`NetstackConfig`]). `inbound` delivers IP packets arriving from the
+/// tunnel; `outbound` receives IP packets the stack wants to send.
 #[must_use]
 pub fn spawn_engine(
-    local_ip: std::net::Ipv4Addr,
-    prefix: u8,
-    gateway: std::net::Ipv4Addr,
-    mtu: usize,
+    config: NetstackConfig,
     inbound: mpsc::Receiver<Bytes>,
     outbound: mpsc::Sender<Bytes>,
 ) -> TunnelConnector {
@@ -395,7 +441,7 @@ pub fn spawn_engine(
         device: TunnelDevice {
             rx: VecDeque::new(),
             tx: outbound,
-            mtu,
+            mtu: config.mtu,
         },
         conns: HashMap::new(),
         resolvers: Vec::new(),
@@ -403,9 +449,10 @@ pub fn spawn_engine(
         next_conn_id: 0,
         next_port: EPHEMERAL_BASE,
         used_ports: HashSet::new(),
-        local_ip,
-        prefix,
-        gateway,
+        local_ip: config.local_ip,
+        prefix: config.prefix,
+        gateway: config.gateway,
+        dns_server: config.dns_server,
         cmd_rx,
         inbound,
         wake: Arc::clone(&wake),
@@ -429,6 +476,7 @@ struct Engine {
     local_ip: std::net::Ipv4Addr,
     prefix: u8,
     gateway: std::net::Ipv4Addr,
+    dns_server: std::net::Ipv4Addr,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     inbound: mpsc::Receiver<Bytes>,
     wake: Arc<Notify>,
@@ -578,7 +626,7 @@ impl Engine {
     }
 
     /// Starts a DNS `A` resolution: bind a UDP socket, send the query to the
-    /// gateway forwarder, and track it until a reply or the deadline.
+    /// configured resolver, and track it until a reply or the deadline.
     fn start_resolve(
         &mut self,
         sockets: &mut SocketSet<'_>,
@@ -599,7 +647,7 @@ impl Engine {
         let handle = sockets.add(udp::Socket::new(rx, tx));
         let local_port = self.alloc_port();
         let sock = sockets.get_mut::<udp::Socket<'_>>(handle);
-        let dst = IpEndpoint::new(IpAddress::from(self.gateway), DNS_PORT);
+        let dst = IpEndpoint::new(IpAddress::from(self.dns_server), DNS_PORT);
         if sock.bind(local_port).is_err() || sock.send_slice(&query, dst).is_err() {
             sockets.remove(handle);
             self.used_ports.remove(&local_port);
@@ -835,13 +883,7 @@ impl Engine {
 ///
 /// [`PacketSink`]: crate::PacketSink
 #[must_use]
-pub fn spawn_over_sink<S>(
-    sink: Arc<S>,
-    local_ip: std::net::Ipv4Addr,
-    prefix: u8,
-    gateway: std::net::Ipv4Addr,
-    mtu: usize,
-) -> TunnelConnector
+pub fn spawn_over_sink<S>(sink: Arc<S>, config: NetstackConfig) -> TunnelConnector
 where
     S: crate::PacketSink + 'static,
 {
@@ -864,7 +906,7 @@ where
         }
     });
 
-    spawn_engine(local_ip, prefix, gateway, mtu, inbound_rx, outbound_tx)
+    spawn_engine(config, inbound_rx, outbound_tx)
 }
 
 impl crate::proxy::UdpFlow for NetstackUdpSocket {
@@ -909,4 +951,33 @@ fn from_smol_endpoint(ep: IpEndpoint) -> Option<SocketAddr> {
         IpAddress::Ipv6(a) => std::net::IpAddr::V6(a),
     };
     Some(SocketAddr::new(ip, ep.port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_defaults_dns_to_the_gateway() {
+        // The default resolver MUST be the gateway forwarder: that is what keeps
+        // lookups inside the tunnel by default. A regression to any other default
+        // would be a DNS-leak vector, so pin it explicitly.
+        let gw: Ipv4Addr = "10.66.0.1".parse().unwrap();
+        let config = NetstackConfig::new("10.66.0.2".parse().unwrap(), 16, gw, 1280);
+        assert_eq!(config.dns_server, gw);
+    }
+
+    #[test]
+    fn with_dns_server_overrides_only_the_resolver() {
+        let gw: Ipv4Addr = "10.66.0.1".parse().unwrap();
+        let resolver: Ipv4Addr = "9.9.9.9".parse().unwrap();
+        let base = NetstackConfig::new("10.66.0.2".parse().unwrap(), 16, gw, 1280);
+        let overridden = base.with_dns_server(resolver);
+        assert_eq!(overridden.dns_server, resolver);
+        // Every other field is untouched by the override.
+        assert_eq!(overridden.local_ip, base.local_ip);
+        assert_eq!(overridden.prefix, base.prefix);
+        assert_eq!(overridden.gateway, base.gateway);
+        assert_eq!(overridden.mtu, base.mtu);
+    }
 }

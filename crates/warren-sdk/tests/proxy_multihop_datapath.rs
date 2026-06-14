@@ -43,6 +43,7 @@ async fn start_proxy_multihop_routes_socks5_through_a_sealed_tunnel() {
     let cfg = ProxyConfig {
         socks5: "127.0.0.1:0".parse().unwrap(),
         http: None,
+        ..ProxyConfig::default()
     };
     let handle = client
         .start_proxy_multihop(&exit, &cfg)

@@ -39,6 +39,7 @@ async fn start_proxy_routes_socks5_through_the_tunnel() {
     let cfg = ProxyConfig {
         socks5: "127.0.0.1:0".parse().unwrap(),
         http: None,
+        ..ProxyConfig::default()
     };
     let handle = client.start_proxy(&exit, &cfg).await.expect("proxy starts");
 

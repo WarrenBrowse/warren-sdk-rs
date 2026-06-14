@@ -71,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = ProxyConfig {
         socks5: "127.0.0.1:0".parse()?,
         http: None,
+        ..ProxyConfig::default()
     };
     let handle = client.start_proxy_multihop(&exit, &cfg).await?;
     println!("SOCKS5 proxy up on {}", handle.local_addr());

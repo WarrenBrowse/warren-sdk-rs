@@ -548,7 +548,13 @@ where
     // size, NOT the raw policy MTU (which can exceed the datagram capacity and
     // make every full-size packet silently fail to send).
     let mtu = warren_net::PacketSink::max_payload(&sink);
-    let connector = warren_net::spawn_over_sink(Arc::new(sink), local_ip, prefix, gateway, mtu);
+    let mut config = warren_net::NetstackConfig::new(local_ip, prefix, gateway, mtu);
+    // dns_disabled exits run no gateway forwarder; honor the operator's override
+    // so lookups still egress through the tunnel rather than the host resolver.
+    if let Some(dns) = cfg.dns_server {
+        config = config.with_dns_server(dns);
+    }
+    let connector = warren_net::spawn_over_sink(Arc::new(sink), config);
 
     let socks_listener = tokio::net::TcpListener::bind(cfg.socks5)
         .await
