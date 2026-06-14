@@ -42,6 +42,8 @@ ed25519-dalek = { workspace = true }
 warren-test-support = { path = "../warren-test-support" }
 # Golden-byte assertions for the DNS codec tests.
 hex = { workspace = true }
+# Bytes for the UDP-flow connector used in the UDP-associate proxy test.
+bytes = { workspace = true }
 # A second smoltcp stack stands in for the exit's TCP termination in the
 # netstack loopback test.
 smoltcp = { version = "0.12", default-features = false, features = [

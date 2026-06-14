@@ -47,5 +47,5 @@ pub use netstack::{
     NetstackStream, NetstackUdpSocket, TunnelConnector, spawn_engine, spawn_over_sink,
 };
 #[cfg(feature = "proxy")]
-pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy};
+pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy, UdpConnector, UdpFlow};
 pub use sink::{MultihopPacketSink, PacketSink, QuicPacketSink};

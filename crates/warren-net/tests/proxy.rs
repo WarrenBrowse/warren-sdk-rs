@@ -3,9 +3,15 @@
 //! and bytes round-trip. No tunnel is involved; the connector seam stands in for
 //! it, which is exactly what makes the accept/handshake/relay loop testable.
 
+use std::net::SocketAddr;
+
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use warren_net::{DirectConnector, HttpConnectProxy, Socks5Proxy};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use warren_net::socks5::Target;
+use warren_net::{
+    Connector, DirectConnector, HttpConnectProxy, NetError, Socks5Proxy, UdpConnector, UdpFlow,
+};
 
 /// Accepts one connection and echoes everything until EOF.
 async fn spawn_echo() -> std::net::SocketAddr {
@@ -125,6 +131,124 @@ async fn http_connect_relays_bytes_to_upstream() {
     let mut got = [0u8; 11];
     client.read_exact(&mut got).await.unwrap();
     assert_eq!(&got, b"warren-http");
+}
+
+/// A UDP flow backed by a real local UDP socket, standing in for the netstack
+/// flow so the relay loop is testable without a tunnel.
+struct LocalUdpFlow {
+    sock: UdpSocket,
+    buf: Vec<u8>,
+}
+
+impl UdpFlow for LocalUdpFlow {
+    async fn send_to(&self, data: Bytes, dst: SocketAddr) -> Result<(), NetError> {
+        self.sock
+            .send_to(&data, dst)
+            .await
+            .map(|_| ())
+            .map_err(NetError::Io)
+    }
+
+    async fn recv_from(&mut self) -> Option<(Bytes, SocketAddr)> {
+        let (n, src) = self.sock.recv_from(&mut self.buf).await.ok()?;
+        Some((Bytes::copy_from_slice(&self.buf[..n]), src))
+    }
+}
+
+/// A connector whose UDP flows use the local OS UDP stack (test seam). Its TCP
+/// `connect` is unused here.
+#[derive(Clone, Copy)]
+struct LocalUdpConnector;
+
+impl Connector for LocalUdpConnector {
+    type Stream = TcpStream;
+    async fn connect(&self, _target: Target) -> Result<Self::Stream, NetError> {
+        Err(NetError::Unsupported("tcp not used in the udp test"))
+    }
+}
+
+impl UdpConnector for LocalUdpConnector {
+    type Flow = LocalUdpFlow;
+    async fn open_udp(&self) -> Result<Self::Flow, NetError> {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.map_err(NetError::Io)?;
+        Ok(LocalUdpFlow {
+            sock,
+            buf: vec![0u8; 64 * 1024],
+        })
+    }
+    async fn resolve_host(&self, _host: &str) -> Result<std::net::IpAddr, NetError> {
+        Err(NetError::Unsupported("no name resolution in the udp test"))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn socks5_udp_associate_relays_datagrams() {
+    // A UDP echo server stands in for the target.
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let Ok((n, src)) = echo.recv_from(&mut buf).await else {
+                break;
+            };
+            let _ = echo.send_to(&buf[..n], src).await;
+        }
+    });
+
+    // The SOCKS5 proxy with UDP support.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let proxy = Socks5Proxy::new(LocalUdpConnector);
+        let _ = proxy.serve_with_udp(listener).await;
+    });
+
+    // Control connection: greeting then UDP ASSOCIATE.
+    let mut ctrl = TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    ctrl.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut method = [0u8; 2];
+    ctrl.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [0x05, 0x00]);
+    // UDP ASSOCIATE (0x03) with a 0.0.0.0:0 placeholder client address.
+    ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut reply = [0u8; 10]; // VER REP RSV ATYP=1 IP(4) PORT(2)
+    ctrl.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0x00, "UDP ASSOCIATE succeeded");
+    let relay_port = u16::from_be_bytes([reply[8], reply[9]]);
+    let relay_addr: SocketAddr = (
+        std::net::Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]),
+        relay_port,
+    )
+        .into();
+
+    // The client's UDP socket sends a wrapped datagram targeting the echo.
+    let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(echo_v4) = echo_addr else {
+        panic!("v4")
+    };
+    let mut dgram = vec![0x00, 0x00, 0x00, 0x01];
+    dgram.extend_from_slice(&echo_v4.ip().octets());
+    dgram.extend_from_slice(&echo_v4.port().to_be_bytes());
+    dgram.extend_from_slice(b"ping");
+    client_udp.send_to(&dgram, relay_addr).await.unwrap();
+
+    // The echoed datagram comes back wrapped with the SOCKS5 UDP header.
+    let mut buf = [0u8; 2048];
+    let (n, _from) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client_udp.recv_from(&mut buf),
+    )
+    .await
+    .expect("a reply arrived")
+    .unwrap();
+    // header is RSV(2) FRAG(1) ATYP(1) IPv4(4) PORT(2) = 10 bytes, then payload.
+    assert!(n >= 10, "header present");
+    assert_eq!(&buf[10..n], b"ping", "the echo payload round-trips");
+    // Keep the control connection alive until here so the association persists.
+    drop(ctrl);
 }
 
 #[tokio::test(flavor = "multi_thread")]

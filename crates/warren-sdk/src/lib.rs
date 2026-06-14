@@ -555,8 +555,10 @@ where
         .map_err(SdkError::Proxy)?;
     let local_addr = socks_listener.local_addr().map_err(SdkError::Proxy)?;
     let socks = warren_net::Socks5Proxy::new(connector.clone());
+    // serve_with_udp also handles UDP ASSOCIATE (datagrams egress at the exit
+    // via the netstack UDP flow); CONNECT behaves identically to serve.
     let mut tasks = vec![tokio::spawn(async move {
-        let _ = socks.serve(socks_listener).await;
+        let _ = socks.serve_with_udp(socks_listener).await;
     })];
 
     let mut http_addr = None;

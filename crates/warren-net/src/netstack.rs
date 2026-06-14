@@ -859,6 +859,28 @@ where
     spawn_engine(local_ip, prefix, gateway, mtu, inbound_rx, outbound_tx)
 }
 
+impl crate::proxy::UdpFlow for NetstackUdpSocket {
+    async fn send_to(&self, data: Bytes, dst: SocketAddr) -> Result<(), NetError> {
+        NetstackUdpSocket::send_to(self, data, dst).await
+    }
+
+    async fn recv_from(&mut self) -> Option<(Bytes, SocketAddr)> {
+        NetstackUdpSocket::recv_from(self).await
+    }
+}
+
+impl crate::proxy::UdpConnector for TunnelConnector {
+    type Flow = NetstackUdpSocket;
+
+    async fn open_udp(&self) -> Result<NetstackUdpSocket, NetError> {
+        TunnelConnector::open_udp(self).await
+    }
+
+    async fn resolve_host(&self, host: &str) -> Result<std::net::IpAddr, NetError> {
+        self.resolve(host).await.map(std::net::IpAddr::V4)
+    }
+}
+
 /// Converts a std IP address to smoltcp's wire type.
 fn to_smol_ip(ip: std::net::IpAddr) -> IpAddress {
     match ip {

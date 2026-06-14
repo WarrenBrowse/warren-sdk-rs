@@ -7,15 +7,17 @@
 //! the connector abstract is what lets the whole accept/handshake/relay loop be
 //! tested in-process without a tunnel.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::NetError;
 use crate::socks5::{
     Command, METHOD_NO_AUTH, METHOD_NONE, Reply, Socks5Error, Target, VERSION, build_method_reply,
-    build_reply, parse_greeting, parse_request,
+    build_reply, encode_udp_datagram, parse_greeting, parse_request, parse_udp_datagram,
 };
 
 /// The unspecified bound address echoed in a successful SOCKS5 reply. A CONNECT
@@ -37,6 +39,38 @@ pub trait Connector: Send + Sync + 'static {
         &self,
         target: Target,
     ) -> impl std::future::Future<Output = Result<Self::Stream, NetError>> + Send;
+}
+
+/// A UDP datagram flow to the outside world, backing SOCKS5 UDP associate. The
+/// tunnel netstack implements it so datagrams egress at the exit.
+pub trait UdpFlow: Send + 'static {
+    /// Sends `data` to `dst` through the flow (lossy, like UDP).
+    fn send_to(
+        &self,
+        data: Bytes,
+        dst: SocketAddr,
+    ) -> impl std::future::Future<Output = Result<(), NetError>> + Send;
+
+    /// Receives the next datagram and its source, or `None` when the flow ends.
+    fn recv_from(
+        &mut self,
+    ) -> impl std::future::Future<Output = Option<(Bytes, SocketAddr)>> + Send;
+}
+
+/// A [`Connector`] that can also open UDP flows and resolve names over the same
+/// path, so a UDP target given as a name is resolved at the exit (no DNS leak).
+pub trait UdpConnector: Connector {
+    /// The UDP flow type opened by [`open_udp`](Self::open_udp).
+    type Flow: UdpFlow;
+
+    /// Opens a UDP flow (an ephemeral egress port) for a UDP association.
+    fn open_udp(&self) -> impl std::future::Future<Output = Result<Self::Flow, NetError>> + Send;
+
+    /// Resolves `host` to an address through the same path as the data plane.
+    fn resolve_host(
+        &self,
+        host: &str,
+    ) -> impl std::future::Future<Output = Result<IpAddr, NetError>> + Send;
 }
 
 /// A [`Connector`] that dials the target with the local OS TCP stack.
@@ -116,6 +150,129 @@ async fn handle_connection<C: Connector>(
         .await
         .map_err(NetError::Io)?;
     Ok(())
+}
+
+impl<C: UdpConnector> Socks5Proxy<C> {
+    /// Like [`serve`](Self::serve) but also handles `UDP ASSOCIATE`: it binds a
+    /// local UDP relay, opens a UDP flow through the connector, and relays
+    /// datagrams both ways for the lifetime of the control connection. `CONNECT`
+    /// is handled exactly as in [`serve`](Self::serve).
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Io`] only if accepting on the listener fails.
+    pub async fn serve_with_udp(&self, listener: TcpListener) -> Result<(), NetError> {
+        loop {
+            let (client, _peer) = listener.accept().await.map_err(NetError::Io)?;
+            let connector = Arc::clone(&self.connector);
+            tokio::spawn(async move {
+                let _ = handle_with_udp(client, connector.as_ref()).await;
+            });
+        }
+    }
+}
+
+/// SOCKS5 handler that supports `CONNECT` and `UDP ASSOCIATE`.
+async fn handle_with_udp<C: UdpConnector>(
+    mut client: TcpStream,
+    connector: &C,
+) -> Result<(), NetError> {
+    negotiate_method(&mut client).await?;
+    let (command, target) = read_request(&mut client).await?;
+    match command {
+        Command::Connect => {
+            let mut upstream = match connector.connect(target).await {
+                Ok(s) => s,
+                Err(e) => {
+                    write_reply(&mut client, Reply::GeneralFailure).await?;
+                    return Err(e);
+                }
+            };
+            write_reply(&mut client, Reply::Succeeded).await?;
+            tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                .await
+                .map_err(NetError::Io)?;
+            Ok(())
+        }
+        Command::UdpAssociate => udp_associate(client, connector).await,
+        Command::Bind => {
+            write_reply(&mut client, Reply::CommandNotSupported).await?;
+            Ok(())
+        }
+    }
+}
+
+/// Largest UDP datagram (header + payload) the relay buffers.
+const MAX_UDP_DATAGRAM: usize = 64 * 1024;
+
+/// Runs one UDP association: bind a loopback relay socket, reply with its
+/// address, then relay datagrams between the client and the tunnel flow until
+/// the TCP control connection closes (which ends the association, per RFC 1928).
+async fn udp_associate<C: UdpConnector>(
+    mut client: TcpStream,
+    connector: &C,
+) -> Result<(), NetError> {
+    // The client sends its datagrams to this loopback relay socket; the BND
+    // address in the reply tells it where.
+    let relay = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .map_err(NetError::Io)?;
+    let relay_addr = relay.local_addr().map_err(NetError::Io)?;
+    client
+        .write_all(&build_reply(Reply::Succeeded, relay_addr))
+        .await
+        .map_err(NetError::Io)?;
+
+    let mut flow = connector.open_udp().await?;
+
+    // A single task owns the flow (recv needs `&mut`, send needs `&`), so no
+    // shared state: `client_src` is the address of the most recent client
+    // datagram, where replies are sent back.
+    let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
+    let mut ctrl = [0u8; 256];
+    let mut client_src: Option<SocketAddr> = None;
+    loop {
+        tokio::select! {
+            // Client -> tunnel: strip the SOCKS5 UDP header, resolve a name over
+            // the tunnel if needed, forward the payload.
+            r = relay.recv_from(&mut buf) => {
+                let (n, src) = r.map_err(NetError::Io)?;
+                client_src = Some(src);
+                if let Ok((target, payload)) = parse_udp_datagram(&buf[..n]) {
+                    let dst = match target {
+                        Target::Ip(addr) => Some(addr),
+                        Target::Domain(host, port) => connector
+                            .resolve_host(&host)
+                            .await
+                            .ok()
+                            .map(|ip| SocketAddr::new(ip, port)),
+                    };
+                    if let Some(dst) = dst {
+                        let _ = flow.send_to(Bytes::copy_from_slice(payload), dst).await;
+                    }
+                }
+            }
+            // Tunnel -> client: re-wrap with the SOCKS5 UDP header and deliver to
+            // the last-seen client source.
+            res = flow.recv_from() => {
+                match res {
+                    Some((data, src)) => {
+                        if let Some(dst) = client_src {
+                            let _ = relay.send_to(&encode_udp_datagram(src, &data), dst).await;
+                        }
+                    }
+                    None => return Ok(()), // flow/engine ended
+                }
+            }
+            // The TCP control connection closing tears down the association.
+            r = client.read(&mut ctrl) => {
+                match r {
+                    Ok(0) | Err(_) => return Ok(()),
+                    Ok(_) => {} // clients normally send nothing here; ignore
+                }
+            }
+        }
+    }
 }
 
 /// Reads the greeting and replies with the selected method.
