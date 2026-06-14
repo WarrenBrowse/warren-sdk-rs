@@ -71,6 +71,11 @@ pub trait UdpConnector: Connector {
         &self,
         host: &str,
     ) -> impl std::future::Future<Output = Result<IpAddr, NetError>> + Send;
+
+    /// Whether IPv6 targets are routable (the engine has a v6 assignment). UDP
+    /// associate refuses v6 datagrams when this is false, rather than sending
+    /// them into a v6 black hole.
+    fn supports_ipv6(&self) -> bool;
 }
 
 /// A [`Connector`] that dials the target with the local OS TCP stack.
@@ -251,9 +256,11 @@ async fn udp_associate<C: UdpConnector>(
                 if let Ok((target, payload)) = parse_udp_datagram(&buf[..n]) {
                     let dst = match target {
                         Target::Ip(addr @ SocketAddr::V4(_)) => Some(addr),
-                        // No IPv6 default route in the netstack yet; drop rather
-                        // than black-hole, matching the TCP path's v6 rejection.
-                        Target::Ip(SocketAddr::V6(_)) => None,
+                        // Route v6 only when the engine has a v6 assignment;
+                        // otherwise drop rather than black-hole it.
+                        Target::Ip(addr @ SocketAddr::V6(_)) => {
+                            connector.supports_ipv6().then_some(addr)
+                        }
                         Target::Domain(host, port) => connector
                             .resolve_host(&host)
                             .await

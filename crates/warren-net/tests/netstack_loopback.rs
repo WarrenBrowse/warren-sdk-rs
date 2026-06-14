@@ -586,6 +586,108 @@ async fn udp_echo_server(
     }
 }
 
+/// An IPv6 UDP echo "exit": owns `ip/prefix`, binds UDP `port`, echoes.
+async fn udp_echo_server_v6(
+    ip: std::net::Ipv6Addr,
+    prefix: u8,
+    port: u16,
+    mut inbound: mpsc::Receiver<Bytes>,
+    outbound: mpsc::Sender<Bytes>,
+) {
+    let mut device = ChanDevice {
+        rx: VecDeque::new(),
+        tx: outbound,
+    };
+    let base = tokio::time::Instant::now();
+    let now =
+        || SmolInstant::from_micros(i64::try_from(base.elapsed().as_micros()).unwrap_or(i64::MAX));
+
+    let mut config = Config::new(HardwareAddress::Ip);
+    config.random_seed = 0x5345_5256_0008;
+    let mut iface = Interface::new(config, &mut device, now());
+    iface.update_ip_addrs(|a| {
+        let _ = a.push(IpCidr::new(IpAddress::from(ip), prefix));
+    });
+
+    let mut sockets = SocketSet::new(Vec::new());
+    let udp_handle = sockets.add(udp::Socket::new(
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 8192]),
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 8192]),
+    ));
+    sockets
+        .get_mut::<udp::Socket<'_>>(udp_handle)
+        .bind(port)
+        .expect("bind udp");
+
+    loop {
+        while let Ok(f) = inbound.try_recv() {
+            device.rx.push_back(f);
+        }
+        let _ = iface.poll(now(), &mut device, &mut sockets);
+
+        let echo = {
+            let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
+            match sock.recv() {
+                Ok((data, meta)) => Some((data.to_vec(), meta.endpoint)),
+                Err(_) => None,
+            }
+        };
+        if let Some((data, endpoint)) = echo {
+            let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
+            let _ = sock.send_slice(&data, endpoint);
+        }
+
+        let delay = iface
+            .poll_delay(now(), &sockets)
+            .map(|d| std::time::Duration::from_micros(d.total_micros()))
+            .unwrap_or_else(|| std::time::Duration::from_millis(5));
+        tokio::select! {
+            f = inbound.recv() => match f {
+                Some(f) => device.rx.push_back(f),
+                None => return,
+            },
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn netstack_udp_flow_reaches_an_ipv6_target() {
+    // A dual-stack engine opens a UDP flow and exchanges a datagram with a v6 UDP
+    // echo exit ([fd66::1]:7) over the tunnel: proves v6 UDP egress through the
+    // netstack (the SOCKS5 UDP-associate egress for v6 targets).
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+
+    let config = NetstackConfig::new(
+        "10.66.0.2".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        MTU,
+    )
+    .with_ipv6("fd66::2".parse().unwrap(), 64, "fd66::1".parse().unwrap());
+    let connector = spawn_engine(config, s2c_rx, c2s_tx);
+    tokio::spawn(udp_echo_server_v6(
+        "fd66::1".parse().unwrap(),
+        64,
+        7,
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let target: std::net::SocketAddr = "[fd66::1]:7".parse().unwrap();
+    let mut udp = connector.open_udp().await.expect("open udp flow");
+    udp.send_to(Bytes::from_static(b"ping6"), target)
+        .await
+        .expect("send");
+    let (data, src) = tokio::time::timeout(std::time::Duration::from_secs(2), udp.recv_from())
+        .await
+        .expect("recv did not time out")
+        .expect("a datagram arrived");
+    assert_eq!(&data[..], b"ping6", "the exit echoed the v6 datagram");
+    assert_eq!(src, target, "the source is the v6 echo server");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn netstack_udp_flow_sends_and_receives_through_the_tunnel() {
     // A UDP flow: the engine binds a netstack UDP socket, sends a datagram to

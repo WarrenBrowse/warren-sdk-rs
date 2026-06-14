@@ -994,9 +994,14 @@ impl crate::proxy::UdpConnector for TunnelConnector {
     }
 
     async fn resolve_host(&self, host: &str) -> Result<std::net::IpAddr, NetError> {
-        // UDP-associate targets resolve A-only for now (v6 UDP egress is a
-        // follow-up); the lookup still egresses over the tunnel.
+        // UDP-associate domain targets resolve A-only for now; literal v6 UDP
+        // targets are routed (see `supports_ipv6`). The lookup egresses over the
+        // tunnel either way.
         self.resolve(host, dns::RecordType::A).await
+    }
+
+    fn supports_ipv6(&self) -> bool {
+        self.has_ipv6
     }
 }
 

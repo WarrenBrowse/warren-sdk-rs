@@ -179,6 +179,10 @@ impl UdpConnector for LocalUdpConnector {
     async fn resolve_host(&self, _host: &str) -> Result<std::net::IpAddr, NetError> {
         Err(NetError::Unsupported("no name resolution in the udp test"))
     }
+
+    fn supports_ipv6(&self) -> bool {
+        false
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
