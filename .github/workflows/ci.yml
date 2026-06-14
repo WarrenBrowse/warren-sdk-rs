@@ -107,6 +107,8 @@ jobs:
           grep -q "async def subscription_expiry" target/bindings/warren_sdk_ffi.py
           grep -q "async def fetch_multihop_exits" target/bindings/warren_sdk_ffi.py
           grep -q "class FfiExit" target/bindings/warren_sdk_ffi.py
+          grep -q "class WarrenFfiProxy" target/bindings/warren_sdk_ffi.py
+          grep -q "async def start_proxy" target/bindings/warren_sdk_ffi.py
 
   deny:
     name: cargo-deny

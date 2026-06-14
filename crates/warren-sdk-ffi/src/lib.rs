@@ -22,11 +22,13 @@
 // admits only the generated boundary code.
 #![allow(unsafe_code)]
 
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use warren_sdk::api::ClientError;
 use warren_sdk::identity::{WarrenIdentity, ss58};
-use warren_sdk::{DefaultClient, SdkError, WarrenClient};
+use warren_sdk::net::ProxyConfig;
+use warren_sdk::{DefaultClient, ProxyHandle, SdkError, WarrenClient};
 
 uniffi::setup_scaffolding!();
 
@@ -294,6 +296,96 @@ impl WarrenFfiClient {
             })
             .collect())
     }
+
+    /// Starts the non-root SOCKS5 proxy over a multihop tunnel to the exit with
+    /// the given `exit_id_hex` (from [`fetch_multihop_exits`](Self::fetch_multihop_exits)),
+    /// binding the listener at `socks5_listen` (e.g. `127.0.0.1:0` for an
+    /// ephemeral port). The returned handle's
+    /// [`socks5_address`](WarrenFfiProxy::socks5_address) is the bound listener;
+    /// drop it or call [`shutdown`](WarrenFfiProxy::shutdown) to tear it down.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InvalidHex`] for a malformed `exit_id_hex`; [`FfiError::Client`]
+    /// for a bad listen address, an exit id absent from the verified directory,
+    /// or a connect/datapath failure; [`FfiError::ServerStatus`] on a non-2xx
+    /// API reply.
+    pub async fn start_proxy(
+        &self,
+        exit_id_hex: String,
+        socks5_listen: String,
+    ) -> Result<Arc<WarrenFfiProxy>, FfiError> {
+        // Validate both arguments before any network so caller mistakes fail
+        // fast and cheaply.
+        let want = hex16(&exit_id_hex)?;
+        let socks5: SocketAddr = socks5_listen.parse().map_err(|_| FfiError::Client {
+            message: "invalid socks5 listen address".to_owned(),
+        })?;
+        let exit = self
+            .inner
+            .fetch_multihop_directory()
+            .await
+            .map_err(map_sdk_error)?
+            .into_iter()
+            .find(|e| e.exit_id == want)
+            .ok_or_else(|| FfiError::Client {
+                message: "exit id not found in the verified directory".to_owned(),
+            })?;
+        let cfg = ProxyConfig { socks5, http: None };
+        let handle = self
+            .inner
+            .start_proxy_multihop(&exit, &cfg)
+            .await
+            .map_err(map_sdk_error)?;
+        let socks5_address = handle.local_addr().to_string();
+        let http_address = handle.http_addr().map(|a| a.to_string());
+        Ok(Arc::new(WarrenFfiProxy {
+            socks5_address,
+            http_address,
+            handle: Mutex::new(Some(handle)),
+        }))
+    }
+}
+
+/// A running non-root SOCKS5 proxy over a multihop tunnel.
+///
+/// Point a SOCKS5-aware app at [`socks5_address`](Self::socks5_address). Dropping
+/// this handle (or calling [`shutdown`](Self::shutdown)) tears down the listeners
+/// and the tunnel.
+#[derive(uniffi::Object)]
+pub struct WarrenFfiProxy {
+    socks5_address: String,
+    http_address: Option<String>,
+    // Taken out and consumed by `shutdown`; otherwise dropped with the object,
+    // whose `ProxyHandle::drop` aborts the listener tasks.
+    handle: Mutex<Option<ProxyHandle>>,
+}
+
+#[uniffi::export]
+impl WarrenFfiProxy {
+    /// The bound SOCKS5 listener address (`ip:port`), with the real port when the
+    /// caller requested `:0`.
+    #[must_use]
+    pub fn socks5_address(&self) -> String {
+        self.socks5_address.clone()
+    }
+
+    /// The bound HTTP CONNECT listener address, if one was configured.
+    #[must_use]
+    pub fn http_address(&self) -> Option<String> {
+        self.http_address.clone()
+    }
+
+    /// Tears down the proxy and its tunnel. Idempotent: a second call is a no-op.
+    pub fn shutdown(&self) {
+        // A poisoned lock means a prior holder panicked; the handle is still
+        // safe to take and drop, so recover rather than propagate.
+        if let Ok(mut guard) = self.handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            handle.shutdown();
+        }
+    }
 }
 
 /// Maps a [`ClientError`] to the FFI error, keeping the no-log discipline: the
@@ -478,6 +570,55 @@ mod tests {
         )
         .expect("valid build");
         let r = client.fetch_multihop_exits().await;
+        assert!(matches!(
+            r,
+            Err(FfiError::Client { .. }) | Err(FfiError::ServerStatus { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn start_proxy_rejects_bad_exit_id_hex_before_any_network() {
+        let id = generate_identity();
+        // api_base is bogus but never contacted: hex parsing fails first.
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        let r = client
+            .start_proxy("not-hex".to_owned(), "127.0.0.1:0".to_owned())
+            .await;
+        assert!(matches!(r, Err(FfiError::InvalidHex(_))));
+    }
+
+    #[tokio::test]
+    async fn start_proxy_rejects_bad_listen_address_before_any_network() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        let r = client
+            .start_proxy("ab".repeat(16), "definitely not an address".to_owned())
+            .await;
+        assert!(matches!(r, Err(FfiError::Client { .. })));
+    }
+
+    #[tokio::test]
+    async fn start_proxy_surfaces_a_client_error_on_unroutable_host() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://127.0.0.1:1".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        let r = client
+            .start_proxy("ab".repeat(16), "127.0.0.1:0".to_owned())
+            .await;
         assert!(matches!(
             r,
             Err(FfiError::Client { .. }) | Err(FfiError::ServerStatus { .. })

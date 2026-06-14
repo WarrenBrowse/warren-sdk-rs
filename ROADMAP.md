@@ -93,8 +93,14 @@ pinned by golden vectors where a wire format is involved. warren-core
   the class with `async def`s, proving the async bridge end to end; each error
   path is unit-tested against an unroutable host. `ClientError`/`SdkError` map to
   `FfiError::{ServerStatus, Client}` with the server-status body dropped (no-log).
-- Remaining: the tunnel/proxy lifecycle handle (an Object with a SOCKS5 local
-  address + graceful shutdown) and an event stream (uniffi callback interface),
+- Proxy lifecycle done: `WarrenFfiClient::start_proxy(exit_id_hex, socks5_listen)`
+  starts the non-root SOCKS5 proxy over a multihop tunnel and returns a
+  `WarrenFfiProxy` Object (`socks5_address()`, `http_address()`, idempotent
+  `shutdown()`; dropping it tears the tunnel down via `ProxyHandle::drop`). Both
+  argument-validation error paths fail fast before any network and are unit-tested;
+  the happy path is covered by the facade e2e tests (it needs a real exit, not
+  injectable through the concrete reqwest transport at the FFI layer).
+- Remaining: an event stream (uniffi callback interface for Up/Down/Reconnect),
   then the first Dart/Flutter integration and the other languages. Every binding
   replays the same `vectors/`.
 
