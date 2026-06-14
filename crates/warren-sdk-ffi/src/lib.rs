@@ -27,7 +27,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use warren_sdk::api::{ClientError, RegisterAccountRequest};
+use warren_sdk::api::{ClientError, RegisterAccountRequest, SupportReportRequest};
 use warren_sdk::identity::{WarrenIdentity, ss58};
 use warren_sdk::net::ProxyConfig;
 use warren_sdk::transport::{Backoff, ConnectionState, RetryError, connect_with_state};
@@ -306,6 +306,50 @@ impl WarrenFfiClient {
             .await
             .map_err(map_client_error)?;
         Ok(resp.expires_at)
+    }
+
+    /// Deletes the subscription bound to this client's wallet (signed
+    /// `DELETE /v1/account`).
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::ServerStatus`] on a non-2xx reply, [`FfiError::Client`] on a
+    /// transport or other client-side failure.
+    pub async fn delete_account(&self) -> Result<(), FfiError> {
+        self.inner
+            .api()
+            .delete_account()
+            .await
+            .map_err(map_client_error)
+    }
+
+    /// Submits a redacted log bundle and a free-form message to the operator
+    /// (signed `POST /v1/support`). Returns the support reference id.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::ServerStatus`] on a non-2xx reply (e.g. payload too large),
+    /// [`FfiError::Client`] on a transport or other client-side failure.
+    pub async fn submit_support(
+        &self,
+        user_message: String,
+        redacted_logs: String,
+        app_version: String,
+        platform: String,
+    ) -> Result<String, FfiError> {
+        let req = SupportReportRequest {
+            user_message,
+            redacted_logs,
+            app_version,
+            platform,
+        };
+        let resp = self
+            .inner
+            .api()
+            .submit_support_report(&req)
+            .await
+            .map_err(map_client_error)?;
+        Ok(resp.reference_id)
     }
 
     /// Whether this client's current egress IP is a Warren exit, i.e. the tunnel
@@ -615,6 +659,45 @@ mod tests {
             ),
             "an unroutable host must surface as a client/server error, not panic"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_account_surfaces_a_client_error_on_unroutable_host() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://127.0.0.1:1".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        let r = client.delete_account().await;
+        assert!(matches!(
+            r,
+            Err(FfiError::Client { .. }) | Err(FfiError::ServerStatus { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn submit_support_surfaces_a_client_error_on_unroutable_host() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://127.0.0.1:1".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        let r = client
+            .submit_support(
+                "stuck".to_owned(),
+                String::new(),
+                "1.0".to_owned(),
+                "macos-arm64".to_owned(),
+            )
+            .await;
+        assert!(matches!(
+            r,
+            Err(FfiError::Client { .. }) | Err(FfiError::ServerStatus { .. })
+        ));
     }
 
     #[tokio::test]
