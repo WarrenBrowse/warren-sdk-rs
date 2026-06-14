@@ -165,9 +165,11 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
     bounded prefix); single-hop stays v4-only (its SetupAck carries no v6
     gateway/prefix). Domain targets resolve over the tunnel with AAAA preferred
     and A fallback when v6 is assigned (the `warren-net::dns` codec now does both
-    `A` and `AAAA`). Validated in-process (literal v6 connect/echo, off-subnet v6
-    default route, AAAA resolve+v6 connect, A fallback). Pending: real-exit v6
-    validation, and v6 UDP-associate egress (UDP resolves A-only today).
+    `A` and `AAAA`). Literal v6 UDP targets egress through the SOCKS5 UDP
+    associate when v6 is assigned (`UdpConnector::supports_ipv6`). Validated
+    in-process (literal v6 connect/echo, off-subnet v6 default route, AAAA
+    resolve+v6 connect, A fallback, v6 UDP flow). Pending: real-exit v6
+    validation, and AAAA for v6 UDP *domain* targets (UDP domains resolve A-only).
   - Pending: validation against a real Warren exit (mandatory before production);
     privileged per-OS TUN/routing/DNS/killswitch; GSO/GRO batch syscalls behind
     the `PacketSink` batch seam and `fast-apple-datapath` on macOS.
