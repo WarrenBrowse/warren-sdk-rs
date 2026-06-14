@@ -1112,6 +1112,61 @@ mod tests {
         task.abort();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn supervisor_retries_past_failed_attempts_then_connects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stable_addr = socks_listener.local_addr().unwrap();
+
+        let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let task = {
+            let attempts = Arc::clone(&attempts);
+            // Keeps the eventual success session's read side open (never closes).
+            let keep_open = Arc::new(tokio::sync::Notify::new());
+            tokio::spawn(async move {
+                supervise_proxy(socks_listener, None, None, state_tx, move || {
+                    let attempts = Arc::clone(&attempts);
+                    let keep_open = Arc::clone(&keep_open);
+                    async move {
+                        // Fail the first two attempts, then establish: exercises the
+                        // backoff/retry branch and the recovery to Connected.
+                        if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                            return Err(SdkError::NoMultihopExit);
+                        }
+                        Ok(EstablishedTunnel {
+                            sink: ClosableSink { close: keep_open },
+                            local_ip: "10.66.0.2".parse().unwrap(),
+                            prefix: 24,
+                            gateway: "10.66.0.1".parse().unwrap(),
+                            ipv6: None,
+                        })
+                    }
+                })
+                .await;
+            })
+        };
+
+        // The supervisor must retry past the two failures (with backoff) and make
+        // the third, successful attempt rather than giving up after the first.
+        let reached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while attempts.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            reached.is_ok(),
+            "supervisor retried past the failures to a successful connect"
+        );
+        // A successful (third) attempt means the serve loop is now live on the
+        // stable address; a bare TCP connect to it succeeds.
+        assert!(proxy_accepts(stable_addr).await, "stable listener is live");
+        task.abort();
+    }
+
     /// A transport that is never actually called by these builder tests.
     struct NullTransport;
 
