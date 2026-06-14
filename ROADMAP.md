@@ -132,8 +132,13 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
   - Done (validated in-process): non-root SOCKS5 proxy + userspace smoltcp
     netstack over the tunnel (SOCKS5 + HTTP CONNECT), wired through `WarrenClient::start_proxy`; e2e from
     a SOCKS5 client through a real QUIC tunnel to a netstack-terminating exit.
+  - DNS-over-tunnel: done. `Target::Domain` is resolved by a smoltcp UDP socket
+    in the netstack engine querying the gateway forwarder (`10.66.0.1:53`) with
+    the pinned `warren-net::dns` codec, so lookups never hit the host resolver.
+    Validated end to end in-process (a DNS+echo "exit" answers the query, then
+    the domain CONNECT echoes).
   - Pending: validation against a real Warren exit (mandatory before production);
-    DNS-over-tunnel for domain targets; UDP associate;
+    a configurable fallback resolver for `dns_disabled` exits; UDP associate;
     privileged per-OS TUN/routing/DNS/killswitch; GSO/GRO batch syscalls behind
     the `PacketSink` batch seam and `fast-apple-datapath` on macOS.
 - Multihop HPKE frame (REQUIRED, blocking, discovered via live-exit validation):

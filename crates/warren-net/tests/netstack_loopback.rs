@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -131,6 +131,149 @@ async fn echo_server(
             _ = tokio::time::sleep(delay) => {}
         }
     }
+}
+
+/// Builds a minimal DNS response for `query` answering with a single A record
+/// for `addr`. The exit forwarder does not need a full parser: it echoes the
+/// query id and question and appends one compressed A answer.
+fn dns_response(query: &[u8], addr: std::net::Ipv4Addr) -> Vec<u8> {
+    let mut r = Vec::with_capacity(query.len() + 16);
+    r.extend_from_slice(&query[0..2]); // transaction id, echoed
+    r.extend_from_slice(&[0x81, 0x80]); // QR + RD + RA, RCODE 0
+    r.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+    r.extend_from_slice(&[0x00, 0x01]); // ANCOUNT
+    r.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // NSCOUNT, ARCOUNT
+    r.extend_from_slice(&query[12..]); // echo the question section verbatim
+    r.extend_from_slice(&[0xC0, 0x0C]); // name pointer to the question
+    r.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // TYPE A, CLASS IN
+    r.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // TTL 60s
+    r.extend_from_slice(&[0x00, 0x04]); // RDLENGTH
+    r.extend_from_slice(&addr.octets()); // RDATA
+    r
+}
+
+/// A smoltcp "exit" that both answers DNS `A` queries on UDP `:53` (always
+/// returning its own address) and echoes TCP on `:9`. Lets a `Target::Domain`
+/// resolve over the tunnel and then connect to the resolved address.
+async fn dns_and_echo_server(
+    ip: std::net::Ipv4Addr,
+    prefix: u8,
+    gateway: std::net::Ipv4Addr,
+    mut inbound: mpsc::Receiver<Bytes>,
+    outbound: mpsc::Sender<Bytes>,
+) {
+    let mut device = ChanDevice {
+        rx: VecDeque::new(),
+        tx: outbound,
+    };
+    let base = tokio::time::Instant::now();
+    let now =
+        || SmolInstant::from_micros(i64::try_from(base.elapsed().as_micros()).unwrap_or(i64::MAX));
+
+    let mut config = Config::new(HardwareAddress::Ip);
+    config.random_seed = 0x5345_5256_0003;
+    let mut iface = Interface::new(config, &mut device, now());
+    iface.update_ip_addrs(|a| {
+        let _ = a.push(IpCidr::new(IpAddress::from(ip), prefix));
+    });
+    let _ = iface.routes_mut().add_default_ipv4_route(gateway);
+
+    let mut sockets = SocketSet::new(Vec::new());
+    let tcp_handle = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+    ));
+    sockets
+        .get_mut::<tcp::Socket<'_>>(tcp_handle)
+        .listen(9)
+        .expect("listen");
+    let udp_handle = sockets.add(udp::Socket::new(
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]),
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]),
+    ));
+    sockets
+        .get_mut::<udp::Socket<'_>>(udp_handle)
+        .bind(53)
+        .expect("bind 53");
+
+    loop {
+        while let Ok(f) = inbound.try_recv() {
+            device.rx.push_back(f);
+        }
+        let _ = iface.poll(now(), &mut device, &mut sockets);
+
+        // DNS: answer any query with this exit's own address.
+        let request = {
+            let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
+            match sock.recv() {
+                Ok((data, meta)) if data.len() >= 12 => Some((data.to_vec(), meta.endpoint)),
+                _ => None,
+            }
+        };
+        if let Some((query, endpoint)) = request {
+            let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
+            let _ = sock.send_slice(&dns_response(&query, ip), endpoint);
+        }
+
+        // TCP echo.
+        let sock = sockets.get_mut::<tcp::Socket<'_>>(tcp_handle);
+        let mut buf = [0u8; 4096];
+        while sock.can_recv() && sock.can_send() {
+            match sock.recv_slice(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let _ = sock.send_slice(&buf[..n]);
+                }
+            }
+        }
+
+        let delay = iface
+            .poll_delay(now(), &sockets)
+            .map(|d| std::time::Duration::from_micros(d.total_micros()))
+            .unwrap_or_else(|| std::time::Duration::from_millis(5));
+        tokio::select! {
+            f = inbound.recv() => match f {
+                Some(f) => device.rx.push_back(f),
+                None => return,
+            },
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn netstack_resolves_a_domain_over_the_tunnel_then_connects() {
+    // A domain CONNECT: the engine sends a DNS query over the tunnel to the
+    // gateway (10.66.0.1:53), the exit answers A = 10.66.0.1, then the engine
+    // connects to 10.66.0.1:9 and echoes. No host resolver is consulted.
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+
+    let connector = spawn_engine(
+        "10.66.0.2".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        MTU,
+        s2c_rx,
+        c2s_tx,
+    );
+    tokio::spawn(dns_and_echo_server(
+        "10.66.0.1".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let mut stream = connector
+        .connect(Target::Domain("example.com".to_owned(), 9))
+        .await
+        .expect("domain resolves over the tunnel and connects");
+    stream.write_all(b"resolved").await.expect("write");
+    stream.flush().await.expect("flush");
+    let mut got = [0u8; 8];
+    stream.read_exact(&mut got).await.expect("read echo");
+    assert_eq!(&got, b"resolved");
 }
 
 #[tokio::test(flavor = "multi_thread")]

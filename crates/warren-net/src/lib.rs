@@ -8,7 +8,9 @@
 //!    smoltcp) synthesizes inner IP packets and drives them through a
 //!    [`PacketSink`] over the tunnel. Feature-complete on Linux, macOS and
 //!    Windows with no elevated privileges, and validated end to end in-process.
-//!    HTTP CONNECT and DNS-over-tunnel for domain targets are still pending.
+//!    An optional HTTP CONNECT listener ([`HttpConnectProxy`]) is supported, and
+//!    domain targets are resolved over the tunnel via the gateway DNS forwarder
+//!    ([`dns`]), so lookups never leak to the host resolver.
 //! 2. **TUN (optional, privileged).** A real TUN device feeds inner IP packets
 //!    straight into a [`PacketSink`], with split-default routing, DNS push and an
 //!    OS-enforced [`killswitch`]. Built per OS behind the `tun` feature. Per the

@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
@@ -28,13 +28,14 @@ use std::task::{Context, Poll, ready};
 use bytes::Bytes;
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::PollSender;
 
+use crate::dns;
 use crate::error::NetError;
 use crate::proxy::Connector;
 use crate::socks5::Target;
@@ -51,6 +52,12 @@ const FRAME_CHANNEL_DEPTH: usize = 1024;
 const PENDING_OUT_CAP: usize = 256 * 1024;
 /// How long to wait for a SYN to complete before failing the connect.
 const CONNECT_TIMEOUT: SmolDuration = SmolDuration::from_secs(10);
+/// How long to wait for a DNS response before failing resolution.
+const DNS_TIMEOUT: SmolDuration = SmolDuration::from_secs(5);
+/// Standard DNS service port (queried on the tunnel gateway / exit forwarder).
+const DNS_PORT: u16 = 53;
+/// UDP buffer for one in-flight DNS query/response (fits an EDNS-sized reply).
+const DNS_BUFFER: usize = 2048;
 
 /// A smoltcp [`Device`] over IP-packet channels. Frames are zero-copy [`Bytes`].
 struct TunnelDevice {
@@ -105,10 +112,35 @@ impl Device for TunnelDevice {
     }
 }
 
+/// A request from a [`TunnelConnector`] to the engine.
+enum Command {
+    /// Open a TCP connection to `addr`.
+    Open(OpenCommand),
+    /// Resolve a host name to an IPv4 address over the tunnel (DNS to the
+    /// gateway forwarder).
+    Resolve(ResolveCommand),
+}
+
 /// Open a TCP connection to `addr`, replying with the bridged stream or an error.
 struct OpenCommand {
     addr: SocketAddr,
     reply: oneshot::Sender<Result<NetstackStream, NetError>>,
+}
+
+/// Resolve `name` (an `A` lookup) over the tunnel, replying with the address.
+struct ResolveCommand {
+    name: String,
+    reply: oneshot::Sender<Result<Ipv4Addr, NetError>>,
+}
+
+/// Engine-side state for one in-flight DNS resolution.
+struct PendingResolve {
+    handle: SocketHandle,
+    local_port: u16,
+    /// Transaction id the response must echo (off-path spoof resistance).
+    id: u16,
+    reply: oneshot::Sender<Result<Ipv4Addr, NetError>>,
+    deadline: SmolInstant,
 }
 
 /// An app->net write for one connection.
@@ -203,8 +235,38 @@ impl AsyncWrite for NetstackStream {
 /// A [`Connector`] backed by the userspace netstack engine.
 #[derive(Clone)]
 pub struct TunnelConnector {
-    commands: mpsc::UnboundedSender<OpenCommand>,
+    commands: mpsc::UnboundedSender<Command>,
     wake: Arc<Notify>,
+}
+
+impl TunnelConnector {
+    /// Resolves `host` to an IPv4 address by sending a DNS `A` query over the
+    /// tunnel to the gateway forwarder (never the host resolver, so the lookup
+    /// cannot leak outside the VPN).
+    async fn resolve(&self, host: &str) -> Result<Ipv4Addr, NetError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(Command::Resolve(ResolveCommand {
+                name: host.to_owned(),
+                reply: reply_tx,
+            }))
+            .map_err(|_| NetError::EngineStopped)?;
+        self.wake.notify_one();
+        reply_rx.await.map_err(|_| NetError::EngineStopped)?
+    }
+
+    /// Opens a TCP connection to an already-resolved IPv4 socket address.
+    async fn open(&self, addr: SocketAddr) -> Result<NetstackStream, NetError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(Command::Open(OpenCommand {
+                addr,
+                reply: reply_tx,
+            }))
+            .map_err(|_| NetError::EngineStopped)?;
+        self.wake.notify_one();
+        reply_rx.await.map_err(|_| NetError::EngineStopped)?
+    }
 }
 
 impl Connector for TunnelConnector {
@@ -218,22 +280,13 @@ impl Connector for TunnelConnector {
             Target::Ip(SocketAddr::V6(_)) => {
                 return Err(NetError::Unsupported("IPv6 targets not yet routed"));
             }
-            // Names must be resolved at the exit (DNS-over-tunnel); not yet wired.
-            Target::Domain(_, _) => {
-                return Err(NetError::Unsupported(
-                    "domain targets require DNS-over-tunnel (not implemented)",
-                ));
+            // Resolve the name over the tunnel, then connect to the IPv4 result.
+            Target::Domain(host, port) => {
+                let ip = self.resolve(&host).await?;
+                SocketAddr::from((ip, port))
             }
         };
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.commands
-            .send(OpenCommand {
-                addr,
-                reply: reply_tx,
-            })
-            .map_err(|_| NetError::EngineStopped)?;
-        self.wake.notify_one();
-        reply_rx.await.map_err(|_| NetError::EngineStopped)?
+        self.open(addr).await
     }
 }
 
@@ -265,6 +318,7 @@ pub fn spawn_engine(
             mtu,
         },
         conns: HashMap::new(),
+        resolvers: Vec::new(),
         next_conn_id: 0,
         next_port: EPHEMERAL_BASE,
         used_ports: HashSet::new(),
@@ -286,13 +340,14 @@ pub fn spawn_engine(
 struct Engine {
     device: TunnelDevice,
     conns: HashMap<u64, Conn>,
+    resolvers: Vec<PendingResolve>,
     next_conn_id: u64,
     next_port: u16,
     used_ports: HashSet<u16>,
     local_ip: std::net::Ipv4Addr,
     prefix: u8,
     gateway: std::net::Ipv4Addr,
-    cmd_rx: mpsc::UnboundedReceiver<OpenCommand>,
+    cmd_rx: mpsc::UnboundedReceiver<Command>,
     inbound: mpsc::Receiver<Bytes>,
     wake: Arc<Notify>,
 }
@@ -318,7 +373,10 @@ impl Engine {
 
         loop {
             while let Ok(cmd) = self.cmd_rx.try_recv() {
-                self.open(&mut iface, &mut sockets, cmd, now(base));
+                match cmd {
+                    Command::Open(c) => self.open(&mut iface, &mut sockets, c, now(base)),
+                    Command::Resolve(c) => self.start_resolve(&mut sockets, c, now(base)),
+                }
             }
             self.ingest_writes();
 
@@ -335,12 +393,24 @@ impl Engine {
             // Drain smoltcp completely before yielding (canonical poll pattern).
             while iface.poll(now(base), &mut self.device, &mut sockets) != PollResult::None {}
             self.drain_sockets(&mut sockets, now(base));
+            self.drain_resolvers(&mut sockets, now(base));
 
-            let delay = iface
+            let mut delay = iface
                 .poll_delay(now(base), &sockets)
                 .map_or(std::time::Duration::from_secs(30), |d| {
                     std::time::Duration::from_micros(d.total_micros())
                 });
+            // A single-shot DNS query has no smoltcp retransmit timer to wake the
+            // loop, so bound the sleep by the nearest resolver deadline.
+            if let Some(nearest) = self.resolvers.iter().map(|r| r.deadline).min() {
+                let now_i = now(base);
+                let remaining = if nearest > now_i {
+                    std::time::Duration::from_micros((nearest - now_i).total_micros())
+                } else {
+                    std::time::Duration::ZERO
+                };
+                delay = delay.min(remaining);
+            }
 
             tokio::select! {
                 _ = self.wake.notified() => {}
@@ -420,6 +490,72 @@ impl Engine {
                 connect: Some((cmd.reply, stream)),
             },
         );
+    }
+
+    /// Starts a DNS `A` resolution: bind a UDP socket, send the query to the
+    /// gateway forwarder, and track it until a reply or the deadline.
+    fn start_resolve(
+        &mut self,
+        sockets: &mut SocketSet<'_>,
+        cmd: ResolveCommand,
+        now: SmolInstant,
+    ) {
+        // A per-query transaction id the response must echo (spoof resistance).
+        let id: u16 = rand::random();
+        let query = match dns::encode_query(&cmd.name, id) {
+            Ok(q) => q,
+            Err(_) => {
+                let _ = cmd.reply.send(Err(NetError::ConnectFailed));
+                return;
+            }
+        };
+        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; DNS_BUFFER]);
+        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; DNS_BUFFER]);
+        let handle = sockets.add(udp::Socket::new(rx, tx));
+        let local_port = self.alloc_port();
+        let sock = sockets.get_mut::<udp::Socket<'_>>(handle);
+        let dst = IpEndpoint::new(IpAddress::from(self.gateway), DNS_PORT);
+        if sock.bind(local_port).is_err() || sock.send_slice(&query, dst).is_err() {
+            sockets.remove(handle);
+            self.used_ports.remove(&local_port);
+            let _ = cmd.reply.send(Err(NetError::ConnectFailed));
+            return;
+        }
+        self.resolvers.push(PendingResolve {
+            handle,
+            local_port,
+            id,
+            reply: cmd.reply,
+            deadline: now + DNS_TIMEOUT,
+        });
+    }
+
+    /// Delivers DNS responses (first `A` record), times out stalled lookups, and
+    /// reaps the UDP sockets of finished resolutions.
+    fn drain_resolvers(&mut self, sockets: &mut SocketSet<'_>, now: SmolInstant) {
+        let mut finished: Vec<(usize, Result<Ipv4Addr, NetError>)> = Vec::new();
+        for (i, r) in self.resolvers.iter().enumerate() {
+            let sock = sockets.get_mut::<udp::Socket<'_>>(r.handle);
+            if sock.can_recv() {
+                if let Ok((data, _meta)) = sock.recv() {
+                    let res = match dns::parse_response(data, r.id) {
+                        Ok(addrs) => addrs.into_iter().next().ok_or(NetError::ConnectFailed),
+                        Err(_) => Err(NetError::ConnectFailed),
+                    };
+                    finished.push((i, res));
+                }
+            } else if now >= r.deadline {
+                finished.push((i, Err(NetError::ConnectTimeout)));
+            }
+        }
+        // Remove highest indices first so the earlier ones stay valid.
+        finished.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        for (i, res) in finished {
+            let r = self.resolvers.swap_remove(i);
+            sockets.remove(r.handle);
+            self.used_ports.remove(&r.local_port);
+            let _ = r.reply.send(res);
+        }
     }
 
     /// Moves app->net writes into per-conn buffers, bounded by `PENDING_OUT_CAP`

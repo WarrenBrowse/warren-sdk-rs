@@ -24,6 +24,8 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "proto-ipv4",
     "proto-ipv6",
     "socket-tcp",
+    # UDP socket for DNS-over-tunnel resolution to the gateway forwarder.
+    "socket-udp",
 ], optional = true }
 
 [features]
@@ -47,6 +49,8 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "medium-ip",
     "proto-ipv4",
     "socket-tcp",
+    # The test exit answers DNS over UDP for the DNS-over-tunnel test.
+    "socket-udp",
 ] }
 
 [lints]
