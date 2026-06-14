@@ -6,10 +6,10 @@
 //! produced by the `uniffi-bindgen` binary in `src/bin/` against the built
 //! `cdylib`; see the crate README for the generate commands.
 //!
-//! This phase covers the pure, fully deterministic identity surface (the part
-//! every sibling-language SDK shares and validates against `vectors/`). The
-//! async tunnel surface (connect/disconnect/events) is added later, since it
-//! needs an async executor bridge per language.
+//! Two surfaces are exported: the pure, deterministic identity functions (shared
+//! by every sibling-language SDK and validated against `vectors/`), and a
+//! [`WarrenFfiClient`] object with async account/directory methods over a tokio
+//! bridge. The tunnel/proxy lifecycle handle and an event stream are added next.
 
 // FFI exports take owned arguments by value on purpose: uniffi marshals owned
 // values across the language boundary, so a borrowed signature would not match
@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use warren_sdk::api::ClientError;
 use warren_sdk::identity::{WarrenIdentity, ss58};
-use warren_sdk::{DefaultClient, WarrenClient};
+use warren_sdk::{DefaultClient, SdkError, WarrenClient};
 
 uniffi::setup_scaffolding!();
 
@@ -80,6 +80,22 @@ impl std::fmt::Debug for FfiIdentity {
             .field("public_key_hex", &self.public_key_hex)
             .finish()
     }
+}
+
+/// A verified multihop exit, as exposed to the FFI boundary. All fields are
+/// public directory data (no secrets): safe to render in a server picker.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiExit {
+    /// 16-byte exit id (cleartext routing key), as 32 hex chars.
+    pub exit_id_hex: String,
+    /// ISO 3166-1 alpha-2 country code.
+    pub country: String,
+    /// City label.
+    pub city: String,
+    /// QUIC endpoint to dial (`ip:port`).
+    pub endpoint: String,
+    /// The exit's Ed25519 identity (TLS RPK pin), as 64 hex chars.
+    pub exit_ed25519_pubkey_hex: String,
 }
 
 /// The four `X-Warren-*` header values for a signed request.
@@ -240,6 +256,44 @@ impl WarrenFfiClient {
             .map_err(map_client_error)?;
         Ok(sub.expires_at)
     }
+
+    /// Whether this client's current egress IP is a Warren exit, i.e. the tunnel
+    /// is active (signed `GET /v1/check`).
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::ServerStatus`] on a non-2xx reply, [`FfiError::Client`] on a
+    /// transport or other client-side failure.
+    pub async fn is_tunnel_active(&self) -> Result<bool, FfiError> {
+        let check = self.inner.api().check().await.map_err(map_client_error)?;
+        Ok(check.is_exit)
+    }
+
+    /// Fetches and verifies the signed multihop directory, returning the trusted
+    /// exits (public data, safe to display in a server picker).
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::Client`] if no directory is published, it fails verification,
+    /// is expired, rolled back, or the fetch fails; [`FfiError::ServerStatus`]
+    /// on a non-2xx API reply.
+    pub async fn fetch_multihop_exits(&self) -> Result<Vec<FfiExit>, FfiError> {
+        let exits = self
+            .inner
+            .fetch_multihop_directory()
+            .await
+            .map_err(map_sdk_error)?;
+        Ok(exits
+            .into_iter()
+            .map(|e| FfiExit {
+                exit_id_hex: hex::encode(e.exit_id),
+                country: e.country,
+                city: e.city,
+                endpoint: e.endpoint.to_string(),
+                exit_ed25519_pubkey_hex: hex::encode(e.exit_ed25519_pubkey),
+            })
+            .collect())
+    }
 }
 
 /// Maps a [`ClientError`] to the FFI error, keeping the no-log discipline: the
@@ -247,6 +301,19 @@ impl WarrenFfiClient {
 fn map_client_error(e: ClientError) -> FfiError {
     match e {
         ClientError::ServerStatus { status, .. } => FfiError::ServerStatus { status },
+        other => FfiError::Client {
+            message: other.to_string(),
+        },
+    }
+}
+
+/// Maps an [`SdkError`] to the FFI error. The nested API case reuses
+/// [`map_client_error`] (so a server status stays structured); every other
+/// variant has a no-log-safe `Display` (transparent verification errors or fixed
+/// strings, no pubkey/address/IP).
+fn map_sdk_error(e: SdkError) -> FfiError {
+    match e {
+        SdkError::Api(inner) => map_client_error(inner),
         other => FfiError::Client {
             message: other.to_string(),
         },
@@ -383,6 +450,38 @@ mod tests {
             ),
             "an unroutable host must surface as a client/server error, not panic"
         );
+    }
+
+    #[tokio::test]
+    async fn is_tunnel_active_surfaces_a_client_error_on_unroutable_host() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://127.0.0.1:1".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        let r = client.is_tunnel_active().await;
+        assert!(matches!(
+            r,
+            Err(FfiError::Client { .. }) | Err(FfiError::ServerStatus { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_multihop_exits_surfaces_a_client_error_on_unroutable_host() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://127.0.0.1:1".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        let r = client.fetch_multihop_exits().await;
+        assert!(matches!(
+            r,
+            Err(FfiError::Client { .. }) | Err(FfiError::ServerStatus { .. })
+        ));
     }
 
     #[test]

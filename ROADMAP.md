@@ -85,16 +85,18 @@ pinned by golden vectors where a wire format is involved. warren-core
 - FFI boundary exception: `warren-sdk-ffi` is the ONLY crate that downgrades
   `unsafe_code` from `forbid` to `deny` (uniffi generates the C-ABI scaffolding;
   we hand-write zero unsafe). Documented at the crate-level `#![allow]`.
-- Async surface started: a `WarrenFfiClient` uniffi Object (built from
-  mnemonic + api_base + pin) exposes a sync `address()` and an async
-  `subscription_expiry()` via `#[uniffi::export(async_runtime = "tokio")]`. The
-  generated Python binding renders it as a class with an `async def`, proving the
-  async bridge end to end; the error path is unit-tested against an unroutable
-  host. `ClientError` maps to `FfiError::{ServerStatus, Client}` with the
-  server-status body dropped (no-log).
-- Remaining: widen the async surface (exits/directory fetch, connect, the proxy
-  lifecycle handle, an event stream), then the first Dart/Flutter integration and
-  the other languages. Every binding replays the same `vectors/`.
+- Async surface in progress: a `WarrenFfiClient` uniffi Object (built from
+  mnemonic + api_base + pin) over `#[uniffi::export(async_runtime = "tokio")]`
+  exposes a sync `address()` plus async `subscription_expiry()`,
+  `is_tunnel_active()` (signed `/v1/check`), and `fetch_multihop_exits()`
+  (verified directory -> `FfiExit` records). The generated Python binding renders
+  the class with `async def`s, proving the async bridge end to end; each error
+  path is unit-tested against an unroutable host. `ClientError`/`SdkError` map to
+  `FfiError::{ServerStatus, Client}` with the server-status body dropped (no-log).
+- Remaining: the tunnel/proxy lifecycle handle (an Object with a SOCKS5 local
+  address + graceful shutdown) and an event stream (uniffi callback interface),
+  then the first Dart/Flutter integration and the other languages. Every binding
+  replays the same `vectors/`.
 
 ## Audit follow-ups (see AUDIT.md)
 
