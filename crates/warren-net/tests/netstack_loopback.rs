@@ -21,7 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use warren_net::socks5::Target;
-use warren_net::{Connector, NetstackConfig, Socks5Proxy, spawn_engine};
+use warren_net::{Connector, NetstackConfig, Socks5Proxy, UdpConnector, spawn_engine};
 
 const MTU: usize = 1500;
 
@@ -1022,6 +1022,43 @@ async fn netstack_resolves_aaaa_over_the_tunnel_then_connects_v6() {
     let mut got = [0u8; 7];
     stream.read_exact(&mut got).await.expect("read echo");
     assert_eq!(&got, b"aaaa-ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn netstack_udp_domain_resolves_aaaa_when_v6_assigned() {
+    // UDP-associate domain targets follow the same dual-stack policy as TCP: with
+    // a v6 assignment the lookup prefers AAAA, so a UDP domain target reaches the
+    // v6 internet instead of being pinned to A-only. The exit answers AAAA; an
+    // A-only client would get no record and fail, so this pins the AAAA path.
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+
+    let config = NetstackConfig::new(
+        "10.66.0.2".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        MTU,
+    )
+    .with_ipv6("fd66::2".parse().unwrap(), 64, "fd66::1".parse().unwrap());
+    let connector = spawn_engine(config, s2c_rx, c2s_tx);
+
+    tokio::spawn(dns_aaaa_and_echo_server_v6(
+        "10.66.0.1".parse().unwrap(),
+        24,
+        "fd66::5".parse().unwrap(),
+        64,
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let ip = UdpConnector::resolve_host(&connector, "example.com")
+        .await
+        .expect("UDP domain target resolves over the tunnel");
+    assert_eq!(
+        ip,
+        "fd66::5".parse::<std::net::IpAddr>().unwrap(),
+        "a UDP domain target prefers AAAA under a v6 assignment"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

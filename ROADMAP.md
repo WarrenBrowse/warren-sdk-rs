@@ -207,8 +207,10 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
     `A` and `AAAA`). Literal v6 UDP targets egress through the SOCKS5 UDP
     associate when v6 is assigned (`UdpConnector::supports_ipv6`). Validated
     in-process (literal v6 connect/echo, off-subnet v6 default route, AAAA
-    resolve+v6 connect, A fallback, v6 UDP flow). Pending: real-exit v6
-    validation, and AAAA for v6 UDP *domain* targets (UDP domains resolve A-only).
+    resolve+v6 connect, A fallback, v6 UDP flow, AAAA-preferred resolution for
+    UDP *domain* targets). UDP domain targets now share the TCP dual-stack policy
+    (AAAA preferred under a v6 assignment, else A) via a shared `resolve_dualstack`
+    helper. Pending: real-exit v6 validation.
   - Pending: validation against a real Warren exit (mandatory before production);
     privileged per-OS TUN/routing/DNS/killswitch; GSO/GRO batch syscalls behind
     the `PacketSink` batch seam and `fast-apple-datapath` on macOS.

@@ -376,6 +376,23 @@ impl TunnelConnector {
         reply_rx.await.map_err(|_| NetError::EngineStopped)?
     }
 
+    /// Resolves `host` over the tunnel, preferring `AAAA` when a v6 assignment
+    /// exists and falling back to `A` only when the name genuinely has no `AAAA`
+    /// record (never on a timeout or transport error, which would just double the
+    /// wait). The query egresses at the exit, so the lookup never leaks to the
+    /// host resolver. Shared by the TCP `connect` and the UDP `resolve_host` paths.
+    async fn resolve_dualstack(&self, host: &str) -> Result<IpAddr, NetError> {
+        if self.has_ipv6 {
+            match self.resolve(host, dns::RecordType::Aaaa).await {
+                Ok(ip) => Ok(ip),
+                Err(NetError::NoDnsRecord) => self.resolve(host, dns::RecordType::A).await,
+                Err(e) => Err(e),
+            }
+        } else {
+            self.resolve(host, dns::RecordType::A).await
+        }
+    }
+
     /// Opens a TCP connection to an already-resolved IPv4 or IPv6 socket address.
     async fn open(&self, addr: SocketAddr) -> Result<NetstackStream, NetError> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -431,17 +448,7 @@ impl Connector for TunnelConnector {
             // double the wait). The query egresses at the exit, so the lookup
             // never leaks to the host resolver.
             Target::Domain(host, port) => {
-                let ip = if self.has_ipv6 {
-                    match self.resolve(&host, dns::RecordType::Aaaa).await {
-                        Ok(ip) => ip,
-                        Err(NetError::NoDnsRecord) => {
-                            self.resolve(&host, dns::RecordType::A).await?
-                        }
-                        Err(e) => return Err(e),
-                    }
-                } else {
-                    self.resolve(&host, dns::RecordType::A).await?
-                };
+                let ip = self.resolve_dualstack(&host).await?;
                 SocketAddr::from((ip, port))
             }
         };
@@ -1214,10 +1221,9 @@ impl crate::proxy::UdpConnector for TunnelConnector {
     }
 
     async fn resolve_host(&self, host: &str) -> Result<std::net::IpAddr, NetError> {
-        // UDP-associate domain targets resolve A-only for now; literal v6 UDP
-        // targets are routed (see `supports_ipv6`). The lookup egresses over the
-        // tunnel either way.
-        self.resolve(host, dns::RecordType::A).await
+        // Same dual-stack policy as TCP: prefer AAAA when v6 is assigned, else A.
+        // The lookup egresses over the tunnel (no host-resolver leak).
+        self.resolve_dualstack(host).await
     }
 
     fn supports_ipv6(&self) -> bool {
