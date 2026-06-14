@@ -22,7 +22,11 @@
 // admits only the generated boundary code.
 #![allow(unsafe_code)]
 
+use std::sync::Arc;
+
+use warren_sdk::api::ClientError;
 use warren_sdk::identity::{WarrenIdentity, ss58};
+use warren_sdk::{DefaultClient, WarrenClient};
 
 uniffi::setup_scaffolding!();
 
@@ -39,6 +43,20 @@ pub enum FfiError {
     /// The SS58 address was malformed.
     #[error("invalid address")]
     InvalidAddress,
+    /// The server returned a non-2xx status. The body is intentionally dropped
+    /// (it is server-controlled and may be noisy); only the code crosses the FFI.
+    #[error("server returned status {status}")]
+    ServerStatus {
+        /// HTTP status code.
+        status: u16,
+    },
+    /// A transport, build, or other client-side failure. The message is derived
+    /// from a no-log-safe `Display` (no pubkey/address/IP/secret).
+    #[error("client error: {message}")]
+    Client {
+        /// Human-readable, redaction-safe summary.
+        message: String,
+    },
 }
 
 /// A Warren identity in FFI-friendly form.
@@ -161,6 +179,80 @@ pub fn sign_request(
     })
 }
 
+/// A live Warren SDK client exposed across the FFI boundary.
+///
+/// Wraps the default reqwest-backed [`DefaultClient`]. Async methods run on the
+/// tokio runtime the host app drives (uniffi `async_runtime = "tokio"`). Held by
+/// the foreign side as an opaque handle; drop it to release the client.
+#[derive(uniffi::Object)]
+pub struct WarrenFfiClient {
+    inner: DefaultClient,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WarrenFfiClient {
+    /// Builds a client from a BIP39 mnemonic, the API base URL (no trailing
+    /// slash), and the server's 64-hex Ed25519 pin.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InvalidMnemonic`] if the phrase is not valid BIP39. (The pin
+    /// is validated lazily on the first signed fetch, not here.)
+    #[uniffi::constructor]
+    pub fn new(
+        mnemonic: String,
+        api_base: String,
+        server_pubkey_pin: String,
+    ) -> Result<Arc<Self>, FfiError> {
+        let identity =
+            WarrenIdentity::from_mnemonic(&mnemonic).map_err(|_| FfiError::InvalidMnemonic)?;
+        let inner = WarrenClient::builder()
+            .identity(identity)
+            .api_base(api_base)
+            .server_pubkey_pin(server_pubkey_pin)
+            .build()
+            // Unreachable in practice (identity and pin are both set above), but
+            // surfaced rather than unwrapped to keep the boundary panic-free.
+            .map_err(|e| FfiError::Client {
+                message: e.to_string(),
+            })?;
+        Ok(Arc::new(Self { inner }))
+    }
+
+    /// The wallet SS58 `wb…` address of this client.
+    #[must_use]
+    pub fn address(&self) -> String {
+        self.inner.api().address()
+    }
+
+    /// Fetches the subscription expiry (unix epoch seconds) for this account.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::ServerStatus`] on a non-2xx reply (e.g. no subscription),
+    /// [`FfiError::Client`] on a transport or other client-side failure.
+    pub async fn subscription_expiry(&self) -> Result<u64, FfiError> {
+        let sub = self
+            .inner
+            .api()
+            .subscription()
+            .await
+            .map_err(map_client_error)?;
+        Ok(sub.expires_at)
+    }
+}
+
+/// Maps a [`ClientError`] to the FFI error, keeping the no-log discipline: the
+/// server-status body is dropped and only redaction-safe `Display` text crosses.
+fn map_client_error(e: ClientError) -> FfiError {
+    match e {
+        ClientError::ServerStatus { status, .. } => FfiError::ServerStatus { status },
+        other => FfiError::Client {
+            message: other.to_string(),
+        },
+    }
+}
+
 fn to_ffi(identity: &WarrenIdentity, mnemonic: String) -> FfiIdentity {
     FfiIdentity {
         mnemonic,
@@ -248,6 +340,49 @@ mod tests {
             address_from_mnemonic("not a mnemonic".to_owned()),
             Err(FfiError::InvalidMnemonic)
         ));
+    }
+
+    #[test]
+    fn client_new_rejects_bad_mnemonic() {
+        let r = WarrenFfiClient::new(
+            "not a mnemonic".to_owned(),
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+        );
+        assert!(matches!(r, Err(FfiError::InvalidMnemonic)));
+    }
+
+    #[test]
+    fn client_new_accepts_valid_inputs_and_exposes_address() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic.clone(),
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        assert_eq!(client.address(), id.address);
+    }
+
+    #[tokio::test]
+    async fn subscription_expiry_surfaces_a_client_error_on_unroutable_host() {
+        // Port 1 on loopback refuses fast, so this exercises the full async FFI
+        // bridge and ClientError -> FfiError mapping without a live server.
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://127.0.0.1:1".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        let r = client.subscription_expiry().await;
+        assert!(
+            matches!(
+                r,
+                Err(FfiError::Client { .. }) | Err(FfiError::ServerStatus { .. })
+            ),
+            "an unroutable host must surface as a client/server error, not panic"
+        );
     }
 
     #[test]

@@ -15,12 +15,19 @@ publish.workspace = true
 crate-type = ["lib", "cdylib"]
 
 [dependencies]
-warren-sdk = { path = "../warren-sdk", default-features = false }
+# Default features bundle the reqwest transport so the async FFI client object
+# can build a working client (WarrenClient<ReqwestTransport>).
+warren-sdk = { path = "../warren-sdk" }
 hex = { workspace = true }
 thiserror = { workspace = true }
 # The FFI binding generator. "cli" provides the uniffi-bindgen entry point used
 # by the src/bin/uniffi-bindgen.rs helper to emit Swift/Kotlin/Python/Ruby.
-uniffi = { version = "0.31", features = ["cli"] }
+# "tokio" lets async exports run on the host app's tokio runtime.
+uniffi = { version = "0.31", features = ["cli", "tokio"] }
+
+[dev-dependencies]
+# Drives the async FFI methods in tests (#[tokio::test]).
+tokio = { workspace = true }
 
 # This crate is the SINGLE FFI boundary exception to the workspace-wide
 # `unsafe_code = "forbid"`: uniffi generates the C-ABI scaffolding (which is

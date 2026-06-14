@@ -85,10 +85,16 @@ pinned by golden vectors where a wire format is involved. warren-core
 - FFI boundary exception: `warren-sdk-ffi` is the ONLY crate that downgrades
   `unsafe_code` from `forbid` to `deny` (uniffi generates the C-ABI scaffolding;
   we hand-write zero unsafe). Documented at the crate-level `#![allow]`.
-- Remaining: the async tunnel surface (connect/disconnect/event stream) needs an
-  async-executor bridge per language (uniffi async export + a runtime), then the
-  first Dart/Flutter integration and the other languages. Every binding replays
-  the same `vectors/`.
+- Async surface started: a `WarrenFfiClient` uniffi Object (built from
+  mnemonic + api_base + pin) exposes a sync `address()` and an async
+  `subscription_expiry()` via `#[uniffi::export(async_runtime = "tokio")]`. The
+  generated Python binding renders it as a class with an `async def`, proving the
+  async bridge end to end; the error path is unit-tested against an unroutable
+  host. `ClientError` maps to `FfiError::{ServerStatus, Client}` with the
+  server-status body dropped (no-log).
+- Remaining: widen the async surface (exits/directory fetch, connect, the proxy
+  lifecycle handle, an event stream), then the first Dart/Flutter integration and
+  the other languages. Every binding replays the same `vectors/`.
 
 ## Audit follow-ups (see AUDIT.md)
 
