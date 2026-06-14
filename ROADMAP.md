@@ -227,11 +227,15 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
      setup frame". The remaining step is a full tunnel with a SUBSCRIBED wallet
      (the exit gates the `IpAssign` on its allowlist + the `/v1/session/open`
      device cap): set `WARREN_MNEMONIC` to complete routing.
-  6. DONE (live-validated, 2026-06-13). A full real tunnel with a subscribed
-     wallet: real `IpAssign` (10.66.0.3/24 from the NL/Amsterdam exit) and
-     confirmed egress (a TCP handshake to a public host completes through the
-     sealed tunnel via `cargo run -p warren-sdk --example live_proxy`). Frame,
-     control `/v2` and PoP cross-language vectors are frozen under `vectors/`.
+  6. DONE (live-validated, 2026-06-13; re-validated against prod v6 2026-06-15).
+     A full real tunnel with a subscribed wallet: real `IpAssign` (from the
+     NL/Amsterdam exit) and confirmed egress (a TCP handshake to a public host
+     completes through the sealed tunnel via `cargo run -p warren-sdk --example
+     live_proxy`). Frame, control `/v2` and PoP cross-language vectors are frozen
+     under `vectors/`. The signed relay list is now v6 (node/endpoint model): the
+     SDK fetches and verifies the live prod v6 list under the pinned server key,
+     the multihop directory cross-checks against it, and end-to-end egress is
+     confirmed on prod v6.
 
 ## Cross-cutting
 
