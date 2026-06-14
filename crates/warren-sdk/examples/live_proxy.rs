@@ -75,7 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..ProxyConfig::default()
     };
     let handle = client.start_proxy_multihop(&exit, &cfg).await?;
-    println!("SOCKS5 proxy up on {}", handle.local_addr());
+    println!(
+        "SOCKS5 proxy up on {} (state: {:?})",
+        handle.local_addr(),
+        handle.state()
+    );
 
     // (2b) Pure-TCP egress probe: a successful SOCKS5 CONNECT to a well-known
     // public service proves a SYN-ACK came back through the sealed tunnel
@@ -138,6 +142,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "ROUTING CONFIRMED: egress IP {tunnel_ip} (the exit), not {direct_ip} (this host)."
         );
     }
+
+    // (4) Clean teardown: stop the datapath (an app would do this on logout or
+    // when the user disconnects). Dropping the handle does the same.
+    handle.shutdown();
+    println!("proxy shut down.");
     Ok(())
 }
 

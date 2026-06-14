@@ -86,9 +86,16 @@ pinned by golden vectors where a wire format is involved. warren-core
 
 ## P8: warren-sdk facade
 
-- `WarrenClient` orchestrating identity, API, discovery, connect and mode
-  selection, with a lifecycle event stream. End-to-end tests against a real exit
-  and the production API.
+- DONE: `WarrenClient` orchestrating identity, API (via `client.api()`),
+  discovery (single-hop + multihop), and the non-root datapaths (`start_proxy`,
+  `start_proxy_multihop`). `ProxyHandle` exposes the listener address(es) and the
+  tunnel connection state (`TunnelState::{Connected, Disconnected}` via `state()`
+  / `watch_state()`), so an app reacts to a dropped tunnel. In-process e2e tested.
+- Pending: auto-reconnect supervisor wired into the facade (the
+  `warren-transport` backoff/state primitives exist; reconnect must rebuild the
+  netstack from a possibly-changed `IpAssign`, so it needs real-exit validation);
+  a one-call port-forward convenience (primitives done in `warren-net`); and
+  end-to-end tests against a real exit and the production API.
 
 ## P9: warren-sdk-ffi (uniffi scaffolding done)
 

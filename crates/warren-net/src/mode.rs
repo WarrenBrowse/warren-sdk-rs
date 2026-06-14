@@ -23,11 +23,19 @@ impl Default for ConnectMode {
 }
 
 /// Configuration for the non-root proxy datapath.
+///
+/// The listeners are unauthenticated, so they MUST stay loopback-bound for the
+/// single-app use case. The default binds `127.0.0.1`; binding a non-loopback
+/// address (for example `0.0.0.0`) turns the SDK into an open proxy reachable by
+/// other hosts on the network. Only do that in an isolated network namespace or
+/// container where you control reachability.
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
-    /// Local address for the SOCKS5 listener.
+    /// Local address for the SOCKS5 listener. Keep this loopback (see the type
+    /// docs); the listener is unauthenticated.
     pub socks5: SocketAddr,
-    /// Optional local address for an HTTP CONNECT listener.
+    /// Optional local address for an HTTP CONNECT listener. Keep this loopback;
+    /// the listener is unauthenticated.
     pub http: Option<SocketAddr>,
     /// DNS resolver to query over the tunnel. `None` uses the exit's gateway
     /// forwarder (the common case). Set this for a `dns_disabled` exit to a
