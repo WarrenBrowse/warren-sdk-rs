@@ -187,3 +187,47 @@ the datapath rides on is not yet the production one**. No real tunnel is possibl
 until the multihop frame lands. ROADMAP is updated to make multihop a required,
 blocking phase rather than an optional one, and to note the exit X25519 descriptor
 must be sourced (separate endpoint) for HPKE.
+
+## Multihop feature audit (5 independent sub-agents)
+
+After the multihop layers landed and were live-validated against a production
+exit, five independent sub-agents audited the new code, one per aspect:
+security, byte-for-byte wire compatibility vs warren-core, architecture /
+portability, TDD / test quality, and multi-platform / CI. Findings and
+disposition:
+
+| Sev | Aspect | Finding | Status |
+|---|---|---|---|
+| HIGH | security + wire (consensus) | The directory verifier only checked the exit descriptor, which signs `(exit_id, x25519)` but NOT `exit_ed25519_pubkey`. The Ed25519 RPK the client pins for the TLS handshake was therefore server-trusted, not operational-key-bound: a hostile directory could swap the RPK to redirect the dial. | FIXED. Now verifies the relay descriptor AND the node attestation (`WARREN_PKI_OPERATIONAL_NODE_V1 \|\| relay_id \|\| exit_ed25519_pubkey \|\| asn_be \|\| country`), dropping any node not fully vouched (matches warren-core `node_fully_vouched`). Live prod directory still yields 3 vouched exits (byte layouts confirmed). 11-test verifier suite added. |
+| HIGH | security | Directory fetch lacked the anti-rollback + validity-window cap the relay-list path already has. | FIXED. `MAX_VALIDITY_SECS` (7d) cap in the verifier (`DirectoryError::ValidityTooLong`); per-directory `generation` floor via a dedicated `GenerationStore` in the facade (`SdkError::RolledBackMultihopDirectory`). |
+| MEDIUM | architecture | `start_proxy_multihop` hardcoded the tunnel subnet (`10.66.0.0/16`, gw `10.66.0.1`) instead of the exit-supplied `IpAssign`, a latent black-hole if a real exit assigns differently. | FIXED. The netstack subnet (ip/prefix/gateway) is now derived from the `IpAssign`. |
+| HIGH | TDD | `multihop_directory.rs` had no test module; `open_response` error paths and the data-plane replay/forgery drop were untested. | FIXED. Directory verifier suite (every `DirectoryError` variant + forged relay/exit/attestation dropped + relabeled-country dropped), `open_response` error tests, a replaying-exit integration test (client drops the duplicate, delivers each packet once), and a facade `NoMultihopDirectory(404)` test. |
+| HIGH | multi-platform | The `tun`/`killswitch` features were never compiled/linted in CI. | FIXED. clippy + test now run `--all-features` on every OS (today empty, in place for the per-OS datapath). |
+| LOW | multi-platform/hygiene | Stale "single rand_core in the tree" comment; `MultihopFrameError` not re-exported. | FIXED. |
+
+Verified-correct by the audits (no action): the HPKE construction (AAD /
+export-info byte layouts, zero-nonce-per-unique-key discipline, forward/reverse
+direction tag), PoP binding, RFC 6479 replay window and verify-then-record
+ordering, frame/control DoS bounds, no-log discipline (no key/IP/nonce in any
+Display or log), `unsafe_code = "forbid"`, the independent fake-exit (re-derives
+crypto, so a green loopback proves wire interop), exclusive self-hosted CI, the
+`--locked` + 1.89 pin, and the address-family-matched UDP bind. All seven pure
+wire layers (frame, control, PoP, HPKE session, setup semantics, replay,
+directory preimage) were confirmed byte-for-byte identical to warren-core.
+
+Deferred (tracked, not blocking):
+
+- Shared cross-language `vectors/*.json` for the multihop frame, control, and PoP
+  formats. The Rust side is byte-pinned by inline literal tests and the live prod
+  directory fixture; the JSON artifacts for the sibling SDKs are a follow-up
+  (needs a fixed-encapsulated-key fixture for the non-deterministic HPKE seal).
+- FFI error shape: `MultihopError::SetupIo` / `TunnelError::HandshakeIo` carry a
+  `Box<dyn Error>` source, not uniffi-serializable. Both (single-hop + multihop)
+  are addressed together in P9 when the tunnel FFI surface is exported.
+- IPv6 datapath: the netstack engine is IPv4-only, so an assigned v6 is not yet
+  routed (the v6 bind branch is also untested). Tracked with the per-OS datapath.
+- The DNS-disabled (`dns_disabled`) downgrade defense is not consumed
+  (`VerifiedExit` omits the field); revisit if/when the SDK gates on DNS.
+- CI runner labels could add a custom org label (e.g. `warren`) to pin jobs to
+  the intended self-hosted hosts; left as a recommendation pending confirmation
+  of the live runners' label sets (changing labels blind could unschedule jobs).
