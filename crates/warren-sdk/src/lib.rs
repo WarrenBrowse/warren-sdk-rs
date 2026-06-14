@@ -584,7 +584,7 @@ where
     if let Some(dns) = cfg.dns_server {
         config = config.with_dns_server(dns);
     }
-    let connector = warren_net::spawn_over_sink(Arc::new(sink), config);
+    let (connector, mut alive_rx) = warren_net::spawn_over_sink(Arc::new(sink), config);
 
     let socks_listener = tokio::net::TcpListener::bind(cfg.socks5)
         .await
@@ -596,6 +596,19 @@ where
     let mut tasks = vec![tokio::spawn(async move {
         let _ = socks.serve_with_udp(socks_listener).await;
     })];
+
+    // Surface tunnel liveness as a connection state an app can observe: the
+    // datapath starts Connected and flips to Disconnected when the tunnel read
+    // side closes (the leak window), so the app can stop sending or reconnect.
+    let (state_tx, state_rx) = tokio::sync::watch::channel(TunnelState::Connected);
+    tasks.push(tokio::spawn(async move {
+        while alive_rx.changed().await.is_ok() {
+            if !*alive_rx.borrow() {
+                let _ = state_tx.send(TunnelState::Disconnected);
+                break;
+            }
+        }
+    }));
 
     let mut http_addr = None;
     if let Some(http_bind) = cfg.http {
@@ -612,6 +625,7 @@ where
     Ok(ProxyHandle {
         local_addr,
         http_addr,
+        state_rx,
         tasks,
     })
 }
@@ -621,10 +635,22 @@ const TUNNEL_PREFIX: u8 = 16;
 /// Tunnel gateway (exit side), matching warren-core's `10.66.0.1`.
 const TUNNEL_GATEWAY: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 66, 0, 1);
 
+/// Liveness of a running proxy datapath's tunnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TunnelState {
+    /// The tunnel is up and the proxy is forwarding.
+    Connected,
+    /// The tunnel read side closed; traffic no longer egresses at the exit. The
+    /// app should stop sending (or tear down and reconnect) to avoid a leak.
+    Disconnected,
+}
+
 /// A running non-root proxy datapath. Dropping it stops the proxy.
 pub struct ProxyHandle {
     local_addr: SocketAddr,
     http_addr: Option<SocketAddr>,
+    state_rx: tokio::sync::watch::Receiver<TunnelState>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -640,6 +666,20 @@ impl ProxyHandle {
     #[must_use]
     pub fn http_addr(&self) -> Option<SocketAddr> {
         self.http_addr
+    }
+
+    /// The current tunnel state ([`TunnelState::Connected`] until the tunnel
+    /// read side closes).
+    #[must_use]
+    pub fn state(&self) -> TunnelState {
+        *self.state_rx.borrow()
+    }
+
+    /// A watch receiver for tunnel-state changes, so an app can await a
+    /// disconnect (`state_rx.changed().await`) rather than poll [`Self::state`].
+    #[must_use]
+    pub fn watch_state(&self) -> tokio::sync::watch::Receiver<TunnelState> {
+        self.state_rx.clone()
     }
 
     /// Stops the proxy datapath.

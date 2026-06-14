@@ -9,6 +9,7 @@
 use ed25519_dalek::SigningKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use warren_sdk::TunnelState;
 use warren_sdk::WarrenClient;
 use warren_sdk::discovery::{ExitId, Location, Relay};
 use warren_sdk::identity::WarrenIdentity;
@@ -42,6 +43,11 @@ async fn start_proxy_routes_socks5_through_the_tunnel() {
         ..ProxyConfig::default()
     };
     let handle = client.start_proxy(&exit, &cfg).await.expect("proxy starts");
+    assert_eq!(
+        handle.state(),
+        TunnelState::Connected,
+        "a freshly started proxy reports Connected"
+    );
 
     let mut sock = TcpStream::connect(handle.local_addr())
         .await

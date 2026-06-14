@@ -32,7 +32,7 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::PollSender;
 
 use crate::dns;
@@ -1158,14 +1158,22 @@ impl Engine {
 /// (for example a PMTU `TooLarge`) drops that one packet and continues; the
 /// whole datapath only tears down when the tunnel read side closes.
 ///
+/// Returns the connector and a liveness watch that flips to `false` when the
+/// tunnel read side closes (the datapath is dead): a caller can surface that as
+/// a disconnect so an app reacts to the leak window.
+///
 /// [`PacketSink`]: crate::PacketSink
 #[must_use]
-pub fn spawn_over_sink<S>(sink: Arc<S>, config: NetstackConfig) -> TunnelConnector
+pub fn spawn_over_sink<S>(
+    sink: Arc<S>,
+    config: NetstackConfig,
+) -> (TunnelConnector, watch::Receiver<bool>)
 where
     S: crate::PacketSink + 'static,
 {
     let (inbound_tx, inbound_rx) = mpsc::channel(FRAME_CHANNEL_DEPTH);
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(FRAME_CHANNEL_DEPTH);
+    let (alive_tx, alive_rx) = watch::channel(true);
 
     let reader = Arc::clone(&sink);
     tokio::spawn(async move {
@@ -1174,6 +1182,8 @@ where
                 break;
             }
         }
+        // The tunnel read side closed (or the engine is gone): signal down.
+        let _ = alive_tx.send(false);
     });
     tokio::spawn(async move {
         while let Some(frame) = outbound_rx.recv().await {
@@ -1183,7 +1193,7 @@ where
         }
     });
 
-    spawn_engine(config, inbound_rx, outbound_tx)
+    (spawn_engine(config, inbound_rx, outbound_tx), alive_rx)
 }
 
 impl crate::proxy::UdpFlow for NetstackUdpSocket {
