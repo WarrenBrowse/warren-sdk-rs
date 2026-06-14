@@ -8,8 +8,9 @@
 //!
 //! Two surfaces are exported: the pure, deterministic identity functions (shared
 //! by every sibling-language SDK and validated against `vectors/`), and a
-//! [`WarrenFfiClient`] object with async account/directory methods over a tokio
-//! bridge. The tunnel/proxy lifecycle handle and an event stream are added next.
+//! [`WarrenFfiClient`] object with async account/directory methods (redeem,
+//! subscription, tunnel check, exit listing) plus `start_proxy`, which returns a
+//! [`WarrenFfiProxy`] lifecycle handle. A connection event stream is added next.
 
 // FFI exports take owned arguments by value on purpose: uniffi marshals owned
 // values across the language boundary, so a borrowed signature would not match
@@ -25,7 +26,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use warren_sdk::api::ClientError;
+use warren_sdk::api::{ClientError, RegisterAccountRequest};
 use warren_sdk::identity::{WarrenIdentity, ss58};
 use warren_sdk::net::ProxyConfig;
 use warren_sdk::{DefaultClient, ProxyHandle, SdkError, WarrenClient};
@@ -257,6 +258,30 @@ impl WarrenFfiClient {
             .await
             .map_err(map_client_error)?;
         Ok(sub.expires_at)
+    }
+
+    /// Redeems a voucher secret to create or extend the subscription bound to
+    /// this client's wallet pubkey (unsigned `POST /v1/register`; the voucher is
+    /// the proof of purchase). Returns the new expiry (unix epoch seconds).
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::ServerStatus`] on a non-2xx reply (e.g. an invalid or spent
+    /// voucher), [`FfiError::Client`] on a transport or other client-side
+    /// failure.
+    pub async fn redeem_voucher(&self, voucher_secret: String) -> Result<u64, FfiError> {
+        let req = RegisterAccountRequest {
+            pubkey_ss58: self.inner.api().address(),
+            voucher_secret,
+            referral_code: None,
+        };
+        let resp = self
+            .inner
+            .api()
+            .register(&req)
+            .await
+            .map_err(map_client_error)?;
+        Ok(resp.expires_at)
     }
 
     /// Whether this client's current egress IP is a Warren exit, i.e. the tunnel
@@ -542,6 +567,22 @@ mod tests {
             ),
             "an unroutable host must surface as a client/server error, not panic"
         );
+    }
+
+    #[tokio::test]
+    async fn redeem_voucher_surfaces_a_client_error_on_unroutable_host() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://127.0.0.1:1".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        let r = client.redeem_voucher("voucher-secret".to_owned()).await;
+        assert!(matches!(
+            r,
+            Err(FfiError::Client { .. }) | Err(FfiError::ServerStatus { .. })
+        ));
     }
 
     #[tokio::test]
