@@ -437,10 +437,18 @@ mod tests {
         .await
         .expect_err("all fail");
         assert!(matches!(err, RetryError::Exhausted { attempts: 3, .. }));
-        let s = states.borrow();
-        assert_eq!(s.first(), Some(&ConnectionState::Connecting));
-        assert_eq!(s.last(), Some(&ConnectionState::Failed));
-        assert!(s.contains(&ConnectionState::Reconnecting));
+        // Exact sequence: attempt 0 Connecting, attempts 1-2 Reconnecting, then
+        // the terminal Failed. Asserting the full vector (not just ends) catches
+        // a stray or misordered transition.
+        assert_eq!(
+            *states.borrow(),
+            vec![
+                ConnectionState::Connecting,
+                ConnectionState::Reconnecting,
+                ConnectionState::Reconnecting,
+                ConnectionState::Failed,
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]

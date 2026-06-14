@@ -152,11 +152,13 @@ fn dns_response(query: &[u8], addr: std::net::Ipv4Addr) -> Vec<u8> {
     r
 }
 
-/// A smoltcp "exit" that both answers DNS `A` queries on UDP `:53` (always
-/// returning its own address) and echoes TCP on `:9`. Lets a `Target::Domain`
-/// resolve over the tunnel and then connect to the resolved address.
+/// A smoltcp "exit" that answers DNS `A` queries on UDP `:53` with `answer`
+/// (deliberately distinct from `ip`, so the test proves the connect target came
+/// from the parsed RDATA, not from the query destination) and echoes TCP on
+/// `:9`. The exit owns both `ip` and `answer` so the resolved connect lands.
 async fn dns_and_echo_server(
     ip: std::net::Ipv4Addr,
+    answer: std::net::Ipv4Addr,
     prefix: u8,
     gateway: std::net::Ipv4Addr,
     mut inbound: mpsc::Receiver<Bytes>,
@@ -175,6 +177,8 @@ async fn dns_and_echo_server(
     let mut iface = Interface::new(config, &mut device, now());
     iface.update_ip_addrs(|a| {
         let _ = a.push(IpCidr::new(IpAddress::from(ip), prefix));
+        // The exit also owns the resolved address so the connect to it lands.
+        let _ = a.push(IpCidr::new(IpAddress::from(answer), prefix));
     });
     let _ = iface.routes_mut().add_default_ipv4_route(gateway);
 
@@ -212,7 +216,7 @@ async fn dns_and_echo_server(
         };
         if let Some((query, endpoint)) = request {
             let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
-            let _ = sock.send_slice(&dns_response(&query, ip), endpoint);
+            let _ = sock.send_slice(&dns_response(&query, answer), endpoint);
         }
 
         // TCP echo.
@@ -244,8 +248,9 @@ async fn dns_and_echo_server(
 #[tokio::test(flavor = "multi_thread")]
 async fn netstack_resolves_a_domain_over_the_tunnel_then_connects() {
     // A domain CONNECT: the engine sends a DNS query over the tunnel to the
-    // gateway (10.66.0.1:53), the exit answers A = 10.66.0.1, then the engine
-    // connects to 10.66.0.1:9 and echoes. No host resolver is consulted.
+    // gateway (10.66.0.1:53), the exit answers A = 10.66.0.5 (distinct from the
+    // gateway, proving the connect target is the parsed RDATA), then the engine
+    // connects to 10.66.0.5:9 and echoes. No host resolver is consulted.
     let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
     let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
 
@@ -259,6 +264,7 @@ async fn netstack_resolves_a_domain_over_the_tunnel_then_connects() {
     );
     tokio::spawn(dns_and_echo_server(
         "10.66.0.1".parse().unwrap(),
+        "10.66.0.5".parse().unwrap(),
         24,
         "10.66.0.1".parse().unwrap(),
         c2s_rx,
