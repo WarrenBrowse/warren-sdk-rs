@@ -25,8 +25,18 @@ pub enum KillSwitchLevel {
 /// A leak-prevention backend.
 pub trait KillSwitch: Send + Sync {
     /// Engages protection, allowing only tunnel traffic plus the exit endpoint.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError`] if the backend cannot install its rules (for example an OS
+    /// firewall backend lacking privilege). The proxy-mode backend never errors.
     fn engage(&self) -> impl std::future::Future<Output = Result<(), NetError>> + Send;
     /// Disengages protection, restoring normal connectivity.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError`] if the backend cannot remove its rules. The proxy-mode
+    /// backend never errors.
     fn disengage(&self) -> impl std::future::Future<Output = Result<(), NetError>> + Send;
     /// The level of protection this backend can guarantee.
     fn guarantees(&self) -> KillSwitchLevel;

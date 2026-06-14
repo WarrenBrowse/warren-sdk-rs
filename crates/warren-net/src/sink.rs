@@ -14,6 +14,11 @@ use crate::error::NetError;
 /// Moves inner IP packets to and from the tunnel.
 pub trait PacketSink: Send + Sync {
     /// Sends one inner IP packet toward the exit.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Tunnel`]/[`NetError::Multihop`] if the tunnel send fails (the
+    /// datagram is too large for the path, or the session has closed).
     fn send_packet(
         &self,
         packet: &[u8],
@@ -21,6 +26,11 @@ pub trait PacketSink: Send + Sync {
 
     /// Awaits the next inner IP packet from the exit, returned zero-copy as
     /// [`Bytes`].
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Tunnel`]/[`NetError::Multihop`] if the tunnel read side has
+    /// closed (the session ended).
     fn recv_packet(&self) -> impl std::future::Future<Output = Result<Bytes, NetError>> + Send;
 
     /// The largest packet payload the current path can carry.
@@ -28,6 +38,11 @@ pub trait PacketSink: Send + Sync {
 
     /// Sends a batch of packets. The default forwards them one by one; a
     /// GSO-aware implementation can override this to coalesce the syscall.
+    ///
+    /// # Errors
+    ///
+    /// The first [`send_packet`](Self::send_packet) error stops the batch and is
+    /// returned.
     fn send_batch(
         &self,
         packets: &[&[u8]],
@@ -43,6 +58,11 @@ pub trait PacketSink: Send + Sync {
     /// Receives at least one and at most `max` packets, blocking for the first.
     /// The default returns a single packet; a GRO-aware implementation can
     /// return several harvested from one syscall.
+    ///
+    /// # Errors
+    ///
+    /// The [`recv_packet`](Self::recv_packet) error on the first packet (the
+    /// session ended).
     fn recv_batch(
         &self,
         max: usize,

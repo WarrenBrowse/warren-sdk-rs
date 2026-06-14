@@ -13,9 +13,10 @@
 //!    so it is informational and does not gate the proof.
 //!
 //! The first QUIC datagrams on a fresh path are frequently lost during warm-up,
-//! so the CONNECT is retried with a short per-attempt budget. DNS-over-tunnel is
-//! not implemented yet, so targets are resolved locally and SOCKS5 CONNECT uses
-//! the IP literal (the bytes still egress at the exit).
+//! so the CONNECT is retried with a short per-attempt budget. This example sends
+//! an IP literal in the SOCKS5 CONNECT for a deterministic proof; the SDK also
+//! resolves domain targets over the tunnel (DNS-over-tunnel, no host-resolver
+//! leak), so a `Target::Domain` would egress its lookup at the exit too.
 
 use std::net::ToSocketAddrs;
 

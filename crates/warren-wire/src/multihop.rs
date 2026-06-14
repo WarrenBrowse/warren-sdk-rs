@@ -31,7 +31,7 @@ pub const EXIT_ID_LEN: usize = 16;
 /// detached AEAD keeps ciphertext == plaintext length). Breakdown, postcard
 /// worst case: version(1) + exit_id(16) + epoch varint(5, `u32::MAX`) + seq
 /// varint(10, `u64::MAX`) + encapsulated_key(32) + aead_tag(16) + ciphertext
-/// length varint(3, up to [`MAX_FRAME_BYTES`]) = 83. Datapaths subtract this
+/// length varint(3, up to `MAX_FRAME_BYTES`) = 83. Datapaths subtract this
 /// from the path datagram size to size the inner MTU. Pinned by
 /// `frame_overhead_never_exceeds_the_bound`.
 pub const MULTIHOP_FRAME_MAX_OVERHEAD: usize = 83;
@@ -64,7 +64,7 @@ pub enum MultihopFrameError {
     /// postcard encode/decode failure.
     #[error("multihop frame codec error: {0}")]
     Codec(#[from] postcard::Error),
-    /// Encoded frame exceeds [`MAX_FRAME_BYTES`].
+    /// Encoded frame exceeds `MAX_FRAME_BYTES`.
     #[error("multihop frame too large")]
     TooLarge,
     /// `version` byte is not [`WARREN_HPKE_VERSION_V1`].
@@ -91,7 +91,7 @@ impl WarrenMultihopFrame {
     ///
     /// # Errors
     ///
-    /// [`MultihopFrameError::TooLarge`] if longer than [`MAX_FRAME_BYTES`],
+    /// [`MultihopFrameError::TooLarge`] if longer than `MAX_FRAME_BYTES`,
     /// [`MultihopFrameError::Codec`] on malformed input, or
     /// [`MultihopFrameError::UnsupportedVersion`] on a wrong version byte.
     pub fn decode(bytes: &[u8]) -> Result<Self, MultihopFrameError> {

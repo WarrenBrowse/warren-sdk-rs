@@ -81,8 +81,14 @@ impl TransportError {
 /// An async HTTP transport. Implemented by the bundled reqwest backend (feature
 /// `reqwest-transport`) and by test mocks.
 pub trait HttpTransport: Send + Sync {
-    /// Executes `request` and returns the response, or a [`TransportError`] if
-    /// the round trip failed at the network layer.
+    /// Executes `request` and returns the response.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::Connect`] if the connection could not be established
+    /// (the retryable case for host fallback), or [`TransportError::Io`] if the
+    /// round trip failed after connecting. A non-2xx HTTP status is a successful
+    /// round trip, not an error here.
     fn execute(
         &self,
         request: HttpRequest,

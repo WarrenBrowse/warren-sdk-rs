@@ -35,6 +35,11 @@ pub trait Connector: Send + Sync + 'static {
     type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
 
     /// Connects to `target`, returning the stream or a [`NetError`].
+    ///
+    /// # Errors
+    ///
+    /// A [`NetError`] when the connection cannot be established (refused, timed
+    /// out, name resolution failed, or the tunnel/engine is gone).
     fn connect(
         &self,
         target: Target,
@@ -45,6 +50,11 @@ pub trait Connector: Send + Sync + 'static {
 /// tunnel netstack implements it so datagrams egress at the exit.
 pub trait UdpFlow: Send + 'static {
     /// Sends `data` to `dst` through the flow (lossy, like UDP).
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::EngineStopped`] if the netstack engine has gone; transient
+    /// per-datagram drops are silent (lossy by design), not errors.
     fn send_to(
         &self,
         data: Bytes,
@@ -64,9 +74,18 @@ pub trait UdpConnector: Connector {
     type Flow: UdpFlow;
 
     /// Opens a UDP flow (an ephemeral egress port) for a UDP association.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::EngineStopped`] if the netstack engine has stopped.
     fn open_udp(&self) -> impl std::future::Future<Output = Result<Self::Flow, NetError>> + Send;
 
     /// Resolves `host` to an address through the same path as the data plane.
+    ///
+    /// # Errors
+    ///
+    /// A [`NetError`] when resolution fails (no record, timeout, or the engine is
+    /// gone).
     fn resolve_host(
         &self,
         host: &str,

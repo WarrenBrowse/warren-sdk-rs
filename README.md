@@ -15,24 +15,31 @@ for the engineering rules.
 
 ## Status
 
-The cryptographic and protocol core is implemented in strict TDD and validated
-end to end in-process (identity to QUIC tunnel to datagram). The per-OS datapath
-(proxy/TUN backends) and the FFI binding codegen are scaffolded behind their
-seams and tracked as the next phases. Applications depend on a single crate,
-`warren-sdk`. See `AUDIT.md` for the post-implementation audit and `ROADMAP.md`
-for the remaining work.
+The whole client stack is implemented in strict TDD and validated end to end
+in-process (identity to QUIC tunnel to datagram to local proxy), and the sealed
+multihop tunnel is **live-validated against a production exit**. The **non-root
+proxy datapath is feature-complete** on Linux, macOS and Windows: SOCKS5 and HTTP
+CONNECT, DNS-over-tunnel (no host-resolver leak), SOCKS5 UDP associate, dual-stack
+IPv6, and the port-forwarding primitives. Applications depend on a single crate,
+`warren-sdk`. `ROADMAP.md` is the source of truth for fine-grained status; see
+`AUDIT.md` for the audit trail.
 
 | Capability | Crate | Status |
 |---|---|---|
 | Non-custodial identity (BIP39, SS58 `wb…`, request signing) | `warren-identity` | done, golden vectors |
-| Handshake + NAT-PMP wire codecs | `warren-wire` | done, golden vectors |
-| Signed account API client (transport-agnostic) | `warren-api` | done; anti-censorship host fallback pending |
-| Signed relay list verify (v5) + weighted selector | `warren-discovery` | done, golden vector |
-| QUIC transport (RFC 7250 raw-public-key TLS 1.3) | `warren-transport` | done; QUIC+RPK handshake validated against a real exit. Multihop tunnel (`MultihopClientTunnel`) is the path real exits accept |
-| Non-root proxy datapath (SOCKS5 + HTTP CONNECT + smoltcp userspace netstack over the tunnel) | `warren-net` | implemented, e2e in-process over both single-hop and sealed multihop; DNS-over-tunnel + per-OS TUN pending |
-| High-level `WarrenClient` facade (`start_proxy` + `start_proxy_multihop` non-root datapaths) | `warren-sdk` | done, in-process e2e |
-| FFI identity surface (uniffi/flutter_rust_bridge-shaped) | `warren-sdk-ffi` | identity surface done; tunnel surface + binding codegen pending (P9) |
-| Multihop HPKE (frame + directory PKI + HPKE session + control/PoP + datapath) | `warren-wire`, `warren-discovery`, `warren-multihop`, `warren-transport` | done; **live-validated against a production exit** (it opens our sealed `IpRequest` and returns a sealed `Rejected` we decode). A full tunnel needs a subscribed wallet (allowlist gate); set `WARREN_MNEMONIC` for `cargo run -p warren-sdk --example live_exit` |
+| Wire codecs: handshake, NAT-PMP, multihop HPKE frame, control `/v2`, PoP | `warren-wire` | done, golden vectors |
+| Signed account API client (transport-agnostic) incl. anti-censorship host fallback (primary / alternatives / no-SNI) and payments/support/incidents | `warren-api` | done |
+| Signed relay list verify (v5) + weighted selector; multihop directory PKI verify | `warren-discovery` | done, golden vectors |
+| QUIC transport (RFC 7250 raw-public-key TLS 1.3) + reconnect/backoff supervisor | `warren-transport` | done; validated against a real exit. The sealed multihop tunnel is the path real exits accept |
+| Multihop HPKE session (X25519 / HKDF-SHA256 / ChaCha20Poly1305, epoch/seq replay) | `warren-multihop` | done; live-validated |
+| Non-root proxy datapath: smoltcp userspace netstack over the tunnel, SOCKS5 + HTTP CONNECT, DNS-over-tunnel (A/AAAA, configurable resolver), UDP associate, dual-stack IPv6, port-forwarding (NAT-PMP client + inbound listen/relay) | `warren-net` | feature-complete, e2e in-process over single-hop and sealed multihop; per-OS privileged TUN backend pending |
+| High-level `WarrenClient` facade (`start_proxy` + `start_proxy_multihop`, discovery, account API) | `warren-sdk` | done, in-process e2e |
+| FFI surface (uniffi): identity + async client + proxy handle + connection-state events; Python/Kotlin bindings CI-validated | `warren-sdk-ffi` | done |
+
+The full tunnel needs a subscribed wallet (the exit gates the IP assignment on its
+allowlist); set `WARREN_MNEMONIC` and run `cargo run -p warren-sdk --example
+live_proxy` (or `--example live_exit` to validate the sealed handshake without a
+subscription).
 
 ## Identity in a few lines
 

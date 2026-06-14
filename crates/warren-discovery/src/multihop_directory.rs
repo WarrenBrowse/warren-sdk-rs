@@ -199,7 +199,7 @@ pub enum DirectoryError {
     #[error("directory operational certificate failed")]
     BadOperationalCert,
     /// The validity window (`expires_at - signed_at`) exceeds the cap
-    /// ([`MAX_VALIDITY_SECS`]): a compromised server cannot outrun revocation.
+    /// (`MAX_VALIDITY_SECS`): a compromised server cannot outrun revocation.
     #[error("directory validity window too long")]
     ValidityTooLong,
 }

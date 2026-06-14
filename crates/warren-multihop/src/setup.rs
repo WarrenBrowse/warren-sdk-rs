@@ -1,7 +1,7 @@
 //! High-level multihop setup exchange (client side).
 //!
 //! Wraps the raw [`ClientSession`] seal/open and the
-//! [`WarrenControlMessage`](warren_wire::WarrenControlMessage) codec into the
+//! [`warren_wire::WarrenControlMessage`] codec into the
 //! single round-trip a client performs before any traffic flows:
 //!
 //! 1. The client seals a `IpRequest` (asserting its account pubkey + a proof of

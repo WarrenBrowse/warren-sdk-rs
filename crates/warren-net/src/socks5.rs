@@ -123,7 +123,10 @@ pub fn build_method_reply(method: u8) -> [u8; 2] {
 ///
 /// # Errors
 ///
-/// See [`Socks5Error`].
+/// [`Socks5Error::Truncated`] on a short buffer, [`Socks5Error::BadVersion`] on a
+/// non-`5` version, [`Socks5Error::BadCommand`] on an unknown command,
+/// [`Socks5Error::BadAtyp`] on an unknown address type, or
+/// [`Socks5Error::BadDomain`] on a non-UTF-8 domain.
 pub fn parse_request(buf: &[u8]) -> Result<(Command, Target), Socks5Error> {
     if buf.len() < 4 {
         return Err(Socks5Error::Truncated);

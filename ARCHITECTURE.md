@@ -35,18 +35,20 @@ portable in concept and pinned by shared golden vectors under `vectors/`.
 | Crate | Layer | Role | Status |
 |---|---|---|---|
 | `warren-identity` | core | BIP39 mnemonic to Ed25519, SS58 `wb…` address, canonical API request signing | done |
-| `warren-wire` | core | Pure codecs: Setup/SetupAck handshake (done), NAT-PMP (done); multihop HPKE frame (todo) | done (multihop todo) |
-| `warren-api` | core | Signed HTTP client for the `/v1/*` account API; transport-agnostic core + optional reqwest | done |
-| `warren-discovery` | core | Verify the signed relay list (v5), weighted exit selection | done |
-| `warren-transport` | net | QUIC handshake (quinn + rustls raw public keys), `ClientSession` datagram plane | done |
-| `warren-net` | net | `PacketSink` seam (done) + QUIC plane (done) + SOCKS5 codec (done) + killswitch levels (done); smoltcp proxy bridge and per-OS TUN/killswitch (todo) | partial |
-| `warren-sdk` | facade | `WarrenClient` composing identity/api/discovery/transport/net | done |
-| `warren-sdk-ffi` | facade | FFI-ready identity surface (done); uniffi/flutter_rust_bridge codegen + async tunnel surface (todo) | partial |
+| `warren-wire` | core | Pure codecs: Setup/SetupAck handshake, NAT-PMP, multihop HPKE frame, control `/v2`, PoP | done |
+| `warren-api` | core | Signed HTTP client for the `/v1/*` account API (incl. payments, support, incidents) with anti-censorship host fallback; transport-agnostic core + optional reqwest | done |
+| `warren-discovery` | core | Verify the signed relay list (v5) + weighted selection; verify the multihop directory PKI chain | done |
+| `warren-multihop` | core | Client HPKE session (X25519 / HKDF-SHA256 / ChaCha20Poly1305), sealed `IpRequest`/`IpAssign`, epoch/seq replay window | done |
+| `warren-transport` | net | QUIC handshake (quinn + rustls raw public keys), single-hop + multihop `ClientSession` datagram plane, reconnect/backoff supervisor | done |
+| `warren-net` | net | `PacketSink` seam + QUIC plane + smoltcp userspace netstack (TCP/UDP, dual-stack IPv6) + SOCKS5/HTTP CONNECT proxy + DNS-over-tunnel + NAT-PMP port-forwarding (client + inbound listen/relay) + killswitch levels; per-OS privileged TUN backend feature-gated (todo) | done (proxy); TUN todo |
+| `warren-sdk` | facade | `WarrenClient` composing identity/api/discovery/multihop/transport/net | done |
+| `warren-sdk-ffi` | facade | uniffi surface: identity + async client + proxy handle + connection-state events; Python/Kotlin bindings CI-validated | done |
 
 Every "done" crate is implemented in TDD with unit tests, golden vectors where a
-wire format is involved, and in-process end-to-end tests for the QUIC stack. The
-"todo" items are the parts that need real hardware/privilege (per-OS TUN,
-killswitch, real exit e2e) or a per-language build harness (binding codegen).
+wire format is involved, and in-process end-to-end tests for the datapath. The
+remaining "todo" is the part that needs real privilege (the per-OS TUN backend
+with its OS firewall killswitch); per CLAUDE.md, the datapath must also be
+validated against a real exit before it is relied on in production.
 
 Applications depend only on `warren-sdk`.
 
@@ -84,9 +86,14 @@ break and requires a schema version bump.
 | Multihop | HPKE (X25519 + HKDF-SHA256 + ChaCha20Poly1305), frame v1 (postcard) |
 | Network constants | tunnel 10.66.0.0/16, gateway 10.66.0.1, initial MTU 1280, idle 180s, keepalive 20s |
 
-## FFI boundary (designed now, implemented in P9)
+## FFI boundary
 
-The public API is kept FFI-friendly so a single `uniffi` definition can generate
-the Dart, Kotlin, Swift, Python and Java bindings: no generics in exported
+The public API is kept FFI-friendly so a single `uniffi` definition generates the
+Dart, Kotlin, Swift, Python and Java bindings: no generics in exported
 signatures, `#[non_exhaustive]` serializable error enums, owned plain types
-across the boundary, and lifecycle events delivered as a stream.
+across the boundary, and connection-state events delivered through a callback
+interface. The `warren-sdk-ffi` crate exposes the identity helpers, an async
+`WarrenFfiClient` (address, voucher, subscription, exits, proxy start), and a
+`WarrenFfiProxy` handle; the Python and Kotlin bindings are generated and
+grep-checked in CI. It is the one crate that relaxes `unsafe_code` from `forbid`
+to `deny` for uniffi's generated scaffolding (documented in the crate).

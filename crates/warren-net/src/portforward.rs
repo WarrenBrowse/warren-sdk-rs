@@ -324,9 +324,9 @@ pub async fn relay_to_local(mut stream: NetstackStream, target: SocketAddr) {
 const MAX_INBOUND_RELAYS: usize = 128;
 
 /// Accepts inbound connections on `listener` (a tunnel-side forwarded port) and
-/// relays each to the local `target`, one task per connection up to
-/// [`MAX_INBOUND_RELAYS`] in flight. Returns when the listener ends (the engine
-/// stopped).
+/// relays each to the local `target`, one task per connection up to a bounded
+/// number in flight (see `MAX_INBOUND_RELAYS`). Returns when the listener ends
+/// (the engine stopped).
 pub async fn serve_inbound(mut listener: NetstackListener, target: SocketAddr) {
     let limit = Arc::new(Semaphore::new(MAX_INBOUND_RELAYS));
     while let Some(stream) = listener.accept().await {

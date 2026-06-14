@@ -1,11 +1,13 @@
 //! Warren VPN client SDK: the single crate applications depend on.
 //!
-//! [`WarrenClient`] composes the layers into one flow:
+//! [`WarrenClient`] composes the layers into one flow. The recommended path is
+//! the sealed multihop tunnel (the handshake production exits accept) behind a
+//! local SOCKS5 proxy the integrating app points itself at:
 //!
 //! ```no_run
 //! # async fn run() -> Result<(), warren_sdk::SdkError> {
 //! use warren_sdk::{WarrenClient, identity::WarrenIdentity};
-//! use warren_sdk::discovery::ExitQuery;
+//! use warren_sdk::net::ProxyConfig;
 //!
 //! let (identity, _mnemonic) = WarrenIdentity::generate();
 //! let client = WarrenClient::builder()
@@ -14,16 +16,24 @@
 //!     .server_pubkey_pin("….hex….")
 //!     .build()?;
 //!
-//! let selector = client.fetch_exits().await?;        // signed list, verified
-//! let exit = selector.select_weighted(&ExitQuery::country("RO"))?.clone();
-//! let sink = client.connect_tunnel(&exit).await?;    // QUIC packet plane
-//! # let _ = sink; Ok(())
+//! // Fetch and verify the signed multihop directory (full PKI chain).
+//! let exits = client.fetch_multihop_directory().await?;
+//! if let Some(exit) = exits.first() {
+//!     // Start the non-root datapath: a local SOCKS5 listener (127.0.0.1:1080
+//!     // by default) whose traffic egresses at the exit over the sealed tunnel.
+//!     let proxy = client.start_proxy_multihop(exit, &ProxyConfig::default()).await?;
+//!     // Point the app's SOCKS5 client at `proxy.local_addr()`; drop the handle
+//!     // (or call `shutdown`) to stop the datapath.
+//!     let _ = proxy.local_addr();
+//! }
+//! # Ok(())
 //! # }
 //! ```
 //!
-//! The returned [`warren_net::QuicPacketSink`] is the packet plane; the proxy
-//! (non-root, default) and TUN (privileged) datapaths in [`warren_net`] drive
-//! it. Wiring a datapath onto the sink is the remaining `warren-net` work.
+//! Account, payment and incident operations are reached through
+//! [`WarrenClient::api`]. The single-hop [`WarrenClient::connect_tunnel`] returns
+//! a raw [`warren_net::QuicPacketSink`] for tests and bespoke datapaths; real
+//! exits require the multihop path above.
 
 pub use warren_api as api;
 pub use warren_discovery as discovery;

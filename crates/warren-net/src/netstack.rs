@@ -1,7 +1,7 @@
 //! Userspace TCP/IP for the non-root proxy datapath.
 //!
 //! A single-threaded smoltcp engine runs on its own task. It owns a [`smoltcp`]
-//! interface over a [`TunnelDevice`] whose frames are bare IP packets (no
+//! interface over a `TunnelDevice` whose frames are bare IP packets (no
 //! Ethernet: `Medium::Ip`) carried in and out over channels. Application TCP
 //! flows accepted by the SOCKS5 proxy become smoltcp TCP sockets; their bytes
 //! are bridged to tokio through per-connection bounded channels exposed as a
