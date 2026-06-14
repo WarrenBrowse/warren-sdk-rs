@@ -36,10 +36,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use warren_api::{ClientError, HttpTransport, WarrenApiClient};
-use warren_discovery::{ExitSelector, Relay, SelectorError, SignedError, verify_signed_relay_list};
+use warren_discovery::{
+    DirectoryError, ExitSelector, Relay, SelectorError, SignedError, VerifiedExit,
+    verify_multihop_directory, verify_signed_relay_list,
+};
 use warren_identity::WarrenIdentity;
-use warren_net::QuicPacketSink;
-use warren_transport::{ClientTunnel, TunnelError};
+use warren_net::{MultihopPacketSink, QuicPacketSink};
+use warren_transport::{ClientTunnel, MultihopClientTunnel, MultihopError, TunnelError};
 
 #[cfg(feature = "reqwest-transport")]
 use warren_api::ReqwestTransport;
@@ -60,6 +63,21 @@ pub enum SdkError {
     /// Establishing the tunnel failed.
     #[error(transparent)]
     Tunnel(#[from] TunnelError),
+    /// The signed multihop directory failed verification.
+    #[error(transparent)]
+    MultihopDirectory(#[from] DirectoryError),
+    /// Establishing the multihop tunnel failed (handshake, policy, or datapath).
+    #[error(transparent)]
+    Multihop(#[from] MultihopError),
+    /// The API has no multihop directory published (`404`).
+    #[error("no multihop directory is published")]
+    NoMultihopDirectory,
+    /// The multihop directory is past its `expires_at` (anti-freeze / replay).
+    #[error("multihop directory is expired")]
+    StaleMultihopDirectory,
+    /// No multihop exit matched the selection.
+    #[error("no multihop exit matched the selection")]
+    NoMultihopExit,
     /// The chosen exit has no dialable address.
     #[error("exit has no dialable address")]
     NoExitAddress,
@@ -394,45 +412,127 @@ impl<T: HttpTransport> WarrenClient<T> {
     ) -> Result<ProxyHandle, SdkError> {
         let sink = self.connect_tunnel(exit).await?;
         let local_ip = sink.session().assigned_ipv4();
-        // The inner IP MTU must fit one QUIC datagram: use the path/policy-aware
-        // payload size, NOT the raw policy MTU (which can exceed the datagram
-        // capacity and make every full-size packet silently fail to send).
-        let mtu = warren_net::PacketSink::max_payload(&sink);
-        let connector = warren_net::spawn_over_sink(
-            Arc::new(sink),
-            local_ip,
-            TUNNEL_PREFIX,
-            TUNNEL_GATEWAY,
-            mtu,
-        );
+        serve_proxy_over_sink(sink, local_ip, cfg).await
+    }
 
-        let socks_listener = tokio::net::TcpListener::bind(cfg.socks5)
+    /// Fetches and verifies the signed multihop directory, returning the trusted
+    /// exits. Enforces the version and the `expires_at` freshness bound; the full
+    /// PKI trust chain (server envelope, operational cert, exit descriptor) is
+    /// verified inside [`verify_multihop_directory`].
+    ///
+    /// The configured server pubkey pin, when set, authenticates which server
+    /// signed the directory; otherwise the chain is accepted on trust-on-first-
+    /// use terms. Each exit's Ed25519 identity should additionally be cross-
+    /// checked against [`Self::fetch_exits`] before use.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::Api`] on fetch failure, [`SdkError::NoMultihopDirectory`] if
+    /// none is published, [`SdkError::MultihopDirectory`] on a bad signature or
+    /// version, and [`SdkError::StaleMultihopDirectory`] if expired.
+    pub async fn fetch_multihop_directory(&self) -> Result<Vec<VerifiedExit>, SdkError> {
+        let json = self
+            .api
+            .get_multihop_directory()
+            .await?
+            .ok_or(SdkError::NoMultihopDirectory)?;
+
+        // The configured relay-list pin doubles as the directory server pin when
+        // present; with no pin, accept the self-consistent chain (TOFU).
+        let pins: Vec<&str> = self.server_pubkey_pin.as_deref().into_iter().collect();
+        let verified = verify_multihop_directory(&json, &pins, &[])?;
+
+        if now_unix_secs() >= verified.expires_at {
+            return Err(SdkError::StaleMultihopDirectory);
+        }
+        Ok(verified.exits)
+    }
+
+    /// Establishes a multihop tunnel to `exit` (the handshake real exits require:
+    /// an HPKE-sealed setup frame, not a bare `Setup`) and returns the sealed
+    /// packet plane.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::Multihop`] if the handshake, policy gate, or datapath fails.
+    pub async fn connect_multihop(
+        &self,
+        exit: &VerifiedExit,
+    ) -> Result<MultihopPacketSink, SdkError> {
+        let tunnel = MultihopClientTunnel::new(self.signing.clone());
+        let session = tunnel
+            .connect(
+                exit.exit_ed25519_pubkey,
+                exit.exit_x25519_multihop_pubkey,
+                exit.exit_id,
+                exit.endpoint,
+            )
+            .await?;
+        Ok(MultihopPacketSink::new(session))
+    }
+
+    /// Starts the non-root proxy datapath over a multihop tunnel to `exit`. Same
+    /// shape as [`Self::start_proxy`] but every packet is HPKE-sealed, so it
+    /// works against production exits.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::Multihop`] from the tunnel, or [`SdkError::Proxy`] if the
+    /// local listener cannot bind.
+    pub async fn start_proxy_multihop(
+        &self,
+        exit: &VerifiedExit,
+        cfg: &warren_net::ProxyConfig,
+    ) -> Result<ProxyHandle, SdkError> {
+        let sink = self.connect_multihop(exit).await?;
+        let local_ip = sink.session().assigned_ipv4();
+        serve_proxy_over_sink(sink, local_ip, cfg).await
+    }
+}
+
+/// Runs the userspace netstack over `sink` and serves the local SOCKS5 (and
+/// optional HTTP CONNECT) proxy. Shared by the single-hop and multihop datapaths.
+async fn serve_proxy_over_sink<S>(
+    sink: S,
+    local_ip: std::net::Ipv4Addr,
+    cfg: &warren_net::ProxyConfig,
+) -> Result<ProxyHandle, SdkError>
+where
+    S: warren_net::PacketSink + 'static,
+{
+    // The inner IP MTU must fit one QUIC datagram: use the path-aware payload
+    // size, NOT the raw policy MTU (which can exceed the datagram capacity and
+    // make every full-size packet silently fail to send).
+    let mtu = warren_net::PacketSink::max_payload(&sink);
+    let connector =
+        warren_net::spawn_over_sink(Arc::new(sink), local_ip, TUNNEL_PREFIX, TUNNEL_GATEWAY, mtu);
+
+    let socks_listener = tokio::net::TcpListener::bind(cfg.socks5)
+        .await
+        .map_err(SdkError::Proxy)?;
+    let local_addr = socks_listener.local_addr().map_err(SdkError::Proxy)?;
+    let socks = warren_net::Socks5Proxy::new(connector.clone());
+    let mut tasks = vec![tokio::spawn(async move {
+        let _ = socks.serve(socks_listener).await;
+    })];
+
+    let mut http_addr = None;
+    if let Some(http_bind) = cfg.http {
+        let http_listener = tokio::net::TcpListener::bind(http_bind)
             .await
             .map_err(SdkError::Proxy)?;
-        let local_addr = socks_listener.local_addr().map_err(SdkError::Proxy)?;
-        let socks = warren_net::Socks5Proxy::new(connector.clone());
-        let mut tasks = vec![tokio::spawn(async move {
-            let _ = socks.serve(socks_listener).await;
-        })];
-
-        let mut http_addr = None;
-        if let Some(http_bind) = cfg.http {
-            let http_listener = tokio::net::TcpListener::bind(http_bind)
-                .await
-                .map_err(SdkError::Proxy)?;
-            http_addr = Some(http_listener.local_addr().map_err(SdkError::Proxy)?);
-            let http = warren_net::HttpConnectProxy::new(connector);
-            tasks.push(tokio::spawn(async move {
-                let _ = http.serve(http_listener).await;
-            }));
-        }
-
-        Ok(ProxyHandle {
-            local_addr,
-            http_addr,
-            tasks,
-        })
+        http_addr = Some(http_listener.local_addr().map_err(SdkError::Proxy)?);
+        let http = warren_net::HttpConnectProxy::new(connector);
+        tasks.push(tokio::spawn(async move {
+            let _ = http.serve(http_listener).await;
+        }));
     }
+
+    Ok(ProxyHandle {
+        local_addr,
+        http_addr,
+        tasks,
+    })
 }
 
 /// Tunnel network prefix length (`10.66.0.0/16`), matching warren-core.

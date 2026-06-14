@@ -100,6 +100,25 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         String::from_utf8(resp.body).map_err(ClientError::ResponseEncoding)
     }
 
+    /// Public `GET /v1/multihop/directory`. Returns the raw signed multihop
+    /// directory JSON, or `None` on `404` (none published). Unsigned: the body
+    /// is itself signed and the caller verifies the full trust chain with
+    /// `warren_discovery::verify_multihop_directory`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on transport failure or a non-200/404 status.
+    pub async fn get_multihop_directory(&self) -> Result<Option<String>, ClientError> {
+        let req = self.unsigned_request(Method::Get, "/v1/multihop/directory", Vec::new());
+        match self.send(req).await {
+            Ok(resp) => String::from_utf8(resp.body)
+                .map(Some)
+                .map_err(ClientError::ResponseEncoding),
+            Err(ClientError::ServerStatus { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Unsigned `POST /v1/register`. Redeems a voucher to bind a subscription to
     /// the account pubkey.
     ///
@@ -440,6 +459,39 @@ mod tests {
             header(req, HEADER_PUBKEY).is_none(),
             "list_exits must be unsigned"
         );
+    }
+
+    #[tokio::test]
+    async fn multihop_directory_returns_body_on_200_and_is_unsigned() {
+        let c = client(MockTransport::new(200, "{\"directory\":true}"));
+        let body = c.get_multihop_directory().await.expect("ok");
+        assert_eq!(body.as_deref(), Some("{\"directory\":true}"));
+        let guard = c.transport.last.lock().unwrap();
+        let req = guard.as_ref().unwrap();
+        assert!(
+            header(req, HEADER_PUBKEY).is_none(),
+            "get_multihop_directory must be unsigned"
+        );
+    }
+
+    #[tokio::test]
+    async fn multihop_directory_maps_404_to_none() {
+        let c = client(MockTransport::new(404, "not found"));
+        let body = c
+            .get_multihop_directory()
+            .await
+            .expect("404 must be Ok(None), not an error");
+        assert_eq!(body, None);
+    }
+
+    #[tokio::test]
+    async fn multihop_directory_propagates_other_errors() {
+        let c = client(MockTransport::new(500, "boom"));
+        let err = c
+            .get_multihop_directory()
+            .await
+            .expect_err("a 500 must propagate as a server-status error");
+        assert!(matches!(err, ClientError::ServerStatus { status: 500, .. }));
     }
 
     type Responder =

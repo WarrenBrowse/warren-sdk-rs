@@ -461,3 +461,158 @@ pub async fn spawn_fake_multihop_exit(exit_key: SigningKey) -> (SocketAddr, Mult
         },
     )
 }
+
+/// Spawns a multihop QUIC "exit" that completes the HPKE-sealed setup exchange
+/// and then terminates inner TCP with a real server-side smoltcp stack at
+/// `10.66.0.1:9`, echoing the payload. Every data datagram is opened on the way
+/// in and re-sealed on the way out, so this exercises the full non-root proxy
+/// datapath over the handshake real exits require.
+///
+/// # Panics
+///
+/// Panics on any setup failure (test helper).
+pub async fn spawn_netstack_multihop_exit(exit_key: SigningKey) -> (SocketAddr, MultihopExitKeys) {
+    let ed25519_pubkey = exit_key.verifying_key().to_bytes();
+    let (recipient_priv, recipient_pub) =
+        ExitKem::gen_keypair(&mut rand_core::UnwrapErr(rand_core::OsRng));
+    let x25519_pubkey: [u8; 32] = recipient_pub.to_bytes().into();
+    let exit_id = [0x11u8; EXIT_ID_LEN];
+
+    let cfg = make_server_config(&exit_key, default_crypto_provider(), &[ALPN_H3])
+        .expect("server config");
+    let endpoint = quinn::Endpoint::server(cfg, "127.0.0.1:0".parse().unwrap())
+        .expect("server endpoint binds");
+    let addr = endpoint.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        let conn = endpoint
+            .accept()
+            .await
+            .expect("incoming")
+            .await
+            .expect("conn");
+        let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
+        let request_bytes = recv.read_to_end(65536).await.expect("read setup request");
+        let request = WarrenMultihopFrame::decode(&request_bytes).expect("decode request");
+        let encapped =
+            <ExitKem as KemTrait>::EncappedKey::from_bytes(&request.encapsulated_key).unwrap();
+        let ctx = setup_receiver::<ExitAead, ExitKdf, ExitKem>(
+            &OpModeR::Base,
+            &recipient_priv,
+            &encapped,
+            WARREN_HPKE_INFO_V1,
+        )
+        .expect("setup_receiver");
+        let _ = exit_open(&ctx, &exit_id, &request).expect("open setup request");
+
+        let assign = WarrenControlMessage::IpAssign {
+            ipv4: [10, 66, 0, 2],
+            prefix_len: 24,
+            gateway_ipv4: [10, 66, 0, 1],
+            ipv6: None,
+            prefix_len_v6: 0,
+            gateway_ipv6: None,
+        };
+        let reply = exit_seal(
+            &ctx,
+            &exit_id,
+            request.encapsulated_key,
+            &encode_control(&assign).expect("encode IpAssign"),
+            request.epoch,
+            0,
+        );
+        send.write_all(&reply.encode().expect("encode reply"))
+            .await
+            .expect("write reply");
+        send.finish().expect("finish reply");
+
+        // Outbound IP packets from the smoltcp stack are queued here, then sealed
+        // and sent in the main loop (single task: keeps the HPKE ctx local).
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut device = ExitDevice {
+            rx: VecDeque::new(),
+            tx: out_tx,
+        };
+        let base = tokio::time::Instant::now();
+        let now = || {
+            SmolInstant::from_micros(i64::try_from(base.elapsed().as_micros()).unwrap_or(i64::MAX))
+        };
+        let mut config = Config::new(HardwareAddress::Ip);
+        config.random_seed = 0x4558_4954_0002;
+        let mut iface = Interface::new(config, &mut device, now());
+        iface.update_ip_addrs(|a| {
+            let _ = a.push(IpCidr::new(IpAddress::v4(10, 66, 0, 1), 16));
+        });
+        let mut sockets = SocketSet::new(Vec::new());
+        let handle = sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+            tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+        ));
+        sockets
+            .get_mut::<tcp::Socket<'_>>(handle)
+            .listen(NETSTACK_EXIT_PORT)
+            .expect("listen");
+
+        let epoch = request.epoch;
+        let mut reverse_seq: u64 = 1;
+        loop {
+            let _ = iface.poll(now(), &mut device, &mut sockets);
+            let sock = sockets.get_mut::<tcp::Socket<'_>>(handle);
+            let mut buf = [0u8; 4096];
+            while sock.can_recv() && sock.can_send() {
+                match sock.recv_slice(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = sock.send_slice(&buf[..n]);
+                    }
+                }
+            }
+            // Seal and send everything smoltcp produced this turn.
+            while let Ok(ip_packet) = out_rx.try_recv() {
+                let frame = exit_seal(
+                    &ctx,
+                    &exit_id,
+                    request.encapsulated_key,
+                    &ip_packet,
+                    epoch,
+                    reverse_seq,
+                );
+                reverse_seq += 1;
+                if conn
+                    .send_datagram(frame.encode().expect("encode out frame").into())
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let delay = iface
+                .poll_delay(now(), &sockets)
+                .map(|d| std::time::Duration::from_micros(d.total_micros()))
+                .unwrap_or_else(|| std::time::Duration::from_millis(5));
+            tokio::select! {
+                dg = conn.read_datagram() => match dg {
+                    Ok(datagram) => {
+                        if let Ok(frame) = WarrenMultihopFrame::decode(&datagram)
+                            && frame.exit_id == exit_id
+                            && let Some(ip) = exit_open(&ctx, &exit_id, &frame)
+                        {
+                            device.rx.push_back(ip);
+                        }
+                    }
+                    Err(_) => break,
+                },
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+        drop(endpoint);
+    });
+
+    (
+        addr,
+        MultihopExitKeys {
+            ed25519_pubkey,
+            x25519_pubkey,
+            exit_id,
+        },
+    )
+}
