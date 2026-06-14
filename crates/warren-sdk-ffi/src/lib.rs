@@ -9,8 +9,9 @@
 //! Two surfaces are exported: the pure, deterministic identity functions (shared
 //! by every sibling-language SDK and validated against `vectors/`), and a
 //! [`WarrenFfiClient`] object with async account/directory methods (redeem,
-//! subscription, tunnel check, exit listing) plus `start_proxy`, which returns a
-//! [`WarrenFfiProxy`] lifecycle handle. A connection event stream is added next.
+//! subscription, tunnel check, exit listing) plus `start_proxy`, which retries
+//! with backoff, reports each [`FfiConnectionState`] to an optional
+//! [`ConnectionObserver`], and returns a [`WarrenFfiProxy`] lifecycle handle.
 
 // FFI exports take owned arguments by value on purpose: uniffi marshals owned
 // values across the language boundary, so a borrowed signature would not match
@@ -29,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use warren_sdk::api::{ClientError, RegisterAccountRequest};
 use warren_sdk::identity::{WarrenIdentity, ss58};
 use warren_sdk::net::ProxyConfig;
+use warren_sdk::transport::{Backoff, ConnectionState, RetryError, connect_with_state};
 use warren_sdk::{DefaultClient, ProxyHandle, SdkError, WarrenClient};
 
 uniffi::setup_scaffolding!();
@@ -60,6 +62,28 @@ pub enum FfiError {
         /// Human-readable, redaction-safe summary.
         message: String,
     },
+}
+
+/// Connection lifecycle state reported to a [`ConnectionObserver`]. Mirrors
+/// [`warren_sdk::transport::ConnectionState`] across the FFI boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiConnectionState {
+    /// The initial connect attempt is in flight.
+    Connecting,
+    /// A connection is established.
+    Connected,
+    /// A previous attempt failed; a retry is in flight.
+    Reconnecting,
+    /// Every attempt failed; the supervisor gave up.
+    Failed,
+}
+
+/// Receives connection-state transitions during [`WarrenFfiClient::start_proxy`].
+/// Implemented on the foreign side (uniffi callback interface) to drive UI.
+#[uniffi::export(callback_interface)]
+pub trait ConnectionObserver: Send + Sync {
+    /// Called for each state transition, in order.
+    fn on_state(&self, state: FfiConnectionState);
 }
 
 /// A Warren identity in FFI-friendly form.
@@ -339,29 +363,53 @@ impl WarrenFfiClient {
         &self,
         exit_id_hex: String,
         socks5_listen: String,
+        observer: Option<Box<dyn ConnectionObserver>>,
     ) -> Result<Arc<WarrenFfiProxy>, FfiError> {
         // Validate both arguments before any network so caller mistakes fail
-        // fast and cheaply.
+        // fast and cheaply (and before any state is reported).
         let want = hex16(&exit_id_hex)?;
         let socks5: SocketAddr = socks5_listen.parse().map_err(|_| FfiError::Client {
             message: "invalid socks5 listen address".to_owned(),
         })?;
-        let exit = self
-            .inner
-            .fetch_multihop_directory()
-            .await
-            .map_err(map_sdk_error)?
-            .into_iter()
-            .find(|e| e.exit_id == want)
-            .ok_or_else(|| FfiError::Client {
-                message: "exit id not found in the verified directory".to_owned(),
-            })?;
         let cfg = ProxyConfig { socks5, http: None };
-        let handle = self
-            .inner
-            .start_proxy_multihop(&exit, &cfg)
+
+        // Forward each supervisor transition to the foreign observer (if any),
+        // ignoring states this binding does not yet model (non_exhaustive).
+        let notify = |state: ConnectionState| {
+            let mapped = match state {
+                ConnectionState::Connecting => Some(FfiConnectionState::Connecting),
+                ConnectionState::Connected => Some(FfiConnectionState::Connected),
+                ConnectionState::Reconnecting => Some(FfiConnectionState::Reconnecting),
+                ConnectionState::Failed => Some(FfiConnectionState::Failed),
+                _ => None,
+            };
+            if let (Some(obs), Some(m)) = (observer.as_ref(), mapped) {
+                obs.on_state(m);
+            }
+        };
+
+        // One attempt = re-verify the directory, pick the exit, dial. Transient
+        // failures retry with full-jitter backoff; each transition is reported.
+        let attempt = || async {
+            let exit = self
+                .inner
+                .fetch_multihop_directory()
+                .await?
+                .into_iter()
+                .find(|e| e.exit_id == want)
+                .ok_or(SdkError::NoMultihopExit)?;
+            self.inner.start_proxy_multihop(&exit, &cfg).await
+        };
+
+        let handle = connect_with_state(Backoff::HANDSHAKE, 3, notify, attempt)
             .await
-            .map_err(map_sdk_error)?;
+            .map_err(|e| match e {
+                RetryError::Exhausted { last, .. } => map_sdk_error(last),
+                // NoAttempts and any future variant: a connect was not achieved.
+                _ => FfiError::Client {
+                    message: "connection was not established".to_owned(),
+                },
+            })?;
         let socks5_address = handle.local_addr().to_string();
         let http_address = handle.http_addr().map(|a| a.to_string());
         Ok(Arc::new(WarrenFfiProxy {
@@ -628,7 +676,7 @@ mod tests {
         )
         .expect("valid build");
         let r = client
-            .start_proxy("not-hex".to_owned(), "127.0.0.1:0".to_owned())
+            .start_proxy("not-hex".to_owned(), "127.0.0.1:0".to_owned(), None)
             .await;
         assert!(matches!(r, Err(FfiError::InvalidHex(_))));
     }
@@ -643,7 +691,11 @@ mod tests {
         )
         .expect("valid build");
         let r = client
-            .start_proxy("ab".repeat(16), "definitely not an address".to_owned())
+            .start_proxy(
+                "ab".repeat(16),
+                "definitely not an address".to_owned(),
+                None,
+            )
             .await;
         assert!(matches!(r, Err(FfiError::Client { .. })));
     }
@@ -658,12 +710,60 @@ mod tests {
         )
         .expect("valid build");
         let r = client
-            .start_proxy("ab".repeat(16), "127.0.0.1:0".to_owned())
+            .start_proxy("ab".repeat(16), "127.0.0.1:0".to_owned(), None)
             .await;
         assert!(matches!(
             r,
             Err(FfiError::Client { .. }) | Err(FfiError::ServerStatus { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn start_proxy_reports_states_to_the_observer_and_ends_in_failed() {
+        // A callback interface is a plain trait, so it is fully testable in Rust.
+        struct Recorder {
+            log: Arc<Mutex<Vec<FfiConnectionState>>>,
+        }
+        impl ConnectionObserver for Recorder {
+            fn on_state(&self, state: FfiConnectionState) {
+                self.log.lock().unwrap().push(state);
+            }
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let observer = Recorder {
+            log: Arc::clone(&log),
+        };
+
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://127.0.0.1:1".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        let r = client
+            .start_proxy(
+                "ab".repeat(16),
+                "127.0.0.1:0".to_owned(),
+                Some(Box::new(observer)),
+            )
+            .await;
+        assert!(r.is_err(), "an unroutable host must fail");
+        let states = log.lock().unwrap();
+        assert_eq!(
+            states.first(),
+            Some(&FfiConnectionState::Connecting),
+            "the first reported state is Connecting"
+        );
+        assert_eq!(
+            states.last(),
+            Some(&FfiConnectionState::Failed),
+            "exhausted retries end in Failed"
+        );
+        assert!(
+            states.contains(&FfiConnectionState::Reconnecting),
+            "retries report Reconnecting"
+        );
     }
 
     #[test]

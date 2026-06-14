@@ -103,9 +103,13 @@ pinned by golden vectors where a wire format is involved. warren-core
   argument-validation error paths fail fast before any network and are unit-tested;
   the happy path is covered by the facade e2e tests (it needs a real exit, not
   injectable through the concrete reqwest transport at the FFI layer).
-- Remaining: an event stream (uniffi callback interface for Up/Down/Reconnect),
-  then the first Dart/Flutter integration and the other languages. Every binding
-  replays the same `vectors/`.
+- Connection event stream done: `start_proxy` takes an optional
+  `ConnectionObserver` (uniffi callback interface) and, via `connect_with_state`,
+  retries the dial with full-jitter backoff while reporting each
+  `FfiConnectionState` (`Connecting` / `Reconnecting` / `Connected` / `Failed`).
+  Tested with a recording observer (the callback interface is a plain Rust trait).
+- Remaining: the first Dart/Flutter integration (and Kotlin/Swift/Python/Java),
+  consuming the generated bindings. Every binding replays the same `vectors/`.
 
 ## Audit follow-ups (see AUDIT.md)
 

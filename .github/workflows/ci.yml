@@ -110,6 +110,8 @@ jobs:
           grep -q "class WarrenFfiProxy" target/bindings/warren_sdk_ffi.py
           grep -q "async def start_proxy" target/bindings/warren_sdk_ffi.py
           grep -q "async def redeem_voucher" target/bindings/warren_sdk_ffi.py
+          grep -q "class FfiConnectionState" target/bindings/warren_sdk_ffi.py
+          grep -q "class ConnectionObserver" target/bindings/warren_sdk_ffi.py
 
   deny:
     name: cargo-deny
