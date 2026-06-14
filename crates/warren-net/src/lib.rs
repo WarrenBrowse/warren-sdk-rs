@@ -46,8 +46,8 @@ pub use killswitch::{KillSwitch, KillSwitchLevel, ProxyOnlyKillSwitch};
 pub use mode::{ConnectMode, ProxyConfig, TunConfig};
 #[cfg(feature = "proxy")]
 pub use netstack::{
-    NetstackConfig, NetstackStream, NetstackUdpSocket, TunnelConnector, spawn_engine,
-    spawn_over_sink,
+    Ipv6Addressing, NetstackConfig, NetstackStream, NetstackUdpSocket, TunnelConnector,
+    spawn_engine, spawn_over_sink,
 };
 #[cfg(feature = "proxy")]
 pub use portforward::{MapSpec, PortForwardError, PortMapping, run_refresh};

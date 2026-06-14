@@ -158,6 +158,14 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
     `dns_disabled` exits; the override still egresses over the tunnel, so lookups
     never leak to the host resolver. Validated in-process (an exit answering DNS
     only at a non-gateway in-tunnel address resolves and connects).
+  - Dual-stack IPv6: DONE (datapath). `NetstackConfig::with_ipv6` installs the
+    exit-granted v6 client address + default v6 route; the connector routes v6
+    targets when v6 was assigned and refuses them otherwise (fail-closed). The
+    facade enables it from the multihop `IpAssign` (v6 + v6 gateway); single-hop
+    stays v4-only (its SetupAck carries no v6 gateway/prefix). Validated in-process
+    (v6 connect/echo over the tunnel). Pending: AAAA-over-tunnel for v6 *domain*
+    targets (literal v6 works; domains still resolve A only), and real-exit v6
+    validation.
   - Pending: validation against a real Warren exit (mandatory before production);
     privileged per-OS TUN/routing/DNS/killswitch; GSO/GRO batch syscalls behind
     the `PacketSink` batch seam and `fast-apple-datapath` on macOS.

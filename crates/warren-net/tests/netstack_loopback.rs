@@ -133,6 +133,70 @@ async fn echo_server(
     }
 }
 
+/// An IPv6 smoltcp "exit" echo server: owns `ip/prefix`, listens TCP on `:9`,
+/// and echoes. On-link with the client (same prefix), so no route is needed.
+async fn echo_server_v6(
+    ip: std::net::Ipv6Addr,
+    prefix: u8,
+    mut inbound: mpsc::Receiver<Bytes>,
+    outbound: mpsc::Sender<Bytes>,
+) {
+    let mut device = ChanDevice {
+        rx: VecDeque::new(),
+        tx: outbound,
+    };
+    let base = tokio::time::Instant::now();
+    let now =
+        || SmolInstant::from_micros(i64::try_from(base.elapsed().as_micros()).unwrap_or(i64::MAX));
+
+    let mut config = Config::new(HardwareAddress::Ip);
+    config.random_seed = 0x5345_5256_0005;
+    let mut iface = Interface::new(config, &mut device, now());
+    iface.update_ip_addrs(|a| {
+        let _ = a.push(IpCidr::new(IpAddress::from(ip), prefix));
+    });
+
+    let mut sockets = SocketSet::new(Vec::new());
+    let handle = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+    ));
+    sockets
+        .get_mut::<tcp::Socket<'_>>(handle)
+        .listen(9)
+        .expect("listen");
+
+    loop {
+        while let Ok(f) = inbound.try_recv() {
+            device.rx.push_back(f);
+        }
+        let _ = iface.poll(now(), &mut device, &mut sockets);
+
+        let sock = sockets.get_mut::<tcp::Socket<'_>>(handle);
+        let mut buf = [0u8; 4096];
+        while sock.can_recv() && sock.can_send() {
+            match sock.recv_slice(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let _ = sock.send_slice(&buf[..n]);
+                }
+            }
+        }
+
+        let delay = iface
+            .poll_delay(now(), &sockets)
+            .map(|d| std::time::Duration::from_micros(d.total_micros()))
+            .unwrap_or_else(|| std::time::Duration::from_millis(5));
+        tokio::select! {
+            f = inbound.recv() => match f {
+                Some(f) => device.rx.push_back(f),
+                None => return,
+            },
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
 /// Builds a minimal DNS response for `query` answering with a single A record
 /// for `addr`. The exit forwarder does not need a full parser: it echoes the
 /// query id and question and appends one compressed A answer.
@@ -428,6 +492,66 @@ async fn netstack_resolves_via_a_configured_non_gateway_resolver() {
     let mut got = [0u8; 8];
     stream.read_exact(&mut got).await.expect("read echo");
     assert_eq!(&got, b"viadns99");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn netstack_connects_to_an_ipv6_target_over_the_tunnel() {
+    // Dual-stack: the engine is assigned both a v4 and a v6 tunnel address, and a
+    // literal IPv6 target is routed over the tunnel to a v6-only echo exit. Proves
+    // the v6 interface address + default route are installed and v6 TCP egresses.
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+
+    let config = NetstackConfig::new(
+        "10.66.0.2".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        MTU,
+    )
+    .with_ipv6("fd66::2".parse().unwrap(), 64, "fd66::1".parse().unwrap());
+    let connector = spawn_engine(config, s2c_rx, c2s_tx);
+
+    tokio::spawn(echo_server_v6(
+        "fd66::1".parse().unwrap(),
+        64,
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let mut stream = connector
+        .connect(Target::Ip("[fd66::1]:9".parse().unwrap()))
+        .await
+        .expect("ipv6 connect over the tunnel succeeds");
+    stream.write_all(b"v6-routed").await.expect("write");
+    stream.flush().await.expect("flush");
+    let mut got = [0u8; 9];
+    stream.read_exact(&mut got).await.expect("read echo");
+    assert_eq!(&got, b"v6-routed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn netstack_rejects_ipv6_target_when_v6_not_assigned() {
+    // Without a v6 assignment the connector must refuse a v6 target rather than
+    // black-hole it (fail fast, fail closed).
+    let (c2s_tx, _c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (_s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+    let connector = spawn_engine(
+        NetstackConfig::new(
+            "10.66.0.2".parse().unwrap(),
+            24,
+            "10.66.0.1".parse().unwrap(),
+            MTU,
+        ),
+        s2c_rx,
+        c2s_tx,
+    );
+    let result = connector
+        .connect(Target::Ip("[fd66::1]:9".parse().unwrap()))
+        .await;
+    assert!(
+        matches!(result, Err(warren_net::NetError::Unsupported(_))),
+        "a v6 target without a v6 assignment must be refused"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

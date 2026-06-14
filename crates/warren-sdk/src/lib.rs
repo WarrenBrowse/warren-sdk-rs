@@ -435,9 +435,10 @@ impl<T: HttpTransport> WarrenClient<T> {
     ) -> Result<ProxyHandle, SdkError> {
         let sink = self.connect_tunnel(exit).await?;
         let local_ip = sink.session().assigned_ipv4();
-        // Single-hop SetupAck carries no subnet, so fall back to the frozen
-        // tunnel defaults (10.66.0.0/16, gateway 10.66.0.1).
-        serve_proxy_over_sink(sink, local_ip, TUNNEL_PREFIX, TUNNEL_GATEWAY, cfg).await
+        // Single-hop SetupAck carries no subnet (and no v6 gateway/prefix), so
+        // fall back to the frozen v4 tunnel defaults (10.66.0.0/16, gw 10.66.0.1)
+        // and stay v4-only.
+        serve_proxy_over_sink(sink, local_ip, TUNNEL_PREFIX, TUNNEL_GATEWAY, None, cfg).await
     }
 
     /// Fetches and verifies the signed multihop directory, returning the trusted
@@ -528,7 +529,17 @@ impl<T: HttpTransport> WarrenClient<T> {
         let local_ip = std::net::Ipv4Addr::from(assignment.ipv4);
         let prefix = assignment.prefix_len;
         let gateway = std::net::Ipv4Addr::from(assignment.gateway_ipv4);
-        serve_proxy_over_sink(sink, local_ip, prefix, gateway, cfg).await
+        // Enable dual-stack only when the exit granted a v6 address AND its
+        // gateway; a v6 address without a gateway would be unroutable.
+        let ipv6 = match (assignment.ipv6, assignment.gateway_ipv6) {
+            (Some(ip), Some(gw)) => Some(warren_net::Ipv6Addressing {
+                local_ip: std::net::Ipv6Addr::from(ip),
+                prefix: assignment.prefix_len_v6,
+                gateway: std::net::Ipv6Addr::from(gw),
+            }),
+            _ => None,
+        };
+        serve_proxy_over_sink(sink, local_ip, prefix, gateway, ipv6, cfg).await
     }
 }
 
@@ -539,6 +550,7 @@ async fn serve_proxy_over_sink<S>(
     local_ip: std::net::Ipv4Addr,
     prefix: u8,
     gateway: std::net::Ipv4Addr,
+    ipv6: Option<warren_net::Ipv6Addressing>,
     cfg: &warren_net::ProxyConfig,
 ) -> Result<ProxyHandle, SdkError>
 where
@@ -549,6 +561,10 @@ where
     // make every full-size packet silently fail to send).
     let mtu = warren_net::PacketSink::max_payload(&sink);
     let mut config = warren_net::NetstackConfig::new(local_ip, prefix, gateway, mtu);
+    // Enable the dual-stack v6 datapath only when the exit actually granted v6.
+    if let Some(v6) = ipv6 {
+        config = config.with_ipv6(v6.local_ip, v6.prefix, v6.gateway);
+    }
     // dns_disabled exits run no gateway forwarder; honor the operator's override
     // so lookups still egress through the tunnel rather than the host resolver.
     if let Some(dns) = cfg.dns_server {

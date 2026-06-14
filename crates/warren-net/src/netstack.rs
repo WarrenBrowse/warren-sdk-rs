@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
@@ -300,6 +300,8 @@ impl Drop for NetstackUdpSocket {
 pub struct TunnelConnector {
     commands: mpsc::UnboundedSender<Command>,
     wake: Arc<Notify>,
+    /// Whether the engine was assigned a v6 address, so v6 targets are routable.
+    has_ipv6: bool,
 }
 
 impl TunnelConnector {
@@ -335,7 +337,7 @@ impl TunnelConnector {
         reply_rx.await.map_err(|_| NetError::EngineStopped)?
     }
 
-    /// Opens a TCP connection to an already-resolved IPv4 socket address.
+    /// Opens a TCP connection to an already-resolved IPv4 or IPv6 socket address.
     async fn open(&self, addr: SocketAddr) -> Result<NetstackStream, NetError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
@@ -355,12 +357,16 @@ impl Connector for TunnelConnector {
     async fn connect(&self, target: Target) -> Result<Self::Stream, NetError> {
         let addr = match target {
             Target::Ip(addr @ SocketAddr::V4(_)) => addr,
-            // IPv6 has no default route wired yet; reject rather than silently
-            // black-hole a v6 target.
-            Target::Ip(SocketAddr::V6(_)) => {
-                return Err(NetError::Unsupported("IPv6 targets not yet routed"));
+            // Route v6 only when the exit granted a v6 address; otherwise refuse
+            // rather than silently black-hole a v6 target.
+            Target::Ip(addr @ SocketAddr::V6(_)) => {
+                if !self.has_ipv6 {
+                    return Err(NetError::Unsupported("IPv6 target but no v6 assignment"));
+                }
+                addr
             }
-            // Resolve the name over the tunnel, then connect to the IPv4 result.
+            // Resolve the name over the tunnel (A only), then connect to the
+            // IPv4 result. AAAA-over-tunnel for v6 domain targets is a follow-up.
             Target::Domain(host, port) => {
                 let ip = self.resolve(&host).await?;
                 SocketAddr::from((ip, port))
@@ -397,12 +403,28 @@ pub struct NetstackConfig {
     pub gateway: Ipv4Addr,
     /// Resolver queried for DNS `A` lookups over the tunnel.
     pub dns_server: Ipv4Addr,
+    /// Dual-stack IPv6 addressing, set iff the exit granted v6. `None` keeps the
+    /// datapath v4-only and v6 targets are refused.
+    pub ipv6: Option<Ipv6Addressing>,
     /// Inner IP MTU; MUST fit one tunnel frame.
     pub mtu: usize,
 }
 
+/// The IPv6 half of a dual-stack tunnel assignment (the v6 client address, its
+/// prefix, and the v6 gateway installed as the default v6 route).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv6Addressing {
+    /// Tunnel-assigned client IPv6 address.
+    pub local_ip: Ipv6Addr,
+    /// IPv6 subnet prefix length.
+    pub prefix: u8,
+    /// Exit-side v6 gateway, installed as the default v6 route.
+    pub gateway: Ipv6Addr,
+}
+
 impl NetstackConfig {
-    /// Builds a config with `dns_server` defaulted to the gateway forwarder.
+    /// Builds a v4-only config with `dns_server` defaulted to the gateway
+    /// forwarder and no IPv6.
     #[must_use]
     pub fn new(local_ip: Ipv4Addr, prefix: u8, gateway: Ipv4Addr, mtu: usize) -> Self {
         Self {
@@ -410,6 +432,7 @@ impl NetstackConfig {
             prefix,
             gateway,
             dns_server: gateway,
+            ipv6: None,
             mtu,
         }
     }
@@ -419,6 +442,18 @@ impl NetstackConfig {
     #[must_use]
     pub fn with_dns_server(mut self, dns_server: Ipv4Addr) -> Self {
         self.dns_server = dns_server;
+        self
+    }
+
+    /// Enables the dual-stack IPv6 datapath with the exit-granted v6 address,
+    /// prefix and gateway. Without this, v6 targets are refused.
+    #[must_use]
+    pub fn with_ipv6(mut self, local_ip: Ipv6Addr, prefix: u8, gateway: Ipv6Addr) -> Self {
+        self.ipv6 = Some(Ipv6Addressing {
+            local_ip,
+            prefix,
+            gateway,
+        });
         self
     }
 }
@@ -453,6 +488,7 @@ pub fn spawn_engine(
         prefix: config.prefix,
         gateway: config.gateway,
         dns_server: config.dns_server,
+        ipv6: config.ipv6,
         cmd_rx,
         inbound,
         wake: Arc::clone(&wake),
@@ -462,6 +498,7 @@ pub fn spawn_engine(
     TunnelConnector {
         commands: cmd_tx,
         wake,
+        has_ipv6: config.ipv6.is_some(),
     }
 }
 
@@ -477,6 +514,7 @@ struct Engine {
     prefix: u8,
     gateway: std::net::Ipv4Addr,
     dns_server: std::net::Ipv4Addr,
+    ipv6: Option<Ipv6Addressing>,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     inbound: mpsc::Receiver<Bytes>,
     wake: Arc<Notify>,
@@ -493,12 +531,20 @@ impl Engine {
         // Randomize the TCP ISN seed (RFC 6528) rather than a fixed constant.
         config.random_seed = rand::random();
         let mut iface = Interface::new(config, &mut self.device, now(base));
+        let v6 = self.ipv6;
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::new(IpAddress::from(self.local_ip), self.prefix));
+            // Dual-stack: add the v6 client address iff the exit granted v6.
+            if let Some(v6) = v6 {
+                let _ = addrs.push(IpCidr::new(IpAddress::from(v6.local_ip), v6.prefix));
+            }
         });
         // Default route to the exit gateway so out-of-subnet (public) targets
         // egress through the tunnel rather than being unroutable.
         let _ = iface.routes_mut().add_default_ipv4_route(self.gateway);
+        if let Some(v6) = v6 {
+            let _ = iface.routes_mut().add_default_ipv6_route(v6.gateway);
+        }
         let mut sockets = SocketSet::new(Vec::new());
 
         loop {
@@ -979,5 +1025,27 @@ mod tests {
         assert_eq!(overridden.prefix, base.prefix);
         assert_eq!(overridden.gateway, base.gateway);
         assert_eq!(overridden.mtu, base.mtu);
+    }
+
+    #[test]
+    fn config_is_v4_only_until_with_ipv6() {
+        let gw: Ipv4Addr = "10.66.0.1".parse().unwrap();
+        let base = NetstackConfig::new("10.66.0.2".parse().unwrap(), 16, gw, 1280);
+        assert_eq!(base.ipv6, None, "v4-only by default");
+
+        let local6: Ipv6Addr = "fd66::2".parse().unwrap();
+        let gw6: Ipv6Addr = "fd66::1".parse().unwrap();
+        let dual = base.with_ipv6(local6, 64, gw6);
+        assert_eq!(
+            dual.ipv6,
+            Some(Ipv6Addressing {
+                local_ip: local6,
+                prefix: 64,
+                gateway: gw6,
+            })
+        );
+        // The v4 half is untouched by enabling v6.
+        assert_eq!(dual.local_ip, base.local_ip);
+        assert_eq!(dual.gateway, base.gateway);
     }
 }
