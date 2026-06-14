@@ -370,13 +370,18 @@ impl Connector for TunnelConnector {
                 addr
             }
             // Resolve the name over the tunnel. With a v6 assignment, prefer
-            // AAAA and fall back to A; otherwise A only. The query egresses at
-            // the exit, so the lookup never leaks to the host resolver.
+            // AAAA and fall back to A only when the name genuinely has no AAAA
+            // record (not on a timeout or transport error, which would just
+            // double the wait). The query egresses at the exit, so the lookup
+            // never leaks to the host resolver.
             Target::Domain(host, port) => {
                 let ip = if self.has_ipv6 {
                     match self.resolve(&host, dns::RecordType::Aaaa).await {
                         Ok(ip) => ip,
-                        Err(_) => self.resolve(&host, dns::RecordType::A).await?,
+                        Err(NetError::NoDnsRecord) => {
+                            self.resolve(&host, dns::RecordType::A).await?
+                        }
+                        Err(e) => return Err(e),
                     }
                 } else {
                     self.resolve(&host, dns::RecordType::A).await?
@@ -731,7 +736,10 @@ impl Engine {
             if sock.can_recv() {
                 if let Ok((data, _meta)) = sock.recv() {
                     let res = match dns::parse_response(data, r.id, r.rtype) {
-                        Ok(addrs) => addrs.into_iter().next().ok_or(NetError::ConnectFailed),
+                        Ok(addrs) => addrs.into_iter().next().ok_or(NetError::NoDnsRecord),
+                        // "No such record" is distinct from a transport/parse
+                        // failure so a dual-stack lookup falls back on it alone.
+                        Err(dns::DnsError::NoAddress) => Err(NetError::NoDnsRecord),
                         Err(_) => Err(NetError::ConnectFailed),
                     };
                     finished.push((i, res));

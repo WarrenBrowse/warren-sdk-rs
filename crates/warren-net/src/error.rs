@@ -31,6 +31,12 @@ pub enum NetError {
     /// The netstack engine task has stopped (tunnel gone).
     #[error("netstack engine stopped")]
     EngineStopped,
+    /// The resolver answered but carried no record of the requested type (for
+    /// example no `AAAA` for a name that only has `A`). Distinct from a timeout
+    /// or transport failure so a dual-stack lookup can fall back to `A` on this
+    /// alone, not on a slow or unreachable resolver.
+    #[error("no DNS record of the requested type")]
+    NoDnsRecord,
     /// The requested backend or feature is not available on this build/OS.
     #[error("unsupported: {0}")]
     Unsupported(&'static str),

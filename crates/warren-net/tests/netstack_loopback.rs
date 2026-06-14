@@ -8,6 +8,8 @@
 //! same client stack must still be validated against a real Warren exit.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use smoltcp::iface::{Config, Interface, SocketSet};
@@ -301,6 +303,102 @@ async fn dns_aaaa_and_echo_server_v6(
         if let Some((query, endpoint)) = request {
             let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
             let _ = sock.send_slice(&dns_aaaa_response(&query, answer6), endpoint);
+        }
+
+        let sock = sockets.get_mut::<tcp::Socket<'_>>(tcp_handle);
+        let mut buf = [0u8; 4096];
+        while sock.can_recv() && sock.can_send() {
+            match sock.recv_slice(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let _ = sock.send_slice(&buf[..n]);
+                }
+            }
+        }
+
+        let delay = iface
+            .poll_delay(now(), &sockets)
+            .map(|d| std::time::Duration::from_micros(d.total_micros()))
+            .unwrap_or_else(|| std::time::Duration::from_millis(5));
+        tokio::select! {
+            f = inbound.recv() => match f {
+                Some(f) => device.rx.push_back(f),
+                None => return,
+            },
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+/// Like the DNS+echo exit but it records whether it ever received an `AAAA`
+/// query (QTYPE `0x001c`) and answers every query with an `A` record. Lets a
+/// fallback test prove the engine actually attempted AAAA before using A.
+async fn dns_a_only_recording_aaaa(
+    ip: std::net::Ipv4Addr,
+    answer: std::net::Ipv4Addr,
+    prefix: u8,
+    gateway: std::net::Ipv4Addr,
+    saw_aaaa: Arc<AtomicBool>,
+    mut inbound: mpsc::Receiver<Bytes>,
+    outbound: mpsc::Sender<Bytes>,
+) {
+    let mut device = ChanDevice {
+        rx: VecDeque::new(),
+        tx: outbound,
+    };
+    let base = tokio::time::Instant::now();
+    let now =
+        || SmolInstant::from_micros(i64::try_from(base.elapsed().as_micros()).unwrap_or(i64::MAX));
+
+    let mut config = Config::new(HardwareAddress::Ip);
+    config.random_seed = 0x5345_5256_0007;
+    let mut iface = Interface::new(config, &mut device, now());
+    iface.update_ip_addrs(|a| {
+        let _ = a.push(IpCidr::new(IpAddress::from(ip), prefix));
+        let _ = a.push(IpCidr::new(IpAddress::from(answer), prefix));
+    });
+    let _ = iface.routes_mut().add_default_ipv4_route(gateway);
+
+    let mut sockets = SocketSet::new(Vec::new());
+    let tcp_handle = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+    ));
+    sockets
+        .get_mut::<tcp::Socket<'_>>(tcp_handle)
+        .listen(9)
+        .expect("listen");
+    let udp_handle = sockets.add(udp::Socket::new(
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]),
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]),
+    ));
+    sockets
+        .get_mut::<udp::Socket<'_>>(udp_handle)
+        .bind(53)
+        .expect("bind 53");
+
+    loop {
+        while let Ok(f) = inbound.try_recv() {
+            device.rx.push_back(f);
+        }
+        let _ = iface.poll(now(), &mut device, &mut sockets);
+
+        let request = {
+            let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
+            match sock.recv() {
+                Ok((data, meta)) if data.len() >= 16 => Some((data.to_vec(), meta.endpoint)),
+                _ => None,
+            }
+        };
+        if let Some((query, endpoint)) = request {
+            // QTYPE is the 2 bytes before the trailing QCLASS.
+            let qtype = u16::from_be_bytes([query[query.len() - 4], query[query.len() - 3]]);
+            if qtype == 0x001c {
+                saw_aaaa.store(true, Ordering::SeqCst);
+            }
+            let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
+            // Always answer A, so an AAAA query yields no AAAA and forces fallback.
+            let _ = sock.send_slice(&dns_response(&query, answer), endpoint);
         }
 
         let sock = sockets.get_mut::<tcp::Socket<'_>>(tcp_handle);
@@ -660,12 +758,15 @@ async fn netstack_falls_back_to_a_when_the_name_has_no_aaaa() {
     .with_ipv6("fd66::2".parse().unwrap(), 64, "fd66::1".parse().unwrap());
     let connector = spawn_engine(config, s2c_rx, c2s_tx);
 
-    // Answers A (not AAAA) for any query; the v4 answer 10.66.0.5 is on-subnet.
-    tokio::spawn(dns_and_echo_server(
+    // Answers A (not AAAA) for any query and records whether an AAAA query was
+    // attempted, so the test fails if the engine skipped AAAA (an A-only policy).
+    let saw_aaaa = Arc::new(AtomicBool::new(false));
+    tokio::spawn(dns_a_only_recording_aaaa(
         "10.66.0.1".parse().unwrap(),
         "10.66.0.5".parse().unwrap(),
         24,
         "10.66.0.1".parse().unwrap(),
+        Arc::clone(&saw_aaaa),
         c2s_rx,
         s2c_tx,
     ));
@@ -679,6 +780,11 @@ async fn netstack_falls_back_to_a_when_the_name_has_no_aaaa() {
     let mut got = [0u8; 10];
     stream.read_exact(&mut got).await.expect("read echo");
     assert_eq!(&got, b"a-fallback");
+    // Pins the AAAA-first policy: the engine must have tried AAAA before A.
+    assert!(
+        saw_aaaa.load(Ordering::SeqCst),
+        "engine attempted AAAA before falling back to A"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
