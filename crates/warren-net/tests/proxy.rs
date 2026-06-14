@@ -246,6 +246,18 @@ async fn socks5_udp_associate_relays_datagrams() {
     .unwrap();
     // header is RSV(2) FRAG(1) ATYP(1) IPv4(4) PORT(2) = 10 bytes, then payload.
     assert!(n >= 10, "header present");
+    assert_eq!(&buf[0..3], &[0x00, 0x00, 0x00], "RSV and FRAG are zero");
+    assert_eq!(buf[3], 0x01, "ATYP is IPv4");
+    assert_eq!(
+        &buf[4..8],
+        &echo_v4.ip().octets(),
+        "the reply header carries the echo source address"
+    );
+    assert_eq!(
+        u16::from_be_bytes([buf[8], buf[9]]),
+        echo_v4.port(),
+        "the reply header carries the echo source port"
+    );
     assert_eq!(&buf[10..n], b"ping", "the echo payload round-trips");
     // Keep the control connection alive until here so the association persists.
     drop(ctrl);

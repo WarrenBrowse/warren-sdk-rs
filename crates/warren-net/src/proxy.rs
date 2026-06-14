@@ -236,11 +236,24 @@ async fn udp_associate<C: UdpConnector>(
             // Client -> tunnel: strip the SOCKS5 UDP header, resolve a name over
             // the tunnel if needed, forward the payload.
             r = relay.recv_from(&mut buf) => {
+                // The relay is an unconnected loopback socket, so a recv error is
+                // fatal (fd gone), not transient: ending the association is right.
                 let (n, src) = r.map_err(NetError::Io)?;
-                client_src = Some(src);
+                // Bind the association to the first client source and drop
+                // datagrams from any other local source: otherwise a co-resident
+                // process could inject traffic and, by setting `client_src`,
+                // hijack the reply stream.
+                match client_src {
+                    None => client_src = Some(src),
+                    Some(known) if known != src => continue,
+                    Some(_) => {}
+                }
                 if let Ok((target, payload)) = parse_udp_datagram(&buf[..n]) {
                     let dst = match target {
-                        Target::Ip(addr) => Some(addr),
+                        Target::Ip(addr @ SocketAddr::V4(_)) => Some(addr),
+                        // No IPv6 default route in the netstack yet; drop rather
+                        // than black-hole, matching the TCP path's v6 rejection.
+                        Target::Ip(SocketAddr::V6(_)) => None,
                         Target::Domain(host, port) => connector
                             .resolve_host(&host)
                             .await

@@ -287,6 +287,14 @@ impl NetstackUdpSocket {
     }
 }
 
+impl Drop for NetstackUdpSocket {
+    fn drop(&mut self) {
+        // Wake the engine so it reaps this flow's smoltcp socket and ephemeral
+        // port promptly, rather than waiting out the poll-delay fallback.
+        self.wake.notify_one();
+    }
+}
+
 /// A [`Connector`] backed by the userspace netstack engine.
 #[derive(Clone)]
 pub struct TunnelConnector {
