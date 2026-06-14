@@ -22,9 +22,13 @@ thiserror = { workspace = true }
 # rand_core 0.9 OsRng for the per-session HPKE ephemeral keypair (hpke 0.13
 # expects the 0.9 trait surface, matching warren-multihop).
 rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
+# rand 0.8 for the full-jitter reconnection backoff sampling.
+rand = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# test-util enables `tokio::time` pause/auto-advance so the reconnect backoff
+# tests run deterministically without real sleeps.
+tokio = { workspace = true, features = ["test-util"] }
 ed25519-dalek = { workspace = true }
 warren-wire = { path = "../warren-wire" }
 warren-test-support = { path = "../warren-test-support" }

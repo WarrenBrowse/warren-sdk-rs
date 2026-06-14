@@ -1,0 +1,19 @@
+{
+  "_comment": "Frozen cross-implementation golden vector for the Warren multihop frame (postcard, frame v1). Every language SDK must reproduce these bytes. Any change is a wire break and requires bumping the frame version. Layout: version u8, exit_id [u8;16] raw, epoch varint, seq varint, encapsulated_key [u8;32] raw, aead_tag [u8;16] raw, ciphertext (len varint + bytes).",
+  "version": 1,
+  "exit_id_len": 16,
+  "encapsulated_key_len": 32,
+  "aead_tag_len": 16,
+  "vectors": [
+    {
+      "_comment": "version 1, exit_id all 0xa1, epoch 7, seq 42, encap all 0x02, tag all 0x03, ciphertext 0xdeadbeef.",
+      "exit_id_hex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "epoch": 7,
+      "seq": 42,
+      "encapsulated_key_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+      "aead_tag_hex": "03030303030303030303030303030303",
+      "ciphertext_hex": "deadbeef",
+      "bytes_hex": "01a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1072a02020202020202020202020202020202020202020202020202020202020202020303030303030303030303030303030304deadbeef"
+    }
+  ]
+}

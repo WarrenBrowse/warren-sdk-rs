@@ -17,6 +17,12 @@ pub mod transport;
 pub mod reqwest_transport;
 
 pub use client::{ClientError, WarrenApiClient};
+pub use dto::{
+    CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
+    IncidentPubkeyMismatchRequest, IncidentReason, InitApplePaymentResponse, MobilePaymentResponse,
+    RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest, SessionOpenRequest,
+    SessionOpenResponse, SubscriptionResponse, SupportReportRequest, SupportReportResponse,
+};
 pub use transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 
 #[cfg(feature = "reqwest-transport")]

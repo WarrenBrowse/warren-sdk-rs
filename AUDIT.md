@@ -215,12 +215,24 @@ crypto, so a green loopback proves wire interop), exclusive self-hosted CI, the
 wire layers (frame, control, PoP, HPKE session, setup semantics, replay,
 directory preimage) were confirmed byte-for-byte identical to warren-core.
 
+Follow-ups landed after the audit (2026-06-14):
+
+- P3 lifecycle endpoints completed in TDD: Apple IAP (`init_apple_payment`,
+  `check_apple_payment`), checkout voucher polling (`pull_pending_voucher`),
+  support (`submit_support_report`), and incident reporters (`report_exit_down`,
+  `report_pubkey_mismatch`), with byte-for-byte JSON DTOs (redacting Debug on the
+  Apple JWS, SCREAMING_SNAKE_CASE `IncidentReason`).
+- P5 reconnection: full-jitter `Backoff` + `connect_with_retry` in
+  `warren-transport::reconnect`, unit-tested with `tokio::time` paused.
+- Shared cross-language `vectors/{multihop_frame,control,pop}.json` are now frozen
+  and replayed by tests (`warren-wire::multihop_vectors`,
+  `warren-multihop::pop_vectors`), mirroring `handshake.json`.
+
 Deferred (tracked, not blocking):
 
-- Shared cross-language `vectors/*.json` for the multihop frame, control, and PoP
-  formats. The Rust side is byte-pinned by inline literal tests and the live prod
-  directory fixture; the JSON artifacts for the sibling SDKs are a follow-up
-  (needs a fixed-encapsulated-key fixture for the non-deterministic HPKE seal).
+- A per-packet HPKE keystream `vectors/*.json` still needs a fixed-encapsulated-
+  key fixture for the non-deterministic seal; the deterministic wire layers
+  (frame, control, PoP preimage) are now covered above.
 - FFI error shape: `MultihopError::SetupIo` / `TunnelError::HandshakeIo` carry a
   `Box<dyn Error>` source, not uniffi-serializable. Both (single-hop + multihop)
   are addressed together in P9 when the tunnel FFI surface is exported.

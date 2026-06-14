@@ -9,8 +9,10 @@
 
 pub mod client;
 pub mod multihop;
+pub mod reconnect;
 pub mod tls;
 
 pub use client::{ClientSession, ClientTunnel, TunnelError};
 pub use multihop::{MultihopClientTunnel, MultihopError, MultihopSession};
+pub use reconnect::{Backoff, BackoffIter, RetryError, connect_with_retry};
 pub use tls::{WarrenTlsError, default_crypto_provider, make_client_config, make_server_config};

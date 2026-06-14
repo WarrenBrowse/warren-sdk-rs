@@ -1,0 +1,132 @@
+//! Replays the shared multihop golden vectors in `vectors/multihop_frame.json`
+//! and `vectors/control.json`. These pin the cross-language wire bytes for the
+//! HPKE dispatch frame and the `/v2` control messages: every sibling-language
+//! SDK must reproduce them byte-for-byte. A failure means the wire layout moved.
+
+use serde::Deserialize;
+use warren_wire::multihop::WarrenMultihopFrame;
+use warren_wire::{PopSignature, WarrenControlMessage, encode_control};
+
+fn read(rel: &str) -> String {
+    let path = format!("{}/../../{rel}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+}
+
+fn bytes16(s: &str) -> [u8; 16] {
+    hex::decode(s).expect("hex").try_into().expect("16 bytes")
+}
+
+fn bytes32(s: &str) -> [u8; 32] {
+    hex::decode(s).expect("hex").try_into().expect("32 bytes")
+}
+
+// ---- multihop frame ----
+
+#[derive(Deserialize)]
+struct FrameFile {
+    version: u8,
+    vectors: Vec<FrameVec>,
+}
+
+#[derive(Deserialize)]
+struct FrameVec {
+    exit_id_hex: String,
+    epoch: u32,
+    seq: u64,
+    encapsulated_key_hex: String,
+    aead_tag_hex: String,
+    ciphertext_hex: String,
+    bytes_hex: String,
+}
+
+#[test]
+fn multihop_frame_vectors_match() {
+    let f: FrameFile = serde_json::from_str(&read("vectors/multihop_frame.json")).expect("parse");
+    assert!(
+        !f.vectors.is_empty(),
+        "vector file must carry at least one case"
+    );
+    for v in &f.vectors {
+        let frame = WarrenMultihopFrame {
+            version: f.version,
+            exit_id: bytes16(&v.exit_id_hex),
+            epoch: v.epoch,
+            seq: v.seq,
+            encapsulated_key: bytes32(&v.encapsulated_key_hex),
+            aead_tag: bytes16(&v.aead_tag_hex),
+            ciphertext: hex::decode(&v.ciphertext_hex).expect("hex"),
+        };
+        assert_eq!(
+            hex::encode(frame.encode().expect("encode")),
+            v.bytes_hex,
+            "multihop frame encode bytes drifted from the frozen vector"
+        );
+        let decoded =
+            WarrenMultihopFrame::decode(&hex::decode(&v.bytes_hex).expect("hex")).expect("decode");
+        assert_eq!(decoded, frame, "multihop frame decode drifted");
+    }
+}
+
+// ---- control messages (/v2) ----
+
+#[derive(Deserialize)]
+struct ControlFile {
+    vectors: Vec<ControlVec>,
+}
+
+#[derive(Deserialize)]
+struct ControlVec {
+    name: String,
+    bytes_hex: String,
+    prefer_ipv4: Option<[u8; 4]>,
+    client_pubkey_hex: Option<String>,
+    #[serde(default)]
+    wants_ipv6: bool,
+    pop_sig_hex: Option<String>,
+    ipv4: Option<[u8; 4]>,
+    prefix_len: Option<u8>,
+    gateway_ipv4: Option<[u8; 4]>,
+}
+
+fn message_for(v: &ControlVec) -> WarrenControlMessage {
+    match v.name.as_str() {
+        "ip_request_minimal" | "ip_request_full" => WarrenControlMessage::IpRequest {
+            prefer_ipv4: v.prefer_ipv4,
+            client_pubkey: v.client_pubkey_hex.as_ref().map(|h| bytes32(h)),
+            wants_ipv6: v.wants_ipv6,
+            pop_sig: v
+                .pop_sig_hex
+                .as_ref()
+                .map(|h| PopSignature(hex::decode(h).expect("hex").try_into().expect("64 bytes"))),
+        },
+        "ip_assign" => WarrenControlMessage::IpAssign {
+            ipv4: v.ipv4.expect("ipv4"),
+            prefix_len: v.prefix_len.expect("prefix_len"),
+            gateway_ipv4: v.gateway_ipv4.expect("gateway_ipv4"),
+            ipv6: None,
+            prefix_len_v6: 0,
+            gateway_ipv6: None,
+        },
+        "ip_exhausted" => WarrenControlMessage::IpExhausted,
+        "rejected" => WarrenControlMessage::Rejected,
+        other => panic!("unknown control vector name: {other}"),
+    }
+}
+
+#[test]
+fn control_vectors_match() {
+    let f: ControlFile = serde_json::from_str(&read("vectors/control.json")).expect("parse");
+    assert!(
+        f.vectors.len() >= 5,
+        "expected the full /v2 control message set"
+    );
+    for v in &f.vectors {
+        let msg = message_for(v);
+        assert_eq!(
+            hex::encode(encode_control(&msg).expect("encode")),
+            v.bytes_hex,
+            "control message `{}` encode bytes drifted from the frozen vector",
+            v.name
+        );
+    }
+}

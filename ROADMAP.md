@@ -19,14 +19,23 @@ pinned by golden vectors where a wire format is involved. warren-core
 - Extract postcard golden vectors from warren-core via a small reference step and
   freeze them under `vectors/`.
 
-## P3: warren-api
+## P3: warren-api (done)
 
 - `WarrenApiClient` over an abstracted async HTTP backend, attaching the signed
   headers from `warren-identity`.
-- Endpoints: register, subscription, check, exits, session open/close, account
-  delete, checkout/voucher polling, mobile payments, incident and support
-  reports.
-- Anti-censorship host fallback (primary, alternatives, no-SNI).
+- Endpoints implemented and tested: register, subscription, check, exits,
+  multihop directory, session open/close, account delete, checkout/voucher
+  polling (`pull_pending_voucher`), Apple in-app payments
+  (`init_apple_payment`/`check_apple_payment`), and the support/incident
+  reporters (`submit_support_report`, `report_exit_down`,
+  `report_pubkey_mismatch`). All request/response DTOs are byte-for-byte
+  JSON-compatible with warren-core (`IncidentReason` is SCREAMING_SNAKE_CASE,
+  the Apple JWS has a redacting `Debug`).
+- Google Play payment init/acknowledge is intentionally NOT in the Rust client:
+  warren-core exposes it only as a server handler, so the mobile binding drives
+  Play Billing natively. Notices and referral are server-only too.
+- Anti-censorship host fallback (primary, alternatives, no-SNI). Signed calls
+  reuse it; unsigned calls (exits, directory, voucher polling) ride it as well.
 
 ## P4: warren-discovery
 
@@ -35,11 +44,15 @@ pinned by golden vectors where a wire format is involved. warren-core
 - Weighted relay selector with geography, IP availability and deterministic
   per-attempt failover. Golden vectors for the signed list.
 
-## P5: warren-transport
+## P5: warren-transport (done)
 
 - QUIC handshake with rustls raw public keys (RFC 7250), ALPN `h3`, 0-RTT off.
 - `ClientTunnel` builder to `ClientSession`, RFC 9221 datagram pump over the
-  `PacketSink` seam, full-jitter reconnection backoff and a reconnect supervisor.
+  `PacketSink` seam.
+- Full-jitter reconnection backoff (`Backoff`, AWS pattern) and a retrying
+  connector (`connect_with_retry`) in `warren-transport::reconnect`, generic
+  over the connect closure so the retry policy is unit-tested with `tokio::time`
+  paused (no real sleeps, no network).
 
 ## P6: warren-net
 
@@ -59,10 +72,19 @@ pinned by golden vectors where a wire format is involved. warren-core
   selection, with a lifecycle event stream. End-to-end tests against a real exit
   and the production API.
 
-## P9: warren-sdk-ffi
+## P9: warren-sdk-ffi (partial: identity surface done)
 
-- uniffi scaffolding and the first Dart/Flutter binding, then Kotlin, Swift,
-  Python and Java. Every binding replays the same `vectors/`.
+- Done and tested: the pure, deterministic identity surface (`generate_identity`,
+  `identity_from_mnemonic`, `address_from_mnemonic`, `ss58_encode`/`ss58_decode`,
+  `sign_request`) with owned, generic-free types and a serializable `FfiError`,
+  exactly the shape uniffi and `flutter_rust_bridge` consume.
+- Remaining (needs an external toolchain, not buildable/testable in this repo on
+  its own): the uniffi/`flutter_rust_bridge` binding codegen and per-language
+  harness (Dart/Flutter first, then Kotlin, Swift, Python, Java), plus the async
+  tunnel surface (connect/disconnect/event stream) which needs an async-executor
+  bridge per language. Annotating the existing functions with `#[uniffi::export]`
+  + `setup_scaffolding!()` is mechanical once that harness lands. Every binding
+  replays the same `vectors/`.
 
 ## Audit follow-ups (see AUDIT.md)
 
@@ -107,7 +129,9 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
      epoch_be||seq_be[||0x02 reverse])`; ChaCha20Poly1305 detached, zero nonce;
      `aad = AAD_V1||exit_id||epoch_be||seq_be`. `seal`/`open_response` with a
      crypto round-trip test (exit-side `setup_receiver` recovers; tampered AAD
-     rejected). TODO: cross-language HPKE vectors generated from warren-core.
+     rejected). Cross-language vectors for the deterministic wire layers (frame,
+     control `/v2`, PoP preimage) are frozen under `vectors/`; a per-packet HPKE
+     keystream vector needs deterministic KEM seeding and stays a nice-to-have.
   4. DONE: datapath integration. The first sealed frame's INNER payload is a
      control message, not a bare `Setup`: ported the `IpRequest`/`IpAssign`
      control codec (`warren-wire::control`, byte-exact `/v2` vectors), the PoP
@@ -127,8 +151,12 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
      control wire layers byte-for-byte against a real exit; no more "malformed
      setup frame". The remaining step is a full tunnel with a SUBSCRIBED wallet
      (the exit gates the `IpAssign` on its allowlist + the `/v1/session/open`
-     device cap): set `WARREN_MNEMONIC` to complete routing. Then freeze shared
-     cross-language vectors (HPKE + control + PoP) generated from warren-core.
+     device cap): set `WARREN_MNEMONIC` to complete routing.
+  6. DONE (live-validated, 2026-06-13). A full real tunnel with a subscribed
+     wallet: real `IpAssign` (10.66.0.3/24 from the NL/Amsterdam exit) and
+     confirmed egress (a TCP handshake to a public host completes through the
+     sealed tunnel via `cargo run -p warren-sdk --example live_proxy`). Frame,
+     control `/v2` and PoP cross-language vectors are frozen under `vectors/`.
 
 ## Cross-cutting
 

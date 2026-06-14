@@ -1,0 +1,17 @@
+{
+  "_comment": "Frozen cross-implementation golden vector for the multihop proof-of-possession (PoP) signed message. The PoP preimage is deterministic raw concatenation: context || exit_id (16) || encapsulated_key (32). The Ed25519 signature itself is RFC 8032 (deterministic), so a sibling SDK reproduces it from its own Ed25519; this vector pins the Warren-specific preimage and the signing-key seed so the whole chain is replayable. Versioned with the control wire (/v2): a layout change mints a new context, never mutates this one.",
+  "context_utf8": "warren/multihop/pop/v2",
+  "context_hex": "77617272656e2f6d756c7469686f702f706f702f7632",
+  "exit_id_len": 16,
+  "encapsulated_key_len": 32,
+  "vectors": [
+    {
+      "_comment": "exit_id all 0xaa, encapsulated_key all 0x5c. preimage = context || exit_id || encap. signing_key_seed is the raw 32-byte Ed25519 seed used to mint the pinned signature.",
+      "exit_id_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "encapsulated_key_hex": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+      "preimage_hex": "77617272656e2f6d756c7469686f702f706f702f7632aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+      "signing_key_seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "signature_hex": "cd1feeffe7958d1550880317bd28c1845bba5313cc057007904eb5eccb01f95244e3f3286b53c507db6560ba4f639c4ab947bfe46536a2e138e016fd04c5d70d"
+    }
+  ]
+}

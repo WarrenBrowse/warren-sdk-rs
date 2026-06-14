@@ -6,8 +6,10 @@ use serde::de::DeserializeOwned;
 use warren_identity::WarrenIdentity;
 
 use crate::dto::{
-    CheckResponse, RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest,
-    SessionOpenRequest, SessionOpenResponse, SubscriptionResponse,
+    CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
+    IncidentPubkeyMismatchRequest, InitApplePaymentResponse, MobilePaymentResponse,
+    RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest, SessionOpenRequest,
+    SessionOpenResponse, SubscriptionResponse, SupportReportRequest, SupportReportResponse,
 };
 use crate::transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 
@@ -191,6 +193,110 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         self.send(http).await.map(|_| ())
     }
 
+    /// Signed `POST /v1/payments/apple/init`. Opens an Apple IAP session bound
+    /// to the signing pubkey and returns the `app_account_token` to hand to
+    /// StoreKit. Empty request body.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`]. A `503` status surfaces as
+    /// [`ClientError::ServerStatus`] when Apple payments are not configured.
+    pub async fn init_apple_payment(&self) -> Result<InitApplePaymentResponse, ClientError> {
+        let http = self.signed_request(Method::Post, "/v1/payments/apple/init", Vec::new())?;
+        self.send_json(http).await
+    }
+
+    /// Signed `POST /v1/payments/apple/check`. Uploads the StoreKit 2 signed
+    /// transaction JWS; on success the subscription is credited and the new
+    /// expiry returned.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`]. Notable statuses surface as
+    /// [`ClientError::ServerStatus`]: `400` invalid transaction, `404` session
+    /// not found, `403` identity mismatch, `422` unknown product.
+    pub async fn check_apple_payment(
+        &self,
+        jws_transaction: &str,
+    ) -> Result<MobilePaymentResponse, ClientError> {
+        let req = CheckApplePaymentRequest {
+            jws_transaction: jws_transaction.to_owned(),
+        };
+        let body = serialize(&req)?;
+        let http = self.signed_request(Method::Post, "/v1/payments/apple/check", body)?;
+        self.send_json(http).await
+    }
+
+    /// Unsigned `GET /v1/checkout/{pending_id}/voucher`. Polls for a voucher
+    /// minted by a web checkout (Lightning, Monero, card). Returns the voucher
+    /// secret once it lands, or `None` on `404` (not landed yet, already
+    /// pulled, or expired); the caller keeps polling within its own deadline.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on transport failure or any non-200/404 status.
+    pub async fn pull_pending_voucher(
+        &self,
+        pending_id: &str,
+    ) -> Result<Option<String>, ClientError> {
+        let path = format!("/v1/checkout/{pending_id}/voucher");
+        let req = self.unsigned_request(Method::Get, &path, Vec::new());
+        match self.send(req).await {
+            Ok(resp) => {
+                let parsed: PullVoucherResponse =
+                    serde_json::from_slice(&resp.body).map_err(ClientError::ResponseJson)?;
+                Ok(Some(parsed.voucher_secret))
+            }
+            Err(ClientError::ServerStatus { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Signed `POST /v1/support`. Submits a redacted log bundle and a free-form
+    /// message; returns the server-assigned reference id.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`]. `413` payload too large and `422` validation
+    /// failure surface as [`ClientError::ServerStatus`].
+    pub async fn submit_support_report(
+        &self,
+        req: &SupportReportRequest,
+    ) -> Result<SupportReportResponse, ClientError> {
+        let body = serialize(req)?;
+        let http = self.signed_request(Method::Post, "/v1/support", body)?;
+        self.send_json(http).await
+    }
+
+    /// Signed `POST /v1/incidents/exit-down`. Best-effort failover telemetry;
+    /// the server replies 204 No Content.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`]. `400` malformed body and `422` unknown
+    /// `reason_code` surface as [`ClientError::ServerStatus`].
+    pub async fn report_exit_down(&self, req: &IncidentExitDownRequest) -> Result<(), ClientError> {
+        let body = serialize(req)?;
+        let http = self.signed_request(Method::Post, "/v1/incidents/exit-down", body)?;
+        self.send(http).await.map(|_| ())
+    }
+
+    /// Signed `POST /v1/incidents/pubkey-mismatch`. Reports a pinned-pubkey
+    /// divergence under a known `exit_id`; the server replies 204 (log-only).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`]. `400` malformed body surfaces as
+    /// [`ClientError::ServerStatus`].
+    pub async fn report_pubkey_mismatch(
+        &self,
+        req: &IncidentPubkeyMismatchRequest,
+    ) -> Result<(), ClientError> {
+        let body = serialize(req)?;
+        let http = self.signed_request(Method::Post, "/v1/incidents/pubkey-mismatch", body)?;
+        self.send(http).await.map(|_| ())
+    }
+
     /// Builds an unsigned request (carries only `accept`/`content-type`).
     fn unsigned_request(&self, method: Method, path: &str, body: Vec<u8>) -> HttpRequest {
         let mut headers = vec![("accept".to_owned(), "application/json".to_owned())];
@@ -335,6 +441,13 @@ fn replace_host(url: &str, new_host: &str) -> String {
         }
         _ => format!("{scheme}://{new_host}{path}"),
     }
+}
+
+/// Internal body of `GET /v1/checkout/{id}/voucher`. Only the secret is
+/// surfaced to the caller as a bare `String`.
+#[derive(serde::Deserialize)]
+struct PullVoucherResponse {
+    voucher_secret: String,
 }
 
 fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, ClientError> {
@@ -689,6 +802,219 @@ mod tests {
             header(r, HEADER_PUBKEY).is_some(),
             "delete_account is signed"
         );
+    }
+
+    #[tokio::test]
+    async fn init_apple_payment_is_signed_post_with_empty_body() {
+        let c = client(MockTransport::new(
+            200,
+            r#"{"app_account_token":"3f1a2b3c-0000-4000-8000-000000000001"}"#,
+        ));
+        let resp = c.init_apple_payment().await.expect("ok");
+        assert_eq!(
+            resp.app_account_token,
+            "3f1a2b3c-0000-4000-8000-000000000001"
+        );
+        let g = c.transport.last.lock().unwrap();
+        let r = g.as_ref().unwrap();
+        assert_eq!(r.method, Method::Post);
+        assert_eq!(r.url, "https://api.example.test/v1/payments/apple/init");
+        assert!(header(r, HEADER_PUBKEY).is_some(), "init is signed");
+        assert!(r.body.is_empty(), "init carries no body");
+    }
+
+    #[tokio::test]
+    async fn check_apple_payment_sends_jws_in_body_and_parses_expiry() {
+        let c = client(MockTransport::new(200, r#"{"expires_at":1800000000}"#));
+        let resp = c
+            .check_apple_payment("header.payload.sig")
+            .await
+            .expect("ok");
+        assert_eq!(resp.expires_at, 1_800_000_000);
+        let g = c.transport.last.lock().unwrap();
+        let r = g.as_ref().unwrap();
+        assert_eq!(r.method, Method::Post);
+        assert_eq!(r.url, "https://api.example.test/v1/payments/apple/check");
+        assert!(header(r, HEADER_PUBKEY).is_some(), "check is signed");
+        let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body["jws_transaction"], "header.payload.sig");
+    }
+
+    #[tokio::test]
+    async fn check_apple_payment_404_is_server_status() {
+        let c = client(MockTransport::new(404, "session not found"));
+        let err = c
+            .check_apple_payment("jws")
+            .await
+            .expect_err("missing session must error");
+        assert!(matches!(err, ClientError::ServerStatus { status: 404, .. }));
+    }
+
+    #[tokio::test]
+    async fn pull_pending_voucher_returns_secret_on_200_and_is_unsigned() {
+        let c = client(MockTransport::new(
+            200,
+            r#"{"voucher_secret":"vch-abcd-1234"}"#,
+        ));
+        let secret = c.pull_pending_voucher("pend-1").await.expect("ok");
+        assert_eq!(secret.as_deref(), Some("vch-abcd-1234"));
+        let g = c.transport.last.lock().unwrap();
+        let r = g.as_ref().unwrap();
+        assert_eq!(r.method, Method::Get);
+        assert_eq!(r.url, "https://api.example.test/v1/checkout/pend-1/voucher");
+        assert!(
+            header(r, HEADER_PUBKEY).is_none(),
+            "voucher polling is unsigned"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_pending_voucher_maps_404_to_none() {
+        let c = client(MockTransport::new(404, "not landed yet"));
+        let secret = c
+            .pull_pending_voucher("pend-1")
+            .await
+            .expect("404 must be Ok(None)");
+        assert_eq!(secret, None);
+    }
+
+    #[tokio::test]
+    async fn pull_pending_voucher_propagates_other_errors() {
+        let c = client(MockTransport::new(500, "boom"));
+        let err = c
+            .pull_pending_voucher("pend-1")
+            .await
+            .expect_err("a 500 must propagate");
+        assert!(matches!(err, ClientError::ServerStatus { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn submit_support_report_is_signed_post_with_full_body() {
+        let c = client(MockTransport::new(200, r#"{"reference_id":"deadbeef"}"#));
+        let req = SupportReportRequest {
+            user_message: "cannot connect".to_owned(),
+            redacted_logs: "line1\nline2".to_owned(),
+            app_version: "1.2.3".to_owned(),
+            platform: "macos-arm64".to_owned(),
+        };
+        let resp = c.submit_support_report(&req).await.expect("ok");
+        assert_eq!(resp.reference_id, "deadbeef");
+        let g = c.transport.last.lock().unwrap();
+        let r = g.as_ref().unwrap();
+        assert_eq!(r.method, Method::Post);
+        assert_eq!(r.url, "https://api.example.test/v1/support");
+        assert!(header(r, HEADER_PUBKEY).is_some(), "support is signed");
+        let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body["user_message"], "cannot connect");
+        assert_eq!(body["redacted_logs"], "line1\nline2");
+        assert_eq!(body["app_version"], "1.2.3");
+        assert_eq!(body["platform"], "macos-arm64");
+    }
+
+    #[tokio::test]
+    async fn report_exit_down_is_signed_post_with_screaming_reason() {
+        let c = client(MockTransport::new(204, ""));
+        let req = IncidentExitDownRequest {
+            exit_pubkey_hex: "ab".repeat(32),
+            reason_code: crate::dto::IncidentReason::HandshakeFail,
+            ts_unix: 1_700_000_123,
+        };
+        c.report_exit_down(&req).await.expect("ok");
+        let g = c.transport.last.lock().unwrap();
+        let r = g.as_ref().unwrap();
+        assert_eq!(r.method, Method::Post);
+        assert_eq!(r.url, "https://api.example.test/v1/incidents/exit-down");
+        assert!(header(r, HEADER_PUBKEY).is_some(), "incident is signed");
+        let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body["reason_code"], "HANDSHAKE_FAIL");
+        assert_eq!(body["exit_pubkey_hex"], "ab".repeat(32));
+        assert_eq!(body["ts_unix"], 1_700_000_123u64);
+    }
+
+    #[tokio::test]
+    async fn report_pubkey_mismatch_is_signed_post_and_serializes_optionals() {
+        let c = client(MockTransport::new(204, ""));
+        let req = IncidentPubkeyMismatchRequest {
+            exit_id_hex: "00".repeat(16),
+            old_pubkey_hex: "11".repeat(32),
+            new_pubkey_hex: "22".repeat(32),
+            country_code: String::new(),
+            city: String::new(),
+            ts_unix: 42,
+        };
+        c.report_pubkey_mismatch(&req).await.expect("ok");
+        let g = c.transport.last.lock().unwrap();
+        let r = g.as_ref().unwrap();
+        assert_eq!(r.method, Method::Post);
+        assert_eq!(
+            r.url,
+            "https://api.example.test/v1/incidents/pubkey-mismatch"
+        );
+        assert!(header(r, HEADER_PUBKEY).is_some(), "incident is signed");
+        // Empty optionals are still present on the wire (no skip_serializing).
+        let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body["country_code"], "");
+        assert_eq!(body["city"], "");
+    }
+
+    // Each new method documents specific failure statuses that surface as
+    // ClientError::ServerStatus. Pin one representative documented status per
+    // method so the documented `# Errors` contract cannot silently rot.
+
+    #[tokio::test]
+    async fn init_apple_payment_503_is_server_status() {
+        let c = client(MockTransport::new(503, "apple payments not configured"));
+        let err = c.init_apple_payment().await.expect_err("503 must surface");
+        assert!(matches!(err, ClientError::ServerStatus { status: 503, .. }));
+    }
+
+    #[tokio::test]
+    async fn submit_support_report_413_is_server_status() {
+        let c = client(MockTransport::new(413, "payload too large"));
+        let req = SupportReportRequest {
+            user_message: "x".to_owned(),
+            redacted_logs: String::new(),
+            app_version: String::new(),
+            platform: String::new(),
+        };
+        let err = c
+            .submit_support_report(&req)
+            .await
+            .expect_err("413 must surface");
+        assert!(matches!(err, ClientError::ServerStatus { status: 413, .. }));
+    }
+
+    #[tokio::test]
+    async fn report_exit_down_422_is_server_status() {
+        let c = client(MockTransport::new(422, "unknown reason_code"));
+        let req = IncidentExitDownRequest {
+            exit_pubkey_hex: "ab".repeat(32),
+            reason_code: crate::dto::IncidentReason::Timeout,
+            ts_unix: 1,
+        };
+        let err = c
+            .report_exit_down(&req)
+            .await
+            .expect_err("422 must surface");
+        assert!(matches!(err, ClientError::ServerStatus { status: 422, .. }));
+    }
+
+    #[tokio::test]
+    async fn report_pubkey_mismatch_400_is_server_status() {
+        let c = client(MockTransport::new(400, "malformed body"));
+        let req = IncidentPubkeyMismatchRequest {
+            exit_id_hex: "00".repeat(16),
+            old_pubkey_hex: "11".repeat(32),
+            new_pubkey_hex: "22".repeat(32),
+            country_code: String::new(),
+            city: String::new(),
+            ts_unix: 1,
+        };
+        let err = c
+            .report_pubkey_mismatch(&req)
+            .await
+            .expect_err("400 must surface");
+        assert!(matches!(err, ClientError::ServerStatus { status: 400, .. }));
     }
 
     #[test]
