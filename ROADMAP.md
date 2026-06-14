@@ -144,8 +144,12 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
     association tied to the TCP control connection). Wired into the facade proxy.
     Validated in-process: egress primitive against a UDP echo exit, and the relay
     end to end via a SOCKS5 UDP client through the proxy.
+  - Configurable resolver: DONE. `NetstackConfig` carries a `dns_server` (defaults
+    to the gateway forwarder), overridable via `ProxyConfig::dns_server` for
+    `dns_disabled` exits; the override still egresses over the tunnel, so lookups
+    never leak to the host resolver. Validated in-process (an exit answering DNS
+    only at a non-gateway in-tunnel address resolves and connects).
   - Pending: validation against a real Warren exit (mandatory before production);
-    a configurable fallback resolver for `dns_disabled` exits;
     privileged per-OS TUN/routing/DNS/killswitch; GSO/GRO batch syscalls behind
     the `PacketSink` batch seam and `fast-apple-datapath` on macOS.
 - Multihop HPKE frame (REQUIRED, blocking, discovered via live-exit validation):
