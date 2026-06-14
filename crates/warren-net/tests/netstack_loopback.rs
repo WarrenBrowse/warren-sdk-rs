@@ -302,6 +302,106 @@ async fn exit_connect_and_check(
     }
 }
 
+/// A smoltcp "exit" that opens `rounds` sequential connections to `target`,
+/// each sending `probe` and verifying the echo, aborting between rounds (RST, so
+/// no TimeWait stall). Reports how many round-tripped. Exercises the client's
+/// accept backlog refill: more rounds than the backlog forces fresh listeners.
+#[allow(clippy::too_many_arguments)]
+async fn exit_connect_n_times(
+    exit_ip: std::net::Ipv4Addr,
+    prefix: u8,
+    gateway: std::net::Ipv4Addr,
+    target: (std::net::Ipv4Addr, u16),
+    probe: &'static [u8],
+    rounds: usize,
+    result_tx: tokio::sync::oneshot::Sender<usize>,
+    mut inbound: mpsc::Receiver<Bytes>,
+    outbound: mpsc::Sender<Bytes>,
+) {
+    let mut device = ChanDevice {
+        rx: VecDeque::new(),
+        tx: outbound,
+    };
+    let base = tokio::time::Instant::now();
+    let now =
+        || SmolInstant::from_micros(i64::try_from(base.elapsed().as_micros()).unwrap_or(i64::MAX));
+
+    let mut config = Config::new(HardwareAddress::Ip);
+    config.random_seed = 0x5345_5256_000a;
+    let mut iface = Interface::new(config, &mut device, now());
+    iface.update_ip_addrs(|a| {
+        let _ = a.push(IpCidr::new(IpAddress::from(exit_ip), prefix));
+    });
+    let _ = iface.routes_mut().add_default_ipv4_route(gateway);
+
+    let mut sockets = SocketSet::new(Vec::new());
+    let handle = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+    ));
+
+    let dst = (IpAddress::from(target.0), target.1);
+    let mut local_port = 49000u16;
+    sockets
+        .get_mut::<tcp::Socket<'_>>(handle)
+        .connect(iface.context(), dst, local_port)
+        .expect("connect");
+
+    let mut completed = 0usize;
+    let mut round = 0usize;
+    let mut sent = false;
+    let mut got = false;
+    let mut result_tx = Some(result_tx);
+
+    loop {
+        while let Ok(f) = inbound.try_recv() {
+            device.rx.push_back(f);
+        }
+        let _ = iface.poll(now(), &mut device, &mut sockets);
+
+        let sock = sockets.get_mut::<tcp::Socket<'_>>(handle);
+        if !sent && sock.can_send() {
+            let _ = sock.send_slice(probe);
+            sent = true;
+        }
+        if !got && sock.can_recv() {
+            let mut buf = [0u8; 64];
+            if let Ok(n) = sock.recv_slice(&mut buf) {
+                if &buf[..n] == probe {
+                    completed += 1;
+                }
+                got = true;
+                sock.abort(); // RST: immediate Closed, no TimeWait
+            }
+        }
+        if got && sock.state() == tcp::State::Closed {
+            round += 1;
+            if round >= rounds {
+                if let Some(tx) = result_tx.take() {
+                    let _ = tx.send(completed);
+                }
+                return;
+            }
+            local_port += 1;
+            sent = false;
+            got = false;
+            let _ = sock.connect(iface.context(), dst, local_port);
+        }
+
+        let delay = iface
+            .poll_delay(now(), &sockets)
+            .map(|d| std::time::Duration::from_micros(d.total_micros()))
+            .unwrap_or_else(|| std::time::Duration::from_millis(5));
+        tokio::select! {
+            f = inbound.recv() => match f {
+                Some(f) => device.rx.push_back(f),
+                None => return,
+            },
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
 /// Builds a minimal DNS response for `query` answering with a single AAAA record
 /// for `addr`, echoing the query id and question and appending one compressed
 /// AAAA answer.
@@ -1167,6 +1267,61 @@ async fn netstack_serves_a_forwarded_port_to_a_local_listener() {
     assert!(
         matched,
         "the inbound connection was relayed to the local listener and echoed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn netstack_listener_refills_its_backlog_across_many_connections() {
+    // Ten sequential inbound connections (more than the 8-socket accept backlog)
+    // must all round-trip, which is only possible if the engine refills the
+    // backlog with fresh listening sockets as accepted ones leave the pool.
+    let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = local.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = local.accept().await {
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+    let connector = spawn_engine(
+        NetstackConfig::new(
+            "10.66.0.2".parse().unwrap(),
+            24,
+            "10.66.0.1".parse().unwrap(),
+            MTU,
+        ),
+        s2c_rx,
+        c2s_tx,
+    );
+
+    let listener = connector.listen(8080).await.expect("listen on 8080");
+    tokio::spawn(warren_net::serve_inbound(listener, local_addr));
+
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(exit_connect_n_times(
+        "10.66.0.1".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        ("10.66.0.2".parse().unwrap(), 8080),
+        b"refill!!",
+        10,
+        result_tx,
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(10), result_rx)
+        .await
+        .expect("did not stall")
+        .expect("exit reported a count");
+    assert_eq!(
+        completed, 10,
+        "all connections round-tripped (backlog refilled)"
     );
 }
 

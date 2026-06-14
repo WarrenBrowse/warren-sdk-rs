@@ -796,6 +796,7 @@ impl Engine {
     /// listeners whose [`NetstackListener`] was dropped.
     fn accept_listeners(&mut self, sockets: &mut SocketSet<'_>, now: SmolInstant) {
         let mut accepted: Vec<(SocketHandle, mpsc::Sender<NetstackStream>)> = Vec::new();
+        let mut to_remove: Vec<SocketHandle> = Vec::new();
         let mut refill: Vec<(u16, usize)> = Vec::new();
         let mut dead: Vec<usize> = Vec::new();
 
@@ -805,21 +806,35 @@ impl Engine {
                 dead.push(li);
                 continue;
             }
-            // Any socket no longer in LISTEN has been engaged by an inbound SYN;
-            // move it out of the backlog and convert it to a connection.
+            // Only convert a backlog socket once it is fully `Established`, so the
+            // app sees connections with `accept(2)` semantics (not mid-handshake).
+            // A socket still in `SynReceived` stays in the pool (it establishes or
+            // smoltcp times it out); one that reached a terminal state without
+            // establishing is reclaimed and the slot refilled.
             let mut engaged = 0usize;
-            listener.pending.retain(|&h| {
-                if sockets.get::<tcp::Socket<'_>>(h).state() == tcp::State::Listen {
-                    true
-                } else {
-                    accepted.push((h, listener.accept_tx.clone()));
-                    engaged += 1;
-                    false
-                }
-            });
+            listener
+                .pending
+                .retain(|&h| match sockets.get::<tcp::Socket<'_>>(h).state() {
+                    tcp::State::Listen | tcp::State::SynReceived => true,
+                    tcp::State::Established => {
+                        accepted.push((h, listener.accept_tx.clone()));
+                        engaged += 1;
+                        false
+                    }
+                    _ => {
+                        to_remove.push(h);
+                        engaged += 1;
+                        false
+                    }
+                });
             if engaged > 0 {
                 refill.push((listener.port, engaged));
             }
+        }
+
+        // Reclaim sockets that died before establishing.
+        for handle in to_remove {
+            sockets.remove(handle);
         }
 
         for (handle, accept_tx) in accepted {

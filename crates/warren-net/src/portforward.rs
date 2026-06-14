@@ -14,10 +14,12 @@
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use warren_wire::natpmp::{self, MapProto, Request, Response, ResultCode};
 
 use crate::error::NetError;
@@ -316,12 +318,27 @@ pub async fn relay_to_local(mut stream: NetstackStream, target: SocketAddr) {
     }
 }
 
+/// Maximum concurrent inbound relays, so an exit-forwarded connection burst
+/// cannot fan out into unbounded host connects and tasks. At the cap, accepting
+/// pauses, which lets the engine's bounded accept queue shed the excess.
+const MAX_INBOUND_RELAYS: usize = 128;
+
 /// Accepts inbound connections on `listener` (a tunnel-side forwarded port) and
-/// relays each to the local `target`, one task per connection. Returns when the
-/// listener ends (the engine stopped).
+/// relays each to the local `target`, one task per connection up to
+/// [`MAX_INBOUND_RELAYS`] in flight. Returns when the listener ends (the engine
+/// stopped).
 pub async fn serve_inbound(mut listener: NetstackListener, target: SocketAddr) {
+    let limit = Arc::new(Semaphore::new(MAX_INBOUND_RELAYS));
     while let Some(stream) = listener.accept().await {
-        tokio::spawn(relay_to_local(stream, target));
+        // Block accepting once the cap is reached: backpressure, not unbounded
+        // fan-out. `acquire_owned` only errors on a closed semaphore (never here).
+        let Ok(permit) = Arc::clone(&limit).acquire_owned().await else {
+            break;
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            relay_to_local(stream, target).await;
+        });
     }
 }
 
