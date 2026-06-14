@@ -58,6 +58,10 @@ const DNS_TIMEOUT: SmolDuration = SmolDuration::from_secs(5);
 const DNS_PORT: u16 = 53;
 /// UDP buffer for one in-flight DNS query/response (fits an EDNS-sized reply).
 const DNS_BUFFER: usize = 2048;
+/// Per-direction UDP payload buffer for a relayed UDP flow (64 KiB).
+const UDP_FLOW_BUFFER: usize = 64 * 1024;
+/// Datagrams buffered per direction for a UDP flow before drops (lossy by design).
+const UDP_CHANNEL_DEPTH: usize = 64;
 
 /// A smoltcp [`Device`] over IP-packet channels. Frames are zero-copy [`Bytes`].
 struct TunnelDevice {
@@ -119,6 +123,26 @@ enum Command {
     /// Resolve a host name to an IPv4 address over the tunnel (DNS to the
     /// gateway forwarder).
     Resolve(ResolveCommand),
+    /// Open a UDP flow (an ephemeral local port) for datagrams to arbitrary
+    /// targets through the tunnel (the SOCKS5 UDP-associate egress).
+    OpenUdp(UdpOpenCommand),
+}
+
+/// Open a UDP flow, replying with a [`NetstackUdpSocket`] handle.
+struct UdpOpenCommand {
+    reply: oneshot::Sender<Result<NetstackUdpSocket, NetError>>,
+}
+
+/// Engine-side state for one UDP flow. Datagrams are lossy by design: when a
+/// bounded channel or the socket buffer is full the datagram is dropped rather
+/// than blocking the single-threaded engine, matching UDP semantics.
+struct UdpFlow {
+    handle: SocketHandle,
+    local_port: u16,
+    /// net->app: datagrams received from the tunnel, tagged with their source.
+    to_app: mpsc::Sender<(Bytes, SocketAddr)>,
+    /// app->net: datagrams to send, tagged with their destination.
+    from_app: mpsc::Receiver<(Bytes, SocketAddr)>,
 }
 
 /// Open a TCP connection to `addr`, replying with the bridged stream or an error.
@@ -232,6 +256,37 @@ impl AsyncWrite for NetstackStream {
     }
 }
 
+/// A UDP socket on the userspace netstack, driven from tokio. One socket serves
+/// a whole flow: send to many destinations, receive from many sources.
+/// Datagrams are lossy (UDP), so a full buffer drops rather than blocks.
+pub struct NetstackUdpSocket {
+    outgoing: mpsc::Sender<(Bytes, SocketAddr)>,
+    incoming: mpsc::Receiver<(Bytes, SocketAddr)>,
+    wake: Arc<Notify>,
+}
+
+impl NetstackUdpSocket {
+    /// Queues `data` for delivery to `dst` through the tunnel.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::EngineStopped`] if the netstack engine has stopped.
+    pub async fn send_to(&self, data: Bytes, dst: SocketAddr) -> Result<(), NetError> {
+        self.outgoing
+            .send((data, dst))
+            .await
+            .map_err(|_| NetError::EngineStopped)?;
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    /// Receives the next datagram and its source, or `None` once the engine has
+    /// stopped.
+    pub async fn recv_from(&mut self) -> Option<(Bytes, SocketAddr)> {
+        self.incoming.recv().await
+    }
+}
+
 /// A [`Connector`] backed by the userspace netstack engine.
 #[derive(Clone)]
 pub struct TunnelConnector {
@@ -250,6 +305,23 @@ impl TunnelConnector {
                 name: host.to_owned(),
                 reply: reply_tx,
             }))
+            .map_err(|_| NetError::EngineStopped)?;
+        self.wake.notify_one();
+        reply_rx.await.map_err(|_| NetError::EngineStopped)?
+    }
+
+    /// Opens a UDP flow (an ephemeral local port) for datagrams to arbitrary
+    /// targets through the tunnel. The returned socket serves a whole SOCKS5 UDP
+    /// association: it can send to and receive from many peers.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::EngineStopped`] if the engine has stopped, or
+    /// [`NetError::ConnectFailed`] if the UDP port could not be bound.
+    pub async fn open_udp(&self) -> Result<NetstackUdpSocket, NetError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(Command::OpenUdp(UdpOpenCommand { reply: reply_tx }))
             .map_err(|_| NetError::EngineStopped)?;
         self.wake.notify_one();
         reply_rx.await.map_err(|_| NetError::EngineStopped)?
@@ -319,6 +391,7 @@ pub fn spawn_engine(
         },
         conns: HashMap::new(),
         resolvers: Vec::new(),
+        udp_flows: Vec::new(),
         next_conn_id: 0,
         next_port: EPHEMERAL_BASE,
         used_ports: HashSet::new(),
@@ -341,6 +414,7 @@ struct Engine {
     device: TunnelDevice,
     conns: HashMap<u64, Conn>,
     resolvers: Vec<PendingResolve>,
+    udp_flows: Vec<UdpFlow>,
     next_conn_id: u64,
     next_port: u16,
     used_ports: HashSet<u16>,
@@ -376,9 +450,11 @@ impl Engine {
                 match cmd {
                     Command::Open(c) => self.open(&mut iface, &mut sockets, c, now(base)),
                     Command::Resolve(c) => self.start_resolve(&mut sockets, c, now(base)),
+                    Command::OpenUdp(c) => self.start_udp(&mut sockets, c),
                 }
             }
             self.ingest_writes();
+            self.pump_udp(&mut sockets);
 
             // Inbound frames from the tunnel into the device.
             loop {
@@ -394,6 +470,7 @@ impl Engine {
             while iface.poll(now(base), &mut self.device, &mut sockets) != PollResult::None {}
             self.drain_sockets(&mut sockets, now(base));
             self.drain_resolvers(&mut sockets, now(base));
+            self.drain_udp(&mut sockets);
 
             let mut delay = iface
                 .poll_delay(now(base), &sockets)
@@ -558,6 +635,86 @@ impl Engine {
         }
     }
 
+    /// Binds a UDP socket for a new flow and hands back a [`NetstackUdpSocket`].
+    fn start_udp(&mut self, sockets: &mut SocketSet<'_>, cmd: UdpOpenCommand) {
+        let rx = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; 16],
+            vec![0u8; UDP_FLOW_BUFFER],
+        );
+        let tx = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; 16],
+            vec![0u8; UDP_FLOW_BUFFER],
+        );
+        let handle = sockets.add(udp::Socket::new(rx, tx));
+        let local_port = self.alloc_port();
+        let sock = sockets.get_mut::<udp::Socket<'_>>(handle);
+        if sock.bind(local_port).is_err() {
+            sockets.remove(handle);
+            self.used_ports.remove(&local_port);
+            let _ = cmd.reply.send(Err(NetError::ConnectFailed));
+            return;
+        }
+        let (to_app_tx, to_app_rx) = mpsc::channel(UDP_CHANNEL_DEPTH);
+        let (from_app_tx, from_app_rx) = mpsc::channel(UDP_CHANNEL_DEPTH);
+        self.udp_flows.push(UdpFlow {
+            handle,
+            local_port,
+            to_app: to_app_tx,
+            from_app: from_app_rx,
+        });
+        let _ = cmd.reply.send(Ok(NetstackUdpSocket {
+            outgoing: from_app_tx,
+            incoming: to_app_rx,
+            wake: Arc::clone(&self.wake),
+        }));
+    }
+
+    /// Sends queued app datagrams out each UDP flow and reaps flows whose app
+    /// handle was dropped.
+    fn pump_udp(&mut self, sockets: &mut SocketSet<'_>) {
+        let mut closed: Vec<usize> = Vec::new();
+        for (i, flow) in self.udp_flows.iter_mut().enumerate() {
+            loop {
+                match flow.from_app.try_recv() {
+                    Ok((data, dst)) => {
+                        let sock = sockets.get_mut::<udp::Socket<'_>>(flow.handle);
+                        // Lossy: a full tx buffer drops this datagram (UDP).
+                        let _ = sock.send_slice(&data, to_smol_endpoint(dst));
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        closed.push(i);
+                        break;
+                    }
+                }
+            }
+        }
+        closed.sort_unstable_by(|a, b| b.cmp(a));
+        for i in closed {
+            let flow = self.udp_flows.swap_remove(i);
+            sockets.remove(flow.handle);
+            self.used_ports.remove(&flow.local_port);
+        }
+    }
+
+    /// Delivers received datagrams (with their source) to each UDP flow's app.
+    fn drain_udp(&mut self, sockets: &mut SocketSet<'_>) {
+        for flow in &self.udp_flows {
+            let sock = sockets.get_mut::<udp::Socket<'_>>(flow.handle);
+            while sock.can_recv() {
+                match sock.recv() {
+                    Ok((data, meta)) => {
+                        if let Some(src) = from_smol_endpoint(meta.endpoint) {
+                            // Lossy: a full app channel drops this datagram (UDP).
+                            let _ = flow.to_app.try_send((Bytes::copy_from_slice(data), src));
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
     /// Moves app->net writes into per-conn buffers, bounded by `PENDING_OUT_CAP`
     /// so a slow tunnel exerts backpressure through the bounded `from_app`
     /// channel rather than growing memory without bound.
@@ -708,4 +865,18 @@ fn to_smol_ip(ip: std::net::IpAddr) -> IpAddress {
         std::net::IpAddr::V4(a) => IpAddress::from(a),
         std::net::IpAddr::V6(a) => IpAddress::from(a),
     }
+}
+
+/// Converts a std socket address to a smoltcp UDP endpoint.
+fn to_smol_endpoint(addr: SocketAddr) -> IpEndpoint {
+    IpEndpoint::new(to_smol_ip(addr.ip()), addr.port())
+}
+
+/// Converts a smoltcp endpoint back to a std socket address.
+fn from_smol_endpoint(ep: IpEndpoint) -> Option<SocketAddr> {
+    let ip = match ep.addr {
+        IpAddress::Ipv4(a) => std::net::IpAddr::V4(a),
+        IpAddress::Ipv6(a) => std::net::IpAddr::V6(a),
+    };
+    Some(SocketAddr::new(ip, ep.port))
 }

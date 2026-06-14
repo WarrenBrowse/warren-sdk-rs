@@ -137,8 +137,13 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
     the pinned `warren-net::dns` codec, so lookups never hit the host resolver.
     Validated end to end in-process (a DNS+echo "exit" answers the query, then
     the domain CONNECT echoes).
+  - UDP associate: egress primitive done. The netstack engine binds a UDP flow
+    (`TunnelConnector::open_udp` -> `NetstackUdpSocket`) that sends/receives
+    datagrams to arbitrary targets through the tunnel (lossy, source-tagged),
+    validated in-process against a UDP echo exit. Pending: the SOCKS5 UDP
+    ASSOCIATE server loop (relay socket + per-datagram header) on top of it.
   - Pending: validation against a real Warren exit (mandatory before production);
-    a configurable fallback resolver for `dns_disabled` exits; UDP associate;
+    a configurable fallback resolver for `dns_disabled` exits;
     privileged per-OS TUN/routing/DNS/killswitch; GSO/GRO batch syscalls behind
     the `PacketSink` batch seam and `fast-apple-datapath` on macOS.
 - Multihop HPKE frame (REQUIRED, blocking, discovered via live-exit validation):
