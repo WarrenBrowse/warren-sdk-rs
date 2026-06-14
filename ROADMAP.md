@@ -161,11 +161,13 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
   - Dual-stack IPv6: DONE (datapath). `NetstackConfig::with_ipv6` installs the
     exit-granted v6 client address + default v6 route; the connector routes v6
     targets when v6 was assigned and refuses them otherwise (fail-closed). The
-    facade enables it from the multihop `IpAssign` (v6 + v6 gateway); single-hop
-    stays v4-only (its SetupAck carries no v6 gateway/prefix). Validated in-process
-    (v6 connect/echo over the tunnel). Pending: AAAA-over-tunnel for v6 *domain*
-    targets (literal v6 works; domains still resolve A only), and real-exit v6
-    validation.
+    facade enables it from the multihop `IpAssign` (v6 + v6 gateway, with a
+    bounded prefix); single-hop stays v4-only (its SetupAck carries no v6
+    gateway/prefix). Domain targets resolve over the tunnel with AAAA preferred
+    and A fallback when v6 is assigned (the `warren-net::dns` codec now does both
+    `A` and `AAAA`). Validated in-process (literal v6 connect/echo, off-subnet v6
+    default route, AAAA resolve+v6 connect, A fallback). Pending: real-exit v6
+    validation, and v6 UDP-associate egress (UDP resolves A-only today).
   - Pending: validation against a real Warren exit (mandatory before production);
     privileged per-OS TUN/routing/DNS/killswitch; GSO/GRO batch syscalls behind
     the `PacketSink` batch seam and `fast-apple-datapath` on macOS.
