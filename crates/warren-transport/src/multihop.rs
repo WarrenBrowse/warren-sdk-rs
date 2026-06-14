@@ -286,6 +286,16 @@ impl MultihopSession {
         self.conn.max_datagram_size()
     }
 
+    /// The largest inner IP packet that fits in one sealed datagram: the path
+    /// datagram size minus the worst-case frame overhead. Falls back to the
+    /// 1280-byte base MTU before the first PMTU probe.
+    #[must_use]
+    pub fn max_inner_payload(&self) -> usize {
+        const BASE_MTU: usize = 1280;
+        let path = self.conn.max_datagram_size().unwrap_or(BASE_MTU);
+        path.saturating_sub(warren_wire::MULTIHOP_FRAME_MAX_OVERHEAD)
+    }
+
     /// The underlying quinn connection (for advanced callers / the pump).
     #[must_use]
     pub fn connection(&self) -> &quinn::Connection {

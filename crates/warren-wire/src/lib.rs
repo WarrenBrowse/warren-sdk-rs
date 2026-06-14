@@ -25,5 +25,6 @@ pub use handshake::{
     SetupAck, decode_setup, decode_setup_ack, encode_setup, encode_setup_ack, features,
 };
 pub use multihop::{
-    WARREN_HPKE_AAD_V1, WARREN_HPKE_VERSION_V1, WARREN_PKI_OPERATIONAL_EXIT_V1, WarrenMultihopFrame,
+    MULTIHOP_FRAME_MAX_OVERHEAD, WARREN_HPKE_AAD_V1, WARREN_HPKE_VERSION_V1,
+    WARREN_PKI_OPERATIONAL_EXIT_V1, WarrenMultihopFrame,
 };

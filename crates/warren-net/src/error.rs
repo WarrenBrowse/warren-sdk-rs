@@ -10,6 +10,9 @@ pub enum NetError {
     /// The tunnel packet plane failed (send/recv datagram).
     #[error("tunnel error")]
     Tunnel(#[from] warren_transport::TunnelError),
+    /// The multihop tunnel packet plane failed (seal/open/send/recv).
+    #[error("multihop tunnel error")]
+    Multihop(#[source] warren_transport::MultihopError),
     /// A local I/O error (proxy listener, TUN device).
     #[error("io error")]
     Io(#[source] std::io::Error),

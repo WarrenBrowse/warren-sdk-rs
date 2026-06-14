@@ -7,7 +7,7 @@
 //! tunnel-side implementation over a [`warren_transport::ClientSession`].
 
 use bytes::Bytes;
-use warren_transport::ClientSession;
+use warren_transport::{ClientSession, MultihopSession};
 
 use crate::error::NetError;
 
@@ -95,5 +95,46 @@ impl PacketSink for QuicPacketSink {
         self.session
             .max_datagram_size()
             .map_or(policy, |path| path.min(policy))
+    }
+}
+
+/// A [`PacketSink`] backed by a multihop tunnel session: every inner IP packet
+/// is HPKE-sealed into a [`WarrenMultihopFrame`](warren_wire::WarrenMultihopFrame)
+/// before it rides the QUIC datagram plane (the handshake real exits require).
+pub struct MultihopPacketSink {
+    session: MultihopSession,
+}
+
+impl MultihopPacketSink {
+    /// Wraps an established multihop session.
+    #[must_use]
+    pub fn new(session: MultihopSession) -> Self {
+        Self { session }
+    }
+
+    /// The underlying session.
+    #[must_use]
+    pub fn session(&self) -> &MultihopSession {
+        &self.session
+    }
+}
+
+impl PacketSink for MultihopPacketSink {
+    async fn send_packet(&self, packet: &[u8]) -> Result<(), NetError> {
+        self.session.send_packet(packet).map_err(NetError::Multihop)
+    }
+
+    async fn recv_packet(&self) -> Result<Bytes, NetError> {
+        self.session
+            .recv_packet()
+            .await
+            .map(Bytes::from)
+            .map_err(NetError::Multihop)
+    }
+
+    fn max_payload(&self) -> usize {
+        // The sealed frame's per-packet overhead is already subtracted, so this
+        // is the inner IP MTU the netstack engine should clamp to.
+        self.session.max_inner_payload()
     }
 }

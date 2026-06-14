@@ -27,6 +27,15 @@ const MAX_FRAME_BYTES: usize = 65536;
 /// Exit identifier length.
 pub const EXIT_ID_LEN: usize = 16;
 
+/// Worst-case bytes a sealed frame adds on top of its inner plaintext (the
+/// detached AEAD keeps ciphertext == plaintext length). Breakdown, postcard
+/// worst case: version(1) + exit_id(16) + epoch varint(5, `u32::MAX`) + seq
+/// varint(10, `u64::MAX`) + encapsulated_key(32) + aead_tag(16) + ciphertext
+/// length varint(3, up to [`MAX_FRAME_BYTES`]) = 83. Datapaths subtract this
+/// from the path datagram size to size the inner MTU. Pinned by
+/// `frame_overhead_never_exceeds_the_bound`.
+pub const MULTIHOP_FRAME_MAX_OVERHEAD: usize = 83;
+
 /// The C1 wire frame carried client -> relay -> exit. `exit_id` is cleartext for
 /// routing; the payload is HPKE-sealed (`encapsulated_key` + `aead_tag` +
 /// `ciphertext`), bound to `(exit_id, epoch, seq)` via the AEAD AAD.
@@ -153,6 +162,30 @@ mod tests {
                 expected: 0x01
             }
         ));
+    }
+
+    #[test]
+    fn frame_overhead_never_exceeds_the_bound() {
+        // Worst case for the varint-encoded fields: max epoch + max seq, and a
+        // large ciphertext so its length varint is at its widest. The encoded
+        // overhead (everything but the ciphertext bytes) must stay within
+        // MULTIHOP_FRAME_MAX_OVERHEAD so datapaths never under-reserve the MTU.
+        let payload_len = MAX_FRAME_BYTES - 256;
+        let frame = WarrenMultihopFrame {
+            version: WARREN_HPKE_VERSION_V1,
+            exit_id: [0xff; EXIT_ID_LEN],
+            epoch: u32::MAX,
+            seq: u64::MAX,
+            encapsulated_key: [0xff; 32],
+            aead_tag: [0xff; 16],
+            ciphertext: vec![0u8; payload_len],
+        };
+        let encoded = frame.encode().expect("encode");
+        let overhead = encoded.len() - payload_len;
+        assert!(
+            overhead <= MULTIHOP_FRAME_MAX_OVERHEAD,
+            "frame overhead {overhead} exceeded the reserved bound {MULTIHOP_FRAME_MAX_OVERHEAD}"
+        );
     }
 
     #[test]
