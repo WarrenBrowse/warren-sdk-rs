@@ -616,3 +616,108 @@ pub async fn spawn_netstack_multihop_exit(exit_key: SigningKey) -> (SocketAddr, 
         },
     )
 }
+
+/// Spawns a multihop exit that, after the sealed setup, REPLAYS each data reply:
+/// it seals the echo once and sends it twice with the SAME `(epoch, seq)`. A
+/// correct client returns each opened packet exactly once (the duplicate is
+/// dropped by the reverse-direction anti-replay window). Used to regression-test
+/// the data-plane verify-then-record ordering.
+///
+/// # Panics
+///
+/// Panics on any setup failure (test helper).
+pub async fn spawn_replaying_multihop_exit(exit_key: SigningKey) -> (SocketAddr, MultihopExitKeys) {
+    let ed25519_pubkey = exit_key.verifying_key().to_bytes();
+    let (recipient_priv, recipient_pub) =
+        ExitKem::gen_keypair(&mut rand_core::UnwrapErr(rand_core::OsRng));
+    let x25519_pubkey: [u8; 32] = recipient_pub.to_bytes().into();
+    let exit_id = [0x11u8; EXIT_ID_LEN];
+
+    let cfg = make_server_config(&exit_key, default_crypto_provider(), &[ALPN_H3])
+        .expect("server config");
+    let endpoint = quinn::Endpoint::server(cfg, "127.0.0.1:0".parse().unwrap())
+        .expect("server endpoint binds");
+    let addr = endpoint.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        let conn = endpoint
+            .accept()
+            .await
+            .expect("incoming")
+            .await
+            .expect("conn");
+        let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
+        let request_bytes = recv.read_to_end(65536).await.expect("read setup request");
+        let request = WarrenMultihopFrame::decode(&request_bytes).expect("decode request");
+        let encapped =
+            <ExitKem as KemTrait>::EncappedKey::from_bytes(&request.encapsulated_key).unwrap();
+        let ctx = setup_receiver::<ExitAead, ExitKdf, ExitKem>(
+            &OpModeR::Base,
+            &recipient_priv,
+            &encapped,
+            WARREN_HPKE_INFO_V1,
+        )
+        .expect("setup_receiver");
+        let _ = exit_open(&ctx, &exit_id, &request).expect("open setup request");
+
+        let assign = WarrenControlMessage::IpAssign {
+            ipv4: [10, 66, 0, 2],
+            prefix_len: 24,
+            gateway_ipv4: [10, 66, 0, 1],
+            ipv6: None,
+            prefix_len_v6: 0,
+            gateway_ipv6: None,
+        };
+        let reply = exit_seal(
+            &ctx,
+            &exit_id,
+            request.encapsulated_key,
+            &encode_control(&assign).expect("encode IpAssign"),
+            request.epoch,
+            0,
+        );
+        send.write_all(&reply.encode().expect("encode reply"))
+            .await
+            .expect("write reply");
+        send.finish().expect("finish reply");
+
+        let mut reverse_seq: u64 = 1;
+        while let Ok(datagram) = conn.read_datagram().await {
+            let Ok(frame) = WarrenMultihopFrame::decode(&datagram) else {
+                continue;
+            };
+            if frame.exit_id != exit_id {
+                continue;
+            }
+            let Some(ip) = exit_open(&ctx, &exit_id, &frame) else {
+                continue;
+            };
+            let echo = exit_seal(
+                &ctx,
+                &exit_id,
+                request.encapsulated_key,
+                &ip,
+                frame.epoch,
+                reverse_seq,
+            );
+            reverse_seq += 1;
+            let bytes = echo.encode().expect("encode echo");
+            // Send the identical sealed frame TWICE (same seq): the client must
+            // accept it once and drop the replay.
+            if conn.send_datagram(bytes.clone().into()).is_err() {
+                break;
+            }
+            let _ = conn.send_datagram(bytes.into());
+        }
+        drop(endpoint);
+    });
+
+    (
+        addr,
+        MultihopExitKeys {
+            ed25519_pubkey,
+            x25519_pubkey,
+            exit_id,
+        },
+    )
+}

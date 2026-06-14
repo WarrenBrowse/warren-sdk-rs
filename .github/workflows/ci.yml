@@ -51,7 +51,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # --locked refuses to mutate Cargo.lock (CI reproducibility: the frozen
       # golden vectors must resolve against the exact transitive crates).
-      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # --all-features also lints the privileged per-OS datapath behind the
+      # `tun`/`killswitch` features on each native runner (today empty, so this
+      # is a no-op that is already in place when those back ends land).
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: cargo test (${{ matrix.name }})
@@ -78,7 +81,7 @@ jobs:
       # loopback tunnel tests can hit a quinn Drop/UDP-bind race on slower
       # runners. The test job is the correctness gate; real exit validation
       # is manual against warren-core (cf. CLAUDE.md).
-      - run: cargo nextest run --locked --workspace --all-targets --retries 2
+      - run: cargo nextest run --locked --workspace --all-targets --all-features --retries 2
 
   deny:
     name: cargo-deny
@@ -92,6 +95,9 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
+      # cargo-deny evaluates the full dependency graph (all features, all target
+      # cfgs) by default, so feature-gated deps behind `tun`/`killswitch` are
+      # already in the license/advisory graph once they are declared.
       - run: cargo deny check
 
   coverage:

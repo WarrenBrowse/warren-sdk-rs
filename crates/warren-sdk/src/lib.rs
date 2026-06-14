@@ -75,6 +75,14 @@ pub enum SdkError {
     /// The multihop directory is past its `expires_at` (anti-freeze / replay).
     #[error("multihop directory is expired")]
     StaleMultihopDirectory,
+    /// The multihop directory's `generation` regressed below the trusted floor.
+    #[error("multihop directory rolled back: generation {got} < trusted floor {floor}")]
+    RolledBackMultihopDirectory {
+        /// Generation in the fetched directory.
+        got: u64,
+        /// Highest generation previously trusted.
+        floor: u64,
+    },
     /// No multihop exit matched the selection.
     #[error("no multihop exit matched the selection")]
     NoMultihopExit,
@@ -168,6 +176,7 @@ pub struct WarrenClientBuilder {
     server_pubkey_pin: Option<String>,
     allow_any_server_key: bool,
     generation_store: Arc<dyn GenerationStore>,
+    multihop_generation_store: Arc<dyn GenerationStore>,
     server_key_store: Option<Arc<dyn ServerKeyStore>>,
 }
 
@@ -227,6 +236,16 @@ impl WarrenClientBuilder {
         self
     }
 
+    /// Sets the anti-rollback [`GenerationStore`] for the multihop directory
+    /// (a separate generation sequence from the signed exit list). Defaults to a
+    /// distinct [`InMemoryGenerationStore`]; supply a persistent store to keep
+    /// directory anti-rollback across restarts.
+    #[must_use]
+    pub fn multihop_generation_store(mut self, store: Arc<dyn GenerationStore>) -> Self {
+        self.multihop_generation_store = store;
+        self
+    }
+
     /// Sets a [`ServerKeyStore`] to enable trust-on-first-use pinning of the
     /// signed-exit-list server key. A TOFU store is itself a valid pinning
     /// strategy, so setting it satisfies the build-time pin requirement.
@@ -283,6 +302,7 @@ impl WarrenClientBuilder {
             signing,
             server_pubkey_pin: pin,
             generation_store: self.generation_store,
+            multihop_generation_store: self.multihop_generation_store,
             server_key_store: self.server_key_store,
         })
     }
@@ -300,6 +320,8 @@ pub struct WarrenClient<T> {
     server_pubkey_pin: Option<String>,
     /// Anti-rollback floor: highest signed-list `generation` trusted so far.
     generation_store: Arc<dyn GenerationStore>,
+    /// Anti-rollback floor for the multihop directory (separate sequence).
+    multihop_generation_store: Arc<dyn GenerationStore>,
     /// Trust-on-first-use pin store, when enabled.
     server_key_store: Option<Arc<dyn ServerKeyStore>>,
 }
@@ -315,6 +337,7 @@ impl WarrenClient<()> {
             server_pubkey_pin: None,
             allow_any_server_key: false,
             generation_store: Arc::new(InMemoryGenerationStore::default()),
+            multihop_generation_store: Arc::new(InMemoryGenerationStore::default()),
             server_key_store: None,
         }
     }
@@ -412,7 +435,9 @@ impl<T: HttpTransport> WarrenClient<T> {
     ) -> Result<ProxyHandle, SdkError> {
         let sink = self.connect_tunnel(exit).await?;
         let local_ip = sink.session().assigned_ipv4();
-        serve_proxy_over_sink(sink, local_ip, cfg).await
+        // Single-hop SetupAck carries no subnet, so fall back to the frozen
+        // tunnel defaults (10.66.0.0/16, gateway 10.66.0.1).
+        serve_proxy_over_sink(sink, local_ip, TUNNEL_PREFIX, TUNNEL_GATEWAY, cfg).await
     }
 
     /// Fetches and verifies the signed multihop directory, returning the trusted
@@ -445,6 +470,17 @@ impl<T: HttpTransport> WarrenClient<T> {
         if now_unix_secs() >= verified.expires_at {
             return Err(SdkError::StaleMultihopDirectory);
         }
+        // Anti-rollback on the directory's own generation sequence (separate from
+        // the signed exit list): reject a replayed older-but-signed directory.
+        let floor = self.multihop_generation_store.load_floor();
+        if verified.generation < floor {
+            return Err(SdkError::RolledBackMultihopDirectory {
+                got: verified.generation,
+                floor,
+            });
+        }
+        self.multihop_generation_store
+            .store_floor(verified.generation);
         Ok(verified.exits)
     }
 
@@ -485,8 +521,14 @@ impl<T: HttpTransport> WarrenClient<T> {
         cfg: &warren_net::ProxyConfig,
     ) -> Result<ProxyHandle, SdkError> {
         let sink = self.connect_multihop(exit).await?;
-        let local_ip = sink.session().assigned_ipv4();
-        serve_proxy_over_sink(sink, local_ip, cfg).await
+        // Honor the exit-supplied subnet from the IpAssign instead of assuming
+        // the default /16 + 10.66.0.1: a real exit may assign a different prefix
+        // or gateway, and a wrong default route would black-hole traffic.
+        let assignment = sink.session().assignment();
+        let local_ip = std::net::Ipv4Addr::from(assignment.ipv4);
+        let prefix = assignment.prefix_len;
+        let gateway = std::net::Ipv4Addr::from(assignment.gateway_ipv4);
+        serve_proxy_over_sink(sink, local_ip, prefix, gateway, cfg).await
     }
 }
 
@@ -495,6 +537,8 @@ impl<T: HttpTransport> WarrenClient<T> {
 async fn serve_proxy_over_sink<S>(
     sink: S,
     local_ip: std::net::Ipv4Addr,
+    prefix: u8,
+    gateway: std::net::Ipv4Addr,
     cfg: &warren_net::ProxyConfig,
 ) -> Result<ProxyHandle, SdkError>
 where
@@ -504,8 +548,7 @@ where
     // size, NOT the raw policy MTU (which can exceed the datagram capacity and
     // make every full-size packet silently fail to send).
     let mtu = warren_net::PacketSink::max_payload(&sink);
-    let connector =
-        warren_net::spawn_over_sink(Arc::new(sink), local_ip, TUNNEL_PREFIX, TUNNEL_GATEWAY, mtu);
+    let connector = warren_net::spawn_over_sink(Arc::new(sink), local_ip, prefix, gateway, mtu);
 
     let socks_listener = tokio::net::TcpListener::bind(cfg.socks5)
         .await

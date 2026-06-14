@@ -262,6 +262,48 @@ mod tests {
         buf
     }
 
+    fn test_session(seed: u64) -> ClientSession {
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+        let (_priv, pub_) = WarrenKem::gen_keypair(&mut rng);
+        let pub_bytes: [u8; 32] = pub_.to_bytes().into();
+        ClientSession::new(&pub_bytes, [0x5a; EXIT_ID_LEN], &mut rng).expect("session")
+    }
+
+    #[test]
+    fn open_response_rejects_wrong_version() {
+        let session = test_session(11);
+        let mut frame = session.seal(b"x", 0, 0).unwrap();
+        frame.version = 0x02;
+        assert!(matches!(
+            session.open_response(&frame),
+            Err(SessionError::UnsupportedVersion)
+        ));
+    }
+
+    #[test]
+    fn open_response_rejects_foreign_exit_id() {
+        let session = test_session(12);
+        let mut frame = session.seal(b"x", 0, 0).unwrap();
+        frame.exit_id = [0xff; EXIT_ID_LEN];
+        assert!(matches!(
+            session.open_response(&frame),
+            Err(SessionError::ExitIdMismatch)
+        ));
+    }
+
+    #[test]
+    fn open_response_rejects_unopenable_frame_as_aead() {
+        // A forward-sealed frame carries the right version + exit_id but is keyed
+        // for the forward direction, so opening it in the reverse direction must
+        // fail the AEAD tag (drives SessionError::Aead through open_response).
+        let session = test_session(13);
+        let frame = session.seal(b"forward-only", 0, 0).unwrap();
+        assert!(matches!(
+            session.open_response(&frame),
+            Err(SessionError::Aead)
+        ));
+    }
+
     #[test]
     fn seal_then_exit_open_roundtrips() {
         let mut rng = ChaCha20Rng::seed_from_u64(1);

@@ -54,7 +54,9 @@ serde_json = "1"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 
 # Weighted random relay selection. rand 0.8 keeps rand_core 0.6, matching
-# ed25519-dalek 2.x, so there is a single rand_core in the tree.
+# ed25519-dalek 2.x. Note the tree intentionally also carries rand_core 0.9
+# (pulled by hpke 0.13 for the multihop HPKE session); the two majors coexist
+# and `cargo deny` tolerates the duplicate (multiple-versions = "warn").
 rand = "0.8"
 
 # QUIC transport. quinn 0.11 with the tokio runtime and ring crypto; rustls is
