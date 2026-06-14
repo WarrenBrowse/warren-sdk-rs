@@ -64,9 +64,6 @@ pub enum PortForwardError {
     /// The UDP flow failed to send or closed underneath us.
     #[error("nat-pmp transport error")]
     Transport(#[source] NetError),
-    /// The gateway reply could not be parsed.
-    #[error("nat-pmp response parse error")]
-    Parse(#[source] natpmp::ParseError),
     /// The gateway answered with a non-success result code. The code names a
     /// protocol condition, not identity material, so it is safe to surface.
     #[error("nat-pmp gateway rejected the request: {0:?}")]
@@ -88,16 +85,18 @@ pub fn refresh_after(lifetime_secs: u32) -> Duration {
     Duration::from_secs(u64::from(lifetime_secs.max(2)) / 2)
 }
 
-/// Sends `request` to the gateway and returns the matching reply, retransmitting
-/// with RFC 6886 exponential backoff until a reply arrives or the attempts are
-/// exhausted. Datagrams whose source is not the gateway's NAT-PMP port are
-/// ignored (anti-spoof), as are replies to a different request.
+/// Sends `request` to the gateway and returns the reply for the same opcode,
+/// retransmitting with RFC 6886 exponential backoff until one arrives or the
+/// attempts are exhausted. Replies are correlated by opcode (NAT-PMP has no
+/// transaction id); callers verify the echoed internal port. Datagrams from a
+/// source other than the gateway's NAT-PMP port, replies to a different opcode,
+/// and malformed frames are all ignored without spending the budget on an error,
+/// so one stray or hostile datagram cannot abort a mapping attempt.
 ///
 /// # Errors
 ///
 /// [`PortForwardError::Transport`] if the flow send fails or the flow closes,
-/// [`PortForwardError::Parse`] on a malformed reply, and
-/// [`PortForwardError::Timeout`] if no matching reply arrives in budget.
+/// and [`PortForwardError::Timeout`] if no matching reply arrives in budget.
 pub async fn exchange<F: UdpFlow>(
     flow: &mut F,
     gateway: Ipv4Addr,
@@ -127,11 +126,15 @@ pub async fn exchange<F: UdpFlow>(
                     if src != server {
                         continue;
                     }
-                    let resp = natpmp::parse_response(&data).map_err(PortForwardError::Parse)?;
+                    // A malformed frame from the gateway endpoint must not abort
+                    // the retransmission budget; ignore it and keep waiting.
+                    let Ok(resp) = natpmp::parse_response(&data) else {
+                        continue;
+                    };
                     if response_matches(&request, &resp) {
                         return Ok(resp);
                     }
-                    // A reply to some other request: keep waiting in this window.
+                    // A reply to some other opcode: keep waiting in this window.
                 }
             }
         }
@@ -227,8 +230,9 @@ pub async fn external_address<F: UdpFlow>(
 ///
 /// # Errors
 ///
-/// [`PortForwardError::Gateway`] on a non-success result code, plus the
-/// [`exchange`] errors.
+/// [`PortForwardError::Gateway`] on a non-success result code,
+/// [`PortForwardError::UnexpectedReply`] if the gateway acknowledges a different
+/// internal port, plus the [`exchange`] errors.
 pub async fn delete<F: UdpFlow>(
     flow: &mut F,
     gateway: Ipv4Addr,
@@ -249,8 +253,17 @@ pub async fn delete<F: UdpFlow>(
     match resp {
         Response::Map {
             result_code: ResultCode::Success,
+            internal_port: echoed,
             ..
-        } => Ok(()),
+        } => {
+            // The ack must name the port we tore down, else it is for a different
+            // allocation (opcode alone does not correlate; NAT-PMP has no id).
+            if echoed == internal_port {
+                Ok(())
+            } else {
+                Err(PortForwardError::UnexpectedReply)
+            }
+        }
         Response::Map { result_code, .. } => Err(PortForwardError::Gateway(result_code)),
         _ => Err(PortForwardError::UnexpectedReply),
     }
@@ -320,6 +333,12 @@ mod tests {
         Silent,
         /// Answer correctly but from a spoofed source (must be ignored).
         WrongSource(u16),
+        /// Grant, but echo the wrong internal port (the caller must reject it).
+        GrantWrongInternal(u16),
+        /// Reply with a malformed frame from the gateway (must be ignored).
+        Garbage,
+        /// The flow has ended: `recv_from` yields `None`.
+        Closed,
     }
 
     /// A NAT-PMP gateway behind the [`UdpFlow`] seam. `send_to` parses the client
@@ -395,11 +414,24 @@ mod tests {
                     Some((map_response(opcode, raw, internal, 0, 0), server()))
                 }
                 Behavior::ExternalIp(ip) => Some((external_address_response(ip), server())),
-                Behavior::Silent => None,
+                Behavior::Silent | Behavior::Closed => None,
                 Behavior::WrongSource(ext) => {
                     let internal = u16::from_be_bytes([data[4], data[5]]);
                     let spoof = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 9), NATPMP_PORT));
                     Some((map_response(opcode, 0, internal, ext, 3600), spoof))
+                }
+                Behavior::GrantWrongInternal(ext) => {
+                    let internal = u16::from_be_bytes([data[4], data[5]]);
+                    let lifetime = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+                    // Echo a different internal port than requested.
+                    Some((
+                        map_response(opcode, 0, internal.wrapping_add(1), ext, lifetime),
+                        server(),
+                    ))
+                }
+                Behavior::Garbage => {
+                    // A non-zero version byte makes the parser reject the frame.
+                    Some((vec![0xFF, 0xFF, 0x00, 0x00], server()))
                 }
             };
             if let Some((bytes, src)) = reply {
@@ -415,6 +447,9 @@ mod tests {
             loop {
                 if let Some(item) = self.inbox.lock().unwrap().pop_front() {
                     return Some(item);
+                }
+                if matches!(self.behavior, Behavior::Closed) {
+                    return None; // the flow has ended
                 }
                 // No reply scripted: pend so the caller's timeout drives retransmit.
                 std::future::pending::<()>().await;
@@ -485,10 +520,42 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_spoofed_source_reply_is_ignored() {
         // The gateway replies with a valid frame but from the wrong source; the
-        // client must reject it and ultimately time out rather than trust it.
+        // client must reject it and ultimately time out rather than trust it. The
+        // budget assertion proves the spoofed reply was actively ignored (the
+        // request kept being retransmitted), not merely never delivered: if the
+        // source guard were removed, the forged grant would return Ok instead.
         let mut gw = FakeGateway::new(Behavior::WrongSource(40002));
+        let requests = Arc::clone(&gw.requests);
         let err = map(&mut gw, GW, spec()).await.unwrap_err();
         assert!(matches!(err, PortForwardError::Timeout));
+        assert_eq!(requests.lock().unwrap().len(), MAX_ATTEMPTS as usize);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_malformed_reply_does_not_abort_the_budget() {
+        // A garbage frame from the gateway endpoint must be ignored, not abort the
+        // exchange; the client retransmits the full budget and then times out.
+        let mut gw = FakeGateway::new(Behavior::Garbage);
+        let requests = Arc::clone(&gw.requests);
+        let err = map(&mut gw, GW, spec()).await.unwrap_err();
+        assert!(matches!(err, PortForwardError::Timeout));
+        assert_eq!(requests.lock().unwrap().len(), MAX_ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn a_grant_for_the_wrong_internal_port_is_rejected() {
+        // The gateway must echo the internal port it mapped; a different one means
+        // the reply is for another allocation and must not be trusted.
+        let mut gw = FakeGateway::new(Behavior::GrantWrongInternal(40004));
+        let err = map(&mut gw, GW, spec()).await.unwrap_err();
+        assert!(matches!(err, PortForwardError::UnexpectedReply));
+    }
+
+    #[tokio::test]
+    async fn a_closed_flow_surfaces_a_transport_error() {
+        let mut gw = FakeGateway::new(Behavior::Closed);
+        let err = map(&mut gw, GW, spec()).await.unwrap_err();
+        assert!(matches!(err, PortForwardError::Transport(_)));
     }
 
     #[test]
