@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use warren_sdk::api::{HttpRequest, HttpResponse, HttpTransport, TransportError};
-use warren_sdk::discovery::{ExitId, ExitQuery, JsonRelay, sign_relay_list};
+use warren_sdk::discovery::{
+    ExitId, ExitQuery, JsonEndpoint, JsonListener, JsonLocation, JsonNode, sign_relay_list,
+};
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::{GenerationStore, SdkError, ServerKeyStore, WarrenClient};
 
@@ -31,19 +33,33 @@ impl HttpTransport for QueueTransport {
 }
 
 fn signed_list(server: &SigningKey, generation: u64, expires_at: u64) -> String {
-    let relay = JsonRelay {
-        endpoint_id: "11".repeat(32),
+    let node = JsonNode {
+        id: "11".repeat(32),
         exit_id: ExitId::from_bytes([0xa1; 16]),
-        ip_addrs: vec!["198.51.100.7:443".to_owned()],
-        country: "RO".to_owned(),
-        city: "Bucharest".to_owned(),
+        multihop_pubkey: None,
+        roles: vec!["entry".to_owned(), "relay".to_owned(), "exit".to_owned()],
+        location: JsonLocation {
+            country: "RO".to_owned(),
+            city: "Bucharest".to_owned(),
+        },
         weight: 100,
         active: true,
-        ipv6_egress: false,
+        endpoints: vec![JsonEndpoint {
+            addr: "198.51.100.7".to_owned(),
+            family: "ipv4".to_owned(),
+            ingress: true,
+            egress: true,
+            listeners: vec![JsonListener {
+                port: 443,
+                transport: "quic".to_owned(),
+                alpn: "h3".to_owned(),
+            }],
+            geoip: None,
+        }],
     };
     // Keep the signed validity window within the verifier's cap (7 days).
     let signed_at = expires_at.saturating_sub(86_400);
-    let signed = sign_relay_list(vec![relay], server, generation, signed_at, expires_at);
+    let signed = sign_relay_list(vec![node], server, generation, signed_at, expires_at);
     serde_json::to_string(&signed).unwrap()
 }
 

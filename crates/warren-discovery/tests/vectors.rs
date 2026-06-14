@@ -28,6 +28,7 @@ struct ExpectedRelay {
     city: String,
     weight: u64,
     ipv6_egress: bool,
+    addrs: Vec<String>,
 }
 
 fn load() -> Vectors {
@@ -57,6 +58,8 @@ fn signed_relay_list_vector_verifies_and_resolves() {
         assert_eq!(got.location().city(), exp.city);
         assert_eq!(got.weight(), exp.weight);
         assert_eq!(got.ipv6_egress(), exp.ipv6_egress);
+        let got_addrs: Vec<String> = got.addrs().iter().map(ToString::to_string).collect();
+        assert_eq!(got_addrs, exp.addrs);
     }
 }
 

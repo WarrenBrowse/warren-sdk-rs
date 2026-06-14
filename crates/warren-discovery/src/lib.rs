@@ -26,6 +26,7 @@ pub use query::{ExitQuery, IpAvailability, LocationConstraint};
 pub use relay::{Location, Relay, RelayList};
 pub use selector::{ExitSelector, SelectorError};
 pub use signed::{
-    JsonRelay, SIGNED_VERSION, SignedError, SignedRelayList, VerifiedRelayList, sign_relay_list,
-    verify_signed_relay_list, verify_signed_relay_list_any,
+    JsonEndpoint, JsonGeoIp, JsonListener, JsonLocation, JsonNode, SIGNED_VERSION, SignedError,
+    SignedRelayList, VerifiedRelayList, sign_relay_list, verify_signed_relay_list,
+    verify_signed_relay_list_any,
 };
