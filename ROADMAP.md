@@ -100,10 +100,18 @@ pinned by golden vectors where a wire format is involved. warren-core
   / `watch_state()`), so an app reacts to a dropped tunnel. In-process e2e tested.
 - DONE: one-call port forwarding on the datapath handle
   (`ProxyHandle::forward_port`, see P7).
-- Pending: auto-reconnect supervisor wired into the facade (the
-  `warren-transport` backoff/state primitives exist; reconnect must rebuild the
-  netstack from a possibly-changed `IpAssign`, so it needs real-exit validation);
-  and end-to-end tests against a real exit and the production API.
+- Reconnect: the app-driven pattern is DONE and live-validated. Each
+  `start_proxy_multihop` rebuilds the whole datapath from a freshly fetched
+  `IpAssign` (a new session may carry a different tunnel address/gateway/MTU), so
+  observing `ProxyHandle::state` and re-calling on `Disconnected` reconnects
+  correctly. `cargo run -p warren-sdk --example live_reconnect` proves two
+  independent sessions each rebuild from a fresh assignment and egress against a
+  production exit. The `warren-transport` `connect_with_state` / `Backoff`
+  primitives (unit-tested) back automatic retry.
+- Pending: a fully automatic in-facade supervisor that keeps the local proxy
+  listener address stable across automatic tunnel rebuilds (the rebuild semantics
+  above are validated; only the stable-listener auto-trigger remains), and
+  end-to-end tests against a real exit and the production API.
 
 ## P9: warren-sdk-ffi (uniffi scaffolding done)
 
