@@ -16,6 +16,14 @@
 //! Anti-replay (epoch/seq monotonicity) is the caller's responsibility, exactly
 //! as in warren-core (the `hpke` crate exposes no seq setter).
 
+pub mod pop;
+pub mod replay;
+pub mod setup;
+
+pub use pop::{POP_CONTEXT_V2, pop_signing_message, sign_pop, verify_pop};
+pub use replay::{REPLAY_WINDOW_SIZE, ReplayWindow};
+pub use setup::{IpAssignment, SetupError};
+
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use hpke::aead::ChaCha20Poly1305 as HpkeChaCha20Poly1305;
@@ -56,6 +64,16 @@ pub enum SessionError {
     /// A response frame carries an unsupported wire version.
     #[error("unsupported multihop version")]
     UnsupportedVersion,
+    /// A received frame's `seq` was a replay or fell below the active window.
+    /// `seq`/`epoch` are protocol counters, not identity material, so they are
+    /// safe to surface for diagnostics.
+    #[error("anti-replay rejection (epoch {epoch}, seq {seq})")]
+    Replay {
+        /// Frame epoch.
+        epoch: u32,
+        /// Frame sequence number.
+        seq: u64,
+    },
 }
 
 /// `AAD_V1 || exit_id(16) || epoch_be(4) || seq_be(8)`.
@@ -122,6 +140,12 @@ impl ClientSession {
     #[must_use]
     pub fn encapsulated_key(&self) -> [u8; 32] {
         self.encapsulated_key
+    }
+
+    /// The 16-byte exit identifier this session targets (cleartext routing tag).
+    #[must_use]
+    pub fn exit_id_bytes(&self) -> [u8; EXIT_ID_LEN] {
+        self.exit_id
     }
 
     /// Derives the per-packet key for `(epoch, seq, direction)`.

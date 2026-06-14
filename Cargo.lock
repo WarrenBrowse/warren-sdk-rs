@@ -1933,6 +1933,7 @@ name = "warren-multihop"
 version = "0.0.1"
 dependencies = [
  "chacha20poly1305",
+ "ed25519-dalek",
  "hpke",
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
