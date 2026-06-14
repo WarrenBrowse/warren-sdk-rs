@@ -1,6 +1,6 @@
 [package]
 name = "warren-sdk-ffi"
-description = "FFI-ready surface for the Warren SDK: plain, owned, generic-free types and serializable errors, shaped for uniffi (Swift/Kotlin/Python/Java) and flutter_rust_bridge (Dart). Binding codegen is wired in a later phase."
+description = "FFI surface for the Warren SDK: plain, owned, generic-free types and serializable errors exported via uniffi (Swift/Kotlin/Python/Ruby). The single FFI boundary crate; all unsafe is uniffi-generated."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,10 +9,32 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+# cdylib is the shared library the uniffi-generated foreign bindings load at
+# runtime; lib keeps the Rust API usable by other crates and the bindgen binary.
+[lib]
+crate-type = ["lib", "cdylib"]
+
 [dependencies]
 warren-sdk = { path = "../warren-sdk", default-features = false }
 hex = { workspace = true }
 thiserror = { workspace = true }
+# The FFI binding generator. "cli" provides the uniffi-bindgen entry point used
+# by the src/bin/uniffi-bindgen.rs helper to emit Swift/Kotlin/Python/Ruby.
+uniffi = { version = "0.31", features = ["cli"] }
 
-[lints]
-workspace = true
+# This crate is the SINGLE FFI boundary exception to the workspace-wide
+# `unsafe_code = "forbid"`: uniffi generates the C-ABI scaffolding (which is
+# unavoidably `unsafe`) and we hand-write zero unsafe. The lint stays at `deny`
+# here, downgraded only by a documented crate-level `#![allow(unsafe_code)]` in
+# lib.rs. Every other crate keeps `forbid` via the workspace lints.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+must_use_candidate = "warn"
+needless_pass_by_value = "warn"

@@ -27,6 +27,8 @@ allow = [
     "Zlib",
     # Public-domain-equivalent license of smoltcp (userspace netstack).
     "0BSD",
+    # uniffi and its codegen dependency tree (Mozilla), the FFI binding layer.
+    "MPL-2.0",
 ]
 confidence-threshold = 0.9
 

@@ -72,19 +72,23 @@ pinned by golden vectors where a wire format is involved. warren-core
   selection, with a lifecycle event stream. End-to-end tests against a real exit
   and the production API.
 
-## P9: warren-sdk-ffi (partial: identity surface done)
+## P9: warren-sdk-ffi (uniffi scaffolding done)
 
 - Done and tested: the pure, deterministic identity surface (`generate_identity`,
   `identity_from_mnemonic`, `address_from_mnemonic`, `ss58_encode`/`ss58_decode`,
-  `sign_request`) with owned, generic-free types and a serializable `FfiError`,
-  exactly the shape uniffi and `flutter_rust_bridge` consume.
-- Remaining (needs an external toolchain, not buildable/testable in this repo on
-  its own): the uniffi/`flutter_rust_bridge` binding codegen and per-language
-  harness (Dart/Flutter first, then Kotlin, Swift, Python, Java), plus the async
-  tunnel surface (connect/disconnect/event stream) which needs an async-executor
-  bridge per language. Annotating the existing functions with `#[uniffi::export]`
-  + `setup_scaffolding!()` is mechanical once that harness lands. Every binding
-  replays the same `vectors/`.
+  `sign_request`) is exported via uniffi (`#[uniffi::export]`,
+  `#[derive(uniffi::Record)]`/`uniffi::Error)]`, `setup_scaffolding!()`) with
+  owned, generic-free types and a serializable `FfiError`. The crate builds a
+  `cdylib`; `src/bin/uniffi-bindgen.rs` generates Swift/Kotlin/Python/Ruby
+  bindings, and a CI job (`bindings`) builds the cdylib and regenerates Python +
+  Kotlin so any export regression fails the build.
+- FFI boundary exception: `warren-sdk-ffi` is the ONLY crate that downgrades
+  `unsafe_code` from `forbid` to `deny` (uniffi generates the C-ABI scaffolding;
+  we hand-write zero unsafe). Documented at the crate-level `#![allow]`.
+- Remaining: the async tunnel surface (connect/disconnect/event stream) needs an
+  async-executor bridge per language (uniffi async export + a runtime), then the
+  first Dart/Flutter integration and the other languages. Every binding replays
+  the same `vectors/`.
 
 ## Audit follow-ups (see AUDIT.md)
 

@@ -1,26 +1,33 @@
-//! FFI-ready surface for the Warren SDK.
+//! FFI surface for the Warren SDK, exported via `uniffi`.
 //!
-//! Every function here uses plain, owned, generic-free types and a serializable
-//! [`FfiError`], which is exactly the shape `uniffi` (Swift, Kotlin, Python,
-//! Java) and `flutter_rust_bridge` (Dart) generate bindings from. The binding
-//! codegen is wired in a later phase; annotating these functions with
-//! `#[uniffi::export]` plus a `uniffi::setup_scaffolding!()` call is mechanical
-//! once the per-language build harness is in place.
+//! Every function uses plain, owned, generic-free types and a serializable
+//! [`FfiError`], the shape `uniffi` generates Swift/Kotlin/Python/Ruby bindings
+//! from (and that `flutter_rust_bridge` can consume for Dart). The bindings are
+//! produced by the `uniffi-bindgen` binary in `src/bin/` against the built
+//! `cdylib`; see the crate README for the generate commands.
 //!
 //! This phase covers the pure, fully deterministic identity surface (the part
 //! every sibling-language SDK shares and validates against `vectors/`). The
-//! async tunnel surface (connect/disconnect/events) is added with the binding
-//! runtime, since it needs an async executor bridge per language.
+//! async tunnel surface (connect/disconnect/events) is added later, since it
+//! needs an async executor bridge per language.
 
-// FFI exports take owned arguments by value on purpose: uniffi and
-// flutter_rust_bridge marshal owned values across the language boundary, so a
-// borrowed signature would not match the generated bindings.
+// FFI exports take owned arguments by value on purpose: uniffi marshals owned
+// values across the language boundary, so a borrowed signature would not match
+// the generated bindings.
 #![allow(clippy::needless_pass_by_value)]
+// FFI BOUNDARY EXCEPTION: this is the one crate where `unsafe_code` is not
+// `forbid` (the workspace forbids it everywhere else). uniffi generates the
+// C-ABI scaffolding, which is unavoidably `unsafe`; we hand-write zero unsafe.
+// The manifest keeps the lint at `deny`, and this single documented `allow`
+// admits only the generated boundary code.
+#![allow(unsafe_code)]
 
 use warren_sdk::identity::{WarrenIdentity, ss58};
 
+uniffi::setup_scaffolding!();
+
 /// A serializable error for the FFI boundary.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
 #[non_exhaustive]
 pub enum FfiError {
     /// The mnemonic is not a valid BIP39 phrase.
@@ -35,7 +42,7 @@ pub enum FfiError {
 }
 
 /// A Warren identity in FFI-friendly form.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiIdentity {
     /// The 12-word BIP39 mnemonic (secret).
     pub mnemonic: String,
@@ -45,8 +52,20 @@ pub struct FfiIdentity {
     pub public_key_hex: String,
 }
 
+// Manual Debug: the mnemonic is seed material and must never reach a log, so it
+// is redacted while the public address and pubkey stay visible for debugging.
+impl std::fmt::Debug for FfiIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FfiIdentity")
+            .field("mnemonic", &"<redacted>")
+            .field("address", &self.address)
+            .field("public_key_hex", &self.public_key_hex)
+            .finish()
+    }
+}
+
 /// The four `X-Warren-*` header values for a signed request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiSignedHeaders {
     /// `X-Warren-PubKey` (SS58 address).
     pub pubkey_ss58: String,
@@ -59,6 +78,7 @@ pub struct FfiSignedHeaders {
 }
 
 /// Generates a fresh identity.
+#[uniffi::export]
 #[must_use]
 pub fn generate_identity() -> FfiIdentity {
     let (identity, mnemonic) = WarrenIdentity::generate();
@@ -70,6 +90,7 @@ pub fn generate_identity() -> FfiIdentity {
 /// # Errors
 ///
 /// [`FfiError::InvalidMnemonic`] if the phrase is not valid BIP39.
+#[uniffi::export]
 pub fn identity_from_mnemonic(mnemonic: String) -> Result<FfiIdentity, FfiError> {
     let identity =
         WarrenIdentity::from_mnemonic(&mnemonic).map_err(|_| FfiError::InvalidMnemonic)?;
@@ -81,6 +102,7 @@ pub fn identity_from_mnemonic(mnemonic: String) -> Result<FfiIdentity, FfiError>
 /// # Errors
 ///
 /// [`FfiError::InvalidMnemonic`] if the phrase is not valid BIP39.
+#[uniffi::export]
 pub fn address_from_mnemonic(mnemonic: String) -> Result<String, FfiError> {
     Ok(WarrenIdentity::from_mnemonic(&mnemonic)
         .map_err(|_| FfiError::InvalidMnemonic)?
@@ -92,6 +114,7 @@ pub fn address_from_mnemonic(mnemonic: String) -> Result<String, FfiError> {
 /// # Errors
 ///
 /// [`FfiError::InvalidHex`] if the input is not 32 bytes of hex.
+#[uniffi::export]
 pub fn ss58_encode(public_key_hex: String) -> Result<String, FfiError> {
     let pk = hex32(&public_key_hex)?;
     Ok(ss58::encode(&pk))
@@ -102,6 +125,7 @@ pub fn ss58_encode(public_key_hex: String) -> Result<String, FfiError> {
 /// # Errors
 ///
 /// [`FfiError::InvalidAddress`] if the address is malformed.
+#[uniffi::export]
 pub fn ss58_decode(address: String) -> Result<String, FfiError> {
     ss58::decode(&address)
         .map(hex::encode)
@@ -116,6 +140,7 @@ pub fn ss58_decode(address: String) -> Result<String, FfiError> {
 /// # Errors
 ///
 /// [`FfiError::InvalidMnemonic`] or [`FfiError::InvalidHex`].
+#[uniffi::export]
 pub fn sign_request(
     mnemonic: String,
     method: String,
@@ -202,6 +227,19 @@ mod tests {
         assert_eq!(headers.pubkey_ss58, id.address);
         assert_eq!(headers.signature_hex.len(), 128);
         assert_eq!(headers.nonce_hex.len(), 32);
+    }
+
+    #[test]
+    fn ffi_identity_debug_redacts_the_mnemonic() {
+        let id = generate_identity();
+        let rendered = format!("{id:?}");
+        assert!(
+            !rendered.contains(&id.mnemonic),
+            "the seed mnemonic must never appear in Debug output"
+        );
+        assert!(rendered.contains("<redacted>"));
+        // The public address stays visible for debugging.
+        assert!(rendered.contains(&id.address));
     }
 
     #[test]

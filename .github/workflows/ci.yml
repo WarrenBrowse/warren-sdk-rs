@@ -83,6 +83,27 @@ jobs:
       # is manual against warren-core (cf. CLAUDE.md).
       - run: cargo nextest run --locked --workspace --all-targets --all-features --retries 2
 
+  bindings:
+    name: uniffi bindings
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+      # Build the cdylib and generate foreign bindings from it. This fails if the
+      # uniffi scaffolding or any exported type/function regresses. --no-format
+      # avoids a dependency on ktlint/swiftformat on the runner.
+      - run: cargo build -p warren-sdk-ffi --locked
+      - run: >
+          cargo run -p warren-sdk-ffi --bin uniffi-bindgen -- generate
+          --library target/debug/libwarren_sdk_ffi.so
+          --language python --language kotlin
+          --no-format --out-dir target/bindings
+      - name: assert exported surface is present
+        run: |
+          grep -q "def generate_identity" target/bindings/warren_sdk_ffi.py
+          grep -q "def sign_request" target/bindings/warren_sdk_ffi.py
+
   deny:
     name: cargo-deny
     runs-on: [self-hosted, Linux, X64]
