@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
@@ -120,8 +120,8 @@ impl Device for TunnelDevice {
 enum Command {
     /// Open a TCP connection to `addr`.
     Open(OpenCommand),
-    /// Resolve a host name to an IPv4 address over the tunnel (DNS to the
-    /// gateway forwarder).
+    /// Resolve a host name to an address over the tunnel (DNS to the configured
+    /// resolver), for the requested record type.
     Resolve(ResolveCommand),
     /// Open a UDP flow (an ephemeral local port) for datagrams to arbitrary
     /// targets through the tunnel (the SOCKS5 UDP-associate egress).
@@ -151,10 +151,11 @@ struct OpenCommand {
     reply: oneshot::Sender<Result<NetstackStream, NetError>>,
 }
 
-/// Resolve `name` (an `A` lookup) over the tunnel, replying with the address.
+/// Resolve `name` over the tunnel for `rtype`, replying with the address.
 struct ResolveCommand {
     name: String,
-    reply: oneshot::Sender<Result<Ipv4Addr, NetError>>,
+    rtype: dns::RecordType,
+    reply: oneshot::Sender<Result<IpAddr, NetError>>,
 }
 
 /// Engine-side state for one in-flight DNS resolution.
@@ -163,7 +164,9 @@ struct PendingResolve {
     local_port: u16,
     /// Transaction id the response must echo (off-path spoof resistance).
     id: u16,
-    reply: oneshot::Sender<Result<Ipv4Addr, NetError>>,
+    /// The record type queried, so the reply is parsed for the matching answer.
+    rtype: dns::RecordType,
+    reply: oneshot::Sender<Result<IpAddr, NetError>>,
     deadline: SmolInstant,
 }
 
@@ -305,14 +308,15 @@ pub struct TunnelConnector {
 }
 
 impl TunnelConnector {
-    /// Resolves `host` to an IPv4 address by sending a DNS `A` query over the
+    /// Resolves `host` to an address of `rtype` by sending a DNS query over the
     /// tunnel to the configured resolver (the gateway forwarder by default,
     /// never the host resolver, so the lookup cannot leak outside the VPN).
-    async fn resolve(&self, host: &str) -> Result<Ipv4Addr, NetError> {
+    async fn resolve(&self, host: &str, rtype: dns::RecordType) -> Result<IpAddr, NetError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
             .send(Command::Resolve(ResolveCommand {
                 name: host.to_owned(),
+                rtype,
                 reply: reply_tx,
             }))
             .map_err(|_| NetError::EngineStopped)?;
@@ -365,10 +369,18 @@ impl Connector for TunnelConnector {
                 }
                 addr
             }
-            // Resolve the name over the tunnel (A only), then connect to the
-            // IPv4 result. AAAA-over-tunnel for v6 domain targets is a follow-up.
+            // Resolve the name over the tunnel. With a v6 assignment, prefer
+            // AAAA and fall back to A; otherwise A only. The query egresses at
+            // the exit, so the lookup never leaks to the host resolver.
             Target::Domain(host, port) => {
-                let ip = self.resolve(&host).await?;
+                let ip = if self.has_ipv6 {
+                    match self.resolve(&host, dns::RecordType::Aaaa).await {
+                        Ok(ip) => ip,
+                        Err(_) => self.resolve(&host, dns::RecordType::A).await?,
+                    }
+                } else {
+                    self.resolve(&host, dns::RecordType::A).await?
+                };
                 SocketAddr::from((ip, port))
             }
         };
@@ -681,7 +693,7 @@ impl Engine {
     ) {
         // A per-query transaction id the response must echo (spoof resistance).
         let id: u16 = rand::random();
-        let query = match dns::encode_query(&cmd.name, id) {
+        let query = match dns::encode_query(&cmd.name, id, cmd.rtype) {
             Ok(q) => q,
             Err(_) => {
                 let _ = cmd.reply.send(Err(NetError::ConnectFailed));
@@ -704,20 +716,21 @@ impl Engine {
             handle,
             local_port,
             id,
+            rtype: cmd.rtype,
             reply: cmd.reply,
             deadline: now + DNS_TIMEOUT,
         });
     }
 
-    /// Delivers DNS responses (first `A` record), times out stalled lookups, and
-    /// reaps the UDP sockets of finished resolutions.
+    /// Delivers DNS responses (first matching record), times out stalled lookups,
+    /// and reaps the UDP sockets of finished resolutions.
     fn drain_resolvers(&mut self, sockets: &mut SocketSet<'_>, now: SmolInstant) {
-        let mut finished: Vec<(usize, Result<Ipv4Addr, NetError>)> = Vec::new();
+        let mut finished: Vec<(usize, Result<IpAddr, NetError>)> = Vec::new();
         for (i, r) in self.resolvers.iter().enumerate() {
             let sock = sockets.get_mut::<udp::Socket<'_>>(r.handle);
             if sock.can_recv() {
                 if let Ok((data, _meta)) = sock.recv() {
-                    let res = match dns::parse_response(data, r.id) {
+                    let res = match dns::parse_response(data, r.id, r.rtype) {
                         Ok(addrs) => addrs.into_iter().next().ok_or(NetError::ConnectFailed),
                         Err(_) => Err(NetError::ConnectFailed),
                     };
@@ -973,7 +986,9 @@ impl crate::proxy::UdpConnector for TunnelConnector {
     }
 
     async fn resolve_host(&self, host: &str) -> Result<std::net::IpAddr, NetError> {
-        self.resolve(host).await.map(std::net::IpAddr::V4)
+        // UDP-associate targets resolve A-only for now (v6 UDP egress is a
+        // follow-up); the lookup still egresses over the tunnel.
+        self.resolve(host, dns::RecordType::A).await
     }
 }
 

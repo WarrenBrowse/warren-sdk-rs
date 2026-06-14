@@ -1,17 +1,47 @@
 //! Minimal DNS client codec for resolution over the tunnel (no host resolver,
 //! so the lookup cannot leak outside the VPN).
 //!
-//! Just enough of RFC 1035 to ask for and read `A` records: a single-question
-//! query with recursion desired, and a response parser that skips names
-//! (including compression pointers) and collects the IPv4 answers. Hand-rolled
-//! to avoid a dependency; the wire layout is pinned by golden-byte tests.
+//! Just enough of RFC 1035/3596 to ask for and read `A` (IPv4) and `AAAA` (IPv6)
+//! records: a single-question query with recursion desired, and a response parser
+//! that skips names (including compression pointers) and collects the answers of
+//! the requested type. Hand-rolled to avoid a dependency; the wire layout is
+//! pinned by golden-byte tests.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// DNS record type `A` (IPv4 host address).
 const TYPE_A: u16 = 1;
+/// DNS record type `AAAA` (IPv6 host address, RFC 3596).
+const TYPE_AAAA: u16 = 28;
 /// DNS class `IN` (Internet).
 const CLASS_IN: u16 = 1;
+
+/// The address record type to query for over the tunnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordType {
+    /// `A`: an IPv4 address (4-byte RDATA).
+    A,
+    /// `AAAA`: an IPv6 address (16-byte RDATA).
+    Aaaa,
+}
+
+impl RecordType {
+    /// The QTYPE value on the wire.
+    fn qtype(self) -> u16 {
+        match self {
+            RecordType::A => TYPE_A,
+            RecordType::Aaaa => TYPE_AAAA,
+        }
+    }
+
+    /// The expected RDATA length for this record type.
+    fn rdlen(self) -> usize {
+        match self {
+            RecordType::A => 4,
+            RecordType::Aaaa => 16,
+        }
+    }
+}
 /// Header flag: recursion desired (byte 2, bit 0).
 const FLAG_RD: u16 = 0x0100;
 /// Header flag: query/response bit (set in responses).
@@ -39,12 +69,13 @@ pub enum DnsError {
     /// The response is not a response, or its RCODE is non-zero.
     #[error("DNS server returned an error response")]
     ServerFailure,
-    /// The response carried no `A` record for the name.
-    #[error("no A record in the DNS response")]
+    /// The response carried no record of the requested type for the name.
+    #[error("no address record in the DNS response")]
     NoAddress,
 }
 
-/// Encodes a single-question `A`/`IN` query for `name` with recursion desired.
+/// Encodes a single-question `IN` query of type `rtype` for `name` with recursion
+/// desired.
 ///
 /// `id` is the 16-bit transaction id the caller must match against the response
 /// (use an unpredictable value per query to resist off-path spoofing).
@@ -53,7 +84,7 @@ pub enum DnsError {
 ///
 /// [`DnsError::InvalidName`] if `name` is empty, exceeds 255 bytes on the wire,
 /// or has an empty or over-long (>63 byte) label.
-pub fn encode_query(name: &str, id: u16) -> Result<Vec<u8>, DnsError> {
+pub fn encode_query(name: &str, id: u16, rtype: RecordType) -> Result<Vec<u8>, DnsError> {
     let mut out = Vec::with_capacity(HEADER_LEN + name.len() + 6);
     out.extend_from_slice(&id.to_be_bytes());
     out.extend_from_slice(&FLAG_RD.to_be_bytes());
@@ -62,7 +93,7 @@ pub fn encode_query(name: &str, id: u16) -> Result<Vec<u8>, DnsError> {
     out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
     out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
     encode_name(name, &mut out)?;
-    out.extend_from_slice(&TYPE_A.to_be_bytes());
+    out.extend_from_slice(&rtype.qtype().to_be_bytes());
     out.extend_from_slice(&CLASS_IN.to_be_bytes());
     Ok(out)
 }
@@ -89,7 +120,7 @@ fn encode_name(name: &str, out: &mut Vec<u8>) -> Result<(), DnsError> {
     Ok(())
 }
 
-/// Parses a DNS response and returns every `A` record address it carries.
+/// Parses a DNS response and returns every address of type `want` it carries.
 ///
 /// Validates the transaction `id` and the RCODE before reading answers, so a
 /// spoofed or error reply is rejected rather than mined for addresses.
@@ -98,8 +129,9 @@ fn encode_name(name: &str, out: &mut Vec<u8>) -> Result<(), DnsError> {
 ///
 /// [`DnsError::IdMismatch`] on an id mismatch, [`DnsError::ServerFailure`] if
 /// the QR bit is unset or the RCODE is non-zero, [`DnsError::Truncated`] on a
-/// short buffer, and [`DnsError::NoAddress`] if no `A` record is present.
-pub fn parse_response(buf: &[u8], id: u16) -> Result<Vec<Ipv4Addr>, DnsError> {
+/// short buffer, and [`DnsError::NoAddress`] if no record of type `want` is
+/// present.
+pub fn parse_response(buf: &[u8], id: u16, want: RecordType) -> Result<Vec<IpAddr>, DnsError> {
     if buf.len() < HEADER_LEN {
         return Err(DnsError::Truncated);
     }
@@ -131,7 +163,7 @@ pub fn parse_response(buf: &[u8], id: u16) -> Result<Vec<Ipv4Addr>, DnsError> {
         if header_end > buf.len() {
             return Err(DnsError::Truncated);
         }
-        let rtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        let rec_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
         let rclass = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]);
         let rdlength = usize::from(u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]));
         let rdata = header_end;
@@ -139,13 +171,20 @@ pub fn parse_response(buf: &[u8], id: u16) -> Result<Vec<Ipv4Addr>, DnsError> {
         if rdata_end > buf.len() {
             return Err(DnsError::Truncated);
         }
-        if rtype == TYPE_A && rclass == CLASS_IN && rdlength == 4 {
-            addrs.push(Ipv4Addr::new(
-                buf[rdata],
-                buf[rdata + 1],
-                buf[rdata + 2],
-                buf[rdata + 3],
-            ));
+        if rec_type == want.qtype() && rclass == CLASS_IN && rdlength == want.rdlen() {
+            match want {
+                RecordType::A => addrs.push(IpAddr::V4(Ipv4Addr::new(
+                    buf[rdata],
+                    buf[rdata + 1],
+                    buf[rdata + 2],
+                    buf[rdata + 3],
+                ))),
+                RecordType::Aaaa => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&buf[rdata..rdata_end]);
+                    addrs.push(IpAddr::V6(Ipv6Addr::from(octets)));
+                }
+            }
         }
         pos = rdata_end;
     }
@@ -184,7 +223,7 @@ mod tests {
 
     #[test]
     fn query_for_example_com_is_byte_exact() {
-        let q = encode_query("example.com", 0x1234).expect("encode");
+        let q = encode_query("example.com", 0x1234, RecordType::A).expect("encode");
         assert_eq!(
             hex::encode(q),
             "123401000001000000000000076578616d706c6503636f6d0000010001"
@@ -192,19 +231,38 @@ mod tests {
     }
 
     #[test]
+    fn aaaa_query_for_example_com_is_byte_exact() {
+        // Identical to the A query except QTYPE = 0x001c (28).
+        let q = encode_query("example.com", 0x1234, RecordType::Aaaa).expect("encode");
+        assert_eq!(
+            hex::encode(q),
+            "123401000001000000000000076578616d706c6503636f6d00001c0001"
+        );
+    }
+
+    #[test]
     fn trailing_dot_is_accepted_and_normalised() {
         assert_eq!(
-            encode_query("example.com.", 1).unwrap(),
-            encode_query("example.com", 1).unwrap()
+            encode_query("example.com.", 1, RecordType::A).unwrap(),
+            encode_query("example.com", 1, RecordType::A).unwrap()
         );
     }
 
     #[test]
     fn empty_and_overlong_labels_are_rejected() {
-        assert_eq!(encode_query("", 1), Err(DnsError::InvalidName));
-        assert_eq!(encode_query("a..b", 1), Err(DnsError::InvalidName));
+        assert_eq!(
+            encode_query("", 1, RecordType::A),
+            Err(DnsError::InvalidName)
+        );
+        assert_eq!(
+            encode_query("a..b", 1, RecordType::A),
+            Err(DnsError::InvalidName)
+        );
         let long = "x".repeat(64);
-        assert_eq!(encode_query(&long, 1), Err(DnsError::InvalidName));
+        assert_eq!(
+            encode_query(&long, 1, RecordType::A),
+            Err(DnsError::InvalidName)
+        );
     }
 
     /// A response for example.com with one A record 93.184.216.34, using a
@@ -222,14 +280,50 @@ mod tests {
 
     #[test]
     fn parses_the_a_record_from_a_pointer_answer() {
-        let addrs = parse_response(&example_response(), 0x1234).expect("parse");
-        assert_eq!(addrs, vec![Ipv4Addr::new(93, 184, 216, 34)]);
+        let addrs = parse_response(&example_response(), 0x1234, RecordType::A).expect("parse");
+        assert_eq!(addrs, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+    }
+
+    /// A response for example.com with one AAAA record
+    /// 2606:2800:220:1:248:1893:25c8:1946, using a compression pointer (0xC00C)
+    /// for the answer name.
+    fn example_aaaa_response() -> Vec<u8> {
+        hex::decode(concat!(
+            "12348180000100010000000007",
+            "6578616d706c6503636f6d00",
+            "001c0001",                         // question QTYPE=AAAA/QCLASS
+            "c00c001c000100000100",             // answer: ptr, AAAA, IN, TTL
+            "0010",                             // RDLENGTH 16
+            "26062800022000010248189325c81946", // RDATA: the v6 address
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn parses_the_aaaa_record_from_a_pointer_answer() {
+        let addrs =
+            parse_response(&example_aaaa_response(), 0x1234, RecordType::Aaaa).expect("parse");
+        assert_eq!(
+            addrs,
+            vec![IpAddr::V6(
+                "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_aaaa_query_answered_only_with_a_has_no_address() {
+        // The A answer must not satisfy an AAAA request.
+        assert_eq!(
+            parse_response(&example_response(), 0x1234, RecordType::Aaaa),
+            Err(DnsError::NoAddress)
+        );
     }
 
     #[test]
     fn id_mismatch_is_rejected() {
         assert_eq!(
-            parse_response(&example_response(), 0x9999),
+            parse_response(&example_response(), 0x9999, RecordType::A),
             Err(DnsError::IdMismatch)
         );
     }
@@ -238,7 +332,10 @@ mod tests {
     fn nonzero_rcode_is_server_failure() {
         let mut r = example_response();
         r[3] |= 0x03; // RCODE = NXDOMAIN
-        assert_eq!(parse_response(&r, 0x1234), Err(DnsError::ServerFailure));
+        assert_eq!(
+            parse_response(&r, 0x1234, RecordType::A),
+            Err(DnsError::ServerFailure)
+        );
     }
 
     #[test]
@@ -248,13 +345,16 @@ mod tests {
             "12348180000100000000000007 6578616d706c6503636f6d00 00010001".replace(' ', ""),
         )
         .unwrap();
-        assert_eq!(parse_response(&bytes, 0x1234), Err(DnsError::NoAddress));
+        assert_eq!(
+            parse_response(&bytes, 0x1234, RecordType::A),
+            Err(DnsError::NoAddress)
+        );
     }
 
     #[test]
     fn truncated_header_is_truncated() {
         assert_eq!(
-            parse_response(&[0x12, 0x34], 0x1234),
+            parse_response(&[0x12, 0x34], 0x1234, RecordType::A),
             Err(DnsError::Truncated)
         );
     }

@@ -219,6 +219,115 @@ fn dns_response(query: &[u8], addr: std::net::Ipv4Addr) -> Vec<u8> {
     r
 }
 
+/// Builds a minimal DNS response for `query` answering with a single AAAA record
+/// for `addr`, echoing the query id and question and appending one compressed
+/// AAAA answer.
+fn dns_aaaa_response(query: &[u8], addr: std::net::Ipv6Addr) -> Vec<u8> {
+    let mut r = Vec::with_capacity(query.len() + 28);
+    r.extend_from_slice(&query[0..2]); // transaction id, echoed
+    r.extend_from_slice(&[0x81, 0x80]); // QR + RD + RA, RCODE 0
+    r.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+    r.extend_from_slice(&[0x00, 0x01]); // ANCOUNT
+    r.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // NSCOUNT, ARCOUNT
+    r.extend_from_slice(&query[12..]); // echo the question section verbatim
+    r.extend_from_slice(&[0xC0, 0x0C]); // name pointer to the question
+    r.extend_from_slice(&[0x00, 0x1C, 0x00, 0x01]); // TYPE AAAA, CLASS IN
+    r.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // TTL 60s
+    r.extend_from_slice(&[0x00, 0x10]); // RDLENGTH 16
+    r.extend_from_slice(&addr.octets()); // RDATA
+    r
+}
+
+/// A dual-stack smoltcp "exit": answers `AAAA` queries on the v4 DNS address
+/// `dns_ip:53` with `answer6` (an IPv6 address it also owns) and echoes TCP on
+/// `:9` at that v6 address. Proves a domain target resolves AAAA over the tunnel
+/// (v4 DNS transport) and then connects over IPv6.
+async fn dns_aaaa_and_echo_server_v6(
+    dns_ip: std::net::Ipv4Addr,
+    prefix4: u8,
+    answer6: std::net::Ipv6Addr,
+    prefix6: u8,
+    mut inbound: mpsc::Receiver<Bytes>,
+    outbound: mpsc::Sender<Bytes>,
+) {
+    let mut device = ChanDevice {
+        rx: VecDeque::new(),
+        tx: outbound,
+    };
+    let base = tokio::time::Instant::now();
+    let now =
+        || SmolInstant::from_micros(i64::try_from(base.elapsed().as_micros()).unwrap_or(i64::MAX));
+
+    let mut config = Config::new(HardwareAddress::Ip);
+    config.random_seed = 0x5345_5256_0006;
+    let mut iface = Interface::new(config, &mut device, now());
+    iface.update_ip_addrs(|a| {
+        let _ = a.push(IpCidr::new(IpAddress::from(dns_ip), prefix4));
+        let _ = a.push(IpCidr::new(IpAddress::from(answer6), prefix6));
+    });
+
+    let mut sockets = SocketSet::new(Vec::new());
+    let tcp_handle = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+    ));
+    sockets
+        .get_mut::<tcp::Socket<'_>>(tcp_handle)
+        .listen(9)
+        .expect("listen");
+    let udp_handle = sockets.add(udp::Socket::new(
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]),
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]),
+    ));
+    sockets
+        .get_mut::<udp::Socket<'_>>(udp_handle)
+        .bind(53)
+        .expect("bind 53");
+
+    loop {
+        while let Ok(f) = inbound.try_recv() {
+            device.rx.push_back(f);
+        }
+        let _ = iface.poll(now(), &mut device, &mut sockets);
+
+        // Answer AAAA queries with the v6 echo address.
+        let request = {
+            let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
+            match sock.recv() {
+                Ok((data, meta)) if data.len() >= 12 => Some((data.to_vec(), meta.endpoint)),
+                _ => None,
+            }
+        };
+        if let Some((query, endpoint)) = request {
+            let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
+            let _ = sock.send_slice(&dns_aaaa_response(&query, answer6), endpoint);
+        }
+
+        let sock = sockets.get_mut::<tcp::Socket<'_>>(tcp_handle);
+        let mut buf = [0u8; 4096];
+        while sock.can_recv() && sock.can_send() {
+            match sock.recv_slice(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let _ = sock.send_slice(&buf[..n]);
+                }
+            }
+        }
+
+        let delay = iface
+            .poll_delay(now(), &sockets)
+            .map(|d| std::time::Duration::from_micros(d.total_micros()))
+            .unwrap_or_else(|| std::time::Duration::from_millis(5));
+        tokio::select! {
+            f = inbound.recv() => match f {
+                Some(f) => device.rx.push_back(f),
+                None => return,
+            },
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
 /// A smoltcp "exit" that answers DNS `A` queries on UDP `:53` with `answer`
 /// (deliberately distinct from `ip`, so the test proves the connect target came
 /// from the parsed RDATA, not from the query destination) and echoes TCP on
@@ -495,6 +604,81 @@ async fn netstack_resolves_via_a_configured_non_gateway_resolver() {
     let mut got = [0u8; 8];
     stream.read_exact(&mut got).await.expect("read echo");
     assert_eq!(&got, b"viadns99");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn netstack_resolves_aaaa_over_the_tunnel_then_connects_v6() {
+    // A dual-stack client resolves a domain over the tunnel: with a v6 assignment
+    // it prefers AAAA, gets fd66::5 (v4 DNS transport to the gateway), and then
+    // connects to it over IPv6. No host resolver is consulted.
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+
+    let config = NetstackConfig::new(
+        "10.66.0.2".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        MTU,
+    )
+    .with_ipv6("fd66::2".parse().unwrap(), 64, "fd66::1".parse().unwrap());
+    let connector = spawn_engine(config, s2c_rx, c2s_tx);
+
+    tokio::spawn(dns_aaaa_and_echo_server_v6(
+        "10.66.0.1".parse().unwrap(),
+        24,
+        "fd66::5".parse().unwrap(),
+        64,
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let mut stream = connector
+        .connect(Target::Domain("example.com".to_owned(), 9))
+        .await
+        .expect("domain resolves AAAA over the tunnel and connects over v6");
+    stream.write_all(b"aaaa-ok").await.expect("write");
+    stream.flush().await.expect("flush");
+    let mut got = [0u8; 7];
+    stream.read_exact(&mut got).await.expect("read echo");
+    assert_eq!(&got, b"aaaa-ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn netstack_falls_back_to_a_when_the_name_has_no_aaaa() {
+    // Dual-stack client, but the name has no AAAA: the AAAA lookup yields no
+    // record, so the engine falls back to A and connects over IPv4. The exit
+    // answers every query with an A record (so the AAAA query is unsatisfied).
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+
+    let config = NetstackConfig::new(
+        "10.66.0.2".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        MTU,
+    )
+    .with_ipv6("fd66::2".parse().unwrap(), 64, "fd66::1".parse().unwrap());
+    let connector = spawn_engine(config, s2c_rx, c2s_tx);
+
+    // Answers A (not AAAA) for any query; the v4 answer 10.66.0.5 is on-subnet.
+    tokio::spawn(dns_and_echo_server(
+        "10.66.0.1".parse().unwrap(),
+        "10.66.0.5".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let mut stream = connector
+        .connect(Target::Domain("example.com".to_owned(), 9))
+        .await
+        .expect("falls back to A and connects over v4");
+    stream.write_all(b"a-fallback").await.expect("write");
+    stream.flush().await.expect("flush");
+    let mut got = [0u8; 10];
+    stream.read_exact(&mut got).await.expect("read echo");
+    assert_eq!(&got, b"a-fallback");
 }
 
 #[tokio::test(flavor = "multi_thread")]

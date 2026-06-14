@@ -40,7 +40,7 @@ pub mod sink;
 pub mod socks5;
 
 #[cfg(feature = "proxy")]
-pub use dns::{DnsError, encode_query, parse_response};
+pub use dns::{DnsError, RecordType, encode_query, parse_response};
 pub use error::NetError;
 pub use killswitch::{KillSwitch, KillSwitchLevel, ProxyOnlyKillSwitch};
 pub use mode::{ConnectMode, ProxyConfig, TunConfig};
