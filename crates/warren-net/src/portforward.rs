@@ -17,9 +17,11 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
+use tokio::net::TcpStream;
 use warren_wire::natpmp::{self, MapProto, Request, Response, ResultCode};
 
 use crate::error::NetError;
+use crate::netstack::{NetstackListener, NetstackStream};
 use crate::proxy::UdpFlow;
 
 /// Standard NAT-PMP server port on the gateway (RFC 6886).
@@ -301,6 +303,25 @@ where
             }
             () = tokio::time::sleep(refresh_after(mapping.lifetime_secs)) => {}
         }
+    }
+}
+
+/// Relays one accepted inbound tunnel `stream` to a local TCP `target` (the
+/// app's server), copying in both directions until either side closes. The
+/// `target` is a host address reached with the OS stack, not the tunnel: it is
+/// the local listener a forwarded port maps to.
+pub async fn relay_to_local(mut stream: NetstackStream, target: SocketAddr) {
+    if let Ok(mut local) = TcpStream::connect(target).await {
+        let _ = tokio::io::copy_bidirectional(&mut stream, &mut local).await;
+    }
+}
+
+/// Accepts inbound connections on `listener` (a tunnel-side forwarded port) and
+/// relays each to the local `target`, one task per connection. Returns when the
+/// listener ends (the engine stopped).
+pub async fn serve_inbound(mut listener: NetstackListener, target: SocketAddr) {
+    while let Some(stream) = listener.accept().await {
+        tokio::spawn(relay_to_local(stream, target));
     }
 }
 

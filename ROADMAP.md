@@ -74,9 +74,15 @@ pinned by golden vectors where a wire format is involved. warren-core
   shutdown). The wire codec was already in `warren-wire::natpmp`. Validated
   in-process against a scripted gateway (grant, rejection, timeout, spoofed
   source, periodic renewal + teardown).
-- Pending: the inbound bridge (a netstack listen socket delivering connections to
-  the mapped internal port up to a local listener; the netstack is connect-only
-  today), facade wiring on `WarrenClient`, and validation against a real exit.
+- Inbound bridge: DONE (primitives). The netstack now listens and accepts
+  (`TunnelConnector::listen` -> `NetstackListener::accept`, an accept-backlog pool
+  mirroring the outbound connect path), and `warren-net::serve_inbound` /
+  `relay_to_local` relay each accepted inbound connection to a local listener
+  (the app's server). Validated in-process (an exit dials in, the netstack
+  accepts, and the connection round-trips to a local echo listener).
+- Pending: a one-call `WarrenClient` convenience composing NAT-PMP map/refresh +
+  `serve_inbound` (the constituent parts are each tested; the composition needs a
+  NAT-PMP-gateway-capable fake exit), and validation against a real exit.
 
 ## P8: warren-sdk facade
 

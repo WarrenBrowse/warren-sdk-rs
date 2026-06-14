@@ -50,7 +50,9 @@ pub use netstack::{
     TunnelConnector, spawn_engine, spawn_over_sink,
 };
 #[cfg(feature = "proxy")]
-pub use portforward::{MapSpec, PortForwardError, PortMapping, run_refresh};
+pub use portforward::{
+    MapSpec, PortForwardError, PortMapping, relay_to_local, run_refresh, serve_inbound,
+};
 #[cfg(feature = "proxy")]
 pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy, UdpConnector, UdpFlow};
 pub use sink::{MultihopPacketSink, PacketSink, QuicPacketSink};

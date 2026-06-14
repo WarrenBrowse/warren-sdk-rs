@@ -1122,6 +1122,55 @@ async fn netstack_accepts_an_inbound_connection_and_echoes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn netstack_serves_a_forwarded_port_to_a_local_listener() {
+    // Full P7 inbound bridge: a local app server (host side) echoes; the engine
+    // listens on a tunnel-side port and `serve_inbound` relays each inbound
+    // connection to that local server. The exit dials in and round-trips.
+    let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = local.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = local.accept().await {
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        }
+    });
+
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+    let connector = spawn_engine(
+        NetstackConfig::new(
+            "10.66.0.2".parse().unwrap(),
+            24,
+            "10.66.0.1".parse().unwrap(),
+            MTU,
+        ),
+        s2c_rx,
+        c2s_tx,
+    );
+
+    let listener = connector.listen(8080).await.expect("listen on 8080");
+    tokio::spawn(warren_net::serve_inbound(listener, local_addr));
+
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(exit_connect_and_check(
+        "10.66.0.1".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        ("10.66.0.2".parse().unwrap(), 8080),
+        b"fwd-port",
+        result_tx,
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let matched = result_rx.await.expect("exit reported a result");
+    assert!(
+        matched,
+        "the inbound connection was relayed to the local listener and echoed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn netstack_tcp_connect_and_echo() {
     let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024); // client -> server
     let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024); // server -> client
