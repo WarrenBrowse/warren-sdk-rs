@@ -109,9 +109,14 @@ jobs:
           grep -q "class FfiExit" target/bindings/warren_sdk_ffi.py
           grep -q "class WarrenFfiProxy" target/bindings/warren_sdk_ffi.py
           grep -q "async def start_proxy" target/bindings/warren_sdk_ffi.py
+          grep -q "async def start_proxy_supervised" target/bindings/warren_sdk_ffi.py
           grep -q "async def redeem_voucher" target/bindings/warren_sdk_ffi.py
           grep -q "class FfiConnectionState" target/bindings/warren_sdk_ffi.py
           grep -q "class ConnectionObserver" target/bindings/warren_sdk_ffi.py
+          grep -q "class FfiMapProto" target/bindings/warren_sdk_ffi.py
+          grep -q "class WarrenFfiForwardedPort" target/bindings/warren_sdk_ffi.py
+          grep -q "class WarrenFfiSupervisedProxy" target/bindings/warren_sdk_ffi.py
+          grep -q "async def forward_port" target/bindings/warren_sdk_ffi.py
           grep -q "async def delete_account" target/bindings/warren_sdk_ffi.py
           grep -q "async def submit_support" target/bindings/warren_sdk_ffi.py
 

@@ -156,6 +156,17 @@ pinned by golden vectors where a wire format is involved. warren-core
   retries the dial with full-jitter backoff while reporting each
   `FfiConnectionState` (`Connecting` / `Reconnecting` / `Connected` / `Failed`).
   Tested with a recording observer (the callback interface is a plain Rust trait).
+- Port forwarding done: `WarrenFfiProxy::forward_port(protocol, internal_port,
+  local_target)` (with `FfiMapProto`) returns a `WarrenFfiForwardedPort` Object
+  (`external_port()`, async `shutdown()`). The selector mapping and the argument
+  validation are unit-tested; the live path is covered by the warren-net e2e (it
+  needs a NAT-PMP-gateway exit, not injectable at the FFI layer).
+- Supervised proxy done: `WarrenFfiClient::start_proxy_supervised` returns a
+  self-healing `WarrenFfiSupervisedProxy` (`socks5_address()`, `http_address()`,
+  `state()`, idempotent `shutdown()`) that keeps the tunnel up across drops behind
+  a stable address, forwarding `ConnectionState` to the observer. Argument-
+  validation paths are unit-tested; the supervisor core is covered by the facade
+  unit tests. All new exports are CI grep-guarded in the generated bindings.
 - Remaining: the first Dart/Flutter integration (and Kotlin/Swift/Python/Java),
   consuming the generated bindings. Every binding replays the same `vectors/`.
 

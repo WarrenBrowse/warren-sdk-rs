@@ -24,6 +24,9 @@ thiserror = { workspace = true }
 # by the src/bin/uniffi-bindgen.rs helper to emit Swift/Kotlin/Python/Ruby.
 # "tokio" lets async exports run on the host app's tokio runtime.
 uniffi = { version = "0.31", features = ["cli", "tokio"] }
+# Spawns the background task that forwards supervised connection-state changes to
+# the foreign observer; async exports run on the host app's tokio runtime.
+tokio = { workspace = true }
 
 [dev-dependencies]
 # Drives the async FFI methods in tests (#[tokio::test]).

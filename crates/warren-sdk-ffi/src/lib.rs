@@ -12,6 +12,10 @@
 //! subscription, tunnel check, exit listing) plus `start_proxy`, which retries
 //! with backoff, reports each [`FfiConnectionState`] to an optional
 //! [`ConnectionObserver`], and returns a [`WarrenFfiProxy`] lifecycle handle.
+//! [`WarrenFfiProxy::forward_port`] exposes NAT-PMP port forwarding, and
+//! [`WarrenFfiClient::start_proxy_supervised`] returns a self-healing
+//! [`WarrenFfiSupervisedProxy`] that keeps the tunnel up across drops behind a
+//! stable address.
 
 // FFI exports take owned arguments by value on purpose: uniffi marshals owned
 // values across the language boundary, so a borrowed signature would not match
@@ -29,9 +33,11 @@ use std::sync::{Arc, Mutex};
 
 use warren_sdk::api::{ClientError, RegisterAccountRequest, SupportReportRequest};
 use warren_sdk::identity::{WarrenIdentity, ss58};
-use warren_sdk::net::ProxyConfig;
+use warren_sdk::net::{ForwardedPort, MapProto, ProxyConfig};
 use warren_sdk::transport::{Backoff, ConnectionState, RetryError, connect_with_state};
-use warren_sdk::{DefaultClient, ProxyHandle, SdkError, WarrenClient};
+use warren_sdk::{
+    DefaultClient, ProxyForwarder, ProxyHandle, SdkError, SupervisedProxyHandle, WarrenClient,
+};
 
 uniffi::setup_scaffolding!();
 
@@ -84,6 +90,25 @@ pub enum FfiConnectionState {
 pub trait ConnectionObserver: Send + Sync {
     /// Called for each state transition, in order.
     fn on_state(&self, state: FfiConnectionState);
+}
+
+/// Transport selector for a forwarded port. Mirrors
+/// [`warren_sdk::net::MapProto`] across the FFI boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiMapProto {
+    /// TCP.
+    Tcp,
+    /// UDP.
+    Udp,
+}
+
+impl From<FfiMapProto> for MapProto {
+    fn from(p: FfiMapProto) -> Self {
+        match p {
+            FfiMapProto::Tcp => MapProto::Tcp,
+            FfiMapProto::Udp => MapProto::Udp,
+        }
+    }
 }
 
 /// A Warren identity in FFI-friendly form.
@@ -424,14 +449,7 @@ impl WarrenFfiClient {
         // Forward each supervisor transition to the foreign observer (if any),
         // ignoring states this binding does not yet model (non_exhaustive).
         let notify = |state: ConnectionState| {
-            let mapped = match state {
-                ConnectionState::Connecting => Some(FfiConnectionState::Connecting),
-                ConnectionState::Connected => Some(FfiConnectionState::Connected),
-                ConnectionState::Reconnecting => Some(FfiConnectionState::Reconnecting),
-                ConnectionState::Failed => Some(FfiConnectionState::Failed),
-                _ => None,
-            };
-            if let (Some(obs), Some(m)) = (observer.as_ref(), mapped) {
+            if let (Some(obs), Some(m)) = (observer.as_ref(), map_connection_state(state)) {
                 obs.on_state(m);
             }
         };
@@ -460,7 +478,79 @@ impl WarrenFfiClient {
             })?;
         let socks5_address = handle.local_addr().to_string();
         let http_address = handle.http_addr().map(|a| a.to_string());
+        // A detached forwarder so port forwards do not need the handle's lock.
+        let forwarder = handle.forwarder();
         Ok(Arc::new(WarrenFfiProxy {
+            socks5_address,
+            http_address,
+            forwarder,
+            handle: Mutex::new(Some(handle)),
+        }))
+    }
+
+    /// Like [`start_proxy`](Self::start_proxy) but self-healing: the returned
+    /// [`WarrenFfiSupervisedProxy`] keeps the tunnel up across drops behind a
+    /// stable SOCKS5 address, rebuilding from a fresh assignment on each
+    /// reconnect. State transitions are reported to `observer`. Returns once the
+    /// listeners are bound (the first tunnel comes up in the background).
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InvalidHex`] for a malformed `exit_id_hex`; [`FfiError::Client`]
+    /// for a bad listen address or an exit id absent from the verified directory;
+    /// [`FfiError::ServerStatus`] on a non-2xx API reply.
+    pub async fn start_proxy_supervised(
+        &self,
+        exit_id_hex: String,
+        socks5_listen: String,
+        observer: Option<Box<dyn ConnectionObserver>>,
+    ) -> Result<Arc<WarrenFfiSupervisedProxy>, FfiError> {
+        let want = hex16(&exit_id_hex)?;
+        let socks5: SocketAddr = socks5_listen.parse().map_err(|_| FfiError::Client {
+            message: "invalid socks5 listen address".to_owned(),
+        })?;
+        let cfg = ProxyConfig {
+            socks5,
+            http: None,
+            dns_server: None,
+        };
+        // Pick the exit once up front so a bad id fails fast; the supervisor then
+        // reconnects to this same exit across drops.
+        let exit = self
+            .inner
+            .fetch_multihop_directory()
+            .await
+            .map_err(map_sdk_error)?
+            .into_iter()
+            .find(|e| e.exit_id == want)
+            .ok_or(SdkError::NoMultihopExit)
+            .map_err(map_sdk_error)?;
+
+        let handle = self
+            .inner
+            .start_proxy_multihop_supervised(&exit, &cfg)
+            .await
+            .map_err(map_sdk_error)?;
+
+        // Forward supervisor state transitions to the foreign observer, if any.
+        if let Some(obs) = observer {
+            let mut rx = handle.watch_state();
+            tokio::spawn(async move {
+                // Emit the current state immediately, then each change.
+                loop {
+                    if let Some(m) = map_connection_state(*rx.borrow_and_update()) {
+                        obs.on_state(m);
+                    }
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        let socks5_address = handle.local_addr().to_string();
+        let http_address = handle.http_addr().map(|a| a.to_string());
+        Ok(Arc::new(WarrenFfiSupervisedProxy {
             socks5_address,
             http_address,
             handle: Mutex::new(Some(handle)),
@@ -477,12 +567,15 @@ impl WarrenFfiClient {
 pub struct WarrenFfiProxy {
     socks5_address: String,
     http_address: Option<String>,
+    // Detached forwarder for `forward_port`: usable without the handle lock, so a
+    // forward can be requested without contending with `shutdown`.
+    forwarder: ProxyForwarder,
     // Taken out and consumed by `shutdown`; otherwise dropped with the object,
     // whose `ProxyHandle::drop` aborts the listener tasks.
     handle: Mutex<Option<ProxyHandle>>,
 }
 
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 impl WarrenFfiProxy {
     /// The bound SOCKS5 listener address (`ip:port`), with the real port when the
     /// caller requested `:0`.
@@ -497,6 +590,39 @@ impl WarrenFfiProxy {
         self.http_address.clone()
     }
 
+    /// Forwards a tunnel-side port: asks the exit to map `internal_port` via
+    /// NAT-PMP and relays inbound connections to `local_target` (an `ip:port` the
+    /// app's local server listens on). Resolves once the exit grants the mapping;
+    /// the returned [`WarrenFfiForwardedPort`] reports the allocated external
+    /// port and keeps the mapping renewed until dropped or shut down.
+    ///
+    /// Needs an exit running a NAT-PMP gateway; not every exit does.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::Client`] for a malformed `local_target` or if the engine has
+    /// stopped or the exit refuses the mapping.
+    pub async fn forward_port(
+        &self,
+        protocol: FfiMapProto,
+        internal_port: u16,
+        local_target: String,
+    ) -> Result<Arc<WarrenFfiForwardedPort>, FfiError> {
+        let target: SocketAddr = local_target.parse().map_err(|_| FfiError::Client {
+            message: "invalid local target address".to_owned(),
+        })?;
+        let forwarded = self
+            .forwarder
+            .forward_port(protocol.into(), internal_port, target)
+            .await
+            .map_err(map_sdk_error)?;
+        Ok(Arc::new(WarrenFfiForwardedPort {
+            external_port: forwarded.external_port(),
+            internal_port: forwarded.internal_port(),
+            inner: Mutex::new(Some(forwarded)),
+        }))
+    }
+
     /// Tears down the proxy and its tunnel. Idempotent: a second call is a no-op.
     pub fn shutdown(&self) {
         // A poisoned lock means a prior holder panicked; the handle is still
@@ -506,6 +632,99 @@ impl WarrenFfiProxy {
         {
             handle.shutdown();
         }
+    }
+}
+
+/// A live forwarded port over a running proxy datapath (see
+/// [`WarrenFfiProxy::forward_port`]). Dropping it lets the exit's lease lapse;
+/// [`shutdown`](Self::shutdown) releases the mapping promptly.
+#[derive(uniffi::Object)]
+pub struct WarrenFfiForwardedPort {
+    external_port: u16,
+    internal_port: u16,
+    inner: Mutex<Option<ForwardedPort>>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WarrenFfiForwardedPort {
+    /// The external port the exit allocated; remote peers reach the app here.
+    #[must_use]
+    pub fn external_port(&self) -> u16 {
+        self.external_port
+    }
+
+    /// The tunnel-side port the exit forwards inbound connections to.
+    #[must_use]
+    pub fn internal_port(&self) -> u16 {
+        self.internal_port
+    }
+
+    /// Releases the forward: stops accepting inbound and asks the exit to delete
+    /// the mapping. Idempotent: a second call is a no-op.
+    pub async fn shutdown(&self) {
+        // Take the handle out under the lock, then await its async teardown with
+        // the lock released (never hold a std mutex across an await).
+        let taken = self.inner.lock().ok().and_then(|mut g| g.take());
+        if let Some(forwarded) = taken {
+            forwarded.shutdown().await;
+        }
+    }
+}
+
+/// A self-healing SOCKS5 proxy over a multihop tunnel (see
+/// [`WarrenFfiClient::start_proxy_supervised`]). The address stays stable while
+/// the tunnel is rebuilt across drops.
+#[derive(uniffi::Object)]
+pub struct WarrenFfiSupervisedProxy {
+    socks5_address: String,
+    http_address: Option<String>,
+    handle: Mutex<Option<SupervisedProxyHandle>>,
+}
+
+#[uniffi::export]
+impl WarrenFfiSupervisedProxy {
+    /// The stable SOCKS5 listener address the app points at across reconnects.
+    #[must_use]
+    pub fn socks5_address(&self) -> String {
+        self.socks5_address.clone()
+    }
+
+    /// The stable HTTP CONNECT listener address, if one was configured.
+    #[must_use]
+    pub fn http_address(&self) -> Option<String> {
+        self.http_address.clone()
+    }
+
+    /// The current connection state, or `Failed` if already shut down.
+    #[must_use]
+    pub fn state(&self) -> FfiConnectionState {
+        self.handle
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|h| h.state()))
+            .and_then(map_connection_state)
+            .unwrap_or(FfiConnectionState::Failed)
+    }
+
+    /// Stops the supervisor and tears down the datapath. Idempotent.
+    pub fn shutdown(&self) {
+        if let Ok(mut guard) = self.handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            handle.shutdown();
+        }
+    }
+}
+
+/// Maps an SDK [`ConnectionState`] to its FFI mirror; `None` for states this
+/// binding does not model (the enum is `#[non_exhaustive]`).
+fn map_connection_state(state: ConnectionState) -> Option<FfiConnectionState> {
+    match state {
+        ConnectionState::Connecting => Some(FfiConnectionState::Connecting),
+        ConnectionState::Connected => Some(FfiConnectionState::Connected),
+        ConnectionState::Reconnecting => Some(FfiConnectionState::Reconnecting),
+        ConnectionState::Failed => Some(FfiConnectionState::Failed),
+        _ => None,
     }
 }
 
@@ -785,6 +1004,48 @@ mod tests {
             )
             .await;
         assert!(matches!(r, Err(FfiError::Client { .. })));
+    }
+
+    #[tokio::test]
+    async fn start_proxy_supervised_rejects_bad_exit_id_hex_before_any_network() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        let r = client
+            .start_proxy_supervised("not-hex".to_owned(), "127.0.0.1:0".to_owned(), None)
+            .await;
+        assert!(matches!(r, Err(FfiError::InvalidHex(_))));
+    }
+
+    #[tokio::test]
+    async fn start_proxy_supervised_rejects_bad_listen_address_before_any_network() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        let r = client
+            .start_proxy_supervised(
+                "ab".repeat(16),
+                "definitely not an address".to_owned(),
+                None,
+            )
+            .await;
+        assert!(matches!(r, Err(FfiError::Client { .. })));
+    }
+
+    #[tokio::test]
+    async fn ffi_map_proto_maps_to_sdk_proto() {
+        // The FFI selector maps to the SDK protocol enum (the only logic on the
+        // forward_port path testable without a live tunnel).
+        assert_eq!(MapProto::from(FfiMapProto::Tcp), MapProto::Tcp);
+        assert_eq!(MapProto::from(FfiMapProto::Udp), MapProto::Udp);
     }
 
     #[tokio::test]

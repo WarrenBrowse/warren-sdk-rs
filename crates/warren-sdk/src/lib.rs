@@ -859,6 +859,44 @@ pub enum TunnelState {
     Disconnected,
 }
 
+/// A detached, cloneable capability to request NAT-PMP port forwards over a
+/// running datapath (see [`ProxyHandle::forwarder`]). It does not own the
+/// datapath lifecycle, so it can be held and used independently of the
+/// [`ProxyHandle`] (the FFI layer keeps one alongside the handle's lock).
+#[derive(Clone)]
+pub struct ProxyForwarder {
+    connector: warren_net::TunnelConnector,
+    gateway: std::net::Ipv4Addr,
+}
+
+impl ProxyForwarder {
+    /// Forwards a tunnel-side port: maps `internal_port` at the exit via NAT-PMP
+    /// and relays inbound connections to `local_target`, renewing until the
+    /// returned [`warren_net::ForwardedPort`] is dropped. See
+    /// [`ProxyHandle::forward_port`].
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::PortForward`] if the engine has stopped, a socket cannot be
+    /// opened, or the exit refuses the mapping.
+    pub async fn forward_port(
+        &self,
+        proto: warren_net::MapProto,
+        internal_port: u16,
+        local_target: SocketAddr,
+    ) -> Result<warren_net::ForwardedPort, SdkError> {
+        warren_net::forward_port(
+            &self.connector,
+            self.gateway,
+            proto,
+            internal_port,
+            local_target,
+        )
+        .await
+        .map_err(SdkError::from)
+    }
+}
+
 /// A running non-root proxy datapath. Dropping it stops the proxy.
 pub struct ProxyHandle {
     local_addr: SocketAddr,
@@ -916,15 +954,20 @@ impl ProxyHandle {
         internal_port: u16,
         local_target: SocketAddr,
     ) -> Result<warren_net::ForwardedPort, SdkError> {
-        warren_net::forward_port(
-            &self.forward_connector,
-            self.gateway,
-            proto,
-            internal_port,
-            local_target,
-        )
-        .await
-        .map_err(SdkError::from)
+        self.forwarder()
+            .forward_port(proto, internal_port, local_target)
+            .await
+    }
+
+    /// A cheap, cloneable [`ProxyForwarder`] for this datapath, detached from the
+    /// handle's lifecycle so a caller (notably the FFI layer) can request port
+    /// forwards without holding the handle across an `.await`.
+    #[must_use]
+    pub fn forwarder(&self) -> ProxyForwarder {
+        ProxyForwarder {
+            connector: self.forward_connector.clone(),
+            gateway: self.gateway,
+        }
     }
 
     /// Stops the proxy datapath.
