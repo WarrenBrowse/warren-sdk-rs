@@ -1087,6 +1087,49 @@ mod real_exit_tests {
         s2.disconnect();
         s3.disconnect();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daita_cover_traffic_is_accepted_by_a_daita_active_exit() {
+        let Some((addr, exit_x25519, exit_rpk)) = running_full_exit() else {
+            eprintln!("skipping: WARREN_EXIT_ADDR not set (needs a rooted --use-tun exit)");
+            return;
+        };
+
+        // The exit advertises DAITA (e.g. a tamaraw machine). The client's
+        // cover-traffic frame (first byte 0xFF, high nibble not 4/6) must be
+        // recognised as a dummy and dropped, never mistaken for an IP packet that
+        // would fault the session. Interleave dummies with IP-looking packets.
+        let key = SigningKey::from_bytes(&CLIENT_SEED);
+        let session = MultihopClientTunnel::new(key)
+            .connect(exit_rpk, exit_x25519, TEST_EXIT_ID, addr)
+            .await
+            .expect("handshake against the DAITA-active exit");
+
+        for i in 0..16u8 {
+            session
+                .send_cover_traffic(200)
+                .expect("exit accepts cover traffic");
+            if i % 4 == 0 {
+                let mut pkt = vec![0x45u8];
+                pkt.extend((0..120u16).map(|b| b as u8 ^ i));
+                session
+                    .send_packet(&pkt)
+                    .expect("exit accepts a real packet");
+            }
+        }
+
+        // Give any exit-side rejection time to surface as a connection close.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            session.connection().close_reason().is_none(),
+            "the DAITA-active exit must not reset the session over cover traffic: {:?}",
+            session.connection().close_reason()
+        );
+        let snap = session.metrics_snapshot();
+        assert_eq!(snap.cover_packets_sent, 16, "all dummies were counted");
+
+        session.disconnect();
+    }
 }
 
 #[cfg(test)]
