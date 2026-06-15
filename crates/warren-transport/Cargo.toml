@@ -12,6 +12,7 @@ publish.workspace = true
 [dependencies]
 warren-wire = { path = "../warren-wire" }
 warren-multihop = { path = "../warren-multihop" }
+warren-daita = { path = "../warren-daita" }
 ed25519-dalek = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }

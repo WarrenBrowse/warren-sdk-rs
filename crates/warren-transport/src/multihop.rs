@@ -1130,6 +1130,69 @@ mod real_exit_tests {
 
         session.disconnect();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daita_driver_emits_scheduled_padding_against_the_real_exit() {
+        use std::sync::Arc;
+
+        use tokio::sync::Notify;
+        use warren_daita::{DaitaConfig, DaitaPool, DaitaState};
+
+        use crate::daita_driver::DaitaDriver;
+
+        let Some((addr, exit_x25519, exit_rpk)) = running_full_exit() else {
+            eprintln!("skipping: WARREN_EXIT_ADDR not set (needs a rooted --use-tun exit)");
+            return;
+        };
+
+        let key = SigningKey::from_bytes(&CLIENT_SEED);
+        let session = Arc::new(
+            MultihopClientTunnel::new(key)
+                .connect(exit_rpk, exit_x25519, TEST_EXIT_ID, addr)
+                .await
+                .expect("handshake for the DAITA driver"),
+        );
+
+        // Drive the curated Tamaraw machine, but with a permissive padding cap so
+        // its constant-rate schedule actually emits within the short test window
+        // (the pool's 0.15 cap would throttle padding without sustained traffic).
+        let base = DaitaPool::default_pool()
+            .pick_named_os("tamaraw")
+            .expect("tamaraw entry");
+        let cfg = DaitaConfig::from_specs(base.machine_specs, 0.9, 0.0);
+        let state = DaitaState::from_config(&cfg, std::time::Instant::now()).expect("daita state");
+        assert!(state.is_enabled());
+
+        let driver = DaitaDriver::new(Arc::clone(&session), state);
+        let handle = driver.handle();
+        let stop = Arc::new(Notify::new());
+        let run = tokio::spawn(Arc::clone(&driver).run(Arc::clone(&stop)));
+
+        // Feed real uplink events so the machine stays in its padding state and
+        // the cap keeps headroom; the driver schedules and emits cover frames.
+        for _ in 0..10 {
+            handle.note_uplink();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+
+        stop.notify_one();
+        run.await.expect("driver task joins");
+
+        assert!(
+            driver.metrics().padding_fired >= 1,
+            "the maybenot machine scheduled at least one padding action"
+        );
+        assert!(
+            session.metrics_snapshot().cover_packets_sent >= 1,
+            "the driver emitted cover frames the real exit accepted"
+        );
+        assert!(
+            session.connection().close_reason().is_none(),
+            "the exit kept the session up through the driven padding"
+        );
+
+        session.disconnect();
+    }
 }
 
 #[cfg(test)]

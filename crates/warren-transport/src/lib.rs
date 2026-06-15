@@ -8,13 +8,16 @@
 //! Pure protocol logic: no TUN, routing, DNS or OS coupling here.
 
 pub mod client;
+pub mod daita_driver;
 pub mod multihop;
 pub mod reconnect;
 pub mod tls;
 
 pub use client::{ClientSession, ClientTunnel, TunnelError, local_ip_for_endpoint};
+pub use daita_driver::{DaitaDriver, DaitaDriverHandle};
 pub use multihop::{
     MultihopClientTunnel, MultihopError, MultihopMetrics, MultihopMetricsSnapshot, MultihopSession,
+    RekeyPolicy,
 };
 pub use reconnect::{
     Backoff, BackoffIter, ConnectionState, JitterBackoff, RetryError, connect_with_retry,

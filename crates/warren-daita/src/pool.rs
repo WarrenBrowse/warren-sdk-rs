@@ -7,6 +7,8 @@
 //! client present the same distribution of defenses to an observer.
 
 use maybenot_machines::{StaticMachine, get_machine};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
 use rand::{Rng, RngCore};
 
@@ -121,6 +123,19 @@ impl DaitaPool {
     pub fn pick_named<R: Rng + RngCore>(&self, name: &str, rng: &mut R) -> Option<DaitaConfig> {
         let entry = self.entries.iter().find(|e| e.name == name)?;
         Some(entry.to_config(rng))
+    }
+
+    /// Like [`Self::pick`] but seeds its own OS RNG, for callers that do not
+    /// carry a rand 0.9 generator.
+    #[must_use]
+    pub fn pick_os(&self) -> Option<DaitaConfig> {
+        self.pick(&mut StdRng::from_os_rng())
+    }
+
+    /// Like [`Self::pick_named`] but seeds its own OS RNG.
+    #[must_use]
+    pub fn pick_named_os(&self, name: &str) -> Option<DaitaConfig> {
+        self.pick_named(name, &mut StdRng::from_os_rng())
     }
 }
 

@@ -2663,6 +2663,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "warren-daita",
  "warren-identity",
  "warren-multihop",
  "warren-test-support",
