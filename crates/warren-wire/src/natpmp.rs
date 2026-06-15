@@ -357,6 +357,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_unsupported_version() {
+        // Long enough to pass the length guard, but a non-zero version byte: the
+        // frame is from an incompatible NAT-PMP dialect and must be rejected.
+        let buf = [0x09, 0x81, 0, 0, 0, 0, 0, 0];
+        assert!(matches!(
+            parse_response(&buf).unwrap_err(),
+            ParseError::UnsupportedVersion(0x09)
+        ));
+    }
+
+    #[test]
     fn rate_limited_result_code_maps() {
         let buf = [
             0x00, 0x81, 0x00, 0x07, 0x00, 0x00, 0x00, 0x01, 0x12, 0x34, 0x00, 0x00, 0x00, 0x00,

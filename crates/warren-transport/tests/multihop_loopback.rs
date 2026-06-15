@@ -8,7 +8,7 @@ use std::net::Ipv4Addr;
 
 use ed25519_dalek::SigningKey;
 use warren_test_support::spawn_fake_multihop_exit;
-use warren_transport::MultihopClientTunnel;
+use warren_transport::{MultihopClientTunnel, MultihopError};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn multihop_setup_assigns_ip_and_sealed_datagram_echoes() {
@@ -65,9 +65,16 @@ async fn wrong_exit_pubkey_is_rejected() {
         .await
     {
         Ok(_) => panic!("a mismatched pin must be rejected"),
-        Err(err) => assert!(
-            !err.to_string().is_empty(),
-            "the error must carry a redacted, non-empty description"
-        ),
+        // The rejection must come from the identity defense specifically: the TLS
+        // raw-public-key pin mismatch fails the QUIC connect, or (had TLS passed)
+        // the post-handshake key check trips. Anything else (bind, setup, frame)
+        // would mean the impostor was not caught for the right reason.
+        Err(err @ (MultihopError::Quic { .. } | MultihopError::ExitIdentityMismatch)) => {
+            assert!(
+                !err.to_string().is_empty(),
+                "the error stays redacted but non-empty"
+            );
+        }
+        Err(other) => panic!("expected an identity-defense rejection, got {other:?}"),
     }
 }

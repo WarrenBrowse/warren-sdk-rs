@@ -523,6 +523,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_json_body_maps_to_response_json() {
+        // A 200 with a non-JSON body is a response-parse failure at the trust
+        // boundary, not a transport error.
+        let c = client(MockTransport::new(200, "{ this is not json"));
+        assert!(matches!(
+            c.subscription().await.unwrap_err(),
+            ClientError::ResponseJson(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_utf8_body_maps_to_response_encoding() {
+        // list_exits returns the raw body as a String; invalid UTF-8 must surface
+        // as ResponseEncoding rather than panicking or lossy-decoding.
+        let t = MockTransport {
+            last: Mutex::new(None),
+            status: 200,
+            body: vec![0xff, 0xfe, 0x00],
+        };
+        assert!(matches!(
+            client(t).list_exits().await.unwrap_err(),
+            ClientError::ResponseEncoding(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn signed_request_carries_valid_signature() {
         use ed25519_dalek::{Signature, Verifier};
         use warren_identity::canonical_message;

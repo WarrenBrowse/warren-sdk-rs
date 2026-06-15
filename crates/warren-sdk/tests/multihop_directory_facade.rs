@@ -4,12 +4,24 @@
 //! share their code with the signed-exit-list path (see `discovery_enforcement`)
 //! and the directory's PKI/signature checks are unit-tested in warren-discovery.
 
+use std::sync::Arc;
+
 use ed25519_dalek::SigningKey;
 use warren_sdk::api::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_sdk::discovery::DirectoryError;
 use warren_sdk::discovery::multihop_directory::test_helpers::mint_directory_json;
 use warren_sdk::identity::WarrenIdentity;
-use warren_sdk::{SdkError, WarrenClient};
+use warren_sdk::{GenerationStore, SdkError, WarrenClient};
+
+/// A [`GenerationStore`] pinned to a fixed anti-rollback floor (test fixture).
+struct FixedFloor(u64);
+
+impl GenerationStore for FixedFloor {
+    fn load_floor(&self) -> u64 {
+        self.0
+    }
+    fn store_floor(&self, _generation: u64) {}
+}
 
 /// Always answers `404` (the API publishes no directory).
 struct NotFoundTransport;
@@ -141,4 +153,53 @@ async fn without_a_root_pin_the_chain_is_accepted_on_tofu_terms() {
         .await
         .expect("TOFU accepts any self-consistent chain");
     assert_eq!(exits.len(), 2);
+}
+
+#[tokio::test]
+async fn an_expired_directory_is_rejected_as_stale() {
+    // Distinct from the signed-list freshness path: the directory has its own
+    // expires_at check in the facade. signed two days ago, expired yesterday.
+    let (root, op, server) = (
+        SigningKey::from_bytes(&[1; 32]),
+        SigningKey::from_bytes(&[2; 32]),
+        SigningKey::from_bytes(&[3; 32]),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let json = mint_directory_json(&root, &op, &server, 1, now - 2 * 86_400, now - 86_400);
+    let client = client_with_roots(json, &server, &[&root]);
+
+    match client.fetch_multihop_directory().await {
+        Err(SdkError::StaleMultihopDirectory) => {}
+        other => panic!("expected StaleMultihopDirectory, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_directory_below_the_generation_floor_is_rejected_as_rolled_back() {
+    // The directory keeps its OWN anti-rollback floor (a separate sequence from the
+    // signed exit list): a generation below the trusted floor is a replay.
+    let (root, op, server) = (
+        SigningKey::from_bytes(&[1; 32]),
+        SigningKey::from_bytes(&[2; 32]),
+        SigningKey::from_bytes(&[3; 32]),
+    );
+    let (signed_at, expires_at) = window();
+    let json = mint_directory_json(&root, &op, &server, 1, signed_at, expires_at);
+    let (identity, _m) = WarrenIdentity::generate();
+    let client = WarrenClient::builder()
+        .identity(identity)
+        .api_base("https://api.example.test")
+        .server_pubkey_pin(pin(&server))
+        .multihop_root_pubkey_pin(pin(&root))
+        .multihop_generation_store(Arc::new(FixedFloor(10)))
+        .build_with_transport(DirectoryTransport(json))
+        .expect("build");
+
+    match client.fetch_multihop_directory().await {
+        Err(SdkError::RolledBackMultihopDirectory { got: 1, floor: 10 }) => {}
+        other => panic!("expected RolledBackMultihopDirectory, got {other:?}"),
+    }
 }

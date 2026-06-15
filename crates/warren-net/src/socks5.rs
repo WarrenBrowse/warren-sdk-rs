@@ -288,6 +288,15 @@ mod tests {
     }
 
     #[test]
+    fn request_rejects_non_utf8_domain() {
+        // ATYP=domain with non-UTF-8 bytes must be rejected, not lossy-decoded:
+        // a malformed client request never becomes a bogus target name.
+        let mut buf = vec![0x05, 0x01, 0x00, 0x03, 0x02, 0xff, 0xfe];
+        buf.extend_from_slice(&80u16.to_be_bytes());
+        assert_eq!(parse_request(&buf), Err(Socks5Error::BadDomain));
+    }
+
+    #[test]
     fn only_connect_is_supported() {
         // VER CMD=BIND RSV ATYP=1 1.2.3.4 :443
         let bind = [0x05, 0x02, 0x00, 0x01, 1, 2, 3, 4, 0x01, 0xbb];

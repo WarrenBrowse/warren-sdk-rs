@@ -312,10 +312,13 @@ mod tests {
     }
 
     #[test]
-    fn feature_bits_are_distinct_powers_of_two() {
-        let all =
-            features::MULTIPATH | features::PORT_FORWARD | features::IPV6 | features::PAD_TO_MTU;
-        assert_eq!(all.count_ones(), 4);
+    fn feature_bits_match_the_frozen_wire_values() {
+        // These bit values are wire-frozen (must match warren-core byte-for-byte).
+        // Pin each literal, not just "distinct powers of two", so a silent renumber
+        // that stays distinct is still caught.
+        assert_eq!(features::MULTIPATH, 0x01);
+        assert_eq!(features::PORT_FORWARD, 0x02);
+        assert_eq!(features::IPV6, 0x04);
         assert_eq!(features::PAD_TO_MTU, 0x08);
     }
 
@@ -328,6 +331,17 @@ mod tests {
         .unwrap();
         assert!(matches!(
             decode_setup(&bytes).unwrap_err(),
+            ProtocolError::VersionMismatch { got: 99, .. }
+        ));
+    }
+
+    #[test]
+    fn setup_ack_version_mismatch_is_detected() {
+        // The SetupAck decoder is a peer-supplied trust boundary too: a frame with
+        // the wrong protocol version is rejected (symmetric with decode_setup).
+        let bytes = encode_setup_ack(&ack_no_daita(99)).unwrap();
+        assert!(matches!(
+            decode_setup_ack(&bytes).unwrap_err(),
             ProtocolError::VersionMismatch { got: 99, .. }
         ));
     }
