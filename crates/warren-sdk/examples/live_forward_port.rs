@@ -8,12 +8,15 @@
 //! real infrastructure:
 //!   - whether the production exit runs a NAT-PMP gateway at all;
 //!   - if it does, that the full map exchange (request, retransmission, parse)
-//!     completes and yields an allocated external port.
+//!     completes and yields an allocated external port;
+//!   - the INBOUND leg end to end: this host doubles as the external internet
+//!     peer by dialing the exit's public `ip:external_port` directly (a distinct
+//!     network path from the in-process tunnel client), and the payload must
+//!     round-trip through the tunnel to the local server.
 //!
-//! It does NOT exercise an inbound dial-in (that needs an external internet peer
-//! reaching the granted external port); a successful grant is still conclusive
-//! that the gateway path works end to end. A clean "gateway disabled / no reply"
-//! is reported as a non-fatal outcome, not a crash.
+//! A clean "gateway disabled / no reply" is reported as a non-fatal outcome, not
+//! a crash; if the grant succeeds but the inbound dial does not round-trip, that
+//! is reported too (the grant itself is still validated).
 
 use std::net::SocketAddr;
 
