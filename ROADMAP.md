@@ -231,7 +231,13 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
     resolve+v6 connect, A fallback, v6 UDP flow, AAAA-preferred resolution for
     UDP *domain* targets). UDP domain targets now share the TCP dual-stack policy
     (AAAA preferred under a v6 assignment, else A) via a shared `resolve_dualstack`
-    helper. Pending: real-exit v6 validation.
+    helper. Real-exit v6 finding (2026-06-15, `cargo run -p warren-sdk --example
+    live_ipv6`): the prod NL exit advertises `ipv6_egress=true` in the signed list
+    but does NOT grant the client a v6 address in the multihop `IpAssign`
+    (`assigned_ipv6 = none`). The SDK requests v6 and correctly falls back to
+    v4-only (fail-closed), no crash. So the client v6 datapath cannot be exercised
+    against prod today: it is gated on the EXIT assigning a v6 tunnel address, a
+    server-side change. The SDK side is in-process-validated and behaves correctly.
   - Pending: validation against a real Warren exit (mandatory before production);
     privileged per-OS TUN/routing/DNS/killswitch; GSO/GRO batch syscalls behind
     the `PacketSink` batch seam and `fast-apple-datapath` on macOS.
