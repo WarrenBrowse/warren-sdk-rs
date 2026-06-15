@@ -758,9 +758,19 @@ async fn wait_until_dead(mut alive_rx: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
+/// Aborts the wrapped task when dropped, so a spawned helper cannot outlive the
+/// scope that owns it (even if that scope is itself cancelled).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Serves SOCKS5 (and optional HTTP CONNECT) on the *borrowed* stable listeners
-/// using `connector`, until the tunnel dies. Returns so the supervisor can
-/// rebuild and resume on the same listeners.
+/// using `connector`, until the tunnel dies (or an accept loop fails). Returns so
+/// the supervisor can rebuild and resume on the same listeners.
 async fn serve_epoch(
     socks_listener: &tokio::net::TcpListener,
     http_listener: Option<&tokio::net::TcpListener>,
@@ -768,25 +778,30 @@ async fn serve_epoch(
     alive_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     // `run` gates both accept loops; the bridge flips it off when the tunnel dies.
+    // Wrapped in `AbortOnDrop` so cancelling this future (handle dropped mid-epoch)
+    // does not leak the bridge task: it is aborted whether we return or are dropped.
     let (run_tx, run_rx) = tokio::sync::watch::channel(true);
-    let bridge = tokio::spawn(async move {
+    let _bridge = AbortOnDrop(tokio::spawn(async move {
         wait_until_dead(alive_rx).await;
         let _ = run_tx.send(false);
-    });
+    }));
     let socks = warren_net::Socks5Proxy::new(connector.clone());
+    // `select!`, not `join!`: the first loop to return ends the epoch. On tunnel
+    // death the bridge flips `run` and whichever loop sees it first returns; if an
+    // accept loop instead fails on its own, that also ends the epoch (a `join!`
+    // would hang waiting on the still-running sibling while the tunnel is alive).
     match http_listener {
         Some(http_listener) => {
             let http = warren_net::HttpConnectProxy::new(connector);
-            let _ = tokio::join!(
-                socks.serve_with_udp_until(socks_listener, run_rx.clone()),
-                http.serve_until(http_listener, run_rx),
-            );
+            tokio::select! {
+                _ = socks.serve_with_udp_until(socks_listener, run_rx.clone()) => {}
+                _ = http.serve_until(http_listener, run_rx) => {}
+            }
         }
         None => {
             let _ = socks.serve_with_udp_until(socks_listener, run_rx).await;
         }
     }
-    bridge.abort();
 }
 
 /// Supervises a proxy datapath across tunnel rebuilds, keeping the local
@@ -808,6 +823,11 @@ async fn supervise_proxy<S, F, Fut>(
 {
     const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
     const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(20);
+    // A session that stayed up at least this long is treated as healthy, so its
+    // next reconnect starts fresh. A shorter one is "flapping" (the exit accepts
+    // the handshake then drops immediately): apply backoff so we do not tight-loop
+    // full cryptographic handshakes and hammer the exit.
+    const MIN_HEALTHY_UPTIME: std::time::Duration = std::time::Duration::from_secs(5);
     let mut backoff = INITIAL_BACKOFF;
     let mut first = true;
     loop {
@@ -819,7 +839,6 @@ async fn supervise_proxy<S, F, Fut>(
         first = false;
         match connect().await {
             Ok(est) => {
-                backoff = INITIAL_BACKOFF;
                 let mtu = warren_net::PacketSink::max_payload(&est.sink);
                 let mut config =
                     warren_net::NetstackConfig::new(est.local_ip, est.prefix, est.gateway, mtu);
@@ -831,8 +850,16 @@ async fn supervise_proxy<S, F, Fut>(
                 }
                 let (connector, alive_rx) = warren_net::spawn_over_sink(Arc::new(est.sink), config);
                 let _ = state_tx.send(ConnectionState::Connected);
+                let up_since = std::time::Instant::now();
                 serve_epoch(&socks_listener, http_listener.as_ref(), connector, alive_rx).await;
-                // The tunnel died: loop, report Reconnecting, and re-establish at once.
+                // The tunnel died. A healthy session resets backoff and reconnects
+                // at once; a flapping one (died almost immediately) backs off first.
+                if up_since.elapsed() >= MIN_HEALTHY_UPTIME {
+                    backoff = INITIAL_BACKOFF;
+                } else {
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+                }
             }
             Err(_) => {
                 // No identity material is logged. Back off before the next attempt.
@@ -1152,6 +1179,44 @@ mod tests {
         assert_eq!(cycles.load(Ordering::SeqCst), 2, "exactly one reconnect");
 
         kill2.notify_one();
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn supervisor_serves_both_socks_and_http_listeners() {
+        // Exercises the dual-listener serve epoch (the `select!` two-branch path):
+        // both stable addresses accept once the tunnel is up.
+        let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_addr = socks_listener.local_addr().unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+
+        let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+        let keep_open = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(async move {
+            supervise_proxy(
+                socks_listener,
+                Some(http_listener),
+                None,
+                state_tx,
+                move || {
+                    let keep_open = Arc::clone(&keep_open);
+                    async move {
+                        Ok::<_, SdkError>(EstablishedTunnel {
+                            sink: ClosableSink { close: keep_open },
+                            local_ip: "10.66.0.2".parse().unwrap(),
+                            prefix: 24,
+                            gateway: "10.66.0.1".parse().unwrap(),
+                            ipv6: None,
+                        })
+                    }
+                },
+            )
+            .await;
+        });
+
+        assert!(proxy_accepts(socks_addr).await, "SOCKS5 listener is live");
+        assert!(proxy_accepts(http_addr).await, "HTTP listener is live");
         task.abort();
     }
 

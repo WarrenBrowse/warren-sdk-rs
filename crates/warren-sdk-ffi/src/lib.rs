@@ -533,7 +533,9 @@ impl WarrenFfiClient {
             .map_err(map_sdk_error)?;
 
         // Forward supervisor state transitions to the foreign observer, if any.
-        if let Some(obs) = observer {
+        // The task is tracked so it is aborted on shutdown/drop: otherwise it
+        // could call `on_state` on a foreign observer the app has already released.
+        let observer_task = observer.map(|obs| {
             let mut rx = handle.watch_state();
             tokio::spawn(async move {
                 // Emit the current state immediately, then each change.
@@ -545,8 +547,8 @@ impl WarrenFfiClient {
                         break;
                     }
                 }
-            });
-        }
+            })
+        });
 
         let socks5_address = handle.local_addr().to_string();
         let http_address = handle.http_addr().map(|a| a.to_string());
@@ -554,6 +556,7 @@ impl WarrenFfiClient {
             socks5_address,
             http_address,
             handle: Mutex::new(Some(handle)),
+            observer_task: Mutex::new(observer_task),
         }))
     }
 }
@@ -679,6 +682,9 @@ pub struct WarrenFfiSupervisedProxy {
     socks5_address: String,
     http_address: Option<String>,
     handle: Mutex<Option<SupervisedProxyHandle>>,
+    // The state-forwarding task, aborted on shutdown/drop so it cannot invoke the
+    // foreign observer after the app has released the proxy.
+    observer_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[uniffi::export]
@@ -706,13 +712,35 @@ impl WarrenFfiSupervisedProxy {
             .unwrap_or(FfiConnectionState::Failed)
     }
 
-    /// Stops the supervisor and tears down the datapath. Idempotent.
+    /// Stops the supervisor and tears down the datapath, and stops forwarding
+    /// state to the observer. Idempotent.
     pub fn shutdown(&self) {
         if let Ok(mut guard) = self.handle.lock()
             && let Some(handle) = guard.take()
         {
             handle.shutdown();
         }
+        self.abort_observer();
+    }
+}
+
+impl WarrenFfiSupervisedProxy {
+    /// Aborts the state-forwarding task so it cannot call the foreign observer
+    /// after teardown. Idempotent (a poisoned lock is recovered, not propagated).
+    fn abort_observer(&self) {
+        if let Ok(mut guard) = self.observer_task.lock()
+            && let Some(task) = guard.take()
+        {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for WarrenFfiSupervisedProxy {
+    fn drop(&mut self) {
+        // The handle's own `Drop` aborts the supervisor; also stop the observer
+        // task here in case the proxy is dropped without an explicit `shutdown`.
+        self.abort_observer();
     }
 }
 
