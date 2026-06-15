@@ -34,6 +34,15 @@
 //! [`WarrenClient::api`]. The single-hop [`WarrenClient::connect_tunnel`] returns
 //! a raw [`warren_net::QuicPacketSink`] for tests and bespoke datapaths; real
 //! exits require the multihop path above.
+//!
+//! Beyond the one-shot [`WarrenClient::start_proxy_multihop`]:
+//! - [`WarrenClient::start_proxy_multihop_supervised`] returns a
+//!   [`SupervisedProxyHandle`] that keeps the tunnel up across drops behind a
+//!   stable local address, reporting [`ConnectionState`] transitions (the
+//!   app-driven alternative is to watch [`ProxyHandle::state`] and reconnect).
+//! - [`ProxyHandle::forward_port`] maps a tunnel-side port at the exit (NAT-PMP)
+//!   and relays inbound connections to a local server, returning a
+//!   [`warren_net::ForwardedPort`].
 
 pub use warren_api as api;
 pub use warren_discovery as discovery;
