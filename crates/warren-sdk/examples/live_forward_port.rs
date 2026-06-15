@@ -17,7 +17,8 @@
 
 use std::net::SocketAddr;
 
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use warren_sdk::WarrenClient;
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::net::{MapProto, ProxyConfig};
@@ -86,11 +87,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 forwarded.external_port(),
                 forwarded.internal_port()
             );
-            println!(
-                "(An external peer dialing the exit on port {} would be relayed to the local \
-                 server; that leg needs an internet peer and is not exercised here.)",
-                forwarded.external_port()
-            );
+
+            // Full inbound leg: this host doubles as the "external internet peer"
+            // by dialing the exit's PUBLIC ip:external_port DIRECTLY (not through
+            // the tunnel). If the exit forwards it through the tunnel to our
+            // internal port, serve_inbound relays it to the local echo and the
+            // payload round-trips. This is a distinct network path from the
+            // in-process tunnel client, so a single host can exercise both ends.
+            let exit_ip = exit.endpoint.ip();
+            let inbound_target = SocketAddr::new(exit_ip, forwarded.external_port());
+            println!("dialing the exit's public {inbound_target} as an external peer ...");
+            let probe = b"inbound-roundtrip";
+            let mut relayed = false;
+            for attempt in 1..=10 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    inbound_roundtrip(inbound_target, probe),
+                )
+                .await
+                {
+                    Ok(Ok(echo)) if echo == probe => {
+                        println!(
+                            "INBOUND CONFIRMED (attempt {attempt}): a connection to the exit's \
+                             public port was forwarded through the tunnel to the local server and \
+                             the payload round-tripped."
+                        );
+                        relayed = true;
+                        break;
+                    }
+                    Ok(Ok(_)) => {}           // connected but wrong/short echo: retry
+                    Ok(Err(_)) | Err(_) => {} // connect/timeout: warm-up, retry
+                }
+            }
+            if !relayed {
+                println!(
+                    "(Mapping was granted, but a direct dial to {inbound_target} did not \
+                     round-trip: the exit may not actually relay inbound forwarded ports, or the \
+                     port is filtered on the path. The grant itself is validated.)"
+                );
+            }
+
             forwarded.shutdown().await;
             println!("mapping released.");
         }
@@ -113,4 +149,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     handle.shutdown();
     Ok(())
+}
+
+/// Connects directly to `target` (the exit's public ip:external_port), sends
+/// `probe`, and returns the bytes echoed back through the forwarded tunnel.
+async fn inbound_roundtrip(
+    target: SocketAddr,
+    probe: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut s = TcpStream::connect(target).await?;
+    s.write_all(probe).await?;
+    s.flush().await?;
+    let mut buf = vec![0u8; probe.len()];
+    s.read_exact(&mut buf).await?;
+    Ok(buf)
 }

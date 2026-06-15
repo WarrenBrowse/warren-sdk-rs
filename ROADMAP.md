@@ -88,12 +88,15 @@ pinned by golden vectors where a wire format is involved. warren-core
   using the datapath's own connector and exit gateway. Validated in-process
   against a NAT-PMP-gateway exit simulator that grants a mapping and then dials
   back into the forwarded port, round-tripping to a local server.
-- Real-exit validation: the NAT-PMP gateway path is live-validated. `cargo run -p
-  warren-sdk --example live_forward_port` opens a real multihop proxy to the
-  NL/Amsterdam prod exit and the exit GRANTS a TCP mapping (allocated external
-  port), then the mapping is released cleanly: the full map exchange works against
-  real infrastructure. Pending only: the inbound dial-in leg (an external internet
-  peer reaching the granted external port), which needs a peer outside the sandbox.
+- Real-exit validation: DONE, end to end. `cargo run -p warren-sdk --example
+  live_forward_port` opens a real multihop proxy to the NL/Amsterdam prod exit,
+  the exit GRANTS a TCP mapping (allocated external port), and then the SAME host
+  dials the exit's public `ip:external_port` directly (as an external internet
+  peer, a distinct network path from the in-process tunnel client): the exit
+  forwards that connection through the sealed tunnel to the client's internal
+  port, `serve_inbound` relays it to the local server, and the payload
+  round-trips. Map exchange, inbound forwarding, relay and teardown are all
+  confirmed against production infrastructure.
 
 ## P8: warren-sdk facade
 
