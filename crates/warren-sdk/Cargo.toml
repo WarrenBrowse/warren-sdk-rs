@@ -15,6 +15,7 @@ warren-api = { path = "../warren-api" }
 warren-discovery = { path = "../warren-discovery" }
 warren-transport = { path = "../warren-transport" }
 warren-net = { path = "../warren-net" }
+warren-daita = { path = "../warren-daita" }
 thiserror = { workspace = true }
 # Needed to bind the local SOCKS5 listener and spawn the proxy datapath task.
 tokio = { workspace = true }

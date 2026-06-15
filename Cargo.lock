@@ -2613,6 +2613,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "warren-api",
+ "warren-daita",
  "warren-discovery",
  "warren-identity",
  "warren-net",

@@ -53,6 +53,11 @@ pub enum SdkError {
     /// Binding the local proxy listener failed.
     #[error("proxy listener bind failed")]
     Proxy(#[source] std::io::Error),
+    /// DAITA was enabled but its configuration could not be built (an unknown
+    /// machine name, an empty pool, or a maybenot framework error). The message
+    /// describes the cause; it carries no identity material.
+    #[error("DAITA configuration failed: {0}")]
+    Daita(String),
     /// The signed exit list is past its `expires_at` (anti-freeze / replay).
     #[error("signed exit list is expired")]
     StaleRelayList,

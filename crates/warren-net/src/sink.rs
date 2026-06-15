@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
-use warren_transport::{ClientSession, MultihopSession};
+use warren_transport::{ClientSession, DaitaDriverHandle, MultihopSession};
 
 use crate::error::NetError;
 
@@ -126,14 +126,25 @@ impl PacketSink for QuicPacketSink {
 /// is HPKE-sealed into a [`WarrenMultihopFrame`](warren_wire::WarrenMultihopFrame)
 /// before it rides the QUIC datagram plane (the handshake real exits require).
 pub struct MultihopPacketSink {
-    session: MultihopSession,
+    session: Arc<MultihopSession>,
+    /// When present, real traffic is reported to a DAITA driver so it can
+    /// schedule uplink cover traffic (the driver itself emits via the session).
+    daita: Option<DaitaDriverHandle>,
 }
 
 impl MultihopPacketSink {
-    /// Wraps an established multihop session.
+    /// Wraps an established multihop session (no DAITA defense).
     #[must_use]
     pub fn new(session: MultihopSession) -> Self {
-        Self { session }
+        Self::from_arc(Arc::new(session), None)
+    }
+
+    /// Wraps a shared session, optionally reporting traffic to a DAITA driver.
+    /// The session is shared so the driver (which emits cover traffic) and this
+    /// sink (which carries real traffic) drive the same tunnel.
+    #[must_use]
+    pub fn from_arc(session: Arc<MultihopSession>, daita: Option<DaitaDriverHandle>) -> Self {
+        Self { session, daita }
     }
 
     /// The underlying session.
@@ -152,15 +163,27 @@ impl MultihopPacketSink {
 
 impl PacketSink for MultihopPacketSink {
     async fn send_packet(&self, packet: &[u8]) -> Result<(), NetError> {
+        // Report the real uplink packet so the DAITA machine can regularise around
+        // it, then send. The driver emits its own cover frames on the same session.
+        if let Some(daita) = &self.daita {
+            daita.note_uplink();
+        }
         self.session.send_packet(packet).map_err(NetError::Multihop)
     }
 
     async fn recv_packet(&self) -> Result<Bytes, NetError> {
-        self.session
+        let packet = self
+            .session
             .recv_packet()
             .await
             .map(Bytes::from)
-            .map_err(NetError::Multihop)
+            .map_err(NetError::Multihop)?;
+        // The session already drops DAITA dummies, so anything surfaced here is a
+        // real downlink packet (`NormalRecv`).
+        if let Some(daita) = &self.daita {
+            daita.note_downlink(false);
+        }
+        Ok(packet)
     }
 
     fn max_payload(&self) -> usize {

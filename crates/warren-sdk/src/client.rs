@@ -74,6 +74,8 @@ pub struct WarrenClientBuilder {
     pub(crate) multihop_root_pubkey_pins: Vec<String>,
     pub(crate) allow_any_server_key: bool,
     pub(crate) auto_local_ip: bool,
+    pub(crate) daita: bool,
+    pub(crate) daita_machine: Option<String>,
     pub(crate) generation_store: Arc<dyn GenerationStore>,
     pub(crate) multihop_generation_store: Arc<dyn GenerationStore>,
     pub(crate) server_key_store: Option<Arc<dyn ServerKeyStore>>,
@@ -136,6 +138,27 @@ impl WarrenClientBuilder {
     #[must_use]
     pub fn auto_local_ip(mut self) -> Self {
         self.auto_local_ip = true;
+        self
+    }
+
+    /// Enables DAITA on multihop tunnels: the client pads its own uplink with
+    /// cover traffic scheduled by a machine picked uniformly from the curated
+    /// [`DaitaPool`](warren_daita::DaitaPool) (the exit pads the downlink
+    /// independently). Off by default. Only affects multihop connects.
+    #[must_use]
+    pub fn daita(mut self) -> Self {
+        self.daita = true;
+        self
+    }
+
+    /// Like [`daita`](Self::daita) but pins the uplink defense to a named curated
+    /// machine (`netflow`, `tamaraw`, `front`, `interspace_server`,
+    /// `scrambler_server`) instead of a random pick. Useful for deterministic
+    /// behaviour in tests and ops debugging.
+    #[must_use]
+    pub fn daita_machine(mut self, name: impl Into<String>) -> Self {
+        self.daita = true;
+        self.daita_machine = Some(name.into());
         self
     }
 
@@ -227,6 +250,8 @@ impl WarrenClientBuilder {
             server_pubkey_pin: pin,
             multihop_root_pubkey_pins: self.multihop_root_pubkey_pins,
             auto_local_ip: self.auto_local_ip,
+            daita: self.daita,
+            daita_machine: self.daita_machine,
             generation_store: self.generation_store,
             multihop_generation_store: self.multihop_generation_store,
             server_key_store: self.server_key_store,
@@ -248,6 +273,10 @@ pub struct WarrenClient<T> {
     pub(crate) multihop_root_pubkey_pins: Vec<String>,
     /// Pin the QUIC endpoint to the default-route source IP for each exit.
     pub(crate) auto_local_ip: bool,
+    /// Enable DAITA uplink cover traffic on multihop tunnels.
+    pub(crate) daita: bool,
+    /// Pin DAITA to a named curated machine (else a random pool pick).
+    pub(crate) daita_machine: Option<String>,
     /// Anti-rollback floor: highest signed-list `generation` trusted so far.
     pub(crate) generation_store: Arc<dyn GenerationStore>,
     /// Anti-rollback floor for the multihop directory (separate sequence).
@@ -268,6 +297,8 @@ impl WarrenClient<()> {
             multihop_root_pubkey_pins: Vec::new(),
             allow_any_server_key: false,
             auto_local_ip: false,
+            daita: false,
+            daita_machine: None,
             generation_store: Arc::new(InMemoryGenerationStore::default()),
             multihop_generation_store: Arc::new(InMemoryGenerationStore::default()),
             server_key_store: None,
@@ -457,7 +488,29 @@ impl<T: HttpTransport> WarrenClient<T> {
                 exit.endpoint,
             )
             .await?;
-        Ok(MultihopPacketSink::new(session))
+        if !self.daita {
+            return Ok(MultihopPacketSink::new(session));
+        }
+        // DAITA on: pick the uplink machine, build the driver over a shared
+        // session, and spawn its padding loop. The loop self-terminates when the
+        // tunnel closes (a cover send then errors), so no explicit stop is needed.
+        let pool = warren_daita::DaitaPool::default_pool();
+        let cfg = match &self.daita_machine {
+            Some(name) => pool
+                .pick_named_os(name)
+                .ok_or_else(|| SdkError::Daita(format!("unknown DAITA machine '{name}'")))?,
+            None => pool
+                .pick_os()
+                .ok_or_else(|| SdkError::Daita("empty DAITA pool".to_owned()))?,
+        };
+        let state = warren_daita::DaitaState::from_config(&cfg, std::time::Instant::now())
+            .map_err(|e| SdkError::Daita(e.to_string()))?;
+        let session = Arc::new(session);
+        let driver = warren_transport::DaitaDriver::new(Arc::clone(&session), state);
+        let handle = driver.handle();
+        let stop = Arc::new(tokio::sync::Notify::new());
+        tokio::spawn(driver.run(stop));
+        Ok(MultihopPacketSink::from_arc(session, Some(handle)))
     }
 
     /// Starts the non-root proxy datapath over a multihop tunnel to `exit`. Same

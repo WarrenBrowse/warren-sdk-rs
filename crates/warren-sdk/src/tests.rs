@@ -359,6 +359,49 @@ async fn connect_multihop_against_a_fake_exit_assigns_ip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn connect_multihop_with_daita_pads_the_uplink() {
+    // Facade wiring: `.daita_machine(..)` makes connect_multihop spawn a DAITA
+    // driver over the session and hand the sink a handle. The handshake still
+    // assigns an IP, and driving real uplink traffic makes the Tamaraw machine
+    // schedule cover frames the driver emits on the same tunnel.
+    use warren_net::PacketSink;
+
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let (addr, keys) = warren_test_support::spawn_fake_multihop_exit(exit_key).await;
+    let exit = fake_verified_exit(addr, &keys);
+
+    let (id, _m) = WarrenIdentity::generate();
+    let client = WarrenClient::builder()
+        .identity(id)
+        .api_base("https://api.example.test")
+        .allow_any_server_key()
+        .daita_machine("tamaraw")
+        .build()
+        .expect("build");
+
+    let sink = client
+        .connect_multihop(&exit)
+        .await
+        .expect("daita multihop connect assigns an IP");
+    assert_eq!(
+        sink.session().assigned_ipv4(),
+        std::net::Ipv4Addr::new(10, 66, 0, 2)
+    );
+
+    for _ in 0..40u8 {
+        let mut pkt = vec![0x45u8];
+        pkt.extend_from_slice(&[0u8; 64]);
+        let _ = sink.send_packet(&pkt).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        sink.session().metrics_snapshot().cover_packets_sent >= 1,
+        "the DAITA driver must emit uplink cover traffic"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn supervised_proxy_reaches_connected_against_a_fake_exit() {
     // Full supervised facade wiring in process: bind listener, background
     // establish over the fake exit, report Connected on the state watch.
