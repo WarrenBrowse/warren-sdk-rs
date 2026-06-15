@@ -17,7 +17,7 @@ const TYPE_AAAA: u16 = 28;
 const CLASS_IN: u16 = 1;
 
 /// The address record type to query for over the tunnel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RecordType {
     /// `A`: an IPv4 address (4-byte RDATA).
     A,
@@ -132,6 +132,21 @@ fn encode_name(name: &str, out: &mut Vec<u8>) -> Result<(), DnsError> {
 /// short buffer, and [`DnsError::NoAddress`] if no record of type `want` is
 /// present.
 pub fn parse_response(buf: &[u8], id: u16, want: RecordType) -> Result<Vec<IpAddr>, DnsError> {
+    parse_response_ttl(buf, id, want).map(|(addrs, _ttl)| addrs)
+}
+
+/// Like [`parse_response`] but also returns the smallest TTL (seconds) across the
+/// matching answer records, for a caller that caches results. `0` if no matching
+/// record carried a TTL (treated as "do not cache" by callers).
+///
+/// # Errors
+///
+/// Same as [`parse_response`].
+pub fn parse_response_ttl(
+    buf: &[u8],
+    id: u16,
+    want: RecordType,
+) -> Result<(Vec<IpAddr>, u32), DnsError> {
     if buf.len() < HEADER_LEN {
         return Err(DnsError::Truncated);
     }
@@ -156,6 +171,7 @@ pub fn parse_response(buf: &[u8], id: u16, want: RecordType) -> Result<Vec<IpAdd
     }
 
     let mut addrs = Vec::new();
+    let mut min_ttl = u32::MAX;
     for _ in 0..ancount {
         pos = skip_name(buf, pos)?;
         // TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) then RDATA.
@@ -165,6 +181,7 @@ pub fn parse_response(buf: &[u8], id: u16, want: RecordType) -> Result<Vec<IpAdd
         }
         let rec_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
         let rclass = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]);
+        let ttl = u32::from_be_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]);
         let rdlength = usize::from(u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]));
         let rdata = header_end;
         let rdata_end = rdata.checked_add(rdlength).ok_or(DnsError::Truncated)?;
@@ -185,6 +202,7 @@ pub fn parse_response(buf: &[u8], id: u16, want: RecordType) -> Result<Vec<IpAdd
                     addrs.push(IpAddr::V6(Ipv6Addr::from(octets)));
                 }
             }
+            min_ttl = min_ttl.min(ttl);
         }
         pos = rdata_end;
     }
@@ -192,7 +210,7 @@ pub fn parse_response(buf: &[u8], id: u16, want: RecordType) -> Result<Vec<IpAdd
     if addrs.is_empty() {
         return Err(DnsError::NoAddress);
     }
-    Ok(addrs)
+    Ok((addrs, if min_ttl == u32::MAX { 0 } else { min_ttl }))
 }
 
 /// Returns the offset just past the name at `pos`, following compression

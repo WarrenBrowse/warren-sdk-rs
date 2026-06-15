@@ -60,6 +60,11 @@ const DNS_TIMEOUT: SmolDuration = SmolDuration::from_secs(5);
 const DNS_PORT: u16 = 53;
 /// UDP buffer for one in-flight DNS query/response (fits an EDNS-sized reply).
 const DNS_BUFFER: usize = 2048;
+/// Cap on a cached DNS entry's lifetime, regardless of the record TTL: bounds how
+/// stale a cached answer can get while still absorbing bursts of repeat lookups.
+const DNS_CACHE_MAX_TTL: SmolDuration = SmolDuration::from_secs(300);
+/// Max distinct cached names before the cache is pruned, bounding memory.
+const DNS_CACHE_CAP: usize = 512;
 /// Per-direction UDP payload buffer for a relayed UDP flow (64 KiB).
 const UDP_FLOW_BUFFER: usize = 64 * 1024;
 /// Datagrams buffered per direction for a UDP flow before drops (lossy by design).
@@ -187,6 +192,8 @@ struct PendingResolve {
     local_port: u16,
     /// Transaction id the response must echo (off-path spoof resistance).
     id: u16,
+    /// The queried name, kept so a successful answer can be cached by name.
+    name: String,
     /// The record type queried, so the reply is parsed for the matching answer.
     rtype: dns::RecordType,
     reply: oneshot::Sender<Result<IpAddr, NetError>>,
@@ -562,6 +569,7 @@ pub fn spawn_engine(
         },
         conns: HashMap::new(),
         resolvers: Vec::new(),
+        dns_cache: HashMap::new(),
         udp_flows: Vec::new(),
         listeners: Vec::new(),
         next_conn_id: 0,
@@ -589,6 +597,9 @@ struct Engine {
     device: TunnelDevice,
     conns: HashMap<u64, Conn>,
     resolvers: Vec<PendingResolve>,
+    /// TTL-bounded cache of resolved names, so repeat connects to the same host
+    /// skip a DNS round-trip over the tunnel. Single-threaded engine, so no lock.
+    dns_cache: HashMap<(String, dns::RecordType), (IpAddr, SmolInstant)>,
     udp_flows: Vec<UdpFlow>,
     listeners: Vec<Listener>,
     next_conn_id: u64,
@@ -915,6 +926,14 @@ impl Engine {
         cmd: ResolveCommand,
         now: SmolInstant,
     ) {
+        // Serve from the TTL-bounded cache when fresh: a repeat connect to the same
+        // host skips the DNS round-trip over the tunnel entirely.
+        if let Some((ip, expiry)) = self.dns_cache.get(&(cmd.name.clone(), cmd.rtype))
+            && *expiry > now
+        {
+            let _ = cmd.reply.send(Ok(*ip));
+            return;
+        }
         // A per-query transaction id the response must echo (spoof resistance).
         let id: u16 = rand::random();
         let query = match dns::encode_query(&cmd.name, id, cmd.rtype) {
@@ -940,6 +959,7 @@ impl Engine {
             handle,
             local_port,
             id,
+            name: cmd.name,
             rtype: cmd.rtype,
             reply: cmd.reply,
             deadline: now + DNS_TIMEOUT,
@@ -949,32 +969,69 @@ impl Engine {
     /// Delivers DNS responses (first matching record), times out stalled lookups,
     /// and reaps the UDP sockets of finished resolutions.
     fn drain_resolvers(&mut self, sockets: &mut SocketSet<'_>, now: SmolInstant) {
-        let mut finished: Vec<(usize, Result<IpAddr, NetError>)> = Vec::new();
+        // (resolver index, result, optional cache entry to store on success).
+        type CacheEntry = (String, dns::RecordType, IpAddr, SmolInstant);
+        let mut finished: Vec<(usize, Result<IpAddr, NetError>, Option<CacheEntry>)> = Vec::new();
         for (i, r) in self.resolvers.iter().enumerate() {
             let sock = sockets.get_mut::<udp::Socket<'_>>(r.handle);
             if sock.can_recv() {
                 if let Ok((data, _meta)) = sock.recv() {
-                    let res = match dns::parse_response(data, r.id, r.rtype) {
-                        Ok(addrs) => addrs.into_iter().next().ok_or(NetError::NoDnsRecord),
+                    let (res, cache) = match dns::parse_response_ttl(data, r.id, r.rtype) {
+                        Ok((addrs, ttl)) => match addrs.into_iter().next() {
+                            Some(ip) => {
+                                // Cache only when the answer carried a TTL, clamped
+                                // to a ceiling to bound staleness.
+                                let entry = (ttl > 0).then(|| {
+                                    let live = SmolDuration::from_secs(u64::from(ttl))
+                                        .min(DNS_CACHE_MAX_TTL);
+                                    (r.name.clone(), r.rtype, ip, now + live)
+                                });
+                                (Ok(ip), entry)
+                            }
+                            None => (Err(NetError::NoDnsRecord), None),
+                        },
                         // "No such record" is distinct from a transport/parse
                         // failure so a dual-stack lookup falls back on it alone.
-                        Err(dns::DnsError::NoAddress) => Err(NetError::NoDnsRecord),
-                        Err(_) => Err(NetError::ConnectFailed),
+                        Err(dns::DnsError::NoAddress) => (Err(NetError::NoDnsRecord), None),
+                        Err(_) => (Err(NetError::ConnectFailed), None),
                     };
-                    finished.push((i, res));
+                    finished.push((i, res, cache));
                 }
             } else if now >= r.deadline {
-                finished.push((i, Err(NetError::ConnectTimeout)));
+                finished.push((i, Err(NetError::ConnectTimeout), None));
             }
         }
         // Remove highest indices first so the earlier ones stay valid.
         finished.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        for (i, res) in finished {
+        for (i, res, cache) in finished {
             let r = self.resolvers.swap_remove(i);
             sockets.remove(r.handle);
             self.used_ports.remove(&r.local_port);
+            if let Some((name, rtype, ip, expiry)) = cache {
+                self.cache_dns(name, rtype, ip, expiry, now);
+            }
             let _ = r.reply.send(res);
         }
+    }
+
+    /// Inserts a resolved name into the DNS cache, pruning to stay under the cap:
+    /// drop expired entries first, then, if still full, clear (a coarse but bounded
+    /// eviction; the cache is a latency optimization, not a correctness store).
+    fn cache_dns(
+        &mut self,
+        name: String,
+        rtype: dns::RecordType,
+        ip: IpAddr,
+        expiry: SmolInstant,
+        now: SmolInstant,
+    ) {
+        if self.dns_cache.len() >= DNS_CACHE_CAP {
+            self.dns_cache.retain(|_, (_, exp)| *exp > now);
+            if self.dns_cache.len() >= DNS_CACHE_CAP {
+                self.dns_cache.clear();
+            }
+        }
+        self.dns_cache.insert((name, rtype), (ip, expiry));
     }
 
     /// Binds a UDP socket for a new flow and hands back a [`NetstackUdpSocket`].

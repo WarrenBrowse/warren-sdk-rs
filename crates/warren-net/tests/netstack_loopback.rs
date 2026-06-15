@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use smoltcp::iface::{Config, Interface, SocketSet};
@@ -616,6 +616,7 @@ async fn dns_and_echo_server(
     answer: std::net::Ipv4Addr,
     prefix: u8,
     gateway: std::net::Ipv4Addr,
+    queries: Arc<AtomicUsize>,
     mut inbound: mpsc::Receiver<Bytes>,
     outbound: mpsc::Sender<Bytes>,
 ) {
@@ -670,6 +671,7 @@ async fn dns_and_echo_server(
             }
         };
         if let Some((query, endpoint)) = request {
+            queries.fetch_add(1, Ordering::SeqCst);
             let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
             let _ = sock.send_slice(&dns_response(&query, answer), endpoint);
         }
@@ -933,6 +935,7 @@ async fn netstack_resolves_a_domain_over_the_tunnel_then_connects() {
         "10.66.0.5".parse().unwrap(),
         24,
         "10.66.0.1".parse().unwrap(),
+        Arc::new(AtomicUsize::new(0)),
         c2s_rx,
         s2c_tx,
     ));
@@ -946,6 +949,50 @@ async fn netstack_resolves_a_domain_over_the_tunnel_then_connects() {
     let mut got = [0u8; 8];
     stream.read_exact(&mut got).await.expect("read echo");
     assert_eq!(&got, b"resolved");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn netstack_caches_dns_so_a_repeat_connect_skips_the_query() {
+    // Two connects to the same domain: the first resolves over the tunnel, the
+    // second must be served from the TTL cache (the exit answers TTL 60s), so the
+    // exit sees exactly one DNS query, not two.
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+
+    let connector = spawn_engine(
+        NetstackConfig::new(
+            "10.66.0.2".parse().unwrap(),
+            24,
+            "10.66.0.1".parse().unwrap(),
+            MTU,
+        ),
+        s2c_rx,
+        c2s_tx,
+    );
+    let queries = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(dns_and_echo_server(
+        "10.66.0.1".parse().unwrap(),
+        "10.66.0.5".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        Arc::clone(&queries),
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let first = UdpConnector::resolve_host(&connector, "example.com")
+        .await
+        .expect("first resolve over the tunnel");
+    let second = UdpConnector::resolve_host(&connector, "example.com")
+        .await
+        .expect("second resolve");
+    assert_eq!(first, second, "both resolutions return the same address");
+    assert_eq!(first, "10.66.0.5".parse::<std::net::IpAddr>().unwrap());
+    assert_eq!(
+        queries.load(Ordering::SeqCst),
+        1,
+        "the second resolution must hit the DNS cache, not re-query the exit"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -972,6 +1019,7 @@ async fn netstack_resolves_via_a_configured_non_gateway_resolver() {
         "10.66.0.5".parse().unwrap(),
         24,
         "10.66.0.1".parse().unwrap(),
+        Arc::new(AtomicUsize::new(0)),
         c2s_rx,
         s2c_tx,
     ));
