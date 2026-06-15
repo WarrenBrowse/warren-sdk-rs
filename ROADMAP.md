@@ -311,6 +311,29 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
      the multihop directory cross-checks against it, and end-to-end egress is
      confirmed on prod v6.
 
+## Deferred client features (surfaced by the 2026-06-15 SDK audit)
+
+These warren-core client capabilities are intentionally not implemented yet. Each
+is a throughput/observability or privileged-mode feature, not a correctness gap,
+and each must be validated against a real exit before it can be claimed done (per
+CLAUDE.md), so none can be finished from in-process tests alone:
+
+- Multipath / connection bonding. The `MULTIPATH` feature bit and the multi-conn
+  `Setup` builder exist, but there is no session-bonding datapath (warren-core
+  `bundle.rs`). Single-session only today.
+- Rekey policy + tunnel metrics. The frame carries an `epoch`, but there is no
+  public rekey driver or metrics snapshot (warren-core `RekeyPolicy`,
+  `MultiHopMetricsSnapshot`). Limits long-session forward-secrecy control and
+  observability.
+- Full DAITA framework. The negotiation surface (`with_daita`, `DaitaConfig`,
+  the dummy first byte) is present, but the padding framework is not driven on
+  the pump (warren-core `multi_hop_pump`). DAITA is advertised, not enforced.
+- Auto outbound-IP detection. Only the manual `with_bind_local_ip` setter exists;
+  warren-core's `detect_default_local_ip_for_endpoint` has no SDK equivalent.
+- OS-enforced killswitch + IPv6 leak block. Only the best-effort
+  `ProxyOnlyKillSwitch` is implemented; the `OsEnforced` level and the v6 leak
+  guard belong to the deferred privileged TUN backend (P6).
+
 ## Cross-cutting
 
 - Keep the public surface FFI-friendly from P2 onward (no exported generics,

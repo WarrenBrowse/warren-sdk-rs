@@ -74,6 +74,26 @@ pub fn derive_node_key(seed: &[u8; 32]) -> SigningKey {
 /// with its canonical SS58 `wb…` address and the ability to sign API requests.
 ///
 /// The secret key is zeroized on drop. `Debug` prints only the public address.
+///
+/// # Examples
+///
+/// ```
+/// use warren_identity::WarrenIdentity;
+///
+/// // Generate a new identity and recover the same one from its mnemonic.
+/// let (identity, mnemonic) = WarrenIdentity::generate();
+/// let restored = WarrenIdentity::from_mnemonic(&mnemonic)?;
+/// assert_eq!(identity.address(), restored.address());
+/// assert!(identity.address().starts_with("wb"));
+///
+/// // Sign an API request (the SDK facade supplies the clock and a random nonce).
+/// let signed = identity.sign_request("GET", "/v1/subscription", b"", 1_700_000_000, [0u8; 16]);
+/// for (name, value) in signed.headers() {
+///     // attach each X-Warren-* header to the outgoing HTTP request
+///     let _ = (name, value);
+/// }
+/// # Ok::<(), warren_identity::IdentityError>(())
+/// ```
 pub struct WarrenIdentity {
     signing: SigningKey,
 }

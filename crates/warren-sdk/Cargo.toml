@@ -25,6 +25,10 @@ tokio = { workspace = true }
 default = ["reqwest-transport"]
 reqwest-transport = ["warren-api/reqwest-transport"]
 
+# Document the full surface on docs.rs (the facade re-exports every layer).
+[package.metadata.docs.rs]
+all-features = true
+
 [dev-dependencies]
 tokio = { workspace = true }
 ed25519-dalek = { workspace = true }

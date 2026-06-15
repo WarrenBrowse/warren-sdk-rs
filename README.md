@@ -64,12 +64,30 @@ println!("address: {}", identity.address()); // wb...
 // Restore it later from the mnemonic.
 let identity = WarrenIdentity::from_mnemonic(&mnemonic)?;
 
-// Sign a Warren API request (the SDK facade supplies the clock and nonce).
+// Sign a Warren API request. The SDK facade supplies the clock and a random
+// nonce; here they are shown explicitly.
+let timestamp = 1_700_000_000;
+let nonce = [0u8; 16];
 let signed = identity.sign_request("GET", "/v1/subscription", b"", timestamp, nonce);
 for (name, value) in signed.headers() {
     // attach X-Warren-* headers to your HTTP request
 }
 ```
+
+## Minimum supported Rust version
+
+MSRV is **1.89** (edition 2024), pinned in `rust-toolchain.toml`. Newer
+toolchains work; older ones are not supported.
+
+## Feature flags
+
+Applications depend only on `warren-sdk`:
+
+| Crate | Feature | Default | Effect |
+|---|---|---|---|
+| `warren-sdk` | `reqwest-transport` | on | Bundles the reqwest HTTP transport so `WarrenClient::builder().build()` works out of the box. Disable it (`default-features = false`) to bring your own `HttpTransport` and build via `build_with_transport`. |
+| `warren-api` | `reqwest-transport` | on | Backs the above; the same opt-out applies. |
+| `warren-discovery` | `test-helpers` | off | Exposes server-side signing helpers for tests in other crates. Never enable in production; it is wired only as a dev-dependency. |
 
 ## Build and test
 
