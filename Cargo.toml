@@ -88,3 +88,16 @@ correctness = { level = "deny", priority = -1 }
 suspicious = { level = "warn", priority = -1 }
 must_use_candidate = "warn"
 needless_pass_by_value = "warn"
+
+# Release profile for this workspace's own artifacts (the FFI cdylib, examples,
+# benches). It does NOT propagate to crates that depend on warren-sdk: a consumer
+# governs the final binary's profile. The point here is cross-crate inlining on
+# the packet datapath, which crosses the PacketSink / Connector / smoltcp-device
+# trait seams between crates; without LTO those stay behind a vtable per packet.
+# `target-cpu` is deliberately left at the portable default (this is a portable
+# SDK). Panic strategy is left to the consuming binary (the FFI boundary handles
+# unwinding via uniffi), so it is not pinned here.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
