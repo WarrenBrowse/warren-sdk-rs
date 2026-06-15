@@ -353,7 +353,10 @@ async fn socks5_udp_associate_pins_the_client_source() {
     );
 
     // The pinned client still works after the rejected injection.
-    client.send_to(&wrapped(b"again"), relay_addr).await.unwrap();
+    client
+        .send_to(&wrapped(b"again"), relay_addr)
+        .await
+        .unwrap();
     let (n, _) = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         client.recv_from(&mut buf),

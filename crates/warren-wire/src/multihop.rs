@@ -170,6 +170,10 @@ mod tests {
         // large ciphertext so its length varint is at its widest. The encoded
         // overhead (everything but the ciphertext bytes) must stay within
         // MULTIHOP_FRAME_MAX_OVERHEAD so datapaths never under-reserve the MTU.
+        // The exact worst-case overhead for the frozen frame layout (see the
+        // byte-pinned vector in multihop_vectors.rs). Re-derive only with a format
+        // change, and keep it <= MULTIHOP_FRAME_MAX_OVERHEAD.
+        const EXACT_WORST_CASE_OVERHEAD: usize = 83;
         let payload_len = MAX_FRAME_BYTES - 256;
         let frame = WarrenMultihopFrame {
             version: WARREN_HPKE_VERSION_V1,
@@ -185,6 +189,13 @@ mod tests {
         assert!(
             overhead <= MULTIHOP_FRAME_MAX_OVERHEAD,
             "frame overhead {overhead} exceeded the reserved bound {MULTIHOP_FRAME_MAX_OVERHEAD}"
+        );
+        // Pin the exact worst-case overhead so a wire-format change is noticed even
+        // when it stays under the bound: the reserved constant must track the real
+        // worst case, not just be an upper bound (which would silently over-reserve).
+        assert_eq!(
+            overhead, EXACT_WORST_CASE_OVERHEAD,
+            "the worst-case frame overhead changed; re-derive MULTIHOP_FRAME_MAX_OVERHEAD"
         );
     }
 
