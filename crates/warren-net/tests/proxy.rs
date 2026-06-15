@@ -268,6 +268,104 @@ async fn socks5_udp_associate_relays_datagrams() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn socks5_udp_associate_pins_the_client_source() {
+    // The association binds to the first client source; a datagram from any other
+    // local source must be dropped, so a co-resident process cannot inject traffic
+    // or hijack the reply stream. Here a second sender gets nothing back while the
+    // pinned client keeps working.
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let Ok((n, src)) = echo.recv_from(&mut buf).await else {
+                break;
+            };
+            let _ = echo.send_to(&buf[..n], src).await;
+        }
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let proxy = Socks5Proxy::new(LocalUdpConnector);
+        let _ = proxy.serve_with_udp(listener).await;
+    });
+
+    // Associate.
+    let mut ctrl = TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    ctrl.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut method = [0u8; 2];
+    ctrl.read_exact(&mut method).await.unwrap();
+    ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut reply = [0u8; 10];
+    ctrl.read_exact(&mut reply).await.unwrap();
+    let relay_addr: SocketAddr = (
+        std::net::Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]),
+        u16::from_be_bytes([reply[8], reply[9]]),
+    )
+        .into();
+
+    let std::net::SocketAddr::V4(echo_v4) = echo_addr else {
+        panic!("v4")
+    };
+    let wrapped = |payload: &[u8]| {
+        let mut d = vec![0x00, 0x00, 0x00, 0x01];
+        d.extend_from_slice(&echo_v4.ip().octets());
+        d.extend_from_slice(&echo_v4.port().to_be_bytes());
+        d.extend_from_slice(payload);
+        d
+    };
+
+    // The pinned client: one round-trip establishes it as the bound source.
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.send_to(&wrapped(b"ping"), relay_addr).await.unwrap();
+    let mut buf = [0u8; 2048];
+    let (n, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.recv_from(&mut buf),
+    )
+    .await
+    .expect("the pinned client gets its reply")
+    .unwrap();
+    assert_eq!(&buf[10..n], b"ping");
+
+    // A second, unpinned source injects to the same relay. The guard must DROP it
+    // before forwarding, so the target never echoes it: were it forwarded, the
+    // echo would come back on the flow and be delivered to the pinned client. So
+    // the pinned client must receive nothing here (this is what fails if the
+    // source-pin `continue` is removed: it would receive "hijack").
+    let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    attacker
+        .send_to(&wrapped(b"hijack"), relay_addr)
+        .await
+        .unwrap();
+    let leaked = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        client.recv_from(&mut buf),
+    )
+    .await;
+    assert!(
+        leaked.is_err(),
+        "an injected datagram from a non-pinned source must not be forwarded"
+    );
+
+    // The pinned client still works after the rejected injection.
+    client.send_to(&wrapped(b"again"), relay_addr).await.unwrap();
+    let (n, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.recv_from(&mut buf),
+    )
+    .await
+    .expect("the pinned association is intact")
+    .unwrap();
+    assert_eq!(&buf[10..n], b"again");
+    drop(ctrl);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn http_rejects_non_connect_method() {
     let proxy = spawn_http_proxy().await;
     let mut client = TcpStream::connect(proxy).await.expect("connect proxy");
