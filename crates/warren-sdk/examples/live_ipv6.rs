@@ -37,42 +37,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let selector = client.fetch_exits().await?;
     let exits = client.fetch_multihop_directory().await?;
-    // Prefer an exit the pinned list marks as IPv6-egress capable.
     let v6_ids: Vec<_> = selector
         .relays()
         .iter()
         .filter(|r| r.ipv6_egress())
         .map(warren_sdk::discovery::Relay::endpoint_id)
         .collect();
-    let exit = exits
-        .iter()
-        .find(|e| v6_ids.contains(&e.exit_ed25519_pubkey))
-        .or_else(|| exits.first())
-        .cloned()
-        .ok_or("no multihop exit")?;
-    println!(
-        "exit: {} / {}  {} (list marks ipv6_egress={})",
-        exit.country,
-        exit.city,
-        exit.endpoint,
-        v6_ids.contains(&exit.exit_ed25519_pubkey)
-    );
 
-    // Inspect the sealed handshake's Ip assignment before starting the proxy.
-    let sink = client.connect_multihop(&exit).await?;
-    let assigned_v6 = sink.session().assigned_ipv6();
-    println!("assigned_ipv4 = {}", sink.session().assigned_ipv4());
-    match assigned_v6 {
-        Some(v6) => println!("assigned_ipv6 = {v6} (dual-stack granted)"),
-        None => {
-            println!(
-                "assigned_ipv6 = none: this exit did not grant a v6 address, so the v6 datapath \
-                 cannot be exercised against it. (The client requested it; the exit declined.)"
-            );
-            return Ok(());
+    // Probe EVERY directory exit's IpAssign for a v6 address (not just one): a
+    // different exit may grant client v6 even if the first does not.
+    println!("probing {} exit(s) for a v6 assignment ...", exits.len());
+    let mut chosen = None;
+    for e in &exits {
+        let marks_v6 = v6_ids.contains(&e.exit_ed25519_pubkey);
+        match client.connect_multihop(e).await {
+            Ok(sink) => {
+                let v6 = sink.session().assigned_ipv6();
+                println!(
+                    "  {} / {} {}: assigned_ipv4={} assigned_ipv6={} (list ipv6_egress={})",
+                    e.country,
+                    e.city,
+                    e.endpoint,
+                    sink.session().assigned_ipv4(),
+                    v6.map_or_else(|| "none".to_owned(), |a| a.to_string()),
+                    marks_v6
+                );
+                if v6.is_some() && chosen.is_none() {
+                    chosen = Some(e.clone());
+                }
+            }
+            Err(err) => println!("  {} / {}: connect failed: {err}", e.country, e.city),
         }
     }
-    drop(sink);
+
+    let Some(exit) = chosen else {
+        println!(
+            "no exit granted a client v6 address: the v6 client datapath cannot be exercised \
+             against prod today. The SDK requested v6 and fell back to v4-only (fail-closed), \
+             which is correct; enabling it is an exit-side change (assign v6 in the IpAssign)."
+        );
+        return Ok(());
+    };
+    println!(
+        "using {} / {} (granted v6) for the egress proof",
+        exit.country, exit.city
+    );
 
     // Start the proxy (re-establishes; the facade enables dual-stack from the
     // fresh assignment) and prove v6 egress.
