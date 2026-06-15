@@ -1462,6 +1462,88 @@ mod tests {
         task.abort();
     }
 
+    /// Builds a `VerifiedExit` pointing at an in-process fake multihop exit.
+    fn fake_verified_exit(
+        addr: SocketAddr,
+        keys: &warren_test_support::MultihopExitKeys,
+    ) -> VerifiedExit {
+        VerifiedExit {
+            exit_id: keys.exit_id,
+            exit_ed25519_pubkey: keys.ed25519_pubkey,
+            exit_x25519_multihop_pubkey: keys.x25519_pubkey,
+            endpoint: addr,
+            country: "ZZ".to_owned(),
+            city: "Test".to_owned(),
+            weight: 100,
+        }
+    }
+
+    fn test_client() -> DefaultClient {
+        let (id, _m) = WarrenIdentity::generate();
+        WarrenClient::builder()
+            .identity(id)
+            .api_base("https://api.example.test")
+            .allow_any_server_key()
+            .build()
+            .expect("build")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_multihop_against_a_fake_exit_assigns_ip() {
+        // Validates the facade's multihop connect + IpAssign extraction in process
+        // (otherwise only exercised by the live examples) against a fake exit that
+        // completes the sealed handshake and assigns 10.66.0.2/24.
+        let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let (addr, keys) = warren_test_support::spawn_fake_multihop_exit(exit_key).await;
+        let exit = fake_verified_exit(addr, &keys);
+
+        let sink = test_client()
+            .connect_multihop(&exit)
+            .await
+            .expect("multihop connect succeeds against the fake exit");
+        assert_eq!(
+            sink.session().assigned_ipv4(),
+            std::net::Ipv4Addr::new(10, 66, 0, 2)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn supervised_proxy_reaches_connected_against_a_fake_exit() {
+        // Full supervised facade wiring in process: bind listener, background
+        // establish over the fake exit, report Connected on the state watch.
+        let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let (addr, keys) = warren_test_support::spawn_fake_multihop_exit(exit_key).await;
+        let exit = fake_verified_exit(addr, &keys);
+
+        let cfg = warren_net::ProxyConfig {
+            socks5: "127.0.0.1:0".parse().unwrap(),
+            http: None,
+            dns_server: None,
+        };
+        let handle = test_client()
+            .start_proxy_multihop_supervised(&exit, &cfg)
+            .await
+            .expect("supervised proxy binds");
+
+        let mut rx = handle.watch_state();
+        let connected = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if *rx.borrow_and_update() == ConnectionState::Connected {
+                    return true;
+                }
+                if rx.changed().await.is_err() {
+                    return false;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            connected,
+            "the supervised proxy reaches Connected against the fake exit"
+        );
+    }
+
     /// A transport that is never actually called by these builder tests.
     struct NullTransport;
 
