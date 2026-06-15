@@ -287,6 +287,37 @@ impl WarrenFfiClient {
         Ok(Arc::new(Self { inner }))
     }
 
+    /// Like [`new`](Self::new) but also pins one or more offline
+    /// multihop-directory ROOT Ed25519 pubkeys (64-hex). With at least one root
+    /// pinned, the directory's operational certificate must be signed by a pinned
+    /// root, so a holder of the online server key alone cannot mint accepted
+    /// exits. Pass an empty list to keep the root trust-on-first-use default.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InvalidMnemonic`] if the phrase is not valid BIP39.
+    #[uniffi::constructor]
+    pub fn with_multihop_roots(
+        mnemonic: String,
+        api_base: String,
+        server_pubkey_pin: String,
+        multihop_root_pubkey_pins: Vec<String>,
+    ) -> Result<Arc<Self>, FfiError> {
+        let identity =
+            WarrenIdentity::from_mnemonic(&mnemonic).map_err(|_| FfiError::InvalidMnemonic)?;
+        let mut builder = WarrenClient::builder()
+            .identity(identity)
+            .api_base(api_base)
+            .server_pubkey_pin(server_pubkey_pin);
+        for root in multihop_root_pubkey_pins {
+            builder = builder.multihop_root_pubkey_pin(root);
+        }
+        let inner = builder.build().map_err(|e| FfiError::Client {
+            message: e.to_string(),
+        })?;
+        Ok(Arc::new(Self { inner }))
+    }
+
     /// The wallet SS58 `wb…` address of this client.
     #[must_use]
     pub fn address(&self) -> String {
@@ -944,6 +975,19 @@ mod tests {
             "ab".repeat(32),
         )
         .expect("valid build");
+        assert_eq!(client.address(), id.address);
+    }
+
+    #[test]
+    fn client_with_multihop_roots_accepts_valid_inputs() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::with_multihop_roots(
+            id.mnemonic.clone(),
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+            vec!["cd".repeat(32)],
+        )
+        .expect("valid build with a root pin");
         assert_eq!(client.address(), id.address);
     }
 

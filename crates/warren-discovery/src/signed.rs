@@ -28,7 +28,11 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+// Signing types are only used by the test-only `sign_relay_list` (and the unit
+// tests); gated so they are not unused imports in a production build.
+#[cfg(any(test, feature = "test-helpers"))]
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 
 use crate::exit_id::ExitId;
