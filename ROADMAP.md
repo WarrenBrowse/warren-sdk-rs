@@ -336,20 +336,25 @@ warren-core via a reference binary, (2) port against those vectors, (3) validate
 against a real exit. Reverse-engineering them from core's source without vectors
 risks silent incompatibility, so they are intentionally not implemented yet:
 
-- Rekey / epoch rotation. warren-core (`warren-multihop/src/session.rs`,
-  `tests/rekey_v1.rs`, `tests/rekey_overlap.rs`) does a fresh KEM encapsulation,
-  bumps the epoch, emits a new `encapsulated_key` for the new epoch, and keeps the
-  previous AEAD context in an OVERLAP window to open in-flight old-epoch frames.
-  The SDK already keys seal/open and the replay window by `epoch`, so the per-
-  packet crypto is ready; what is missing (and needs vectors + a real exit) is the
-  rekey control signal, the overlap window, and the `RekeyPolicy` driver.
-- Multipath / connection bonding. warren-core (`warren-client/src/bundle.rs`,
-  `tests/bonded_bundle_e2e.rs`) bonds N connections the exit treats as ONE bundle
-  (a single assigned IP, packets for it arriving on any member). Needs the multi-
-  conn bundle setup wire (so the exit coheres the bundle to one IP) plus a
-  `BondedPacketSink` (stripe send / merge recv). N independent multihop sessions
-  would each get a DIFFERENT IP, which is not a coherent bundle, so this cannot be
-  faked in-process without modelling the exit's bundle semantics.
+- Rekey / epoch rotation. CORE DONE: `ClientSession::rekey` (fresh KEM, epoch+1,
+  overlap slot) + `prune_old_epoch` + epoch-aware seal/open are implemented and
+  unit-tested (overlap opens old-epoch reverse frames; prune ends the window).
+  Rekey introduces NO new wire format (it reuses the frame's `epoch` +
+  `encapsulated_key`). REMAINING (transport driver, needs a real exit to validate):
+  drive `MultihopSession::rekey` behind interior mutability (the datapath holds the
+  session via `Arc` under `&self`), keep a replay window PER active epoch during the
+  overlap (the window is per `(exit_id, epoch)`), reset the forward seq for the new
+  epoch, and add a `RekeyPolicy` (8-hour doctrine) timer. The fake exit also needs
+  to re-derive its receiver context on an epoch/encapsulated-key change for a
+  round-trip in-process test.
+- Multipath / connection bonding. DONE: `warren_net::BondedPacketSink` (stripe
+  send / merge recv) + facade `connect_multihop_bonded` / `start_proxy_multihop_bonded`.
+  Coherence comes from every member using the same account identity, so a real
+  exit's sticky allocator (keyed on `client_pubkey`, already in `IpRequest`) assigns
+  the bundle ONE IP, no new wire format. The striping/merge logic is unit-tested and
+  the bundle-of-one datapath is tested against the fake exit; the multi-member
+  sticky-IP coherence still needs a real-exit pass (the fake exit accepts one
+  connection).
 - OS-enforced killswitch + IPv6 leak block. Only the best-effort
   `ProxyOnlyKillSwitch` is implemented; the `OsEnforced` level and the v6 leak
   guard belong to the deferred privileged TUN backend (P6), not userland.

@@ -40,6 +40,13 @@ the pre-release `0.0.x` line.
   uptime) on the session, the sink, and `ProxyHandle::metrics()`.
 - DAITA cover-traffic primitive: `MultihopSession::send_cover_traffic` emits the
   frozen `0xFF` dummy frame (dropped by the exit) for client-side traffic shaping.
+- Multipath connection bonding: `warren_net::BondedPacketSink` plus facade
+  `connect_multihop_bonded` / `start_proxy_multihop_bonded` (stripe send, merge
+  recv across N same-identity sessions the exit coheres to one sticky IP).
+- Rekey crypto core: `warren_multihop::ClientSession::rekey` (fresh KEM, epoch+1,
+  overlap window) + `prune_old_epoch` + epoch-aware seal/open. The transport-level
+  driver (per-epoch replay windows, `RekeyPolicy` timer) remains, pending a real
+  exit to validate against.
 
 ### Performance
 
