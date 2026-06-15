@@ -360,13 +360,18 @@ echo harness covers the **datagram plane**. The exit's full termination mode
   the SAME account identity receive the SAME sticky IP from the exit's allocator
   (keyed on `client_pubkey`); a distinct identity gets a distinct IP. No new wire
   format. (The bonded sink stripes over N such same-IP connections.)
-- DAITA. DONE + REAL-EXIT VALIDATED (cover-traffic primitive): a DAITA-active exit
-  (tamaraw) accepts the client's `0xFF` cover frames and drops them without
-  resetting the session, and the full handshake is wire-compatible with a
-  DAITA-enabled `SetupAck`. REMAINING (client feature, not a validation gap): HONOR
-  the negotiated schedule, i.e. parse the exit's `DaitaConfig` from the handshake
-  and run the maybenot state machine to emit the defended distribution. This is a
-  port of warren-core's maybenot driver, not blocked by anything external.
+- DAITA. DONE + REAL-EXIT VALIDATED (full schedule). The clean-room `warren-daita`
+  crate ports warren-core's DAITA layer: the wire `DaitaConfig`, the curated
+  five-machine pool, and the maybenot-backed `DaitaState` driver (event -> action
+  -> per-machine timer). `warren_transport::DaitaDriver` pumps the scheduled uplink
+  cover traffic over a live `MultihopSession`, and the facade exposes it opt-in
+  (`WarrenClientBuilder::daita()` / `daita_machine(name)`, auto-spawned in
+  `connect_multihop`). Validated against the real DAITA-active exit: the driver
+  emits the maybenot-scheduled padding and the exit accepts it (multihop DAITA is
+  client-unilateral, so there is no negotiated `DaitaConfig` to parse on this path;
+  the client pads its uplink from its own pool, the exit pads the downlink). What a
+  later milestone could still add: single-hop `SetupAck.daita_spec` parsing, and a
+  longer-horizon defended-distribution effectiveness study (research, not wire).
 - OS-enforced killswitch + IPv6 leak block. Only the best-effort
   `ProxyOnlyKillSwitch` is implemented; the `OsEnforced` level and the v6 leak
   guard belong to the deferred privileged TUN backend (P6), not userland.

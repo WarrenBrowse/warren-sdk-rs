@@ -43,6 +43,13 @@ the pre-release `0.0.x` line.
 - Multipath connection bonding: `warren_net::BondedPacketSink` plus facade
   `connect_multihop_bonded` / `start_proxy_multihop_bonded` (stripe send, merge
   recv across N same-identity sessions the exit coheres to one sticky IP).
+- DAITA traffic-analysis defense, end to end. New clean-room `warren-daita` crate
+  (maybenot 2.2.2): the wire `DaitaConfig`, the curated five-machine pool
+  (`netflow`/`tamaraw`/`front`/`interspace_server`/`scrambler_server`), and the
+  `DaitaState` driver (event -> action -> per-machine timer). `DaitaDriver` pumps
+  the scheduled uplink cover traffic over a multihop session, wired into the facade
+  opt-in via `WarrenClientBuilder::daita()` / `daita_machine(name)` (auto-spawned in
+  `connect_multihop`). Validated live against the real DAITA-active exit.
 - Rekey / epoch rotation, end to end: `warren_multihop::ClientSession::rekey`
   (fresh KEM, epoch+1, overlap window) plus the live transport driver
   `MultihopSession::rekey` / `prune_old_epoch` (an `RwLock<ClientSession>` so the
@@ -60,8 +67,9 @@ the pre-release `0.0.x` line.
     rekey rotation (epoch switch, overlap window, per-epoch datapath).
   - Full termination mode (`WARREN_EXIT_ADDR`, rooted `--use-tun` exit): the real
     `IpAssign` handshake (a 10.66.0.0/16 IP is assigned), the sticky-IP multipath
-    coherence (same identity -> same IP, distinct identity -> distinct IP), and a
-    DAITA-active exit accepting the client's `0xFF` cover traffic.
+    coherence (same identity -> same IP, distinct identity -> distinct IP), a
+    DAITA-active exit accepting the client's `0xFF` cover traffic, and the
+    `DaitaDriver` emitting maybenot-scheduled padding the exit accepts.
 
 ### Performance
 
