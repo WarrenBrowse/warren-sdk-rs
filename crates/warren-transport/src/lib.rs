@@ -15,6 +15,7 @@ pub mod tls;
 pub use client::{ClientSession, ClientTunnel, TunnelError};
 pub use multihop::{MultihopClientTunnel, MultihopError, MultihopSession};
 pub use reconnect::{
-    Backoff, BackoffIter, ConnectionState, RetryError, connect_with_retry, connect_with_state,
+    Backoff, BackoffIter, ConnectionState, JitterBackoff, RetryError, connect_with_retry,
+    connect_with_state,
 };
 pub use tls::{WarrenTlsError, default_crypto_provider, make_client_config, make_server_config};

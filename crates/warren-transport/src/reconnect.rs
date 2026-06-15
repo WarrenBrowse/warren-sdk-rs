@@ -76,6 +76,16 @@ impl Backoff {
             next: Duration::ZERO,
         }
     }
+
+    /// Builds an unbounded [`JitterBackoff`] for a supervisor that retries
+    /// indefinitely (the first delay is still [`Duration::ZERO`]).
+    #[must_use]
+    pub fn forever(self) -> JitterBackoff {
+        JitterBackoff {
+            backoff: self,
+            next: Duration::ZERO,
+        }
+    }
 }
 
 /// Iterator of successive backoff delays from a [`Backoff`].
@@ -89,6 +99,24 @@ pub struct BackoffIter {
     next: Duration,
 }
 
+/// Advances `next` per the full-jitter law and returns this attempt's delay: the
+/// first call (when `next` is zero) fires immediately and seeds `next` at `base`;
+/// each later call draws from `[current / 2, current]` and doubles up to `max`.
+/// Shared by the finite [`BackoffIter`] and the unbounded [`JitterBackoff`].
+fn jitter_step(backoff: &Backoff, next: &mut Duration) -> Duration {
+    if next.is_zero() {
+        *next = backoff.base.min(backoff.max);
+        return Duration::ZERO;
+    }
+    let current = (*next).min(backoff.max);
+    *next = current.saturating_mul(2).min(backoff.max);
+    let half = current / 2;
+    let half_nanos = u64::try_from(half.as_nanos()).unwrap_or(u64::MAX);
+    // Inclusive range so the delay can be exactly `current` (= half + half).
+    let jitter_nanos = rand::thread_rng().gen_range(0..=half_nanos);
+    half + Duration::from_nanos(jitter_nanos)
+}
+
 impl Iterator for BackoffIter {
     type Item = Duration;
 
@@ -97,25 +125,35 @@ impl Iterator for BackoffIter {
             return None;
         }
         self.remaining -= 1;
-
-        // First attempt fires immediately; seed the next upper bound at base.
-        if self.next.is_zero() {
-            self.next = self.backoff.base.min(self.backoff.max);
-            return Some(Duration::ZERO);
-        }
-
-        let current = self.next.min(self.backoff.max);
-        self.next = current.saturating_mul(2).min(self.backoff.max);
-
-        let half = current / 2;
-        let half_nanos = u64::try_from(half.as_nanos()).unwrap_or(u64::MAX);
-        // Inclusive range so the delay can be exactly `current` (= half + half).
-        let jitter_nanos = rand::thread_rng().gen_range(0..=half_nanos);
-        Some(half + Duration::from_nanos(jitter_nanos))
+        Some(jitter_step(&self.backoff, &mut self.next))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.remaining, Some(self.remaining))
+    }
+}
+
+/// Unbounded full-jitter backoff for supervisors that retry indefinitely (where
+/// the finite [`BackoffIter`] does not fit). Same jitter law: the first
+/// [`next_delay`](Self::next_delay) is zero, then each is drawn from
+/// `[current / 2, current]` doubling up to the ceiling. [`reset`](Self::reset)
+/// returns to the immediate-retry state, e.g. after a session that stayed healthy.
+#[derive(Clone, Copy, Debug)]
+pub struct JitterBackoff {
+    backoff: Backoff,
+    next: Duration,
+}
+
+impl JitterBackoff {
+    /// Returns the next delay and advances the schedule.
+    #[must_use]
+    pub fn next_delay(&mut self) -> Duration {
+        jitter_step(&self.backoff, &mut self.next)
+    }
+
+    /// Resets to the immediate-retry state (the next delay is zero again).
+    pub fn reset(&mut self) {
+        self.next = Duration::ZERO;
     }
 }
 
@@ -279,6 +317,21 @@ mod tests {
         for d in Backoff::SHORT.take(50) {
             assert!(d <= Backoff::SHORT.max, "delay {d:?} exceeded the ceiling");
         }
+    }
+
+    #[test]
+    fn jitter_backoff_is_unbounded_zero_first_and_resets() {
+        let mut b = Backoff::SHORT.forever();
+        assert_eq!(b.next_delay(), Duration::ZERO, "first delay is immediate");
+        // Drive far past the doubling horizon: stays bounded and non-zero, forever.
+        for _ in 0..200 {
+            let d = b.next_delay();
+            assert!(d > Duration::ZERO, "post-first delays are non-zero");
+            assert!(d <= Backoff::SHORT.max, "delay {d:?} exceeded the ceiling");
+        }
+        // Reset returns to the immediate-retry state (e.g. after a healthy session).
+        b.reset();
+        assert_eq!(b.next_delay(), Duration::ZERO, "reset re-arms immediate retry");
     }
 
     #[test]

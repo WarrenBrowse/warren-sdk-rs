@@ -939,14 +939,18 @@ async fn supervise_proxy<S, F, Fut>(
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<EstablishedTunnel<S>, SdkError>>,
 {
-    const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
-    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(20);
     // A session that stayed up at least this long is treated as healthy, so its
     // next reconnect starts fresh. A shorter one is "flapping" (the exit accepts
     // the handshake then drops immediately): apply backoff so we do not tight-loop
     // full cryptographic handshakes and hammer the exit.
     const MIN_HEALTHY_UPTIME: std::time::Duration = std::time::Duration::from_secs(5);
-    let mut backoff = INITIAL_BACKOFF;
+    // Full-jitter backoff (base 250 ms, ceiling 20 s) so many clients losing the
+    // same exit at once do not reconnect in a synchronized wave (thundering herd).
+    let mut backoff = warren_transport::Backoff {
+        base: std::time::Duration::from_millis(250),
+        max: std::time::Duration::from_secs(20),
+    }
+    .forever();
     let mut first = true;
     loop {
         let _ = state_tx.send(if first {
@@ -973,16 +977,14 @@ async fn supervise_proxy<S, F, Fut>(
                 // The tunnel died. A healthy session resets backoff and reconnects
                 // at once; a flapping one (died almost immediately) backs off first.
                 if up_since.elapsed() >= MIN_HEALTHY_UPTIME {
-                    backoff = INITIAL_BACKOFF;
+                    backoff.reset();
                 } else {
-                    tokio::time::sleep(backoff).await;
-                    backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+                    tokio::time::sleep(backoff.next_delay()).await;
                 }
             }
             Err(_) => {
                 // No identity material is logged. Back off before the next attempt.
-                tokio::time::sleep(backoff).await;
-                backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+                tokio::time::sleep(backoff.next_delay()).await;
             }
         }
     }

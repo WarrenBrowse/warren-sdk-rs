@@ -76,26 +76,37 @@ pub enum SessionError {
     },
 }
 
+/// Fixed AAD length: these are built on every sealed/opened packet, so they are
+/// stack arrays (no per-packet heap allocation).
+const AAD_LEN: usize = WARREN_HPKE_AAD_V1.len() + EXIT_ID_LEN + 4 + 8;
+/// Max export-info length (the reverse direction appends one tag byte).
+const EXPORT_INFO_MAX: usize = WARREN_HPKE_AAD_V1.len() + 4 + 8 + 1;
+
 /// `AAD_V1 || exit_id(16) || epoch_be(4) || seq_be(8)`.
-fn compose_aad(exit_id: &[u8; EXIT_ID_LEN], epoch: u32, seq: u64) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(WARREN_HPKE_AAD_V1.len() + EXIT_ID_LEN + 4 + 8);
-    aad.extend_from_slice(WARREN_HPKE_AAD_V1);
-    aad.extend_from_slice(exit_id);
-    aad.extend_from_slice(&epoch.to_be_bytes());
-    aad.extend_from_slice(&seq.to_be_bytes());
+fn compose_aad(exit_id: &[u8; EXIT_ID_LEN], epoch: u32, seq: u64) -> [u8; AAD_LEN] {
+    let mut aad = [0u8; AAD_LEN];
+    let prefix = WARREN_HPKE_AAD_V1.len();
+    aad[..prefix].copy_from_slice(WARREN_HPKE_AAD_V1);
+    aad[prefix..prefix + EXIT_ID_LEN].copy_from_slice(exit_id);
+    aad[prefix + EXIT_ID_LEN..prefix + EXIT_ID_LEN + 4].copy_from_slice(&epoch.to_be_bytes());
+    aad[prefix + EXIT_ID_LEN + 4..].copy_from_slice(&seq.to_be_bytes());
     aad
 }
 
 /// `AAD_V1 || epoch_be(4) || seq_be(8)` (+ `0x02` for the reverse direction).
-fn compose_export_info(epoch: u32, seq: u64, reverse: bool) -> Vec<u8> {
-    let mut info = Vec::with_capacity(WARREN_HPKE_AAD_V1.len() + 4 + 8 + 1);
-    info.extend_from_slice(WARREN_HPKE_AAD_V1);
-    info.extend_from_slice(&epoch.to_be_bytes());
-    info.extend_from_slice(&seq.to_be_bytes());
+/// Returns the fixed buffer and the used length (reverse uses one extra byte).
+fn compose_export_info(epoch: u32, seq: u64, reverse: bool) -> ([u8; EXPORT_INFO_MAX], usize) {
+    let mut info = [0u8; EXPORT_INFO_MAX];
+    let prefix = WARREN_HPKE_AAD_V1.len();
+    info[..prefix].copy_from_slice(WARREN_HPKE_AAD_V1);
+    info[prefix..prefix + 4].copy_from_slice(&epoch.to_be_bytes());
+    info[prefix + 4..prefix + 12].copy_from_slice(&seq.to_be_bytes());
+    let mut len = prefix + 12;
     if reverse {
-        info.push(DIRECTION_TAG_REVERSE);
+        info[len] = DIRECTION_TAG_REVERSE;
+        len += 1;
     }
-    info
+    (info, len)
 }
 
 /// A client-side HPKE session against one exit. The KEM ECDH runs once in
@@ -151,8 +162,9 @@ impl ClientSession {
     /// Derives the per-packet key for `(epoch, seq, direction)`.
     fn packet_key(&self, epoch: u32, seq: u64, reverse: bool) -> Result<[u8; 32], SessionError> {
         let mut key = [0u8; PER_PACKET_KEY_LEN];
+        let (info, n) = compose_export_info(epoch, seq, reverse);
         self.ctx
-            .export(&compose_export_info(epoch, seq, reverse), &mut key)
+            .export(&info[..n], &mut key)
             .map_err(|_| SessionError::Hpke)?;
         Ok(key)
     }
@@ -243,11 +255,8 @@ mod tests {
         )
         .unwrap();
         let mut key = [0u8; PER_PACKET_KEY_LEN];
-        ctx.export(
-            &compose_export_info(frame.epoch, frame.seq, false),
-            &mut key,
-        )
-        .unwrap();
+        let (info, n) = compose_export_info(frame.epoch, frame.seq, false);
+        ctx.export(&info[..n], &mut key).unwrap();
         let aad = compose_aad(&frame.exit_id, frame.epoch, frame.seq);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let mut buf = frame.ciphertext.clone();
@@ -342,11 +351,8 @@ mod tests {
         )
         .unwrap();
         let mut key = [0u8; PER_PACKET_KEY_LEN];
-        ctx.export(
-            &compose_export_info(frame.epoch, frame.seq, false),
-            &mut key,
-        )
-        .unwrap();
+        let (info, n) = compose_export_info(frame.epoch, frame.seq, false);
+        ctx.export(&info[..n], &mut key).unwrap();
         let aad = compose_aad(&frame.exit_id, frame.epoch, frame.seq);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let mut buf = frame.ciphertext.clone();

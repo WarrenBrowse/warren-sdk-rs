@@ -46,8 +46,10 @@ const TCP_BUFFER: usize = 64 * 1024;
 const EPHEMERAL_BASE: u16 = 49152;
 /// Per-connection app<->engine channel depth (chunks); the backpressure point.
 const CONN_CHANNEL_DEPTH: usize = 32;
-/// Frame-channel depth toward/from the tunnel.
-const FRAME_CHANNEL_DEPTH: usize = 1024;
+/// Frame-channel depth toward/from the tunnel. Kept shallow so queueing adds at
+/// most a few ms of latency under load (a deeper queue buffers jitter the VPN
+/// datapath should shed); the writer applies backpressure once it fills.
+const FRAME_CHANNEL_DEPTH: usize = 256;
 /// Max buffered app->net bytes per connection before the writer is throttled.
 const PENDING_OUT_CAP: usize = 256 * 1024;
 /// How long to wait for a SYN to complete before failing the connect.
