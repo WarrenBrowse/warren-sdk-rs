@@ -484,6 +484,58 @@ impl<T: HttpTransport> WarrenClient<T> {
         Ok(handle)
     }
 
+    /// Opens `n` (>= 1) multihop sessions to `exit` and bonds them into one
+    /// [`warren_net::BondedPacketSink`]: outbound packets stripe across members,
+    /// inbound packets merge. Every member uses this client's identity, so a real
+    /// exit's sticky allocator assigns the bundle ONE tunnel IP. Lifts the single-
+    /// connection bandwidth ceiling. Validate against a real exit before relying on
+    /// the bundle's sticky-IP coherence.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::Multihop`] if any member fails to establish.
+    pub async fn connect_multihop_bonded(
+        &self,
+        exit: &VerifiedExit,
+        n: usize,
+    ) -> Result<warren_net::BondedPacketSink, SdkError> {
+        let mut sinks = Vec::with_capacity(n.max(1));
+        for _ in 0..n.max(1) {
+            sinks.push(self.connect_multihop(exit).await?);
+        }
+        Ok(warren_net::BondedPacketSink::new(sinks))
+    }
+
+    /// Starts the non-root proxy datapath over a bonded set of `n` multihop
+    /// sessions to `exit` (see [`Self::connect_multihop_bonded`]). Same shape as
+    /// [`Self::start_proxy_multihop`] but traffic is striped across `n` tunnels.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::Multihop`] from establishing a member, [`SdkError::ExitDnsDisabled`]
+    /// per [`Self::start_proxy_multihop`], or [`SdkError::Proxy`] on a bind failure.
+    pub async fn start_proxy_multihop_bonded(
+        &self,
+        exit: &VerifiedExit,
+        n: usize,
+        cfg: &warren_net::ProxyConfig,
+    ) -> Result<ProxyHandle, SdkError> {
+        ensure_dns_reachable(exit.dns_disabled, cfg)?;
+        let n = n.max(1);
+        let mut sinks = Vec::with_capacity(n);
+        for _ in 0..n {
+            sinks.push(self.connect_multihop(exit).await?);
+        }
+        // All members share the exit's sticky assignment; read it from the first,
+        // and expose that member's metrics on the handle.
+        let (local_ip, prefix, gateway, ipv6) = addressing_from_session(sinks[0].session());
+        let metrics = sinks[0].metrics();
+        let bond = warren_net::BondedPacketSink::new(sinks);
+        let mut handle = serve_proxy_over_sink(bond, local_ip, prefix, gateway, ipv6, cfg).await?;
+        handle.metrics = Some(metrics);
+        Ok(handle)
+    }
+
     /// Starts a *self-healing* multihop proxy datapath: it binds the local
     /// SOCKS5 (and optional HTTP CONNECT) listeners once, then keeps a sealed
     /// tunnel to `exit` up across drops, rebuilding the netstack from a freshly

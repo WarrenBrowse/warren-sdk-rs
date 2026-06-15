@@ -56,7 +56,7 @@ pub use portforward::{
 };
 #[cfg(feature = "proxy")]
 pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy, UdpConnector, UdpFlow};
-pub use sink::{MultihopPacketSink, PacketSink, QuicPacketSink};
+pub use sink::{BondedPacketSink, MultihopPacketSink, PacketSink, QuicPacketSink};
 /// The NAT-PMP mapping protocol selector (TCP or UDP), re-exported from the wire
 /// codec so callers can name it without depending on `warren-wire` directly.
 pub use warren_wire::natpmp::MapProto;
