@@ -366,6 +366,16 @@ fn decode_node_id(s: &str) -> Result<[u8; 32], SignedError> {
 fn json_node_to_relay(n: JsonNode) -> Result<Relay, SignedError> {
     let endpoint_id = decode_node_id(&n.id)?;
 
+    // Validate roles against the frozen v6 set (entry/relay/exit), matching
+    // warren-core's `parse_role`: an unknown token means the list was produced by
+    // a newer schema and must be rejected rather than silently used. The token
+    // itself is a protocol label, but the message stays static (no-log discipline).
+    for role in &n.roles {
+        if !matches!(role.as_str(), "entry" | "relay" | "exit") {
+            return Err(SignedError::Node("unrecognized node role".to_owned()));
+        }
+    }
+
     let mut addrs: Vec<SocketAddr> = Vec::new();
     let mut ipv6_egress = false;
     for ep in &n.endpoints {
@@ -476,6 +486,20 @@ mod tests {
     fn endpoint_family_mismatch_is_rejected() {
         let mut node = sample_node();
         node.endpoints[0].family = "ipv6".to_owned(); // addr is ipv4
+        let signed = sign_relay_list(vec![node], &fixed_server_key(), 1, 1, 2);
+        let json = serde_json::to_string(&signed).unwrap();
+        assert!(matches!(
+            verify_signed_relay_list(&json, None).unwrap_err(),
+            SignedError::Node(_)
+        ));
+    }
+
+    #[test]
+    fn unrecognized_role_is_rejected() {
+        // warren-core rejects a node whose role is outside {entry,relay,exit}; the
+        // SDK must reject the (validly signed) list too rather than use the node.
+        let mut node = sample_node();
+        node.roles.push("superexit".to_owned());
         let signed = sign_relay_list(vec![node], &fixed_server_key(), 1, 1, 2);
         let json = serde_json::to_string(&signed).unwrap();
         assert!(matches!(
