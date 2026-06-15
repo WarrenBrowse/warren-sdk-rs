@@ -23,6 +23,41 @@ const MAX_IDLE_TIMEOUT_SECS: u64 = 180;
 const KEEP_ALIVE_INTERVAL_SECS: u64 = 20;
 const INITIAL_MTU: u16 = 1280;
 
+/// Resolves the QUIC endpoint bind address: an explicit pin wins; else, when
+/// `auto` is set, the detected default-route source IP (port 0); else `None`
+/// (unspecified bind, OS chooses). Shared by both tunnels.
+pub(crate) fn effective_bind(
+    explicit: Option<SocketAddr>,
+    auto: bool,
+    exit_addr: SocketAddr,
+) -> Option<SocketAddr> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    auto.then(|| local_ip_for_endpoint(exit_addr).map(|ip| SocketAddr::new(ip, 0)))
+        .flatten()
+}
+
+/// Detects the local source IP the OS would use to reach `exit_addr`, for pinning
+/// the QUIC endpoint to the default-route interface on a multi-homed host.
+///
+/// It binds a UDP socket and `connect`s it to the endpoint, which selects a route
+/// and source address without sending any packet, then reads the chosen local IP.
+/// Returns `None` if the IP is unspecified (no route) or the probe fails, in which
+/// case the caller should fall back to an unspecified bind (let the OS choose).
+#[must_use]
+pub fn local_ip_for_endpoint(exit_addr: SocketAddr) -> Option<std::net::IpAddr> {
+    let bind: SocketAddr = if exit_addr.is_ipv6() {
+        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
+    } else {
+        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
+    };
+    let sock = std::net::UdpSocket::bind(bind).ok()?;
+    sock.connect(exit_addr).ok()?;
+    let local = sock.local_addr().ok()?.ip();
+    (!local.is_unspecified()).then_some(local)
+}
+
 /// Failure dialing the QUIC connection, before any Warren framing. Mapped by
 /// each tunnel into its own error enum (see the `From` impls), so the shared
 /// [`dial_quic`] handshake prefix is written once.
@@ -162,6 +197,7 @@ pub struct ClientTunnel {
     daita_support: bool,
     device_id: [u8; DEVICE_ID_LEN],
     bind_local_ip: Option<SocketAddr>,
+    auto_local_ip: bool,
 }
 
 impl ClientTunnel {
@@ -174,6 +210,7 @@ impl ClientTunnel {
             daita_support: false,
             device_id: [0u8; DEVICE_ID_LEN],
             bind_local_ip: None,
+            auto_local_ip: false,
         }
     }
 
@@ -205,6 +242,15 @@ impl ClientTunnel {
         self
     }
 
+    /// Auto-detects the default-route source IP for the exit and binds to it
+    /// (multi-NIC determinism). Ignored when [`with_bind_local_ip`](Self::with_bind_local_ip)
+    /// is set, and falls back to an unspecified bind if detection fails.
+    #[must_use]
+    pub fn with_auto_local_ip(mut self) -> Self {
+        self.auto_local_ip = true;
+        self
+    }
+
     /// The client's 32-byte Ed25519 public key.
     #[must_use]
     pub fn node_id(&self) -> [u8; 32] {
@@ -229,7 +275,7 @@ impl ClientTunnel {
             &self.signing_key,
             exit_pubkey,
             exit_addr,
-            self.bind_local_ip,
+            effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
         )
         .await?;
 
@@ -363,6 +409,31 @@ impl ClientSession {
 mod tests {
     use super::*;
     use std::error::Error;
+
+    #[test]
+    fn local_ip_for_a_loopback_endpoint_is_loopback() {
+        // The OS source IP for a loopback destination is loopback, deterministically.
+        let ip = local_ip_for_endpoint("127.0.0.1:9".parse().unwrap())
+            .expect("a loopback route always exists");
+        assert_eq!(ip, std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn effective_bind_prefers_explicit_then_auto_then_unspecified() {
+        let exit: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let explicit: SocketAddr = "10.0.0.5:0".parse().unwrap();
+        // An explicit pin always wins, even with auto on.
+        assert_eq!(effective_bind(Some(explicit), true, exit), Some(explicit));
+        // No pin, no auto: let the OS choose (unspecified bind).
+        assert_eq!(effective_bind(None, false, exit), None);
+        // No pin, auto on: detect the source IP (loopback here), OS-chosen port.
+        let auto = effective_bind(None, true, exit).expect("auto detects a source");
+        assert_eq!(
+            auto.ip(),
+            std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(auto.port(), 0);
+    }
 
     #[test]
     fn typed_errors_preserve_their_source() {

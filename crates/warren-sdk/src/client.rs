@@ -73,6 +73,7 @@ pub struct WarrenClientBuilder {
     pub(crate) server_pubkey_pin: Option<String>,
     pub(crate) multihop_root_pubkey_pins: Vec<String>,
     pub(crate) allow_any_server_key: bool,
+    pub(crate) auto_local_ip: bool,
     pub(crate) generation_store: Arc<dyn GenerationStore>,
     pub(crate) multihop_generation_store: Arc<dyn GenerationStore>,
     pub(crate) server_key_store: Option<Arc<dyn ServerKeyStore>>,
@@ -126,6 +127,15 @@ impl WarrenClientBuilder {
     #[must_use]
     pub fn multihop_root_pubkey_pin(mut self, hex: impl Into<String>) -> Self {
         self.multihop_root_pubkey_pins.push(hex.into());
+        self
+    }
+
+    /// Pins the QUIC endpoint to the default-route source IP for each exit
+    /// (multi-NIC determinism). Off by default (the OS chooses the source); falls
+    /// back to an unspecified bind if detection fails.
+    #[must_use]
+    pub fn auto_local_ip(mut self) -> Self {
+        self.auto_local_ip = true;
         self
     }
 
@@ -216,6 +226,7 @@ impl WarrenClientBuilder {
             signing,
             server_pubkey_pin: pin,
             multihop_root_pubkey_pins: self.multihop_root_pubkey_pins,
+            auto_local_ip: self.auto_local_ip,
             generation_store: self.generation_store,
             multihop_generation_store: self.multihop_generation_store,
             server_key_store: self.server_key_store,
@@ -235,6 +246,8 @@ pub struct WarrenClient<T> {
     pub(crate) server_pubkey_pin: Option<String>,
     /// Pinned offline multihop-directory root keys (empty = root TOFU).
     pub(crate) multihop_root_pubkey_pins: Vec<String>,
+    /// Pin the QUIC endpoint to the default-route source IP for each exit.
+    pub(crate) auto_local_ip: bool,
     /// Anti-rollback floor: highest signed-list `generation` trusted so far.
     pub(crate) generation_store: Arc<dyn GenerationStore>,
     /// Anti-rollback floor for the multihop directory (separate sequence).
@@ -254,6 +267,7 @@ impl WarrenClient<()> {
             server_pubkey_pin: None,
             multihop_root_pubkey_pins: Vec::new(),
             allow_any_server_key: false,
+            auto_local_ip: false,
             generation_store: Arc::new(InMemoryGenerationStore::default()),
             multihop_generation_store: Arc::new(InMemoryGenerationStore::default()),
             server_key_store: None,
@@ -332,7 +346,10 @@ impl<T: HttpTransport> WarrenClient<T> {
         exit: &warren_discovery::Relay,
     ) -> Result<QuicPacketSink, SdkError> {
         let addr: SocketAddr = *exit.addrs().first().ok_or(SdkError::NoExitAddress)?;
-        let tunnel = ClientTunnel::new(self.signing.clone());
+        let mut tunnel = ClientTunnel::new(self.signing.clone());
+        if self.auto_local_ip {
+            tunnel = tunnel.with_auto_local_ip();
+        }
         let session = tunnel.connect(exit.endpoint_id(), addr).await?;
         Ok(QuicPacketSink::new(session))
     }
@@ -428,7 +445,10 @@ impl<T: HttpTransport> WarrenClient<T> {
         &self,
         exit: &VerifiedExit,
     ) -> Result<MultihopPacketSink, SdkError> {
-        let tunnel = MultihopClientTunnel::new(self.signing.clone());
+        let mut tunnel = MultihopClientTunnel::new(self.signing.clone());
+        if self.auto_local_ip {
+            tunnel = tunnel.with_auto_local_ip();
+        }
         let session = tunnel
             .connect(
                 exit.exit_ed25519_pubkey,
@@ -485,10 +505,11 @@ impl<T: HttpTransport> WarrenClient<T> {
         ensure_dns_reachable(exit.dns_disabled, cfg)?;
         let signing = self.signing.clone();
         let exit = exit.clone();
+        let auto_local_ip = self.auto_local_ip;
         self.spawn_supervised(cfg, move || {
             let signing = signing.clone();
             let exit = exit.clone();
-            async move { establish_multihop(signing, &exit).await }
+            async move { establish_multihop(signing, &exit, auto_local_ip).await }
         })
         .await
     }
@@ -520,6 +541,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         }
         let signing = self.signing.clone();
         let exits = exits.to_vec();
+        let auto_local_ip = self.auto_local_ip;
         // Shared cursor: advanced only on a failed attempt, so a working exit is
         // kept (stable egress) and a broken one is rotated past on the next try.
         let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -529,7 +551,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             let cursor = Arc::clone(&cursor);
             async move {
                 let idx = cursor.load(Ordering::Relaxed) % exits.len();
-                match establish_multihop(signing, &exits[idx]).await {
+                match establish_multihop(signing, &exits[idx], auto_local_ip).await {
                     Ok(tunnel) => Ok(tunnel),
                     Err(e) => {
                         cursor.fetch_add(1, Ordering::Relaxed);

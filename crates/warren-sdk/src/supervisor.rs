@@ -196,8 +196,13 @@ pub(crate) async fn supervise_proxy<S, F, Fut>(
 pub(crate) async fn establish_multihop(
     signing: warren_identity::ed25519_dalek::SigningKey,
     exit: &VerifiedExit,
+    auto_local_ip: bool,
 ) -> Result<EstablishedTunnel<MultihopPacketSink>, SdkError> {
-    let session = MultihopClientTunnel::new(signing)
+    let mut tunnel = MultihopClientTunnel::new(signing);
+    if auto_local_ip {
+        tunnel = tunnel.with_auto_local_ip();
+    }
+    let session = tunnel
         .connect(
             exit.exit_ed25519_pubkey,
             exit.exit_x25519_multihop_pubkey,

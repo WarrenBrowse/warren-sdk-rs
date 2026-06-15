@@ -30,7 +30,7 @@ use warren_multihop::{ClientSession as HpkeSession, IpAssignment, ReplayWindow, 
 use warren_wire::control::{CONTROL_FIRST_BYTE, try_decode_control};
 use warren_wire::multihop::{EXIT_ID_LEN, WarrenMultihopFrame};
 
-use crate::client::{QuicDialError, dial_quic};
+use crate::client::{QuicDialError, dial_quic, effective_bind};
 use crate::tls;
 
 /// Largest sealed setup frame accepted on the reliable stream (matches the data
@@ -108,6 +108,7 @@ pub struct MultihopClientTunnel {
     /// signs the setup proof of possession.
     signing_key: SigningKey,
     bind_local_ip: Option<SocketAddr>,
+    auto_local_ip: bool,
     wants_ipv6: bool,
 }
 
@@ -118,6 +119,7 @@ impl MultihopClientTunnel {
         Self {
             signing_key,
             bind_local_ip: None,
+            auto_local_ip: false,
             wants_ipv6: false,
         }
     }
@@ -127,6 +129,15 @@ impl MultihopClientTunnel {
     #[must_use]
     pub fn with_bind_local_ip(mut self, addr: SocketAddr) -> Self {
         self.bind_local_ip = Some(addr);
+        self
+    }
+
+    /// Auto-detect the default-route source IP for the exit and bind to it
+    /// (multi-NIC determinism). Ignored when [`with_bind_local_ip`](Self::with_bind_local_ip)
+    /// is set; falls back to an unspecified bind if detection fails.
+    #[must_use]
+    pub fn with_auto_local_ip(mut self) -> Self {
+        self.auto_local_ip = true;
         self
     }
 
@@ -166,7 +177,7 @@ impl MultihopClientTunnel {
             &self.signing_key,
             exit_pubkey,
             exit_addr,
-            self.bind_local_ip,
+            effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
         )
         .await?;
 
