@@ -38,6 +38,7 @@ async fn start_proxy_multihop_routes_socks5_through_a_sealed_tunnel() {
         country: "RO".to_owned(),
         city: "Bucharest".to_owned(),
         weight: 100,
+        dns_disabled: false,
     };
 
     let cfg = ProxyConfig {

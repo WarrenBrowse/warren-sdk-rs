@@ -116,6 +116,12 @@ pub enum SdkError {
     /// The chosen exit has no dialable address.
     #[error("exit has no dialable address")]
     NoExitAddress,
+    /// The chosen exit runs no in-tunnel DNS forwarder and no override resolver
+    /// was configured, so name resolution over the tunnel would fail closed.
+    /// Set [`ProxyConfig::dns_server`](warren_net::ProxyConfig) to a reachable
+    /// resolver, or pick an exit that resolves DNS.
+    #[error("exit runs no DNS forwarder and no resolver was configured")]
+    ExitDnsDisabled,
     /// Binding the local proxy listener failed.
     #[error("proxy listener bind failed")]
     Proxy(#[source] std::io::Error),
@@ -583,6 +589,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         exit: &VerifiedExit,
         cfg: &warren_net::ProxyConfig,
     ) -> Result<ProxyHandle, SdkError> {
+        ensure_dns_reachable(exit.dns_disabled, cfg)?;
         let sink = self.connect_multihop(exit).await?;
         let (local_ip, prefix, gateway, ipv6) = addressing_from_session(sink.session());
         serve_proxy_over_sink(sink, local_ip, prefix, gateway, ipv6, cfg).await
@@ -611,6 +618,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         exit: &VerifiedExit,
         cfg: &warren_net::ProxyConfig,
     ) -> Result<SupervisedProxyHandle, SdkError> {
+        ensure_dns_reachable(exit.dns_disabled, cfg)?;
         let signing = self.signing.clone();
         let exit = exit.clone();
         self.spawn_supervised(cfg, move || {
@@ -641,6 +649,10 @@ impl<T: HttpTransport> WarrenClient<T> {
     ) -> Result<SupervisedProxyHandle, SdkError> {
         if exits.is_empty() {
             return Err(SdkError::NoMultihopExit);
+        }
+        // No candidate can resolve names without a forwarder or an override.
+        if cfg.dns_server.is_none() && exits.iter().all(|e| e.dns_disabled) {
+            return Err(SdkError::ExitDnsDisabled);
         }
         let signing = self.signing.clone();
         let exits = exits.to_vec();
@@ -1179,6 +1191,21 @@ fn warren_api_default_base() -> String {
     String::new()
 }
 
+/// Fails closed when an exit runs no DNS forwarder and the caller supplied no
+/// override resolver: starting the datapath anyway would leave every name-based
+/// connection silently unresolvable. (In proxy mode lookups never touch the host
+/// resolver, so this is a fail-fast usability guard, not a leak fix; the leak
+/// concern is the privileged TUN backend's, which is deferred.)
+fn ensure_dns_reachable(
+    dns_disabled: bool,
+    cfg: &warren_net::ProxyConfig,
+) -> Result<(), SdkError> {
+    if dns_disabled && cfg.dns_server.is_none() {
+        return Err(SdkError::ExitDnsDisabled);
+    }
+    Ok(())
+}
+
 /// Current Unix time in seconds; `0` if the clock is before the epoch (which
 /// makes `is_expired` conservatively treat the list as not-yet-expired rather
 /// than spuriously rejecting it).
@@ -1507,6 +1534,7 @@ mod tests {
             country: "ZZ".to_owned(),
             city: "Test".to_owned(),
             weight: 100,
+            dns_disabled: false,
         }
     }
 
@@ -1593,6 +1621,38 @@ mod tests {
             .await
             .expect("proxy datapath starts over the fake exit");
         assert_eq!(handle.state(), TunnelState::Connected);
+    }
+
+    #[tokio::test]
+    async fn start_proxy_multihop_refuses_a_dns_disabled_exit_without_a_resolver() {
+        // The guard must fire before any connect attempt, so an unroutable address
+        // never matters: a dns_disabled exit with no override resolver is rejected.
+        let exit = VerifiedExit {
+            exit_id: [0u8; 16],
+            exit_ed25519_pubkey: [0u8; 32],
+            exit_x25519_multihop_pubkey: [0u8; 32],
+            endpoint: "203.0.113.1:443".parse().unwrap(),
+            country: "ZZ".to_owned(),
+            city: "Test".to_owned(),
+            weight: 1,
+            dns_disabled: true,
+        };
+        let cfg = warren_net::ProxyConfig {
+            socks5: "127.0.0.1:0".parse().unwrap(),
+            http: None,
+            dns_server: None,
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            test_client().start_proxy_multihop(&exit, &cfg),
+        )
+        .await
+        .expect("the guard returns immediately, well before any connect timeout");
+        match result {
+            Err(SdkError::ExitDnsDisabled) => {}
+            Err(other) => panic!("expected ExitDnsDisabled, got {other:?}"),
+            Ok(_) => panic!("a dns_disabled exit without a resolver must be refused"),
+        }
     }
 
     /// A transport that is never actually called by these builder tests.

@@ -74,6 +74,7 @@ fn is_false(b: &bool) -> bool {
 
 /// Relay (entry) descriptor. Field order frozen (warren-core `RelayDescriptorSigned`).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct RelayDescriptorSigned {
     #[serde(with = "hexn")]
     relay_id: [u8; 16],
@@ -86,6 +87,7 @@ struct RelayDescriptorSigned {
 
 /// Exit descriptor. Field order frozen (warren-core `ExitDescriptorSigned`).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct ExitDescriptorSigned {
     #[serde(with = "hexn")]
     exit_id: [u8; 16],
@@ -102,6 +104,7 @@ struct ExitDescriptorSigned {
 
 /// One fleet node. Field order frozen (warren-core `NodeEntry`).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct NodeEntry {
     relay: RelayDescriptorSigned,
     exit: ExitDescriptorSigned,
@@ -115,6 +118,7 @@ struct NodeEntry {
 
 /// Full signed directory wire form (`GET /v1/multihop/directory`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct SignedDirectory {
     version: u32,
     nodes: Vec<NodeEntry>,
@@ -158,6 +162,9 @@ pub struct VerifiedExit {
     pub city: String,
     /// Selection weight.
     pub weight: u64,
+    /// The exit runs no in-tunnel DNS forwarder: name resolution over the tunnel
+    /// will fail unless the client points the netstack at another resolver.
+    pub dns_disabled: bool,
 }
 
 /// Verified directory: trusted exits plus freshness metadata the caller enforces.
@@ -374,6 +381,7 @@ pub fn verify_multihop_directory(
             country: n.country,
             city: n.city,
             weight: n.weight,
+            dns_disabled: n.exit.dns_disabled,
         })
         .collect();
 
@@ -618,6 +626,20 @@ mod tests {
     fn malformed_json_is_rejected() {
         assert!(matches!(
             verify_multihop_directory("{not json", &[], &[]),
+            Err(DirectoryError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_top_level_field_is_rejected() {
+        // Parity with the signed relay list: the directory wire form is strict, so
+        // a newer-schema (or tampered) directory is rejected rather than silently
+        // accepted with fields ignored.
+        let (root, op, server) = (key(1), key(2), key(3));
+        let json = signed_directory_json(&root, &op, &server, vec![], 1000, 1000 + 3600);
+        let tampered = json.replacen('{', "{\"surprise\":true,", 1);
+        assert!(matches!(
+            verify_multihop_directory(&tampered, &[], &[]),
             Err(DirectoryError::Json(_))
         ));
     }
