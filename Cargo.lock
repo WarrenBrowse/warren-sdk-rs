@@ -2453,6 +2453,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "warren-api",
@@ -2468,6 +2469,7 @@ name = "warren-sdk-ffi"
 version = "0.0.1"
 dependencies = [
  "hex",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "uniffi",

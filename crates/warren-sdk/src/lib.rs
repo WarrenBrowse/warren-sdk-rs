@@ -59,6 +59,7 @@ pub use warren_transport::ConnectionState;
 mod client;
 mod error;
 mod proxy;
+mod store;
 mod supervisor;
 
 pub use client::{
@@ -67,6 +68,7 @@ pub use client::{
 };
 pub use error::{BuildError, SdkError};
 pub use proxy::{ProxyForwarder, ProxyHandle, TunnelState};
+pub use store::{FileGenerationStore, FileServerKeyStore};
 pub use supervisor::SupervisedProxyHandle;
 
 #[cfg(test)]

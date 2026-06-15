@@ -31,6 +31,8 @@ tokio = { workspace = true }
 [dev-dependencies]
 # Drives the async FFI methods in tests (#[tokio::test]).
 tokio = { workspace = true }
+# Temp state directory for the persistence constructor test.
+tempfile = { workspace = true }
 
 # This crate is the SINGLE FFI boundary exception to the workspace-wide
 # `unsafe_code = "forbid"`: uniffi generates the C-ABI scaffolding (which is

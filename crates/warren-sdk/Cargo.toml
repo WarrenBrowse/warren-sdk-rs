@@ -39,6 +39,7 @@ warren-test-support = { path = "../warren-test-support" }
 serde_json = { workspace = true }
 hex = { workspace = true }
 bytes = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

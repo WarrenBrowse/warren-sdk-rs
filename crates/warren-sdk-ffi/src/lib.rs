@@ -36,7 +36,8 @@ use warren_sdk::identity::{WarrenIdentity, ss58};
 use warren_sdk::net::{ForwardedPort, MapProto, ProxyConfig};
 use warren_sdk::transport::{Backoff, ConnectionState, RetryError, connect_with_state};
 use warren_sdk::{
-    DefaultClient, ProxyForwarder, ProxyHandle, SdkError, SupervisedProxyHandle, WarrenClient,
+    DefaultClient, FileGenerationStore, FileServerKeyStore, ProxyForwarder, ProxyHandle, SdkError,
+    SupervisedProxyHandle, WarrenClient,
 };
 
 uniffi::setup_scaffolding!();
@@ -309,6 +310,51 @@ impl WarrenFfiClient {
             .identity(identity)
             .api_base(api_base)
             .server_pubkey_pin(server_pubkey_pin);
+        for root in multihop_root_pubkey_pins {
+            builder = builder.multihop_root_pubkey_pin(root);
+        }
+        let inner = builder.build().map_err(|e| FfiError::Client {
+            message: e.to_string(),
+        })?;
+        Ok(Arc::new(Self { inner }))
+    }
+
+    /// Like [`with_multihop_roots`](Self::with_multihop_roots) but also persists
+    /// the anti-rollback floors (signed list and multihop directory) and the
+    /// trust-on-first-use server pin under `state_dir`, so they survive a restart.
+    /// Without persistence those reset every launch, letting a network attacker
+    /// replay an older-but-valid list to a freshly started client.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InvalidMnemonic`] for a bad phrase, or [`FfiError::Client`] if
+    /// `state_dir` cannot be created or its existing state cannot be read.
+    #[uniffi::constructor]
+    pub fn with_persistence(
+        mnemonic: String,
+        api_base: String,
+        server_pubkey_pin: String,
+        multihop_root_pubkey_pins: Vec<String>,
+        state_dir: String,
+    ) -> Result<Arc<Self>, FfiError> {
+        let identity =
+            WarrenIdentity::from_mnemonic(&mnemonic).map_err(|_| FfiError::InvalidMnemonic)?;
+        let dir = std::path::Path::new(&state_dir);
+        let io_err = |_| FfiError::Client {
+            message: "persistence state directory is not usable".to_owned(),
+        };
+        std::fs::create_dir_all(dir).map_err(io_err)?;
+        let relay_gen = FileGenerationStore::new(dir.join("relay_generation")).map_err(io_err)?;
+        let mh_gen = FileGenerationStore::new(dir.join("multihop_generation")).map_err(io_err)?;
+        let key_store = FileServerKeyStore::new(dir.join("server_key")).map_err(io_err)?;
+
+        let mut builder = WarrenClient::builder()
+            .identity(identity)
+            .api_base(api_base)
+            .server_pubkey_pin(server_pubkey_pin)
+            .generation_store(Arc::new(relay_gen))
+            .multihop_generation_store(Arc::new(mh_gen))
+            .server_key_store(Arc::new(key_store));
         for root in multihop_root_pubkey_pins {
             builder = builder.multihop_root_pubkey_pin(root);
         }
@@ -989,6 +1035,23 @@ mod tests {
         )
         .expect("valid build with a root pin");
         assert_eq!(client.address(), id.address);
+    }
+
+    #[test]
+    fn client_with_persistence_builds_and_creates_state_dir() {
+        let id = generate_identity();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("warren-state");
+        let client = WarrenFfiClient::with_persistence(
+            id.mnemonic.clone(),
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+            vec![],
+            state.to_string_lossy().into_owned(),
+        )
+        .expect("valid build with persistence");
+        assert_eq!(client.address(), id.address);
+        assert!(state.is_dir(), "the state directory is created");
     }
 
     #[tokio::test]
