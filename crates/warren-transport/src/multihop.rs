@@ -22,7 +22,6 @@
 //! anti-replay-protected by a sliding window.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -31,11 +30,9 @@ use warren_multihop::{ClientSession as HpkeSession, IpAssignment, ReplayWindow, 
 use warren_wire::control::{CONTROL_FIRST_BYTE, try_decode_control};
 use warren_wire::multihop::{EXIT_ID_LEN, WarrenMultihopFrame};
 
-use crate::client::warren_transport_config;
+use crate::client::{QuicDialError, dial_quic};
 use crate::tls;
 
-/// ALPN protocol identifier ("h3"), matching warren-core's exits.
-const ALPN_H3: &[u8] = b"h3";
 /// Largest sealed setup frame accepted on the reliable stream (matches the data
 /// frame ceiling; the setup payload is a few hundred bytes in practice).
 const MAX_SETUP_FRAME_BYTES: usize = 65536;
@@ -88,6 +85,21 @@ pub enum MultihopError {
     /// Reading a datagram failed (the connection closed).
     #[error("read datagram failed")]
     ReadDatagram(#[source] quinn::ConnectionError),
+}
+
+impl From<QuicDialError> for MultihopError {
+    fn from(e: QuicDialError) -> Self {
+        match e {
+            QuicDialError::Tls(x) => MultihopError::Tls(x),
+            QuicDialError::Bind(x) => MultihopError::Bind(x),
+            QuicDialError::Connect(x) => MultihopError::Connect(x),
+            QuicDialError::Quic(source) => MultihopError::Quic {
+                context: "connect",
+                source,
+            },
+            QuicDialError::IdentityMismatch => MultihopError::ExitIdentityMismatch,
+        }
+    }
 }
 
 /// Builder/dialer for a multihop client tunnel.
@@ -150,38 +162,13 @@ impl MultihopClientTunnel {
         exit_id: [u8; EXIT_ID_LEN],
         exit_addr: SocketAddr,
     ) -> Result<MultihopSession, MultihopError> {
-        let mut client_cfg = tls::make_client_config(
+        let (endpoint, conn) = dial_quic(
             &self.signing_key,
-            tls::default_crypto_provider(),
-            &[ALPN_H3],
+            exit_pubkey,
+            exit_addr,
+            self.bind_local_ip,
         )
-        .map_err(MultihopError::Tls)?;
-        client_cfg.transport_config(Arc::new(warren_transport_config()));
-
-        let bind = self.bind_local_ip.unwrap_or_else(|| {
-            if exit_addr.is_ipv6() {
-                SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
-            } else {
-                SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
-            }
-        });
-        let mut endpoint = quinn::Endpoint::client(bind).map_err(MultihopError::Bind)?;
-        endpoint.set_default_client_config(client_cfg);
-
-        let server_name = tls::name::encode(&exit_pubkey);
-        let conn = endpoint
-            .connect(exit_addr, &server_name)
-            .map_err(MultihopError::Connect)?
-            .await
-            .map_err(|e| MultihopError::Quic {
-                context: "connect",
-                source: e,
-            })?;
-
-        match tls::peer_pubkey(&conn) {
-            Some(pk) if pk == exit_pubkey => {}
-            _ => return Err(MultihopError::ExitIdentityMismatch),
-        }
+        .await?;
 
         // Build the per-session HPKE context (one KEM ECDH against the exit's
         // X25519 multihop key); its encapsulated key rides every frame.

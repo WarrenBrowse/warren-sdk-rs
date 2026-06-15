@@ -23,6 +23,59 @@ const MAX_IDLE_TIMEOUT_SECS: u64 = 180;
 const KEEP_ALIVE_INTERVAL_SECS: u64 = 20;
 const INITIAL_MTU: u16 = 1280;
 
+/// Failure dialing the QUIC connection, before any Warren framing. Mapped by
+/// each tunnel into its own error enum (see the `From` impls), so the shared
+/// [`dial_quic`] handshake prefix is written once.
+pub(crate) enum QuicDialError {
+    Tls(tls::WarrenTlsError),
+    Bind(std::io::Error),
+    Connect(quinn::ConnectError),
+    Quic(quinn::ConnectionError),
+    IdentityMismatch,
+}
+
+/// Dials and authenticates a QUIC connection to `exit_addr`: builds the TLS
+/// raw-public-key client config, binds a local endpoint matching the address
+/// family (unless `bind_local_ip` pins one), connects with the SNI-encoded exit
+/// key, and confirms the authenticated peer key equals `exit_pubkey`. The shared
+/// prefix of every Warren tunnel handshake (single-hop and multihop).
+/// Returns the dialed `(Endpoint, Connection)`. The endpoint drives the
+/// connection's I/O, so the caller must keep it alive for the session's lifetime.
+pub(crate) async fn dial_quic(
+    signing_key: &SigningKey,
+    exit_pubkey: [u8; 32],
+    exit_addr: SocketAddr,
+    bind_local_ip: Option<SocketAddr>,
+) -> Result<(quinn::Endpoint, quinn::Connection), QuicDialError> {
+    let mut client_cfg =
+        tls::make_client_config(signing_key, tls::default_crypto_provider(), &[ALPN_H3])
+            .map_err(QuicDialError::Tls)?;
+    client_cfg.transport_config(Arc::new(warren_transport_config()));
+
+    let bind = bind_local_ip.unwrap_or_else(|| {
+        if exit_addr.is_ipv6() {
+            SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
+        } else {
+            SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
+        }
+    });
+    let mut endpoint = quinn::Endpoint::client(bind).map_err(QuicDialError::Bind)?;
+    endpoint.set_default_client_config(client_cfg);
+
+    let server_name = tls::name::encode(&exit_pubkey);
+    let conn = endpoint
+        .connect(exit_addr, &server_name)
+        .map_err(QuicDialError::Connect)?
+        .await
+        .map_err(QuicDialError::Quic)?;
+
+    // Confirm the authenticated peer key matches the expected exit identity.
+    match tls::peer_pubkey(&conn) {
+        Some(pk) if pk == exit_pubkey => Ok((endpoint, conn)),
+        _ => Err(QuicDialError::IdentityMismatch),
+    }
+}
+
 pub(crate) fn warren_transport_config() -> quinn::TransportConfig {
     let mut tc = quinn::TransportConfig::default();
     tc.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
@@ -84,6 +137,21 @@ pub enum TunnelError {
     /// Reading a datagram failed (connection closed).
     #[error("read datagram failed")]
     ReadDatagram(#[source] quinn::ConnectionError),
+}
+
+impl From<QuicDialError> for TunnelError {
+    fn from(e: QuicDialError) -> Self {
+        match e {
+            QuicDialError::Tls(x) => TunnelError::Tls(x),
+            QuicDialError::Bind(x) => TunnelError::Bind(x),
+            QuicDialError::Connect(x) => TunnelError::Connect(x),
+            QuicDialError::Quic(source) => TunnelError::Quic {
+                context: "connect",
+                source,
+            },
+            QuicDialError::IdentityMismatch => TunnelError::ExitIdentityMismatch,
+        }
+    }
 }
 
 /// Builder for an identity-bound client tunnel.
@@ -157,38 +225,13 @@ impl ClientTunnel {
         exit_pubkey: [u8; 32],
         exit_addr: SocketAddr,
     ) -> Result<ClientSession, TunnelError> {
-        let mut client_cfg = tls::make_client_config(
+        let (endpoint, conn) = dial_quic(
             &self.signing_key,
-            tls::default_crypto_provider(),
-            &[ALPN_H3],
-        )?;
-        client_cfg.transport_config(Arc::new(warren_transport_config()));
-
-        let bind = self.bind_local_ip.unwrap_or_else(|| {
-            if exit_addr.is_ipv6() {
-                SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
-            } else {
-                SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
-            }
-        });
-        let mut endpoint = quinn::Endpoint::client(bind).map_err(TunnelError::Bind)?;
-        endpoint.set_default_client_config(client_cfg);
-
-        let server_name = tls::name::encode(&exit_pubkey);
-        let conn = endpoint
-            .connect(exit_addr, &server_name)
-            .map_err(TunnelError::Connect)?
-            .await
-            .map_err(|e| TunnelError::Quic {
-                context: "connect",
-                source: e,
-            })?;
-
-        // Confirm the authenticated peer key matches the expected exit identity.
-        match tls::peer_pubkey(&conn) {
-            Some(pk) if pk == exit_pubkey => {}
-            _ => return Err(TunnelError::ExitIdentityMismatch),
-        }
+            exit_pubkey,
+            exit_addr,
+            self.bind_local_ip,
+        )
+        .await?;
 
         let (mut send, mut recv) = conn.open_bi().await.map_err(|e| TunnelError::Quic {
             context: "open_bi",

@@ -149,6 +149,28 @@ impl<C: Connector> Socks5Proxy<C> {
     }
 }
 
+/// Opens the upstream flow for a `CONNECT` target and relays bytes both ways,
+/// replying success or general-failure to the client. Shared by the plain and
+/// UDP-capable SOCKS5 handlers so the CONNECT leg lives in one place.
+async fn relay_connect<C: Connector>(
+    client: &mut TcpStream,
+    connector: &C,
+    target: Target,
+) -> Result<(), NetError> {
+    let mut upstream = match connector.connect(target).await {
+        Ok(s) => s,
+        Err(e) => {
+            write_reply(client, Reply::GeneralFailure).await?;
+            return Err(e);
+        }
+    };
+    write_reply(client, Reply::Succeeded).await?;
+    tokio::io::copy_bidirectional(client, &mut upstream)
+        .await
+        .map_err(NetError::Io)?;
+    Ok(())
+}
+
 /// Drives one client through the SOCKS5 handshake, then relays bytes both ways.
 async fn handle_connection<C: Connector>(
     mut client: TcpStream,
@@ -161,20 +183,7 @@ async fn handle_connection<C: Connector>(
         write_reply(&mut client, Reply::CommandNotSupported).await?;
         return Ok(());
     }
-
-    let mut upstream = match connector.connect(target).await {
-        Ok(s) => s,
-        Err(e) => {
-            write_reply(&mut client, Reply::GeneralFailure).await?;
-            return Err(e);
-        }
-    };
-
-    write_reply(&mut client, Reply::Succeeded).await?;
-    tokio::io::copy_bidirectional(&mut client, &mut upstream)
-        .await
-        .map_err(NetError::Io)?;
-    Ok(())
+    relay_connect(&mut client, connector, target).await
 }
 
 impl<C: UdpConnector> Socks5Proxy<C> {
@@ -242,20 +251,7 @@ async fn handle_with_udp<C: UdpConnector>(
     negotiate_method(&mut client).await?;
     let (command, target) = read_request(&mut client).await?;
     match command {
-        Command::Connect => {
-            let mut upstream = match connector.connect(target).await {
-                Ok(s) => s,
-                Err(e) => {
-                    write_reply(&mut client, Reply::GeneralFailure).await?;
-                    return Err(e);
-                }
-            };
-            write_reply(&mut client, Reply::Succeeded).await?;
-            tokio::io::copy_bidirectional(&mut client, &mut upstream)
-                .await
-                .map_err(NetError::Io)?;
-            Ok(())
-        }
+        Command::Connect => relay_connect(&mut client, connector, target).await,
         Command::UdpAssociate => udp_associate(client, connector).await,
         Command::Bind => {
             write_reply(&mut client, Reply::CommandNotSupported).await?;
