@@ -531,34 +531,90 @@ impl WarrenFfiClient {
             .start_proxy_multihop_supervised(&exit, &cfg)
             .await
             .map_err(map_sdk_error)?;
-
-        // Forward supervisor state transitions to the foreign observer, if any.
-        // The task is tracked so it is aborted on shutdown/drop: otherwise it
-        // could call `on_state` on a foreign observer the app has already released.
-        let observer_task = observer.map(|obs| {
-            let mut rx = handle.watch_state();
-            tokio::spawn(async move {
-                // Emit the current state immediately, then each change.
-                loop {
-                    if let Some(m) = map_connection_state(*rx.borrow_and_update()) {
-                        obs.on_state(m);
-                    }
-                    if rx.changed().await.is_err() {
-                        break;
-                    }
-                }
-            })
-        });
-
-        let socks5_address = handle.local_addr().to_string();
-        let http_address = handle.http_addr().map(|a| a.to_string());
-        Ok(Arc::new(WarrenFfiSupervisedProxy {
-            socks5_address,
-            http_address,
-            handle: Mutex::new(Some(handle)),
-            observer_task: Mutex::new(observer_task),
-        }))
+        Ok(wrap_supervised(handle, observer))
     }
+
+    /// Like [`start_proxy_supervised`](Self::start_proxy_supervised) but with exit
+    /// FAILOVER over a prioritized list of `exit_id_hex` candidates: the datapath
+    /// sticks with the first that connects and rotates to the next only when the
+    /// current one fails to (re)establish, so a single broken or unreachable exit
+    /// no longer wedges the tunnel. The app chooses the candidate set (for example
+    /// every exit in a country), keeping egress within its constraints.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InvalidHex`] for a malformed id; [`FfiError::Client`] for a bad
+    /// listen address or if none of the ids match a verified directory exit;
+    /// [`FfiError::ServerStatus`] on a non-2xx API reply.
+    pub async fn start_proxy_supervised_failover(
+        &self,
+        exit_id_hexes: Vec<String>,
+        socks5_listen: String,
+        observer: Option<Box<dyn ConnectionObserver>>,
+    ) -> Result<Arc<WarrenFfiSupervisedProxy>, FfiError> {
+        let wanted: Vec<[u8; 16]> = exit_id_hexes
+            .iter()
+            .map(|h| hex16(h))
+            .collect::<Result<_, _>>()?;
+        let socks5: SocketAddr = socks5_listen.parse().map_err(|_| FfiError::Client {
+            message: "invalid socks5 listen address".to_owned(),
+        })?;
+        let cfg = ProxyConfig {
+            socks5,
+            http: None,
+            dns_server: None,
+        };
+        // Resolve the candidates once, preserving the caller's priority order.
+        let directory = self
+            .inner
+            .fetch_multihop_directory()
+            .await
+            .map_err(map_sdk_error)?;
+        let exits: Vec<_> = wanted
+            .iter()
+            .filter_map(|id| directory.iter().find(|e| &e.exit_id == id).cloned())
+            .collect();
+        if exits.is_empty() {
+            return Err(map_sdk_error(SdkError::NoMultihopExit));
+        }
+
+        let handle = self
+            .inner
+            .start_proxy_multihop_supervised_failover(&exits, &cfg)
+            .await
+            .map_err(map_sdk_error)?;
+        Ok(wrap_supervised(handle, observer))
+    }
+}
+
+/// Wires the optional foreign observer to a supervised handle's state watch and
+/// packages both into a [`WarrenFfiSupervisedProxy`]. The state-forwarding task
+/// is tracked so it is aborted on shutdown/drop: otherwise it could call
+/// `on_state` on a foreign observer the app has already released.
+fn wrap_supervised(
+    handle: SupervisedProxyHandle,
+    observer: Option<Box<dyn ConnectionObserver>>,
+) -> Arc<WarrenFfiSupervisedProxy> {
+    let observer_task = observer.map(|obs| {
+        let mut rx = handle.watch_state();
+        tokio::spawn(async move {
+            // Emit the current state immediately, then each change.
+            loop {
+                if let Some(m) = map_connection_state(*rx.borrow_and_update()) {
+                    obs.on_state(m);
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+    });
+    Arc::new(WarrenFfiSupervisedProxy {
+        socks5_address: handle.local_addr().to_string(),
+        http_address: handle.http_addr().map(|a| a.to_string()),
+        handle: Mutex::new(Some(handle)),
+        observer_task: Mutex::new(observer_task),
+    })
 }
 
 /// A running non-root SOCKS5 proxy over a multihop tunnel.
@@ -1061,6 +1117,44 @@ mod tests {
         let r = client
             .start_proxy_supervised(
                 "ab".repeat(16),
+                "definitely not an address".to_owned(),
+                None,
+            )
+            .await;
+        assert!(matches!(r, Err(FfiError::Client { .. })));
+    }
+
+    #[tokio::test]
+    async fn start_proxy_supervised_failover_rejects_bad_exit_id_hex_before_any_network() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        let r = client
+            .start_proxy_supervised_failover(
+                vec!["ab".repeat(16), "not-hex".to_owned()],
+                "127.0.0.1:0".to_owned(),
+                None,
+            )
+            .await;
+        assert!(matches!(r, Err(FfiError::InvalidHex(_))));
+    }
+
+    #[tokio::test]
+    async fn start_proxy_supervised_failover_rejects_bad_listen_address_before_any_network() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        let r = client
+            .start_proxy_supervised_failover(
+                vec!["ab".repeat(16)],
                 "definitely not an address".to_owned(),
                 None,
             )

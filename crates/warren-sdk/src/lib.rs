@@ -40,6 +40,8 @@
 //!   [`SupervisedProxyHandle`] that keeps the tunnel up across drops behind a
 //!   stable local address, reporting [`ConnectionState`] transitions (the
 //!   app-driven alternative is to watch [`ProxyHandle::state`] and reconnect).
+//!   [`WarrenClient::start_proxy_multihop_supervised_failover`] does the same over
+//!   a prioritized exit list, rotating past a broken or unreachable exit.
 //! - [`ProxyHandle::forward_port`] maps a tunnel-side port at the exit (NAT-PMP)
 //!   and relays inbound connections to a local server, returning a
 //!   [`warren_net::ForwardedPort`].
@@ -564,7 +566,9 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// across reconnects: the app keeps pointing at the same proxy address and the
     /// datapath transparently re-establishes. Reconnection targets the same
     /// `exit`; the first attempt's failure is surfaced (the handle reports
-    /// [`ConnectionState::Reconnecting`]) but does not error the call.
+    /// [`ConnectionState::Reconnecting`]) but does not error the call. For
+    /// resilience to a permanently-unreachable exit, see
+    /// [`Self::start_proxy_multihop_supervised_failover`].
     ///
     /// # Errors
     ///
@@ -575,6 +579,73 @@ impl<T: HttpTransport> WarrenClient<T> {
         exit: &VerifiedExit,
         cfg: &warren_net::ProxyConfig,
     ) -> Result<SupervisedProxyHandle, SdkError> {
+        let signing = self.signing.clone();
+        let exit = exit.clone();
+        self.spawn_supervised(cfg, move || {
+            let signing = signing.clone();
+            let exit = exit.clone();
+            async move { establish_multihop(signing, &exit).await }
+        })
+        .await
+    }
+
+    /// Self-healing multihop proxy with exit FAILOVER: same stable-listener,
+    /// self-rebuilding datapath as [`Self::start_proxy_multihop_supervised`], but
+    /// over a prioritized list of candidate `exits`. It sticks with the first exit
+    /// that connects (stable egress), and only rotates to the next candidate when
+    /// the current one fails to (re)establish, wrapping around the list. The app
+    /// chooses the candidate set (for example every exit in the desired country),
+    /// so egress stays within its constraints while a single broken or
+    /// unreachable exit no longer wedges the datapath.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::NoMultihopExit`] if `exits` is empty; [`SdkError::Proxy`] if a
+    /// local listener cannot bind. Connect failures surface as state, not here.
+    pub async fn start_proxy_multihop_supervised_failover(
+        &self,
+        exits: &[VerifiedExit],
+        cfg: &warren_net::ProxyConfig,
+    ) -> Result<SupervisedProxyHandle, SdkError> {
+        if exits.is_empty() {
+            return Err(SdkError::NoMultihopExit);
+        }
+        let signing = self.signing.clone();
+        let exits = exits.to_vec();
+        // Shared cursor: advanced only on a failed attempt, so a working exit is
+        // kept (stable egress) and a broken one is rotated past on the next try.
+        let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.spawn_supervised(cfg, move || {
+            let signing = signing.clone();
+            let exits = exits.clone();
+            let cursor = Arc::clone(&cursor);
+            async move {
+                let idx = cursor.load(Ordering::Relaxed) % exits.len();
+                match establish_multihop(signing, &exits[idx]).await {
+                    Ok(tunnel) => Ok(tunnel),
+                    Err(e) => {
+                        cursor.fetch_add(1, Ordering::Relaxed);
+                        Err(e)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    /// Binds the stable proxy listeners, spawns the supervisor over `connect`, and
+    /// returns the [`SupervisedProxyHandle`]. Shared by the single-exit and
+    /// failover supervised datapaths; only the (re)connect closure differs.
+    async fn spawn_supervised<F, Fut>(
+        &self,
+        cfg: &warren_net::ProxyConfig,
+        connect: F,
+    ) -> Result<SupervisedProxyHandle, SdkError>
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<EstablishedTunnel<MultihopPacketSink>, SdkError>>
+            + Send,
+    {
         let socks_listener = tokio::net::TcpListener::bind(cfg.socks5)
             .await
             .map_err(SdkError::Proxy)?;
@@ -591,41 +662,9 @@ impl<T: HttpTransport> WarrenClient<T> {
         };
 
         let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
-        let signing = self.signing.clone();
-        let exit = exit.clone();
         let dns_server = cfg.dns_server;
         let task = tokio::spawn(async move {
-            supervise_proxy(
-                socks_listener,
-                http_listener,
-                dns_server,
-                state_tx,
-                move || {
-                    let signing = signing.clone();
-                    let exit = exit.clone();
-                    async move {
-                        let session = MultihopClientTunnel::new(signing)
-                            .connect(
-                                exit.exit_ed25519_pubkey,
-                                exit.exit_x25519_multihop_pubkey,
-                                exit.exit_id,
-                                exit.endpoint,
-                            )
-                            .await?;
-                        let sink = MultihopPacketSink::new(session);
-                        let (local_ip, prefix, gateway, ipv6) =
-                            addressing_from_session(sink.session());
-                        Ok::<_, SdkError>(EstablishedTunnel {
-                            sink,
-                            local_ip,
-                            prefix,
-                            gateway,
-                            ipv6,
-                        })
-                    }
-                },
-            )
-            .await;
+            supervise_proxy(socks_listener, http_listener, dns_server, state_tx, connect).await;
         });
 
         Ok(SupervisedProxyHandle {
@@ -745,6 +784,32 @@ fn addressing_from_session(
         _ => None,
     };
     (local_ip, prefix, gateway, ipv6)
+}
+
+/// Opens a sealed multihop tunnel to `exit` and packages it with the netstack
+/// addressing derived from its fresh `IpAssign`. The (re)connect step shared by
+/// the supervised single-exit and failover datapaths.
+async fn establish_multihop(
+    signing: warren_identity::ed25519_dalek::SigningKey,
+    exit: &VerifiedExit,
+) -> Result<EstablishedTunnel<MultihopPacketSink>, SdkError> {
+    let session = MultihopClientTunnel::new(signing)
+        .connect(
+            exit.exit_ed25519_pubkey,
+            exit.exit_x25519_multihop_pubkey,
+            exit.exit_id,
+            exit.endpoint,
+        )
+        .await?;
+    let sink = MultihopPacketSink::new(session);
+    let (local_ip, prefix, gateway, ipv6) = addressing_from_session(sink.session());
+    Ok(EstablishedTunnel {
+        sink,
+        local_ip,
+        prefix,
+        gateway,
+        ipv6,
+    })
 }
 
 /// An established tunnel plus the netstack addressing derived from its `IpAssign`.
@@ -1226,6 +1291,55 @@ mod tests {
 
         assert!(proxy_accepts(socks_addr).await, "SOCKS5 listener is live");
         assert!(proxy_accepts(http_addr).await, "HTTP listener is live");
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn supervisor_failover_rotates_past_a_broken_exit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Two candidate "exits": index 0 always fails to connect (a broken exit
+        // like prod SG), index 1 connects. This mirrors the rotating closure of
+        // start_proxy_multihop_supervised_failover: the cursor advances only on
+        // failure, so the supervisor must rotate past 0 and succeed on 1.
+        let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let (ok_tx, mut ok_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let keep_open = Arc::new(tokio::sync::Notify::new());
+
+        let task = tokio::spawn(async move {
+            supervise_proxy(socks_listener, None, None, state_tx, move || {
+                let cursor = Arc::clone(&cursor);
+                let ok_tx = ok_tx.clone();
+                let keep_open = Arc::clone(&keep_open);
+                async move {
+                    let idx = cursor.load(Ordering::Relaxed) % 2;
+                    if idx == 0 {
+                        cursor.fetch_add(1, Ordering::Relaxed); // rotate past the broken exit
+                        return Err(SdkError::NoMultihopExit);
+                    }
+                    let _ = ok_tx.send(idx);
+                    Ok(EstablishedTunnel {
+                        sink: ClosableSink { close: keep_open },
+                        local_ip: "10.66.0.2".parse().unwrap(),
+                        prefix: 24,
+                        gateway: "10.66.0.1".parse().unwrap(),
+                        ipv6: None,
+                    })
+                }
+            })
+            .await;
+        });
+
+        let success_idx = tokio::time::timeout(std::time::Duration::from_secs(5), ok_rx.recv())
+            .await
+            .expect("failover reached a working exit in time")
+            .expect("a connect succeeded");
+        assert_eq!(
+            success_idx, 1,
+            "failover rotated past the broken exit 0 to the working exit 1"
+        );
         task.abort();
     }
 

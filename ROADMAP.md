@@ -114,6 +114,13 @@ pinned by golden vectors where a wire format is involved. warren-core
     re-calling on `Disconnected` reconnects correctly. `cargo run -p warren-sdk
     --example live_reconnect` proves two independent sessions each rebuild from a
     fresh assignment and egress against a production exit.
+  - Exit failover: `start_proxy_multihop_supervised_failover` supervises over a
+    prioritized exit list, sticking with the first that connects (stable egress)
+    and rotating to the next only on a failed (re)establish, so a single broken or
+    unreachable exit no longer wedges the datapath. Motivated by a live finding (a
+    prod exit that consistently fails the multihop setup). Unit-tested (rotates
+    past a broken exit to a working one); exposed on the FFI as
+    `start_proxy_supervised_failover`.
   - Automatic in-facade supervisor: `start_proxy_multihop_supervised` binds the
     SOCKS5/HTTP listeners once and keeps the tunnel up across drops, rebuilding
     the netstack from a fresh `IpAssign` on each reconnect while the app-facing
