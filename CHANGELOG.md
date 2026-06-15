@@ -29,6 +29,18 @@ the pre-release `0.0.x` line.
 - The supervised proxy now backs off with full jitter (avoiding synchronized
   reconnect waves) via the new `warren_transport::JitterBackoff`.
 
+### Added (userland features)
+
+- DNS result cache in the netstack engine: repeat connects to a host reuse a
+  TTL-bounded cached answer instead of re-querying over the tunnel.
+- Auto outbound-IP detection: `warren_transport::local_ip_for_endpoint`, tunnel
+  `with_auto_local_ip()`, and facade `WarrenClientBuilder::auto_local_ip()` pin the
+  QUIC endpoint to the default-route source IP (multi-NIC determinism).
+- Session metrics: `MultihopMetricsSnapshot` (bytes/packets/cover-traffic/epoch/
+  uptime) on the session, the sink, and `ProxyHandle::metrics()`.
+- DAITA cover-traffic primitive: `MultihopSession::send_cover_traffic` emits the
+  frozen `0xFF` dummy frame (dropped by the exit) for client-side traffic shaping.
+
 ### Performance
 
 - A release profile (thin LTO, `codegen-units = 1`) enables cross-crate inlining

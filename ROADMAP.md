@@ -313,26 +313,46 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
 
 ## Deferred client features (surfaced by the 2026-06-15 SDK audit)
 
-These warren-core client capabilities are intentionally not implemented yet. Each
-is a throughput/observability or privileged-mode feature, not a correctness gap,
-and each must be validated against a real exit before it can be claimed done (per
-CLAUDE.md), so none can be finished from in-process tests alone:
+Userland items completed since the audit (in-process tested; the datapath ones
+still want a real-exit pass before being relied on in production):
 
-- Multipath / connection bonding. The `MULTIPATH` feature bit and the multi-conn
-  `Setup` builder exist, but there is no session-bonding datapath (warren-core
-  `bundle.rs`). Single-session only today.
-- Rekey policy + tunnel metrics. The frame carries an `epoch`, but there is no
-  public rekey driver or metrics snapshot (warren-core `RekeyPolicy`,
-  `MultiHopMetricsSnapshot`). Limits long-session forward-secrecy control and
-  observability.
-- Full DAITA framework. The negotiation surface (`with_daita`, `DaitaConfig`,
-  the dummy first byte) is present, but the padding framework is not driven on
-  the pump (warren-core `multi_hop_pump`). DAITA is advertised, not enforced.
-- Auto outbound-IP detection. Only the manual `with_bind_local_ip` setter exists;
-  warren-core's `detect_default_local_ip_for_endpoint` has no SDK equivalent.
+- DONE: DNS result cache in the netstack engine (TTL-bounded; repeat connects to
+  a host skip the over-tunnel query).
+- DONE: auto outbound-IP detection (`local_ip_for_endpoint`, tunnel
+  `with_auto_local_ip`, facade `auto_local_ip()`), the multi-NIC equivalent of
+  warren-core's `detect_default_local_ip_for_endpoint`.
+- DONE: session metrics (`MultihopMetricsSnapshot`: bytes/packets/cover/epoch/
+  uptime) on the session, sink and `ProxyHandle::metrics()`.
+- DONE (primitive): DAITA cover-traffic SEND (`MultihopSession::send_cover_traffic`,
+  the frozen `0xFF` dummy frame the exit drops). The cover-traffic building block
+  exists; the full DAITA *schedule* (when to emit, the defended distribution) is
+  still to be ported from warren-core's `multi_hop_pump` and validated.
+
+Still deferred. NOT blocked by privilege (these are userland), but each is a
+FROZEN WIRE FORMAT in warren-core, so per the prime directives (wire-compat is
+non-negotiable, golden vectors are the contract, validate against a real exit
+before claiming done) the correct path is: (1) extract golden vectors from
+warren-core via a reference binary, (2) port against those vectors, (3) validate
+against a real exit. Reverse-engineering them from core's source without vectors
+risks silent incompatibility, so they are intentionally not implemented yet:
+
+- Rekey / epoch rotation. warren-core (`warren-multihop/src/session.rs`,
+  `tests/rekey_v1.rs`, `tests/rekey_overlap.rs`) does a fresh KEM encapsulation,
+  bumps the epoch, emits a new `encapsulated_key` for the new epoch, and keeps the
+  previous AEAD context in an OVERLAP window to open in-flight old-epoch frames.
+  The SDK already keys seal/open and the replay window by `epoch`, so the per-
+  packet crypto is ready; what is missing (and needs vectors + a real exit) is the
+  rekey control signal, the overlap window, and the `RekeyPolicy` driver.
+- Multipath / connection bonding. warren-core (`warren-client/src/bundle.rs`,
+  `tests/bonded_bundle_e2e.rs`) bonds N connections the exit treats as ONE bundle
+  (a single assigned IP, packets for it arriving on any member). Needs the multi-
+  conn bundle setup wire (so the exit coheres the bundle to one IP) plus a
+  `BondedPacketSink` (stripe send / merge recv). N independent multihop sessions
+  would each get a DIFFERENT IP, which is not a coherent bundle, so this cannot be
+  faked in-process without modelling the exit's bundle semantics.
 - OS-enforced killswitch + IPv6 leak block. Only the best-effort
   `ProxyOnlyKillSwitch` is implemented; the `OsEnforced` level and the v6 leak
-  guard belong to the deferred privileged TUN backend (P6).
+  guard belong to the deferred privileged TUN backend (P6), not userland.
 
 ## Cross-cutting
 
