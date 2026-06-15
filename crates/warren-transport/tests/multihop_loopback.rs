@@ -56,6 +56,43 @@ async fn multihop_setup_assigns_ip_and_sealed_datagram_echoes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cover_traffic_is_sent_then_a_real_packet_still_round_trips() {
+    // DAITA cover traffic: a dummy frame is sent (and dropped by the exit), then a
+    // real packet still echoes correctly (the dummy advanced the seq without
+    // desyncing the datapath), and only the real packet counts as app data.
+    let exit_key = SigningKey::from_bytes(&[9u8; 32]);
+    let (exit_addr, keys) = spawn_fake_multihop_exit(exit_key).await;
+    let session = MultihopClientTunnel::new(SigningKey::from_bytes(&[1u8; 32]))
+        .connect(
+            keys.ed25519_pubkey,
+            keys.x25519_pubkey,
+            keys.exit_id,
+            exit_addr,
+        )
+        .await
+        .expect("multihop setup");
+
+    session.send_cover_traffic(64).expect("send cover traffic");
+
+    let packet = {
+        let mut p = vec![0x45u8, 0, 0, 20];
+        p.extend_from_slice(b"warren-multihop-data");
+        p
+    };
+    session.send_packet(&packet).expect("send real packet");
+    let echoed = session.recv_packet().await.expect("recv real echo");
+    assert_eq!(echoed, packet, "the real packet round-trips past the dummy");
+
+    let m = session.metrics_snapshot();
+    assert_eq!(
+        m.packets_sent, 1,
+        "cover traffic is not counted as app data"
+    );
+    assert_eq!(m.cover_packets_sent, 1, "one cover frame was sent");
+    session.disconnect();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn wrong_exit_pubkey_is_rejected() {
     // The TLS peer cannot present a cert matching the wrong pinned identity, so
     // the connect must fail rather than seal traffic to an impostor.

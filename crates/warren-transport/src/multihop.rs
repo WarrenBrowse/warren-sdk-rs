@@ -255,6 +255,7 @@ pub struct MultihopMetrics {
     bytes_recv: AtomicU64,
     packets_sent: AtomicU64,
     packets_recv: AtomicU64,
+    cover_packets_sent: AtomicU64,
     epoch: AtomicU32,
     connected_since: Instant,
 }
@@ -266,6 +267,7 @@ impl MultihopMetrics {
             bytes_recv: AtomicU64::new(0),
             packets_sent: AtomicU64::new(0),
             packets_recv: AtomicU64::new(0),
+            cover_packets_sent: AtomicU64::new(0),
             epoch: AtomicU32::new(epoch),
             connected_since: Instant::now(),
         }
@@ -279,6 +281,7 @@ impl MultihopMetrics {
             bytes_recv: self.bytes_recv.load(Ordering::Relaxed),
             packets_sent: self.packets_sent.load(Ordering::Relaxed),
             packets_recv: self.packets_recv.load(Ordering::Relaxed),
+            cover_packets_sent: self.cover_packets_sent.load(Ordering::Relaxed),
             epoch: self.epoch.load(Ordering::Relaxed),
             uptime_secs: self.connected_since.elapsed().as_secs(),
         }
@@ -298,6 +301,8 @@ pub struct MultihopMetricsSnapshot {
     pub packets_sent: u64,
     /// Total IP packets received.
     pub packets_recv: u64,
+    /// Total DAITA cover-traffic (dummy) frames sent (not app data).
+    pub cover_packets_sent: u64,
     /// Current HPKE epoch (rotates on rekey).
     pub epoch: u32,
     /// Seconds since the session was established.
@@ -368,19 +373,48 @@ impl MultihopSession {
     /// the frame fails to encode, [`MultihopError::SendDatagram`] if quinn
     /// refuses the datagram.
     pub fn send_packet(&self, ip_packet: &[u8]) -> Result<(), MultihopError> {
-        let seq = self.seq_send.fetch_add(1, Ordering::AcqRel);
-        let frame = self
-            .session
-            .seal(ip_packet, self.epoch, seq)
-            .map_err(|e| MultihopError::Setup(SetupError::Session(e)))?;
-        let bytes = frame.encode().map_err(MultihopError::Frame)?;
-        self.conn
-            .send_datagram(bytes.into())
-            .map_err(MultihopError::SendDatagram)?;
+        self.seal_and_send(ip_packet)?;
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .bytes_sent
             .fetch_add(ip_packet.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Seals `plaintext` as the next forward frame and sends it as a datagram,
+    /// advancing the forward sequence. Shared by real packets and cover traffic;
+    /// does not touch the app-data metrics (the caller owns that distinction).
+    fn seal_and_send(&self, plaintext: &[u8]) -> Result<(), MultihopError> {
+        let seq = self.seq_send.fetch_add(1, Ordering::AcqRel);
+        let frame = self
+            .session
+            .seal(plaintext, self.epoch, seq)
+            .map_err(|e| MultihopError::Setup(SetupError::Session(e)))?;
+        let bytes = frame.encode().map_err(MultihopError::Frame)?;
+        self.conn
+            .send_datagram(bytes.into())
+            .map_err(MultihopError::SendDatagram)
+    }
+
+    /// Sends a DAITA cover-traffic (dummy) frame: a sealed frame whose plaintext
+    /// begins with the dummy tag (`0xFF`) followed by `padding_len` zero bytes,
+    /// which the exit drops on receipt (it is not an IP packet). Client-unilateral
+    /// traffic shaping to blur real-traffic timing/volume; carries no app data and
+    /// is not counted in the app-data metrics. This is the cover-traffic building
+    /// block; a full DAITA defense schedule that decides WHEN to emit dummies is
+    /// driven above this seam (and validated against a real exit before relied on).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`send_packet`](Self::send_packet) (seal, encode, or datagram send).
+    pub fn send_cover_traffic(&self, padding_len: usize) -> Result<(), MultihopError> {
+        let mut dummy = Vec::with_capacity(1 + padding_len);
+        dummy.push(DAITA_DUMMY_FIRST_BYTE);
+        dummy.resize(1 + padding_len, 0);
+        self.seal_and_send(&dummy)?;
+        self.metrics
+            .cover_packets_sent
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
