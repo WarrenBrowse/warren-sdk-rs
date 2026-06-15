@@ -110,7 +110,7 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     /// # Errors
     ///
     /// [`ClientError`] on transport failure or a non-200/404 status.
-    pub async fn get_multihop_directory(&self) -> Result<Option<String>, ClientError> {
+    pub async fn fetch_multihop_directory(&self) -> Result<Option<String>, ClientError> {
         let req = self.unsigned_request(Method::Get, "/v1/multihop/directory", Vec::new());
         match self.send(req).await {
             Ok(resp) => String::from_utf8(resp.body)
@@ -577,13 +577,13 @@ mod tests {
     #[tokio::test]
     async fn multihop_directory_returns_body_on_200_and_is_unsigned() {
         let c = client(MockTransport::new(200, "{\"directory\":true}"));
-        let body = c.get_multihop_directory().await.expect("ok");
+        let body = c.fetch_multihop_directory().await.expect("ok");
         assert_eq!(body.as_deref(), Some("{\"directory\":true}"));
         let guard = c.transport.last.lock().unwrap();
         let req = guard.as_ref().unwrap();
         assert!(
             header(req, HEADER_PUBKEY).is_none(),
-            "get_multihop_directory must be unsigned"
+            "fetch_multihop_directory must be unsigned"
         );
     }
 
@@ -591,7 +591,7 @@ mod tests {
     async fn multihop_directory_maps_404_to_none() {
         let c = client(MockTransport::new(404, "not found"));
         let body = c
-            .get_multihop_directory()
+            .fetch_multihop_directory()
             .await
             .expect("404 must be Ok(None), not an error");
         assert_eq!(body, None);
@@ -601,7 +601,7 @@ mod tests {
     async fn multihop_directory_propagates_other_errors() {
         let c = client(MockTransport::new(500, "boom"));
         let err = c
-            .get_multihop_directory()
+            .fetch_multihop_directory()
             .await
             .expect_err("a 500 must propagate as a server-status error");
         assert!(matches!(err, ClientError::ServerStatus { status: 500, .. }));

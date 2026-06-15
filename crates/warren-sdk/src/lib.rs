@@ -519,7 +519,7 @@ impl<T: HttpTransport> WarrenClient<T> {
     pub async fn fetch_multihop_directory(&self) -> Result<Vec<VerifiedExit>, SdkError> {
         let json = self
             .api
-            .get_multihop_directory()
+            .fetch_multihop_directory()
             .await?
             .ok_or(SdkError::NoMultihopDirectory)?;
 

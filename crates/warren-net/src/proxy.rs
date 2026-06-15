@@ -22,7 +22,8 @@ use crate::socks5::{
 
 /// The unspecified bound address echoed in a successful SOCKS5 reply. A CONNECT
 /// reply does not need a meaningful bound address.
-const REPLY_BOUND: &str = "0.0.0.0:0";
+const REPLY_BOUND: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 /// Opens a byte stream to a SOCKS5 [`Target`].
 ///
@@ -409,9 +410,8 @@ async fn read_request(client: &mut TcpStream) -> Result<(Command, Target), NetEr
 }
 
 async fn write_reply(client: &mut TcpStream, reply: Reply) -> Result<(), NetError> {
-    let bound = REPLY_BOUND.parse().expect("static bound address parses");
     client
-        .write_all(&build_reply(reply, bound))
+        .write_all(&build_reply(reply, REPLY_BOUND))
         .await
         .map_err(NetError::Io)
 }

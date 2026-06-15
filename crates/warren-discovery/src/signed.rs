@@ -210,17 +210,29 @@ pub enum SignedError {
     /// Signature does not verify against the pubkey and canonical bytes.
     #[error("signature verification failed")]
     BadSignature,
-    /// A node entry has an invalid id, address, or family.
-    #[error("invalid node entry: {0}")]
-    Node(String),
+    /// A node's id is not a valid 16-byte hex exit id.
+    #[error("invalid node id")]
+    InvalidNodeId,
+    /// A node carries a role outside the recognized set (entry/relay/exit).
+    #[error("unrecognized node role")]
+    UnrecognizedRole,
+    /// A node endpoint address is not a valid IP socket address.
+    #[error("invalid endpoint address")]
+    InvalidEndpointAddress,
+    /// A node endpoint's declared family disagrees with its address.
+    #[error("endpoint family mismatch")]
+    EndpointFamilyMismatch,
 }
 
-/// Signs a relay list (server side; used here for fixtures and tests).
+/// Signs a relay list (server side). Test-only: gated so this fixture helper
+/// never enters the production-compiled surface (in-crate tests via `cfg(test)`,
+/// other crates via the `test-helpers` feature).
 ///
 /// # Panics
 ///
 /// Panics only if JSON serialization of the preimage fails, which is infallible
 /// in practice.
+#[cfg(any(test, feature = "test-helpers"))]
 #[must_use]
 pub fn sign_relay_list(
     nodes: Vec<JsonNode>,
@@ -354,7 +366,7 @@ fn decode_node_id(s: &str) -> Result<[u8; 32], SignedError> {
     hex::decode(s)
         .ok()
         .and_then(|v| <[u8; 32]>::try_from(v).ok())
-        .ok_or_else(|| SignedError::Node("invalid node id".to_owned()))
+        .ok_or(SignedError::InvalidNodeId)
 }
 
 /// Maps a verified v6 node to a resolved [`Relay`]: the dialable addresses are
@@ -372,7 +384,7 @@ fn json_node_to_relay(n: JsonNode) -> Result<Relay, SignedError> {
     // itself is a protocol label, but the message stays static (no-log discipline).
     for role in &n.roles {
         if !matches!(role.as_str(), "entry" | "relay" | "exit") {
-            return Err(SignedError::Node("unrecognized node role".to_owned()));
+            return Err(SignedError::UnrecognizedRole);
         }
     }
 
@@ -382,14 +394,14 @@ fn json_node_to_relay(n: JsonNode) -> Result<Relay, SignedError> {
         let ip: IpAddr = ep
             .addr
             .parse()
-            .map_err(|_| SignedError::Node("invalid endpoint address".to_owned()))?;
+            .map_err(|_| SignedError::InvalidEndpointAddress)?;
         // The declared family must agree with the address (matches warren-core).
         let family_ok = matches!(
             (ip, ep.family.as_str()),
             (IpAddr::V4(_), "ipv4") | (IpAddr::V6(_), "ipv6")
         );
         if !family_ok {
-            return Err(SignedError::Node("endpoint family mismatch".to_owned()));
+            return Err(SignedError::EndpointFamilyMismatch);
         }
         if ep.egress && ip.is_ipv6() {
             ipv6_egress = true;
@@ -490,7 +502,7 @@ mod tests {
         let json = serde_json::to_string(&signed).unwrap();
         assert!(matches!(
             verify_signed_relay_list(&json, None).unwrap_err(),
-            SignedError::Node(_)
+            SignedError::EndpointFamilyMismatch
         ));
     }
 
@@ -504,7 +516,7 @@ mod tests {
         let json = serde_json::to_string(&signed).unwrap();
         assert!(matches!(
             verify_signed_relay_list(&json, None).unwrap_err(),
-            SignedError::Node(_)
+            SignedError::UnrecognizedRole
         ));
     }
 

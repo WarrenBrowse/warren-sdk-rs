@@ -344,7 +344,10 @@ impl MultihopSession {
             // Verify-then-record: probe the window, open (authenticate), then
             // commit the seq. A frame failing any step is dropped, never fatal.
             {
-                let replay = self.replay.lock().expect("replay window poisoned");
+                // Recover rather than panic on a poisoned lock: the replay window
+                // is plain integer state and stays consistent across a panic, and a
+                // library must not unwind into an FFI embedder.
+                let replay = self.replay.lock().unwrap_or_else(|e| e.into_inner());
                 if replay.check(frame.seq, frame.epoch).is_err() {
                     continue;
                 }
@@ -353,7 +356,7 @@ impl MultihopSession {
                 continue;
             };
             {
-                let mut replay = self.replay.lock().expect("replay window poisoned");
+                let mut replay = self.replay.lock().unwrap_or_else(|e| e.into_inner());
                 if replay.check_and_record(frame.seq, frame.epoch).is_err() {
                     continue;
                 }
