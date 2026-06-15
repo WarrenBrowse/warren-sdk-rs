@@ -19,6 +19,7 @@ members = [
     "crates/warren-sdk",
     "crates/warren-sdk-ffi",
     "crates/warren-multihop",
+    "crates/warren-daita",
     "crates/warren-test-support",
 ]
 

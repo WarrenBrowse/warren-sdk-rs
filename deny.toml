@@ -5,6 +5,19 @@
 [advisories]
 version = 2
 yanked = "deny"
+# RUSTSEC ignores are limited to UNMAINTAINED advisories on transitive deps whose
+# code is frozen and not attacker-reachable in a way that matters here.
+ignore = [
+    # bincode 1.3.3: flagged unmaintained by RUSTSEC-2025-0141 after the upstream
+    # team permanently ceased development, explicitly declaring 1.3.3 "a complete
+    # version of bincode that is not in need of any updates". It is pulled only
+    # transitively by maybenot 2.2.2 / maybenot-machines 1.0.1 (the DAITA defense
+    # framework), which use it to (de)serialize curated machine specs we generate
+    # ourselves, never attacker-controlled bytes. warren-core ignores the same
+    # advisory for the same reason. Removing this requires maybenot to migrate off
+    # bincode; track upstream.
+    "RUSTSEC-2025-0141",
+]
 
 [licenses]
 version = 2

@@ -1,0 +1,27 @@
+[package]
+name = "warren-daita"
+description = "Warren DAITA v2 client driver: a clean-room maybenot wrapper (wire DaitaConfig, curated machine pool, event/timer state machine) that schedules cover-traffic padding. Wire-compatible with warren-core DAITA."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+# DAITA v2 traffic-analysis-defense framework + the curated machine library.
+# Pinned to match warren-core's wire output (serialized machine specs must be
+# byte-identical so a Warren exit and this client speak the same defense).
+maybenot = "=2.2.2"
+maybenot-machines = "=1.0.1"
+# maybenot 2.2.2 is built against rand 0.9 (its RNG bound + StdRng seeding).
+rand = "0.9"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
