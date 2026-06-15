@@ -1344,6 +1344,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Same rotate-only-on-failure cursor as the failover closure, but exit 0
+        // always works. After a healthy session drops, the supervisor must
+        // reconnect on the SAME exit 0 (stable egress), not rotate away: the
+        // cursor advances on connect failure, never on a mere drop.
+        let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let (used_tx, mut used_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let (close_tx, mut close_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Arc<tokio::sync::Notify>>();
+
+        let task = tokio::spawn(async move {
+            supervise_proxy(socks_listener, None, None, state_tx, move || {
+                let cursor = Arc::clone(&cursor);
+                let used_tx = used_tx.clone();
+                let close_tx = close_tx.clone();
+                async move {
+                    let idx = cursor.load(Ordering::Relaxed) % 2;
+                    if idx != 0 {
+                        cursor.fetch_add(1, Ordering::Relaxed);
+                        return Err(SdkError::NoMultihopExit);
+                    }
+                    // Exit 0 works: hand the test a fresh close handle for this
+                    // session so it can drop it, and report the idx used.
+                    let close = Arc::new(tokio::sync::Notify::new());
+                    let _ = close_tx.send(Arc::clone(&close));
+                    let _ = used_tx.send(idx);
+                    Ok(EstablishedTunnel {
+                        sink: ClosableSink { close },
+                        local_ip: "10.66.0.2".parse().unwrap(),
+                        prefix: 24,
+                        gateway: "10.66.0.1".parse().unwrap(),
+                        ipv6: None,
+                    })
+                }
+            })
+            .await;
+        });
+
+        // Cycle 1: connected on exit 0.
+        let used1 = tokio::time::timeout(std::time::Duration::from_secs(5), used_rx.recv())
+            .await
+            .expect("first connect happened")
+            .expect("idx");
+        let close1 = close_rx.recv().await.expect("close handle 1");
+        assert_eq!(used1, 0);
+
+        // Drop the healthy session; the supervisor reconnects.
+        close1.notify_one();
+        let used2 = tokio::time::timeout(std::time::Duration::from_secs(5), used_rx.recv())
+            .await
+            .expect("reconnected after the drop")
+            .expect("idx");
+        assert_eq!(
+            used2, 0,
+            "a healthy drop reconnects on the SAME exit (stable egress), no rotation"
+        );
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn supervisor_retries_past_failed_attempts_then_connects() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
