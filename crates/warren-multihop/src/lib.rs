@@ -109,12 +109,28 @@ fn compose_export_info(epoch: u32, seq: u64, reverse: bool) -> ([u8; EXPORT_INFO
     (info, len)
 }
 
+/// One epoch's HPKE sender context and the encapsulated key that rides its frames.
+struct EpochCtx {
+    epoch: u32,
+    ctx: hpke::aead::AeadCtxS<WarrenAead, WarrenKdf, WarrenKem>,
+    encapsulated_key: [u8; 32],
+}
+
 /// A client-side HPKE session against one exit. The KEM ECDH runs once in
 /// [`ClientSession::new`]; per-frame work is a key export plus an AEAD pass.
+///
+/// A [`rekey`](ClientSession::rekey) runs a fresh KEM (new encapsulated key) and
+/// bumps the epoch, keeping the previous context in an overlap slot so reverse
+/// frames still sealed under the old epoch open until [`prune_old_epoch`] is
+/// called. Wire-identical to warren-core: rekey introduces no new frame type, it
+/// reuses the frame's `epoch` + `encapsulated_key` fields.
 pub struct ClientSession {
-    ctx: hpke::aead::AeadCtxS<WarrenAead, WarrenKdf, WarrenKem>,
+    exit_x25519: [u8; 32],
     exit_id: [u8; EXIT_ID_LEN],
-    encapsulated_key: [u8; 32],
+    current: EpochCtx,
+    /// Previous epoch context kept briefly so in-flight old-epoch reverse frames
+    /// still open after a rekey (the overlap window). At most one is retained.
+    old: Option<EpochCtx>,
 }
 
 impl ClientSession {
@@ -129,6 +145,21 @@ impl ClientSession {
         exit_id: [u8; EXIT_ID_LEN],
         rng: &mut R,
     ) -> Result<Self, SessionError> {
+        let current = Self::derive_epoch(exit_x25519_pubkey, 0, rng)?;
+        Ok(Self {
+            exit_x25519: *exit_x25519_pubkey,
+            exit_id,
+            current,
+            old: None,
+        })
+    }
+
+    /// Runs a fresh KEM against the exit key for `epoch`, returning its context.
+    fn derive_epoch<R: CryptoRng + RngCore>(
+        exit_x25519_pubkey: &[u8; 32],
+        epoch: u32,
+        rng: &mut R,
+    ) -> Result<EpochCtx, SessionError> {
         let pubkey = <WarrenKem as KemTrait>::PublicKey::from_bytes(exit_x25519_pubkey)
             .map_err(|_| SessionError::Hpke)?;
         let (encapped, ctx) = setup_sender::<WarrenAead, WarrenKdf, WarrenKem, R>(
@@ -140,17 +171,23 @@ impl ClientSession {
         .map_err(|_| SessionError::Hpke)?;
         let mut encapsulated_key = [0u8; 32];
         encapsulated_key.copy_from_slice(&encapped.to_bytes());
-        Ok(Self {
+        Ok(EpochCtx {
+            epoch,
             ctx,
-            exit_id,
             encapsulated_key,
         })
     }
 
-    /// The 32-byte encapsulated key carried on every frame of this session.
+    /// The 32-byte encapsulated key carried on every frame of the current epoch.
     #[must_use]
     pub fn encapsulated_key(&self) -> [u8; 32] {
-        self.encapsulated_key
+        self.current.encapsulated_key
+    }
+
+    /// The current epoch (starts at `0`, `+1` per [`rekey`](Self::rekey)).
+    #[must_use]
+    pub fn epoch(&self) -> u32 {
+        self.current.epoch
     }
 
     /// The 16-byte exit identifier this session targets (cleartext routing tag).
@@ -159,17 +196,53 @@ impl ClientSession {
         self.exit_id
     }
 
-    /// Derives the per-packet key for `(epoch, seq, direction)`.
-    fn packet_key(&self, epoch: u32, seq: u64, reverse: bool) -> Result<[u8; 32], SessionError> {
+    /// Rotates the session: a fresh KEM (new encapsulated key), epoch `+1`, with
+    /// the previous context retained for the overlap window. Bounds the AEAD
+    /// nonce-overflow exposure of a long-lived session (warren-core doctrine).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Hpke`] if the fresh `setup_sender` fails.
+    pub fn rekey<R: CryptoRng + RngCore>(&mut self, rng: &mut R) -> Result<u32, SessionError> {
+        let next_epoch = self.current.epoch.saturating_add(1);
+        let next = Self::derive_epoch(&self.exit_x25519, next_epoch, rng)?;
+        self.old = Some(std::mem::replace(&mut self.current, next));
+        Ok(next_epoch)
+    }
+
+    /// Ends the overlap window: drops the previous-epoch context so old-epoch
+    /// reverse frames no longer open. Call once the overlap deadline elapses.
+    pub fn prune_old_epoch(&mut self) {
+        self.old = None;
+    }
+
+    /// The sender context that seals/opens frames for `epoch` (current or the
+    /// retained old epoch), if known.
+    fn ctx_for(&self, epoch: u32) -> Option<&EpochCtx> {
+        if epoch == self.current.epoch {
+            Some(&self.current)
+        } else {
+            self.old.as_ref().filter(|o| o.epoch == epoch)
+        }
+    }
+
+    /// Derives the per-packet key for `(epoch, seq, direction)` from `ctx`.
+    fn packet_key(
+        ctx: &EpochCtx,
+        epoch: u32,
+        seq: u64,
+        reverse: bool,
+    ) -> Result<[u8; 32], SessionError> {
         let mut key = [0u8; PER_PACKET_KEY_LEN];
         let (info, n) = compose_export_info(epoch, seq, reverse);
-        self.ctx
+        ctx.ctx
             .export(&info[..n], &mut key)
             .map_err(|_| SessionError::Hpke)?;
         Ok(key)
     }
 
-    /// Seals `payload` into a frame for the client -> exit direction.
+    /// Seals `payload` into a frame for the client -> exit direction at the
+    /// current epoch (the `epoch` argument must be the current epoch).
     ///
     /// # Errors
     ///
@@ -181,7 +254,8 @@ impl ClientSession {
         epoch: u32,
         seq: u64,
     ) -> Result<WarrenMultihopFrame, SessionError> {
-        let key = self.packet_key(epoch, seq, false)?;
+        let ctx = self.ctx_for(epoch).ok_or(SessionError::Hpke)?;
+        let key = Self::packet_key(ctx, epoch, seq, false)?;
         let aad = compose_aad(&self.exit_id, epoch, seq);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let mut buf = payload.to_vec();
@@ -195,19 +269,20 @@ impl ClientSession {
             exit_id: self.exit_id,
             epoch,
             seq,
-            encapsulated_key: self.encapsulated_key,
+            encapsulated_key: ctx.encapsulated_key,
             aead_tag,
             ciphertext: buf,
         })
     }
 
-    /// Opens an exit -> client response frame sealed against this session.
+    /// Opens an exit -> client response frame sealed against this session. The
+    /// frame's `epoch` selects the current or the overlap (old) context.
     ///
     /// # Errors
     ///
     /// [`SessionError::ExitIdMismatch`]/[`SessionError::UnsupportedVersion`] on a
-    /// foreign frame, [`SessionError::Hpke`] on exporter failure, or
-    /// [`SessionError::Aead`] if the tag does not verify.
+    /// foreign frame, [`SessionError::Hpke`] on an unknown epoch or exporter
+    /// failure, or [`SessionError::Aead`] if the tag does not verify.
     pub fn open_response(&self, frame: &WarrenMultihopFrame) -> Result<Vec<u8>, SessionError> {
         if frame.version != WARREN_HPKE_VERSION_V1 {
             return Err(SessionError::UnsupportedVersion);
@@ -215,7 +290,8 @@ impl ClientSession {
         if frame.exit_id != self.exit_id {
             return Err(SessionError::ExitIdMismatch);
         }
-        let key = self.packet_key(frame.epoch, frame.seq, true)?;
+        let ctx = self.ctx_for(frame.epoch).ok_or(SessionError::Hpke)?;
+        let key = Self::packet_key(ctx, frame.epoch, frame.seq, true)?;
         let aad = compose_aad(&self.exit_id, frame.epoch, frame.seq);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let mut buf = frame.ciphertext.clone();
@@ -269,6 +345,85 @@ mod tests {
             )
             .unwrap();
         buf
+    }
+
+    /// The exit sealing a REVERSE (exit -> client) frame: `setup_receiver` against
+    /// the frame's encapsulated key, reverse export info, then AEAD seal.
+    fn exit_seal_reverse(
+        recipient_priv: &<WarrenKem as KemTrait>::PrivateKey,
+        encapsulated_key: &[u8; 32],
+        exit_id: &[u8; EXIT_ID_LEN],
+        epoch: u32,
+        seq: u64,
+        plaintext: &[u8],
+    ) -> WarrenMultihopFrame {
+        let encapped = <WarrenKem as KemTrait>::EncappedKey::from_bytes(encapsulated_key).unwrap();
+        let ctx = setup_receiver::<WarrenAead, WarrenKdf, WarrenKem>(
+            &OpModeR::Base,
+            recipient_priv,
+            &encapped,
+            WARREN_HPKE_INFO_V1,
+        )
+        .unwrap();
+        let mut key = [0u8; PER_PACKET_KEY_LEN];
+        let (info, n) = compose_export_info(epoch, seq, true);
+        ctx.export(&info[..n], &mut key).unwrap();
+        let aad = compose_aad(exit_id, epoch, seq);
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let mut buf = plaintext.to_vec();
+        let tag = cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&NONCE_ZERO_12), &aad, &mut buf)
+            .unwrap();
+        let mut aead_tag = [0u8; 16];
+        aead_tag.copy_from_slice(tag.as_slice());
+        WarrenMultihopFrame {
+            version: WARREN_HPKE_VERSION_V1,
+            exit_id: *exit_id,
+            epoch,
+            seq,
+            encapsulated_key: *encapsulated_key,
+            aead_tag,
+            ciphertext: buf,
+        }
+    }
+
+    #[test]
+    fn rekey_rotates_epoch_with_an_overlap_window() {
+        let mut rng = ChaCha20Rng::seed_from_u64(7);
+        let (recipient_priv, recipient_pub) = WarrenKem::gen_keypair(&mut rng);
+        let pub_bytes: [u8; 32] = recipient_pub.to_bytes().into();
+        let exit_id = [0x07; EXIT_ID_LEN];
+        let mut session = ClientSession::new(&pub_bytes, exit_id, &mut rng).unwrap();
+        assert_eq!(session.epoch(), 0);
+        let e0_key = session.encapsulated_key();
+
+        // A reverse frame sealed by the exit at epoch 0, still in flight at rekey.
+        let rev0 = exit_seal_reverse(&recipient_priv, &e0_key, &exit_id, 0, 1, b"old-reply");
+
+        // Rekey: epoch 1 with a fresh KEM key.
+        assert_eq!(session.rekey(&mut rng).unwrap(), 1);
+        assert_eq!(session.epoch(), 1);
+        assert_ne!(session.encapsulated_key(), e0_key, "rekey runs a fresh KEM");
+
+        // Forward seal now rides epoch 1 + the new key; the exit recovers it.
+        let fwd1 = session.seal(b"new-data", 1, 0).unwrap();
+        assert_eq!(fwd1.epoch, 1);
+        assert_eq!(fwd1.encapsulated_key, session.encapsulated_key());
+        assert_eq!(exit_open(&recipient_priv, &fwd1), b"new-data");
+
+        // Overlap window: the old-epoch reverse frame still opens.
+        assert_eq!(session.open_response(&rev0).unwrap(), b"old-reply");
+        // A new-epoch reverse frame opens too.
+        let e1_key = session.encapsulated_key();
+        let rev1 = exit_seal_reverse(&recipient_priv, &e1_key, &exit_id, 1, 1, b"new-reply");
+        assert_eq!(session.open_response(&rev1).unwrap(), b"new-reply");
+
+        // After pruning, old-epoch reverse frames no longer open.
+        session.prune_old_epoch();
+        assert!(
+            session.open_response(&rev0).is_err(),
+            "old epoch is dropped after pruning the overlap"
+        );
     }
 
     fn test_session(seed: u64) -> ClientSession {
@@ -338,8 +493,9 @@ mod tests {
         let pub_bytes: [u8; 32] = recipient_pub.to_bytes().into();
         let session = ClientSession::new(&pub_bytes, [0x07; EXIT_ID_LEN], &mut rng).unwrap();
 
-        let mut frame = session.seal(b"hello", 3, 9).unwrap();
-        // Flip the seq: the AAD/key no longer match, so the AEAD tag fails.
+        // Seal at the session's current epoch (0); flip the seq afterward so the
+        // AAD/key no longer match and the AEAD tag fails to verify.
+        let mut frame = session.seal(b"hello", 0, 9).unwrap();
         frame.seq = 10;
         let encapped =
             <WarrenKem as KemTrait>::EncappedKey::from_bytes(&frame.encapsulated_key).unwrap();
