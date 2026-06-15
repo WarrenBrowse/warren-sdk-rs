@@ -62,7 +62,19 @@ pinned by golden vectors where a wire format is involved. warren-core
 - Non-root `netstack` backend first: userspace TCP/IP (smoltcp) plus a local
   SOCKS5 and HTTP CONNECT proxy, feature-complete on Linux, macOS and Windows.
 - Then the privileged `tun` backend: real TUN per OS, split-default routing, DNS
-  push, killswitch (nft / pf / WFP).
+  push, killswitch (nft / pf / WFP). DEFERRED (not started, by decision
+  2026-06-15: the non-root proxy mode covers userland today). Key constraint for
+  whoever starts it: `warren-net` is `unsafe_code = forbid`, and opening the TUN
+  device (`/dev/net/tun` ioctl / utun / Wintun) needs `unsafe`. Two viable routes,
+  to pick first: (a) depend on a vetted TUN crate (e.g. `tun-rs`), which wraps the
+  unsafe but adds a dependency to clear through `cargo deny` (license / advisory /
+  supply-chain) in this security-sensitive crate; or (b) a dedicated
+  `warren-tun-sys` crate with a documented `unsafe` exception, mirroring the
+  `warren-sdk-ffi` precedent, with zero third-party deps but hand-audited unsafe.
+  Routing/DNS/killswitch are then per-OS (netlink or shelling to `ip`/`nft` on
+  Linux). Per CLAUDE.md the whole backend must be validated against a real exit
+  with privilege before it can be claimed done; it cannot be validated from the
+  dev sandbox.
 
 ## P7: port forwarding
 
