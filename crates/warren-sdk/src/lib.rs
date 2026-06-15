@@ -1544,6 +1544,25 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_proxy_multihop_against_a_fake_exit_is_connected() {
+        // The non-supervised datapath sets up over the fake exit and reports a
+        // live tunnel (the proxy listener is bound and the state is Connected).
+        let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let (addr, keys) = warren_test_support::spawn_fake_multihop_exit(exit_key).await;
+        let exit = fake_verified_exit(addr, &keys);
+        let cfg = warren_net::ProxyConfig {
+            socks5: "127.0.0.1:0".parse().unwrap(),
+            http: None,
+            dns_server: None,
+        };
+        let handle = test_client()
+            .start_proxy_multihop(&exit, &cfg)
+            .await
+            .expect("proxy datapath starts over the fake exit");
+        assert_eq!(handle.state(), TunnelState::Connected);
+    }
+
     /// A transport that is never actually called by these builder tests.
     struct NullTransport;
 
