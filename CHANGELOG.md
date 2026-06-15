@@ -53,12 +53,15 @@ the pre-release `0.0.x` line.
 
 ### Testing
 
-- Real-exit wire-compat validation: the gated `real_exit_tests` (in
-  `warren-transport`, opt-in via `WARREN_EXIT_BIN`) spawn the genuine `warren-core`
-  exit binary in multihop echo mode and drive its real HPKE session cache with this
-  SDK's `ClientSession`/`MultihopSession`. They validate the sealed-frame datapath
-  and the full rekey rotation (epoch switch, overlap window, per-epoch datapath)
-  against the reference implementation, not just the in-repo fake exit.
+- Real-exit wire-compat validation against the genuine `warren-core` exit run
+  locally (gated `real_exit_tests` in `warren-transport`), not just the in-repo
+  fake exit:
+  - Echo mode (`WARREN_EXIT_BIN`, no root): the sealed-frame datapath and the full
+    rekey rotation (epoch switch, overlap window, per-epoch datapath).
+  - Full termination mode (`WARREN_EXIT_ADDR`, rooted `--use-tun` exit): the real
+    `IpAssign` handshake (a 10.66.0.0/16 IP is assigned), the sticky-IP multipath
+    coherence (same identity -> same IP, distinct identity -> distinct IP), and a
+    DAITA-active exit accepting the client's `0xFF` cover traffic.
 
 ### Performance
 

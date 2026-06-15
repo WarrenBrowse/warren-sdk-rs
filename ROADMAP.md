@@ -346,21 +346,27 @@ checkout, then point `WARREN_EXIT_BIN` at the binary; the gated tests in
 (`--multihop --allow-anonymous-clients`, no subscription, no API, no root) and
 drive its real HPKE `SessionCache` with this SDK's `ClientSession`. This is what
 validated rekey live (epoch rotation, overlap window, per-epoch datapath). The
-echo harness covers the **datagram plane**; the items below need the exit's
-**allocator / DAITA termination mode**, which only runs under `--use-tun` (root /
-`CAP_NET_ADMIN`), so they are gated on a rooted exit run or prod, not on code:
+echo harness covers the **datagram plane**. The exit's full termination mode
+(allocator + DAITA + the setup handshake) runs under `--use-tun` (root /
+`CAP_NET_ADMIN`); a rooted local run of it validated the items below
+(`WARREN_EXIT_ADDR` points the gated tests at the running exit):
 
-- Multipath / connection bonding. DONE: `warren_net::BondedPacketSink` (stripe
-  send / merge recv) + facade `connect_multihop_bonded` / `start_proxy_multihop_bonded`.
-  Coherence comes from every member using the same account identity, so a real
-  exit's sticky allocator (keyed on `client_pubkey`, already in `IpRequest`) assigns
-  the bundle ONE IP, no new wire format. The striping/merge logic is unit-tested and
-  the bundle-of-one datapath is tested against the fake exit; the multi-member
-  sticky-IP coherence needs the exit's allocator mode (root + TUN) to validate.
-- DAITA full schedule. The `0xFF` cover-traffic send primitive is done; the
-  defended distribution (the maybenot state machine + its `DaitaConfig` negotiated
-  in the Setup/SetupAck handshake) needs the exit's full termination mode (root +
-  TUN), which also performs the handshake the echo harness skips.
+- DONE + REAL-EXIT VALIDATED: full `IpAssign` handshake. `connect()` completes the
+  sealed `IpRequest` -> `IpAssign` exchange against the real exit and is assigned a
+  10.66.0.0/16 tunnel IP (previously only fake-exit tested).
+- DONE + REAL-EXIT VALIDATED: multipath / connection bonding coherence.
+  `warren_net::BondedPacketSink` (stripe send / merge recv) + facade
+  `connect_multihop_bonded` / `start_proxy_multihop_bonded`. Two connections under
+  the SAME account identity receive the SAME sticky IP from the exit's allocator
+  (keyed on `client_pubkey`); a distinct identity gets a distinct IP. No new wire
+  format. (The bonded sink stripes over N such same-IP connections.)
+- DAITA. DONE + REAL-EXIT VALIDATED (cover-traffic primitive): a DAITA-active exit
+  (tamaraw) accepts the client's `0xFF` cover frames and drops them without
+  resetting the session, and the full handshake is wire-compatible with a
+  DAITA-enabled `SetupAck`. REMAINING (client feature, not a validation gap): HONOR
+  the negotiated schedule, i.e. parse the exit's `DaitaConfig` from the handshake
+  and run the maybenot state machine to emit the defended distribution. This is a
+  port of warren-core's maybenot driver, not blocked by anything external.
 - OS-enforced killswitch + IPv6 leak block. Only the best-effort
   `ProxyOnlyKillSwitch` is implemented; the `OsEnforced` level and the v6 leak
   guard belong to the deferred privileged TUN backend (P6), not userland.
