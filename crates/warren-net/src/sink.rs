@@ -137,6 +137,13 @@ impl MultihopPacketSink {
     pub fn session(&self) -> &MultihopSession {
         &self.session
     }
+
+    /// A cheap, cloneable handle to the session's live counters, so a caller can
+    /// keep reading totals after this sink is consumed by the datapath engine.
+    #[must_use]
+    pub fn metrics(&self) -> std::sync::Arc<warren_transport::MultihopMetrics> {
+        self.session.metrics()
+    }
 }
 
 impl PacketSink for MultihopPacketSink {

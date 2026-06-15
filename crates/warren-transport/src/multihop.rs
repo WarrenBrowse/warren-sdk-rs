@@ -22,8 +22,9 @@
 //! anti-replay-protected by a sliding window.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
 use warren_multihop::{ClientSession as HpkeSession, IpAssignment, ReplayWindow, SetupError};
@@ -241,8 +242,66 @@ impl MultihopClientTunnel {
             seq_send: AtomicU64::new(1),
             replay: Mutex::new(replay),
             assignment,
+            metrics: Arc::new(MultihopMetrics::new(0)),
         })
     }
+}
+
+/// Live data-plane counters for a multihop session, cheaply shareable (`Arc`):
+/// a clone can be held past the session (e.g. by a proxy handle) to read totals.
+#[derive(Debug)]
+pub struct MultihopMetrics {
+    bytes_sent: AtomicU64,
+    bytes_recv: AtomicU64,
+    packets_sent: AtomicU64,
+    packets_recv: AtomicU64,
+    epoch: AtomicU32,
+    connected_since: Instant,
+}
+
+impl MultihopMetrics {
+    fn new(epoch: u32) -> Self {
+        Self {
+            bytes_sent: AtomicU64::new(0),
+            bytes_recv: AtomicU64::new(0),
+            packets_sent: AtomicU64::new(0),
+            packets_recv: AtomicU64::new(0),
+            epoch: AtomicU32::new(epoch),
+            connected_since: Instant::now(),
+        }
+    }
+
+    /// A point-in-time snapshot of the counters.
+    #[must_use]
+    pub fn snapshot(&self) -> MultihopMetricsSnapshot {
+        MultihopMetricsSnapshot {
+            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
+            bytes_recv: self.bytes_recv.load(Ordering::Relaxed),
+            packets_sent: self.packets_sent.load(Ordering::Relaxed),
+            packets_recv: self.packets_recv.load(Ordering::Relaxed),
+            epoch: self.epoch.load(Ordering::Relaxed),
+            uptime_secs: self.connected_since.elapsed().as_secs(),
+        }
+    }
+}
+
+/// A serializable point-in-time view of a session's counters. Plain scalars so it
+/// maps cleanly across the FFI boundary to the sibling-language SDKs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MultihopMetricsSnapshot {
+    /// Total inner IP bytes sealed and sent.
+    pub bytes_sent: u64,
+    /// Total inner IP bytes received and opened.
+    pub bytes_recv: u64,
+    /// Total IP packets sent.
+    pub packets_sent: u64,
+    /// Total IP packets received.
+    pub packets_recv: u64,
+    /// Current HPKE epoch (rotates on rekey).
+    pub epoch: u32,
+    /// Seconds since the session was established.
+    pub uptime_secs: u64,
 }
 
 /// An established multihop session: IP packets travel as per-packet sealed
@@ -257,6 +316,7 @@ pub struct MultihopSession {
     seq_send: AtomicU64,
     replay: Mutex<ReplayWindow>,
     assignment: IpAssignment,
+    metrics: Arc<MultihopMetrics>,
 }
 
 impl MultihopSession {
@@ -316,7 +376,25 @@ impl MultihopSession {
         let bytes = frame.encode().map_err(MultihopError::Frame)?;
         self.conn
             .send_datagram(bytes.into())
-            .map_err(MultihopError::SendDatagram)
+            .map_err(MultihopError::SendDatagram)?;
+        self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(ip_packet.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// A cheap, cloneable handle to this session's live counters. Hold it past the
+    /// session (e.g. a proxy handle) to read totals without the session itself.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<MultihopMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// A point-in-time snapshot of this session's counters.
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> MultihopMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// Await the next inbound IP packet, opening sealed datagrams and skipping
@@ -367,7 +445,13 @@ impl MultihopSession {
                     let _ = try_decode_control(&plaintext);
                     continue;
                 }
-                Some(_) => return Ok(plaintext),
+                Some(_) => {
+                    self.metrics.packets_recv.fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .bytes_recv
+                        .fetch_add(plaintext.len() as u64, Ordering::Relaxed);
+                    return Ok(plaintext);
+                }
                 None => continue,
             }
         }

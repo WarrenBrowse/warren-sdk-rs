@@ -44,6 +44,14 @@ async fn multihop_setup_assigns_ip_and_sealed_datagram_echoes() {
         "the sealed round-trip must preserve the packet"
     );
 
+    // The metrics counters reflect the one packet each way.
+    let m = session.metrics_snapshot();
+    assert_eq!(m.packets_sent, 1, "one packet sent");
+    assert_eq!(m.packets_recv, 1, "one packet received");
+    assert_eq!(m.bytes_sent, packet.len() as u64);
+    assert_eq!(m.bytes_recv, echoed.len() as u64);
+    assert_eq!(m.epoch, 0);
+
     session.disconnect();
 }
 

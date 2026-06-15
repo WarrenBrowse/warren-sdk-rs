@@ -475,8 +475,13 @@ impl<T: HttpTransport> WarrenClient<T> {
     ) -> Result<ProxyHandle, SdkError> {
         ensure_dns_reachable(exit.dns_disabled, cfg)?;
         let sink = self.connect_multihop(exit).await?;
+        // Capture the session's counters before the sink moves into the engine, so
+        // the handle can expose live metrics for the datapath's lifetime.
+        let metrics = sink.metrics();
         let (local_ip, prefix, gateway, ipv6) = addressing_from_session(sink.session());
-        serve_proxy_over_sink(sink, local_ip, prefix, gateway, ipv6, cfg).await
+        let mut handle = serve_proxy_over_sink(sink, local_ip, prefix, gateway, ipv6, cfg).await?;
+        handle.metrics = Some(metrics);
+        Ok(handle)
     }
 
     /// Starts a *self-healing* multihop proxy datapath: it binds the local

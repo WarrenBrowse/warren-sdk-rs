@@ -13,7 +13,9 @@ pub mod reconnect;
 pub mod tls;
 
 pub use client::{ClientSession, ClientTunnel, TunnelError, local_ip_for_endpoint};
-pub use multihop::{MultihopClientTunnel, MultihopError, MultihopSession};
+pub use multihop::{
+    MultihopClientTunnel, MultihopError, MultihopMetrics, MultihopMetricsSnapshot, MultihopSession,
+};
 pub use reconnect::{
     Backoff, BackoffIter, ConnectionState, JitterBackoff, RetryError, connect_with_retry,
     connect_with_state,

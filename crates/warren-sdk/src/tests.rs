@@ -412,6 +412,9 @@ async fn start_proxy_multihop_against_a_fake_exit_is_connected() {
         .await
         .expect("proxy datapath starts over the fake exit");
     assert_eq!(handle.state(), TunnelState::Connected);
+    // The multihop datapath exposes live session metrics (epoch 0 at setup).
+    let m = handle.metrics().expect("multihop proxy exposes metrics");
+    assert_eq!(m.epoch, 0);
 }
 
 #[tokio::test]

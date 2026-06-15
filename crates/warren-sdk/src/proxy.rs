@@ -67,6 +67,9 @@ pub struct ProxyHandle {
     pub(crate) forward_connector: warren_net::TunnelConnector,
     pub(crate) gateway: std::net::Ipv4Addr,
     pub(crate) tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Live session counters, present for the multihop datapath (`None` for the
+    /// single-hop `start_proxy`, which has no sealed-session metrics).
+    pub(crate) metrics: Option<std::sync::Arc<warren_transport::MultihopMetrics>>,
 }
 
 impl ProxyHandle {
@@ -75,6 +78,14 @@ impl ProxyHandle {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// A snapshot of the datapath's live counters (bytes/packets/epoch/uptime),
+    /// or `None` for the single-hop [`start_proxy`](crate::WarrenClient::start_proxy)
+    /// path, which carries no sealed-session metrics.
+    #[must_use]
+    pub fn metrics(&self) -> Option<warren_transport::MultihopMetricsSnapshot> {
+        self.metrics.as_ref().map(|m| m.snapshot())
     }
 
     /// The address the HTTP CONNECT listener bound, if one was configured.
@@ -240,6 +251,7 @@ where
         forward_connector,
         gateway,
         tasks,
+        metrics: None,
     })
 }
 
