@@ -1009,6 +1009,84 @@ mod real_exit_tests {
 
         session.disconnect();
     }
+
+    /// Connects to an ALREADY-RUNNING full exit (TUN termination + allocator),
+    /// addressed by `WARREN_EXIT_ADDR` (e.g. `127.0.0.1:4434`), with its X25519
+    /// multihop pubkey at `WARREN_EXIT_PUBKEY_FILE`. Unlike the echo harness, this
+    /// exit performs the real setup handshake and assigns a tunnel IP, so it
+    /// validates `connect()` end-to-end and the sticky-IP allocator (multipath
+    /// coherence). Needs the exit run under root (`--use-tun`); skipped otherwise.
+    fn running_full_exit() -> Option<(SocketAddr, [u8; 32], [u8; 32])> {
+        let addr: SocketAddr = std::env::var("WARREN_EXIT_ADDR")
+            .ok()?
+            .parse()
+            .expect("WARREN_EXIT_ADDR must be host:port");
+        let pubkey_file = std::env::var("WARREN_EXIT_PUBKEY_FILE")
+            .unwrap_or_else(|_| "/tmp/warren-exit-poc/pub.hex".to_string());
+        let mut exit_x25519 = [0u8; 32];
+        hex::decode_to_slice(
+            std::fs::read_to_string(&pubkey_file)
+                .expect("read WARREN_EXIT_PUBKEY_FILE")
+                .trim(),
+            &mut exit_x25519,
+        )
+        .expect("exit pubkey hex");
+        let exit_rpk = warren_identity::WarrenIdentity::from_mnemonic(TEST_MNEMONIC)
+            .expect("derive exit identity")
+            .public_key();
+        Some((addr, exit_x25519, exit_rpk))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_handshake_assigns_a_real_ip_with_sticky_multipath_coherence() {
+        let Some((addr, exit_x25519, exit_rpk)) = running_full_exit() else {
+            eprintln!("skipping: WARREN_EXIT_ADDR not set (needs a rooted --use-tun exit)");
+            return;
+        };
+
+        // First connection completes the real sealed IpRequest -> IpAssign exchange.
+        let key = SigningKey::from_bytes(&CLIENT_SEED);
+        let s1 = MultihopClientTunnel::new(key.clone())
+            .connect(exit_rpk, exit_x25519, TEST_EXIT_ID, addr)
+            .await
+            .expect("full multihop handshake");
+        let ip1 = s1.assigned_ipv4();
+        assert_eq!(
+            (ip1.octets()[0], ip1.octets()[1]),
+            (10, 66),
+            "assigned a real 10.66.0.0/16 tunnel IP, got {ip1}"
+        );
+
+        // A second connection under the SAME account identity must land on the
+        // SAME tunnel IP: this is exactly the multipath/bonding coherence the exit
+        // guarantees via its sticky allocator keyed on client_pubkey.
+        let s2 = MultihopClientTunnel::new(key.clone())
+            .connect(exit_rpk, exit_x25519, TEST_EXIT_ID, addr)
+            .await
+            .expect("second same-identity handshake");
+        assert_eq!(
+            s2.assigned_ipv4(),
+            ip1,
+            "same identity must receive the same sticky IP across the bundle"
+        );
+
+        // A DISTINCT identity must get a DISTINCT IP (the allocator does not share
+        // an address across accounts).
+        let other = SigningKey::from_bytes(&[0x42u8; 32]);
+        let s3 = MultihopClientTunnel::new(other)
+            .connect(exit_rpk, exit_x25519, TEST_EXIT_ID, addr)
+            .await
+            .expect("distinct-identity handshake");
+        assert_ne!(
+            s3.assigned_ipv4(),
+            ip1,
+            "a distinct account must receive a distinct tunnel IP"
+        );
+
+        s1.disconnect();
+        s2.disconnect();
+        s3.disconnect();
+    }
 }
 
 #[cfg(test)]
