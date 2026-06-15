@@ -154,6 +154,16 @@ mod tests {
     }
 
     #[test]
+    fn from_hex_rejects_non_hex_of_correct_length() {
+        // Right length (32 chars) but non-hex bytes: the length guard passes and
+        // the decode must reject, distinct from WrongHexLength.
+        assert_eq!(
+            ExitId::from_hex(&"zz".repeat(16)),
+            Err(ExitIdError::InvalidHex)
+        );
+    }
+
+    #[test]
     fn json_serializes_as_hex_string() {
         let id = ExitId::from_bytes([0xaa; 16]);
         assert_eq!(

@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use warren_api::{HttpRequest, HttpResponse, HttpTransport, TransportError};
-use warren_discovery::VerifiedExit;
+use warren_discovery::{ExitId, Location, Relay, VerifiedExit};
 use warren_identity::WarrenIdentity;
 use warren_transport::ConnectionState;
 
@@ -443,6 +443,24 @@ async fn start_proxy_multihop_refuses_a_dns_disabled_exit_without_a_resolver() {
         Err(SdkError::ExitDnsDisabled) => {}
         Err(other) => panic!("expected ExitDnsDisabled, got {other:?}"),
         Ok(_) => panic!("a dns_disabled exit without a resolver must be refused"),
+    }
+}
+
+#[tokio::test]
+async fn connect_tunnel_without_a_dialable_address_is_no_exit_address() {
+    // A relay that resolved to zero dialable addresses must fail fast rather than
+    // attempt a connect to nothing.
+    let relay = Relay::new(
+        [0u8; 32],
+        ExitId::from_bytes([0u8; 16]),
+        Vec::new(),
+        Location::new("ZZ", "Test"),
+        1,
+        true,
+    );
+    match test_client().connect_tunnel(&relay).await {
+        Err(SdkError::NoExitAddress) => {}
+        other => panic!("expected NoExitAddress, got {other:?}"),
     }
 }
 
