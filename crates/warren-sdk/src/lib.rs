@@ -204,6 +204,7 @@ pub struct WarrenClientBuilder {
     api_base: String,
     api_alternative_hosts: Vec<String>,
     server_pubkey_pin: Option<String>,
+    multihop_root_pubkey_pins: Vec<String>,
     allow_any_server_key: bool,
     generation_store: Arc<dyn GenerationStore>,
     multihop_generation_store: Arc<dyn GenerationStore>,
@@ -242,6 +243,22 @@ impl WarrenClientBuilder {
     #[must_use]
     pub fn server_pubkey_pin(mut self, hex: impl Into<String>) -> Self {
         self.server_pubkey_pin = Some(hex.into());
+        self
+    }
+
+    /// Pins an offline multihop-directory ROOT Ed25519 pubkey (64-char hex). Call
+    /// more than once to trust several roots (key rotation).
+    ///
+    /// The root is the anchor a compromised online server cannot outrun: when at
+    /// least one root is pinned, the directory's operational certificate must be
+    /// signed by a pinned root, so a holder of the online server key alone cannot
+    /// mint exits the client accepts. When NONE is set the operational cert is
+    /// accepted on trust-on-first-use terms (the server pin still authenticates the
+    /// envelope, and each exit's Ed25519 identity should be cross-checked against
+    /// [`WarrenClient::fetch_exits`]). Production using multihop SHOULD pin a root.
+    #[must_use]
+    pub fn multihop_root_pubkey_pin(mut self, hex: impl Into<String>) -> Self {
+        self.multihop_root_pubkey_pins.push(hex.into());
         self
     }
 
@@ -331,6 +348,7 @@ impl WarrenClientBuilder {
             api,
             signing,
             server_pubkey_pin: pin,
+            multihop_root_pubkey_pins: self.multihop_root_pubkey_pins,
             generation_store: self.generation_store,
             multihop_generation_store: self.multihop_generation_store,
             server_key_store: self.server_key_store,
@@ -348,6 +366,8 @@ pub struct WarrenClient<T> {
     api: WarrenApiClient<T>,
     signing: warren_identity::ed25519_dalek::SigningKey,
     server_pubkey_pin: Option<String>,
+    /// Pinned offline multihop-directory root keys (empty = root TOFU).
+    multihop_root_pubkey_pins: Vec<String>,
     /// Anti-rollback floor: highest signed-list `generation` trusted so far.
     generation_store: Arc<dyn GenerationStore>,
     /// Anti-rollback floor for the multihop directory (separate sequence).
@@ -365,6 +385,7 @@ impl WarrenClient<()> {
             api_base: warren_api_default_base(),
             api_alternative_hosts: Vec::new(),
             server_pubkey_pin: None,
+            multihop_root_pubkey_pins: Vec::new(),
             allow_any_server_key: false,
             generation_store: Arc::new(InMemoryGenerationStore::default()),
             multihop_generation_store: Arc::new(InMemoryGenerationStore::default()),
@@ -478,8 +499,11 @@ impl<T: HttpTransport> WarrenClient<T> {
     ///
     /// The configured server pubkey pin, when set, authenticates which server
     /// signed the directory; otherwise the chain is accepted on trust-on-first-
-    /// use terms. Each exit's Ed25519 identity should additionally be cross-
-    /// checked against [`Self::fetch_exits`] before use.
+    /// use terms. Any root pins set via
+    /// [`multihop_root_pubkey_pin`](WarrenClientBuilder::multihop_root_pubkey_pin)
+    /// additionally anchor the operational certificate to the offline root. Each
+    /// exit's Ed25519 identity should additionally be cross-checked against
+    /// [`Self::fetch_exits`] before use.
     ///
     /// # Errors
     ///
@@ -496,7 +520,15 @@ impl<T: HttpTransport> WarrenClient<T> {
         // The configured relay-list pin doubles as the directory server pin when
         // present; with no pin, accept the self-consistent chain (TOFU).
         let pins: Vec<&str> = self.server_pubkey_pin.as_deref().into_iter().collect();
-        let verified = verify_multihop_directory(&json, &pins, &[])?;
+        // Anchor the operational cert to the pinned offline root(s) when set, so a
+        // holder of the online server key alone cannot mint accepted exits. Empty =
+        // root TOFU (documented on `multihop_root_pubkey_pin`).
+        let roots: Vec<&str> = self
+            .multihop_root_pubkey_pins
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let verified = verify_multihop_directory(&json, &pins, &roots)?;
 
         if now_unix_secs() >= verified.expires_at {
             return Err(SdkError::StaleMultihopDirectory);

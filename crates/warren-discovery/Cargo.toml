@@ -9,6 +9,12 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+# Exposes server-side signing helpers (signed-list and multihop-directory
+# minting) for tests in OTHER crates. Off by default so these fixtures never
+# enter the production-compiled surface; enabled via the dev-dependency.
+test-helpers = []
+
 [dependencies]
 warren-identity = { path = "../warren-identity" }
 ed25519-dalek = { workspace = true }

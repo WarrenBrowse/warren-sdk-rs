@@ -385,6 +385,116 @@ pub fn verify_multihop_directory(
     })
 }
 
+/// Server-side directory minting for tests. Gated so it never compiles into the
+/// production surface: available to in-crate tests (`cfg(test)`) and to other
+/// crates' tests through the `test-helpers` feature. It mirrors the operator's
+/// signing exactly (canonical preimage order, full PKI chain) so a facade or
+/// integration test can exercise [`verify_multihop_directory`] end to end.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_helpers {
+    use super::{
+        ExitDescriptorSigned, MULTIHOP_DIRECTORY_VERSION, NodeEntry, RelayDescriptorSigned,
+        SignedDirectory, UnsignedDirectory, WARREN_PKI_OPERATIONAL_EXIT_V2,
+        WARREN_PKI_OPERATIONAL_NODE_V1, WARREN_PKI_OPERATIONAL_RELAY_V1,
+        WARREN_PKI_ROOT_OPERATIONAL_V1,
+    };
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn op_sign(op: &SigningKey, ctx: &[u8], parts: &[&[u8]]) -> [u8; 64] {
+        let mut payload = ctx.to_vec();
+        for p in parts {
+            payload.extend_from_slice(p);
+        }
+        op.sign(&payload).to_bytes()
+    }
+
+    fn vouched_node(op: &SigningKey, tag: u8, country: &str, asn: u32) -> NodeEntry {
+        let endpoint: std::net::SocketAddr = format!("198.51.100.{tag}:443").parse().unwrap();
+        let relay_id = [tag; 16];
+        let relay_ed = [tag.wrapping_add(1); 32];
+        let exit_id = [tag.wrapping_add(2); 16];
+        let exit_ed = [tag.wrapping_add(3); 32];
+        let exit_x = [tag.wrapping_add(4); 32];
+        let relay_sig = op_sign(op, WARREN_PKI_OPERATIONAL_RELAY_V1, &[&relay_id, &relay_ed]);
+        let exit_sig = op_sign(
+            op,
+            WARREN_PKI_OPERATIONAL_EXIT_V2,
+            &[&exit_id, &exit_x, &[0u8]],
+        );
+        let attestation = op_sign(
+            op,
+            WARREN_PKI_OPERATIONAL_NODE_V1,
+            &[&relay_id, &exit_ed, &asn.to_be_bytes(), country.as_bytes()],
+        );
+        NodeEntry {
+            relay: RelayDescriptorSigned {
+                relay_id,
+                relay_ed25519_pubkey: relay_ed,
+                endpoint,
+                signature: relay_sig,
+            },
+            exit: ExitDescriptorSigned {
+                exit_id,
+                exit_ed25519_pubkey: exit_ed,
+                exit_x25519_multihop_pubkey: exit_x,
+                endpoint,
+                signature: exit_sig,
+                dns_disabled: false,
+            },
+            country: country.to_owned(),
+            city: "City".to_owned(),
+            asn,
+            weight: 100,
+            attestation_hex: hex::encode(attestation),
+        }
+    }
+
+    /// Mints the wire JSON the API serves at `GET /v1/multihop/directory`: two
+    /// fully-vouched nodes, the operational key certified by `root`, the envelope
+    /// signed by `server`. Pass a `root` the verifier does not pin to exercise the
+    /// operational-cert rejection path.
+    #[must_use]
+    pub fn mint_directory_json(
+        root: &SigningKey,
+        op: &SigningKey,
+        server: &SigningKey,
+        generation: u64,
+        signed_at: u64,
+        expires_at: u64,
+    ) -> String {
+        let nodes = vec![
+            vouched_node(op, 10, "RO", 100),
+            vouched_node(op, 20, "NL", 200),
+        ];
+        let op_pub = op.verifying_key().to_bytes();
+        let cert = op_sign(root, WARREN_PKI_ROOT_OPERATIONAL_V1, &[&op_pub]);
+        let unsigned = UnsignedDirectory {
+            version: MULTIHOP_DIRECTORY_VERSION,
+            nodes: &nodes,
+            generation,
+            signed_at,
+            expires_at,
+            operational_pubkey_hex: &hex::encode(op_pub),
+            operational_cert_hex: &hex::encode(cert),
+            server_pubkey_hex: &hex::encode(server.verifying_key().to_bytes()),
+        };
+        let canonical = serde_json::to_vec(&unsigned).unwrap();
+        let sig = server.sign(&canonical).to_bytes();
+        let full = SignedDirectory {
+            version: MULTIHOP_DIRECTORY_VERSION,
+            nodes,
+            generation,
+            signed_at,
+            expires_at,
+            operational_pubkey_hex: hex::encode(op_pub),
+            operational_cert_hex: hex::encode(cert),
+            server_pubkey_hex: hex::encode(server.verifying_key().to_bytes()),
+            signature_hex: hex::encode(sig),
+        };
+        serde_json::to_string(&full).unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

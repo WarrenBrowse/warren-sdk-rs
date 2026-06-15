@@ -28,6 +28,9 @@ reqwest-transport = ["warren-api/reqwest-transport"]
 [dev-dependencies]
 tokio = { workspace = true }
 ed25519-dalek = { workspace = true }
+# Enable the directory/relay-list minting helpers for facade tests (test-only;
+# the feature is off in production builds, which never compile dev-dependencies).
+warren-discovery = { path = "../warren-discovery", features = ["test-helpers"] }
 warren-test-support = { path = "../warren-test-support" }
 serde_json = { workspace = true }
 hex = { workspace = true }
