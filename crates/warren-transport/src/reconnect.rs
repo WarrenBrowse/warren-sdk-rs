@@ -331,7 +331,11 @@ mod tests {
         }
         // Reset returns to the immediate-retry state (e.g. after a healthy session).
         b.reset();
-        assert_eq!(b.next_delay(), Duration::ZERO, "reset re-arms immediate retry");
+        assert_eq!(
+            b.next_delay(),
+            Duration::ZERO,
+            "reset re-arms immediate retry"
+        );
     }
 
     #[test]

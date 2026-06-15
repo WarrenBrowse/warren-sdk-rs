@@ -25,10 +25,10 @@ pub use multihop_directory::{
 pub use query::{ExitQuery, IpAvailability, LocationConstraint};
 pub use relay::{Location, Relay, RelayList};
 pub use selector::{ExitSelector, SelectorError};
+/// Test-only signed-list minting (off in production; see [`signed::sign_relay_list`]).
+#[cfg(any(test, feature = "test-helpers"))]
+pub use signed::sign_relay_list;
 pub use signed::{
     JsonEndpoint, JsonGeoIp, JsonListener, JsonLocation, JsonNode, SIGNED_VERSION, SignedError,
     SignedRelayList, VerifiedRelayList, verify_signed_relay_list, verify_signed_relay_list_any,
 };
-/// Test-only signed-list minting (off in production; see [`signed::sign_relay_list`]).
-#[cfg(any(test, feature = "test-helpers"))]
-pub use signed::sign_relay_list;
