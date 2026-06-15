@@ -17,17 +17,22 @@
 //!    datagram plane, forward seq continuing from `1` (the setup frame was the
 //!    first forward frame, `seq = 0`).
 //!
-//! The live [`MultihopSession`] datapath stays at `epoch = 0`; epoch rotation is
-//! driven at the [`ClientSession`](warren_multihop::ClientSession) layer (fresh
-//! KEM, epoch `+1`, overlap window), and its wire-compatibility with the exit's
-//! `encapsulated_key`-keyed session cache is validated live against the real
-//! `warren-core` exit (see the `real_exit_tests` module). The reverse direction
-//! is anti-replay-protected by a sliding window.
+//! The live [`MultihopSession`] can rotate its HPKE epoch in place
+//! ([`MultihopSession::rekey`]) without tearing down the connection: a fresh KEM
+//! (new `encapsulated_key`), epoch `+1`, the forward sequence restarted at `0`,
+//! and the previous epoch retained for an overlap window. The exit re-derives its
+//! receiver context implicitly on the new `encapsulated_key` (no rekey control
+//! message). [`RekeyPolicy`] carries the warren-core doctrine (rotate within 8 h,
+//! 5-second overlap); a supervisor drives it. The whole rotation is validated
+//! live against the real `warren-core` exit (see the `real_exit_tests` module).
+//! The reverse direction is anti-replay-protected by a per-epoch sliding window,
+//! so the new epoch's low sequence numbers are not mistaken for replays.
 
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use warren_multihop::{ClientSession as HpkeSession, IpAssignment, ReplayWindow, SetupError};
@@ -230,7 +235,7 @@ impl MultihopClientTunnel {
         let assignment = session
             .open_setup_reply(&reply_frame)
             .map_err(MultihopError::Setup)?;
-        let mut replay = ReplayWindow::new();
+        let mut replay = EpochReplay::new();
         // The setup reply cannot be a replay (fresh window), but recording it
         // keeps a later data datagram from reusing that (epoch, seq).
         let _ = replay.check_and_record(reply_frame.seq, reply_frame.epoch);
@@ -238,14 +243,14 @@ impl MultihopClientTunnel {
         Ok(MultihopSession {
             _endpoint: endpoint,
             conn,
-            session,
+            session: RwLock::new(session),
             exit_id,
-            epoch: 0,
             // Setup consumed forward seq 0; data starts at 1.
             seq_send: AtomicU64::new(1),
             replay: Mutex::new(replay),
             assignment,
             metrics: Arc::new(MultihopMetrics::new(0)),
+            last_rekey_at: Mutex::new(Instant::now()),
         })
     }
 }
@@ -312,19 +317,140 @@ pub struct MultihopMetricsSnapshot {
     pub uptime_secs: u64,
 }
 
+/// How many epochs' reverse anti-replay windows are retained at once. Mirrors
+/// the exit's bound (`REPLAY_EPOCHS_KEPT`): the current epoch plus a few recent
+/// ones cover any in-flight old-epoch reverse frame during a rekey overlap.
+const REKEY_EPOCHS_KEPT: usize = 4;
+
+/// Reverse anti-replay across epochs: each epoch has its own seq space (the
+/// exit restarts the reverse counter per epoch), so a single sliding window
+/// would spuriously reject the new epoch's low seqs after a rekey. This keeps
+/// one [`ReplayWindow`] per epoch, evicting the oldest beyond
+/// [`REKEY_EPOCHS_KEPT`].
+struct EpochReplay {
+    windows: BTreeMap<u32, ReplayWindow>,
+}
+
+impl EpochReplay {
+    fn new() -> Self {
+        Self {
+            windows: BTreeMap::new(),
+        }
+    }
+
+    /// Probe `seq` for `epoch` without recording. An epoch never seen yet
+    /// accepts (its window is created on the matching record).
+    fn check(&self, seq: u64, epoch: u32) -> Result<(), warren_multihop::SessionError> {
+        match self.windows.get(&epoch) {
+            Some(w) => w.check(seq, epoch),
+            None => Ok(()),
+        }
+    }
+
+    /// Record `seq` for `epoch`, creating the epoch's window on first use and
+    /// evicting the oldest epoch once more than [`REKEY_EPOCHS_KEPT`] are held.
+    fn check_and_record(
+        &mut self,
+        seq: u64,
+        epoch: u32,
+    ) -> Result<(), warren_multihop::SessionError> {
+        let result = self
+            .windows
+            .entry(epoch)
+            .or_default()
+            .check_and_record(seq, epoch);
+        while self.windows.len() > REKEY_EPOCHS_KEPT {
+            // pop_first removes the lowest epoch key: the oldest, safe to forget.
+            self.windows.pop_first();
+        }
+        result
+    }
+}
+
+/// The session rekey doctrine (warren-core doc 19 § 11.6): rotate the HPKE
+/// context within `interval` to bound a long-lived session's AEAD exposure, and
+/// keep the previous epoch openable for `overlap` so in-flight reverse frames
+/// sealed just before the rotation still decrypt (the exit's session cache TTL).
+///
+/// This is a pure policy value; a supervisor drives it:
+/// `if policy.is_due(session.since_last_rekey()) { session.rekey()?;
+/// sleep(policy.overlap()); session.prune_old_epoch(); }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RekeyPolicy {
+    interval: Duration,
+    overlap: Duration,
+}
+
+impl RekeyPolicy {
+    /// The warren-core doctrine: rekey before 8 hours, 5-second overlap (the
+    /// exit's `SESSION_CACHE_TTL`).
+    #[must_use]
+    pub const fn doctrine() -> Self {
+        Self {
+            interval: Duration::from_secs(8 * 60 * 60),
+            overlap: Duration::from_secs(5),
+        }
+    }
+
+    /// Override the rotation interval (kept at or below the 8-hour doctrine cap).
+    #[must_use]
+    pub const fn with_interval(mut self, interval: Duration) -> Self {
+        self.interval = interval;
+        self
+    }
+
+    /// Override the overlap window.
+    #[must_use]
+    pub const fn with_overlap(mut self, overlap: Duration) -> Self {
+        self.overlap = overlap;
+        self
+    }
+
+    /// The rotation interval.
+    #[must_use]
+    pub const fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// The overlap window during which the previous epoch stays openable.
+    #[must_use]
+    pub const fn overlap(&self) -> Duration {
+        self.overlap
+    }
+
+    /// Whether a rekey is due given the time since the last rotation.
+    #[must_use]
+    pub fn is_due(&self, since_last_rekey: Duration) -> bool {
+        since_last_rekey >= self.interval
+    }
+}
+
+impl Default for RekeyPolicy {
+    fn default() -> Self {
+        Self::doctrine()
+    }
+}
+
 /// An established multihop session: IP packets travel as per-packet sealed
 /// `WarrenMultihopFrame`s over QUIC datagrams.
+///
+/// The session can rotate its HPKE epoch in place ([`rekey`](Self::rekey)) while
+/// the datapath keeps sealing under `&self`: the inner [`ClientSession`] sits
+/// behind an `RwLock` (seals take a read lock, a rekey takes the write lock), so
+/// no datagram is sealed against a half-rotated context.
 pub struct MultihopSession {
     // Held so the endpoint outlives the connection.
     _endpoint: quinn::Endpoint,
     conn: quinn::Connection,
-    session: HpkeSession,
+    session: RwLock<HpkeSession>,
     exit_id: [u8; EXIT_ID_LEN],
-    epoch: u32,
     seq_send: AtomicU64,
-    replay: Mutex<ReplayWindow>,
+    replay: Mutex<EpochReplay>,
     assignment: IpAssignment,
     metrics: Arc<MultihopMetrics>,
+    /// When the current epoch was installed (construction or last rekey); drives
+    /// [`RekeyPolicy::is_due`].
+    last_rekey_at: Mutex<Instant>,
 }
 
 impl MultihopSession {
@@ -388,15 +514,77 @@ impl MultihopSession {
     /// advancing the forward sequence. Shared by real packets and cover traffic;
     /// does not touch the app-data metrics (the caller owns that distinction).
     fn seal_and_send(&self, plaintext: &[u8]) -> Result<(), MultihopError> {
+        // Read-lock the session for the whole seal: a concurrent rekey holds the
+        // write lock, so the epoch read and the seq bump cannot straddle a
+        // rotation (no frame is sealed at the new epoch with a stale seq, nor at
+        // the old epoch after the seq reset).
+        let guard = self.session.read().unwrap_or_else(|e| e.into_inner());
+        let epoch = guard.epoch();
         let seq = self.seq_send.fetch_add(1, Ordering::AcqRel);
-        let frame = self
-            .session
-            .seal(plaintext, self.epoch, seq)
+        let frame = guard
+            .seal(plaintext, epoch, seq)
             .map_err(|e| MultihopError::Setup(SetupError::Session(e)))?;
+        drop(guard);
         let bytes = frame.encode().map_err(MultihopError::Frame)?;
         self.conn
             .send_datagram(bytes.into())
             .map_err(MultihopError::SendDatagram)
+    }
+
+    /// Rotate the HPKE context: a fresh KEM (new `encapsulated_key`), epoch `+1`,
+    /// the forward sequence restarted at `0` (warren-core doc 19 § 5.4), and the
+    /// previous epoch retained for the overlap so the exit's just-sent reverse
+    /// frames still open. The exit re-derives its receiver context implicitly on
+    /// the new `encapsulated_key`; there is no rekey control message.
+    ///
+    /// Close the overlap with [`prune_old_epoch`](Self::prune_old_epoch) once the
+    /// policy's overlap window elapses.
+    ///
+    /// # Errors
+    ///
+    /// [`MultihopError::Setup`] if the fresh `setup_sender` fails.
+    pub fn rekey(&self) -> Result<u32, MultihopError> {
+        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
+        let mut guard = self.session.write().unwrap_or_else(|e| e.into_inner());
+        let new_epoch = guard
+            .rekey(&mut rng)
+            .map_err(|e| MultihopError::Setup(SetupError::Session(e)))?;
+        // Publish the seq reset and epoch under the write lock, before any seal
+        // can observe the new epoch (the write lock excludes all read-lock seals).
+        self.seq_send.store(0, Ordering::SeqCst);
+        self.metrics.epoch.store(new_epoch, Ordering::Relaxed);
+        drop(guard);
+        *self.last_rekey_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        Ok(new_epoch)
+    }
+
+    /// End the rekey overlap: drop the previous-epoch context so old-epoch reverse
+    /// frames no longer open. Call once the [`RekeyPolicy::overlap`] deadline
+    /// elapses. Idempotent.
+    pub fn prune_old_epoch(&self) {
+        self.session
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .prune_old_epoch();
+    }
+
+    /// The current HPKE epoch (starts at `0`, `+1` per [`rekey`](Self::rekey)).
+    #[must_use]
+    pub fn current_epoch(&self) -> u32 {
+        self.session
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .epoch()
+    }
+
+    /// Time since the current epoch was installed (construction or last rekey).
+    /// Feed it to [`RekeyPolicy::is_due`] to decide when to rotate.
+    #[must_use]
+    pub fn since_last_rekey(&self) -> Duration {
+        self.last_rekey_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
     }
 
     /// Sends a DAITA cover-traffic (dummy) frame: a sealed frame whose plaintext
@@ -465,7 +653,12 @@ impl MultihopSession {
                     continue;
                 }
             }
-            let Ok(plaintext) = self.session.open_response(&frame) else {
+            let opened = self
+                .session
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .open_response(&frame);
+            let Ok(plaintext) = opened else {
                 continue;
             };
             {
@@ -497,6 +690,31 @@ impl MultihopSession {
     /// Close the connection cleanly.
     pub fn disconnect(&self) {
         self.conn.close(0u32.into(), b"client disconnect");
+    }
+}
+
+#[cfg(test)]
+impl MultihopSession {
+    /// Builds a session over an already-dialed raw connection, skipping the
+    /// setup/IpAssign exchange. Used to drive the multihop echo exit (which does
+    /// not run the setup stream) through the live rekey datapath in tests.
+    fn from_raw_for_test(
+        endpoint: quinn::Endpoint,
+        conn: quinn::Connection,
+        session: HpkeSession,
+        exit_id: [u8; EXIT_ID_LEN],
+    ) -> Self {
+        Self {
+            _endpoint: endpoint,
+            conn,
+            session: RwLock::new(session),
+            exit_id,
+            seq_send: AtomicU64::new(0),
+            replay: Mutex::new(EpochReplay::new()),
+            assignment: IpAssignment::placeholder_for_test(),
+            metrics: Arc::new(MultihopMetrics::new(0)),
+            last_rekey_at: Mutex::new(Instant::now()),
+        }
     }
 }
 
@@ -720,5 +938,122 @@ mod real_exit_tests {
 
         conn.close(0u32.into(), b"done");
         drop(endpoint);
+    }
+
+    /// Sends an IP-looking packet through the live session and asserts the exit
+    /// echoes it back through `recv_packet` (so the whole driver, not just the
+    /// raw `ClientSession`, survives the round-trip).
+    async fn session_echo(sess: &MultihopSession, payload: &[u8]) {
+        sess.send_packet(payload).expect("send_packet");
+        let got = tokio::time::timeout(Duration::from_secs(5), sess.recv_packet())
+            .await
+            .expect("echo within 5s")
+            .expect("recv_packet");
+        assert_eq!(
+            got, payload,
+            "echo must match the sent packet byte-for-byte"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_session_rekeys_in_place_against_the_real_exit() {
+        let Some((_exit, addr, exit_x25519, exit_rpk)) = spawn_real_exit() else {
+            eprintln!("skipping: WARREN_EXIT_BIN not set");
+            return;
+        };
+
+        let client_key = SigningKey::from_bytes(&CLIENT_SEED);
+        let (endpoint, conn) = dial_with_retry(&client_key, exit_rpk, addr).await;
+
+        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
+        let hpke =
+            ClientSession::new(&exit_x25519, TEST_EXIT_ID, &mut rng).expect("HPKE setup_sender");
+        let session = MultihopSession::from_raw_for_test(endpoint, conn, hpke, TEST_EXIT_ID);
+
+        // An IPv4-looking packet (first nibble 4) so recv_packet returns it
+        // instead of dropping it as DAITA padding or a control message.
+        let make_pkt = |tag: u8| -> Vec<u8> {
+            let mut p = vec![0x45u8];
+            p.extend((0..160u16).map(|i| (i as u8) ^ tag));
+            p
+        };
+
+        assert_eq!(session.current_epoch(), 0);
+        for tag in 0..6u8 {
+            session_echo(&session, &make_pkt(tag)).await;
+        }
+
+        // Rotate the live session in place under &self: fresh KEM, epoch+1, the
+        // forward sequence restarts at 0. The datapath must keep working without
+        // tearing down the connection.
+        let new_epoch = session.rekey().expect("rekey");
+        assert_eq!(new_epoch, 1);
+        assert_eq!(session.current_epoch(), 1);
+        assert_eq!(
+            session.metrics_snapshot().epoch,
+            1,
+            "metrics reflect the rotated epoch"
+        );
+
+        for tag in 6..12u8 {
+            session_echo(&session, &make_pkt(tag)).await;
+        }
+
+        // A second rotation works too (epoch counter keeps climbing).
+        assert_eq!(session.rekey().expect("rekey 2"), 2);
+        session_echo(&session, &make_pkt(0xC3)).await;
+
+        // Pruning the overlap is safe and leaves the current epoch usable.
+        session.prune_old_epoch();
+        session_echo(&session, &make_pkt(0xD4)).await;
+
+        session.disconnect();
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn rekey_policy_doctrine_is_eight_hours_with_five_second_overlap() {
+        let p = RekeyPolicy::doctrine();
+        assert_eq!(p.interval(), Duration::from_secs(8 * 60 * 60));
+        assert_eq!(p.overlap(), Duration::from_secs(5));
+        assert_eq!(RekeyPolicy::default(), p);
+    }
+
+    #[test]
+    fn rekey_policy_is_due_only_past_the_interval() {
+        let p = RekeyPolicy::doctrine().with_interval(Duration::from_secs(100));
+        assert!(!p.is_due(Duration::from_secs(99)));
+        assert!(p.is_due(Duration::from_secs(100)));
+        assert!(p.is_due(Duration::from_secs(101)));
+    }
+
+    #[test]
+    fn epoch_replay_isolates_seq_spaces_across_epochs() {
+        let mut r = EpochReplay::new();
+        // Same seq in two different epochs is NOT a replay (separate windows).
+        r.check_and_record(0, 0).expect("epoch 0 seq 0");
+        r.check_and_record(0, 1)
+            .expect("epoch 1 seq 0 is independent");
+        // But repeating a seq within one epoch is a replay.
+        assert!(r.check_and_record(0, 0).is_err(), "epoch 0 seq 0 replay");
+        assert!(r.check_and_record(0, 1).is_err(), "epoch 1 seq 0 replay");
+    }
+
+    #[test]
+    fn epoch_replay_evicts_oldest_epochs_beyond_the_cap() {
+        let mut r = EpochReplay::new();
+        // Fill more than the retention cap, then the lowest epoch's window is gone,
+        // so its seqs are accepted again (treated as a fresh epoch).
+        for epoch in 0..(REKEY_EPOCHS_KEPT as u32 + 1) {
+            r.check_and_record(5, epoch).expect("record");
+        }
+        assert!(
+            r.check_and_record(5, 0).is_ok(),
+            "evicted epoch 0 window forgets its seqs"
+        );
     }
 }

@@ -9,6 +9,12 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+# Exposes test-only constructors (e.g. `IpAssignment::placeholder_for_test`) for
+# downstream harnesses that bypass the real setup exchange. OFF by default; only
+# ever enabled as a dev-dependency feature, never in a production dependency.
+test-helpers = []
+
 [dependencies]
 warren-wire = { path = "../warren-wire" }
 thiserror = { workspace = true }

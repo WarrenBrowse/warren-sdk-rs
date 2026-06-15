@@ -42,6 +42,24 @@ pub struct IpAssignment {
     pub gateway_ipv6: Option<[u8; 16]>,
 }
 
+impl IpAssignment {
+    /// A loopback placeholder assignment for test harnesses that bypass the real
+    /// setup exchange (e.g. the multihop echo exit, which assigns no IP). Never
+    /// compiled into a production build.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    pub fn placeholder_for_test() -> Self {
+        Self {
+            ipv4: [127, 0, 0, 2],
+            prefix_len: 24,
+            gateway_ipv4: [127, 0, 0, 1],
+            ipv6: None,
+            prefix_len_v6: 0,
+            gateway_ipv6: None,
+        }
+    }
+}
+
 /// Failure of the multihop setup exchange.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

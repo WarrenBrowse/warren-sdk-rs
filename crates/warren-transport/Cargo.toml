@@ -36,6 +36,9 @@ warren-test-support = { path = "../warren-test-support" }
 # WARREN_EXIT_BIN integration test can pin it (wire-compat: same derivation
 # the reference exit uses). Leaf crate, no dependency cycle.
 warren-identity = { path = "../warren-identity" }
+# test-helpers exposes IpAssignment::placeholder_for_test for the raw multihop
+# session built in the WARREN_EXIT_BIN rekey-driver test (dev-only feature).
+warren-multihop = { path = "../warren-multihop", features = ["test-helpers"] }
 tempfile = { workspace = true }
 hex = { workspace = true }
 
