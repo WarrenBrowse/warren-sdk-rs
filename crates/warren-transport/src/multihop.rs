@@ -17,9 +17,12 @@
 //!    datagram plane, forward seq continuing from `1` (the setup frame was the
 //!    first forward frame, `seq = 0`).
 //!
-//! Rekey/epoch rotation is out of scope here: the session stays at `epoch = 0`,
-//! matching warren-core's single-epoch setup path. The reverse direction is
-//! anti-replay-protected by a sliding window.
+//! The live [`MultihopSession`] datapath stays at `epoch = 0`; epoch rotation is
+//! driven at the [`ClientSession`](warren_multihop::ClientSession) layer (fresh
+//! KEM, epoch `+1`, overlap window), and its wire-compatibility with the exit's
+//! `encapsulated_key`-keyed session cache is validated live against the real
+//! `warren-core` exit (see the `real_exit_tests` module). The reverse direction
+//! is anti-replay-protected by a sliding window.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -494,5 +497,228 @@ impl MultihopSession {
     /// Close the connection cleanly.
     pub fn disconnect(&self) {
         self.conn.close(0u32.into(), b"client disconnect");
+    }
+}
+
+/// Wire-compatibility validation against the genuine `warren-core` exit.
+///
+/// These tests spawn the real `warren-exit` binary in multihop echo mode (the
+/// reference implementation, not the in-repo fake) and drive its HPKE datagram
+/// plane with this SDK's [`ClientSession`](warren_multihop::ClientSession). They
+/// are the authoritative wire-compat oracle: if the per-packet key derivation,
+/// the AAD layout, the encapsulated-key serialization, the postcard frame shape,
+/// or the rekey contract drift from the reference, the round-trip stops opening.
+///
+/// They are gated on the `WARREN_EXIT_BIN` env var (absolute path to a built
+/// `warren-exit`); without it each test returns immediately so `cargo test`
+/// stays green on machines that do not have the reference checkout. Build the
+/// binary with `cargo build -p warren-exit` in the `warren-core` checkout and
+/// point `WARREN_EXIT_BIN` at `target/debug/warren-exit`.
+#[cfg(test)]
+mod real_exit_tests {
+    use super::*;
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
+
+    use warren_multihop::ClientSession;
+
+    /// Frozen BIP39 test vector. The exit derives BOTH its Ed25519 QUIC RPK
+    /// (via the identity HKDF) and its long-lived X25519 multihop key from this
+    /// mnemonic; we re-derive the RPK locally to pin the TLS peer.
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    /// Matches the `--multihop-exit-id` hex we pass the exit.
+    const TEST_EXIT_ID: [u8; EXIT_ID_LEN] = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ];
+    const TEST_EXIT_ID_HEX: &str = "00112233445566778899aabbccddeeff";
+    /// Deterministic client identity (the value is irrelevant in permissive mode).
+    const CLIENT_SEED: [u8; 32] = [0x77; 32];
+
+    /// Kills the spawned exit on drop so a panicking test never leaks the process.
+    struct ExitGuard(Child);
+    impl Drop for ExitGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A bound-then-released loopback UDP port. Small TOCTOU window before the
+    /// exit rebinds it; acceptable for a serial, opt-in integration test.
+    fn free_udp_port() -> u16 {
+        std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind ephemeral udp")
+            .local_addr()
+            .expect("local_addr")
+            .port()
+    }
+
+    /// Spawns the real exit in multihop echo mode. Returns `None` when
+    /// `WARREN_EXIT_BIN` is unset (the test then no-ops to keep CI green).
+    /// On success: the running exit, its address, its X25519 multihop pubkey,
+    /// and its Ed25519 RPK (re-derived here from the same mnemonic).
+    fn spawn_real_exit() -> Option<(ExitGuard, SocketAddr, [u8; 32], [u8; 32])> {
+        let bin = std::env::var("WARREN_EXIT_BIN").ok()?;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mnemonic_file = dir.path().join("mnemonic.txt");
+        std::fs::write(&mnemonic_file, format!("{TEST_MNEMONIC}\n")).expect("write mnemonic");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&mnemonic_file, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod mnemonic");
+        }
+        let pubkey_out = dir.path().join("multihop_pub.hex");
+        let port = free_udp_port();
+
+        let child = Command::new(&bin)
+            .arg("--multihop")
+            .arg("--allow-anonymous-clients")
+            .arg("--bind-addr")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("--mnemonic-file")
+            .arg(&mnemonic_file)
+            .arg("--multihop-exit-id")
+            .arg(TEST_EXIT_ID_HEX)
+            .arg("--multihop-pubkey-out")
+            .arg(&pubkey_out)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn warren-exit (is WARREN_EXIT_BIN a valid path?)");
+        let guard = ExitGuard(child);
+
+        // The exit writes its X25519 pubkey just before binding the endpoint, so
+        // poll for it as a readiness signal (then still retry the QUIC dial).
+        let mut exit_x25519 = [0u8; 32];
+        let mut ready = false;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&pubkey_out) {
+                let s = s.trim();
+                if s.len() == 64 && hex::decode_to_slice(s, &mut exit_x25519).is_ok() {
+                    ready = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(ready, "exit did not publish its X25519 multihop pubkey");
+
+        // Re-derive the exit's Ed25519 RPK from the same mnemonic (identical
+        // frozen identity derivation): pinning it proves both ends agree.
+        let exit_rpk = warren_identity::WarrenIdentity::from_mnemonic(TEST_MNEMONIC)
+            .expect("derive exit identity")
+            .public_key();
+
+        Some((
+            guard,
+            (Ipv4Addr::LOCALHOST, port).into(),
+            exit_x25519,
+            exit_rpk,
+        ))
+    }
+
+    /// Dials the exit's raw multihop QUIC plane, retrying until it is listening.
+    async fn dial_with_retry(
+        client_key: &SigningKey,
+        exit_rpk: [u8; 32],
+        addr: SocketAddr,
+    ) -> (quinn::Endpoint, quinn::Connection) {
+        for attempt in 0..50u32 {
+            match crate::client::dial_quic(
+                client_key,
+                exit_rpk,
+                addr,
+                effective_bind(None, false, addr),
+            )
+            .await
+            {
+                Ok(pair) => return pair,
+                Err(_) if attempt < 49 => tokio::time::sleep(Duration::from_millis(100)).await,
+                Err(e) => panic!("dial_quic never succeeded: {e:?}"),
+            }
+        }
+        unreachable!()
+    }
+
+    /// One sealed forward datagram, echoed back and opened. Asserts the exit
+    /// returned our exact plaintext through the reverse HPKE direction.
+    async fn echo_roundtrip(
+        conn: &quinn::Connection,
+        session: &ClientSession,
+        epoch: u32,
+        seq: u64,
+        payload: &[u8],
+    ) {
+        let frame = session.seal(payload, epoch, seq).expect("seal");
+        conn.send_datagram(frame.encode().expect("encode").into())
+            .expect("send_datagram");
+        let resp = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+            .await
+            .expect("echo within 5s")
+            .expect("read_datagram");
+        let resp_frame = WarrenMultihopFrame::decode(&resp).expect("decode echo");
+        let opened = session.open_response(&resp_frame).expect("open echo");
+        assert_eq!(
+            opened, payload,
+            "echo must match the sealed payload byte-for-byte"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_round_trips_across_epochs_against_the_real_exit() {
+        let Some((_exit, addr, exit_x25519, exit_rpk)) = spawn_real_exit() else {
+            eprintln!("skipping: WARREN_EXIT_BIN not set");
+            return;
+        };
+
+        let client_key = SigningKey::from_bytes(&CLIENT_SEED);
+        let (endpoint, conn) = dial_with_retry(&client_key, exit_rpk, addr).await;
+
+        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
+        let mut session =
+            ClientSession::new(&exit_x25519, TEST_EXIT_ID, &mut rng).expect("HPKE setup_sender");
+
+        // Epoch 0: a handful of frames open cleanly (baseline datapath).
+        for seq in 0..8u64 {
+            let payload: Vec<u8> = (0..200).map(|i| (i as u64 ^ seq) as u8).collect();
+            echo_roundtrip(&conn, &session, 0, seq, &payload).await;
+        }
+
+        // Rekey: a fresh encapsulated_key makes the exit's session cache MISS and
+        // run a brand new `setup_receiver`. The new-epoch datapath must round-trip.
+        let new_epoch = session.rekey(&mut rng).expect("rekey");
+        assert_eq!(new_epoch, 1);
+        for seq in 0..8u64 {
+            let payload: Vec<u8> = (0..200).map(|i| (i as u64 ^ seq ^ 0xA5) as u8).collect();
+            echo_roundtrip(&conn, &session, new_epoch, seq, &payload).await;
+        }
+
+        // Overlap window: the exit keeps the previous encapsulated_key's session
+        // briefly (its cache TTL), so an in-flight OLD-epoch frame still opens.
+        echo_roundtrip(
+            &conn,
+            &session,
+            0,
+            100,
+            b"old-epoch frame in the overlap window",
+        )
+        .await;
+
+        // Closing the overlap drops the old context client-side: sealing at the
+        // retired epoch is now refused (no key material to reuse a stale nonce).
+        session.prune_old_epoch();
+        assert!(
+            session.seal(b"after prune", 0, 101).is_err(),
+            "old epoch must be unusable once the overlap window is pruned"
+        );
+
+        // The current epoch is unaffected by the prune.
+        echo_roundtrip(&conn, &session, new_epoch, 8, b"current epoch still works").await;
+
+        conn.close(0u32.into(), b"done");
+        drop(endpoint);
     }
 }

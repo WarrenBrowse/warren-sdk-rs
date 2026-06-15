@@ -32,6 +32,12 @@ tokio = { workspace = true, features = ["test-util"] }
 ed25519-dalek = { workspace = true }
 warren-wire = { path = "../warren-wire" }
 warren-test-support = { path = "../warren-test-support" }
+# Re-derives the real exit's Ed25519 RPK from its BIP39 mnemonic so the
+# WARREN_EXIT_BIN integration test can pin it (wire-compat: same derivation
+# the reference exit uses). Leaf crate, no dependency cycle.
+warren-identity = { path = "../warren-identity" }
+tempfile = { workspace = true }
+hex = { workspace = true }
 
 [lints]
 workspace = true

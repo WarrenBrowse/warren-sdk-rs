@@ -61,6 +61,7 @@ pub fn local_ip_for_endpoint(exit_addr: SocketAddr) -> Option<std::net::IpAddr> 
 /// Failure dialing the QUIC connection, before any Warren framing. Mapped by
 /// each tunnel into its own error enum (see the `From` impls), so the shared
 /// [`dial_quic`] handshake prefix is written once.
+#[derive(Debug)]
 pub(crate) enum QuicDialError {
     Tls(tls::WarrenTlsError),
     Bind(std::io::Error),
