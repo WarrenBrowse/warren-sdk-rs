@@ -36,10 +36,21 @@ IPv6, and the port-forwarding primitives. Applications depend on a single crate,
 | High-level `WarrenClient` facade (`start_proxy` + `start_proxy_multihop` + self-healing `start_proxy_multihop_supervised`, with exit failover, discovery, account API); `ProxyHandle` exposes connection state and one-call `forward_port` | `warren-sdk` | done, in-process e2e |
 | FFI surface (uniffi): identity + async client + proxy handle + connection-state events + `forward_port` + self-healing supervised proxy; Python/Kotlin bindings CI-validated | `warren-sdk-ffi` | done |
 
-The full tunnel needs a subscribed wallet (the exit gates the IP assignment on its
-allowlist); set `WARREN_MNEMONIC` and run `cargo run -p warren-sdk --example
-live_proxy` (or `--example live_exit` to validate the sealed handshake without a
-subscription).
+### Live validation against production
+
+Set `WARREN_MNEMONIC` to a subscribed account and run any of the `warren-sdk`
+examples below (`cargo run -p warren-sdk --example <name>`). They validate the
+SDK against the production API and real exits:
+
+| Example | Proves |
+|---|---|
+| `live_exit` | signed v6 exit list + multihop directory verify and cross-check; sealed handshake reaches the exit policy gate (no subscription needed) |
+| `live_proxy` | full multihop tunnel: real `IpAssign` + egress through the sealed tunnel |
+| `live_reconnect` | app-driven reconnect: independent sessions each rebuild from a fresh `IpAssign` and egress |
+| `live_supervised` | self-healing supervised proxy: stable address, reaches `Connected`, egresses |
+| `live_failover` | exit failover routes around a broken exit (broken candidate first) to a working one |
+| `live_forward_port` | NAT-PMP port forward end to end: the exit grants a mapping and an external dial-in to the public port round-trips through the tunnel |
+| `live_ipv6` | surveys every exit's `IpAssign` for a v6 address and, if granted, proves IPv6 egress |
 
 ## Identity in a few lines
 
