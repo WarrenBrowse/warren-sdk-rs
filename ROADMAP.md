@@ -88,8 +88,12 @@ pinned by golden vectors where a wire format is involved. warren-core
   using the datapath's own connector and exit gateway. Validated in-process
   against a NAT-PMP-gateway exit simulator that grants a mapping and then dials
   back into the forwarded port, round-tripping to a local server.
-- Pending: validation against a real exit (needs an exit that runs a NAT-PMP
-  gateway and an external peer to dial the forwarded port from the internet).
+- Real-exit validation: the NAT-PMP gateway path is live-validated. `cargo run -p
+  warren-sdk --example live_forward_port` opens a real multihop proxy to the
+  NL/Amsterdam prod exit and the exit GRANTS a TCP mapping (allocated external
+  port), then the mapping is released cleanly: the full map exchange works against
+  real infrastructure. Pending only: the inbound dial-in leg (an external internet
+  peer reaching the granted external port), which needs a peer outside the sandbox.
 
 ## P8: warren-sdk facade
 
@@ -117,9 +121,12 @@ pinned by golden vectors where a wire format is involved. warren-core
     variants so one bound port survives rebuilds. Unit-tested in-process with a
     fake sink whose read side closes on demand (asserts auto-reconnect + the
     listener stays live on the same address across the rebuild).
+- The supervisor happy path is live-validated: `cargo run -p warren-sdk --example
+  live_supervised` starts `start_proxy_multihop_supervised` against the prod exit,
+  reaches `Connected` on the state watch, and egresses through the stable address.
 - Pending: real-exit validation of the automatic supervisor's drop-triggered
-  reconnect (forcing a mid-session tunnel drop on a production exit is not
-  reliably reproducible from the dev sandbox; the rebuild-from-fresh-`IpAssign`
+  reconnect specifically (forcing a mid-session tunnel drop on a production exit is
+  not reliably reproducible from the dev sandbox; the rebuild-from-fresh-`IpAssign`
   path it reuses is already live-validated), and broader end-to-end tests against
   a real exit and the production API.
 
