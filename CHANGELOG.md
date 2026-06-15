@@ -43,10 +43,22 @@ the pre-release `0.0.x` line.
 - Multipath connection bonding: `warren_net::BondedPacketSink` plus facade
   `connect_multihop_bonded` / `start_proxy_multihop_bonded` (stripe send, merge
   recv across N same-identity sessions the exit coheres to one sticky IP).
-- Rekey crypto core: `warren_multihop::ClientSession::rekey` (fresh KEM, epoch+1,
-  overlap window) + `prune_old_epoch` + epoch-aware seal/open. The transport-level
-  driver (per-epoch replay windows, `RekeyPolicy` timer) remains, pending a real
-  exit to validate against.
+- Rekey / epoch rotation, end to end: `warren_multihop::ClientSession::rekey`
+  (fresh KEM, epoch+1, overlap window) plus the live transport driver
+  `MultihopSession::rekey` / `prune_old_epoch` (an `RwLock<ClientSession>` so the
+  datapath keeps sealing under `&self`, forward-seq reset per epoch, a per-epoch
+  reverse anti-replay map) and `RekeyPolicy` (the 8-hour doctrine). Rekey reuses
+  the frame's `epoch` + `encapsulated_key` (no new wire format; the exit re-derives
+  its receiver context implicitly).
+
+### Testing
+
+- Real-exit wire-compat validation: the gated `real_exit_tests` (in
+  `warren-transport`, opt-in via `WARREN_EXIT_BIN`) spawn the genuine `warren-core`
+  exit binary in multihop echo mode and drive its real HPKE session cache with this
+  SDK's `ClientSession`/`MultihopSession`. They validate the sealed-frame datapath
+  and the full rekey rotation (epoch switch, overlap window, per-epoch datapath)
+  against the reference implementation, not just the in-repo fake exit.
 
 ### Performance
 

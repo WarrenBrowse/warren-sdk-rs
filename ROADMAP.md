@@ -326,35 +326,41 @@ still want a real-exit pass before being relied on in production):
 - DONE (primitive): DAITA cover-traffic SEND (`MultihopSession::send_cover_traffic`,
   the frozen `0xFF` dummy frame the exit drops). The cover-traffic building block
   exists; the full DAITA *schedule* (when to emit, the defended distribution) is
-  still to be ported from warren-core's `multi_hop_pump` and validated.
+  still to be ported from warren-core's maybenot machine and validated.
+- DONE + REAL-EXIT VALIDATED: rekey / epoch rotation, end to end. The crypto core
+  (`ClientSession::rekey`: fresh KEM, epoch+1, overlap slot + epoch-aware seal/open)
+  AND the transport driver (`MultihopSession::rekey`/`prune_old_epoch` behind an
+  `RwLock<ClientSession>`, forward-seq reset to 0 per epoch, a per-epoch reverse
+  anti-replay map, `RekeyPolicy` 8-hour doctrine) are implemented and validated
+  LIVE against the genuine `warren-core` exit (see below). Rekey introduces NO new
+  wire format (it reuses the frame's `epoch` + `encapsulated_key`; the exit
+  re-derives its receiver context implicitly on the new key, no control message).
 
-Still deferred. NOT blocked by privilege (these are userland), but each is a
-FROZEN WIRE FORMAT in warren-core, so per the prime directives (wire-compat is
-non-negotiable, golden vectors are the contract, validate against a real exit
-before claiming done) the correct path is: (1) extract golden vectors from
-warren-core via a reference binary, (2) port against those vectors, (3) validate
-against a real exit. Reverse-engineering them from core's source without vectors
-risks silent incompatibility, so they are intentionally not implemented yet:
+### Real-exit validation harness (the wire-compat oracle)
 
-- Rekey / epoch rotation. CORE DONE: `ClientSession::rekey` (fresh KEM, epoch+1,
-  overlap slot) + `prune_old_epoch` + epoch-aware seal/open are implemented and
-  unit-tested (overlap opens old-epoch reverse frames; prune ends the window).
-  Rekey introduces NO new wire format (it reuses the frame's `epoch` +
-  `encapsulated_key`). REMAINING (transport driver, needs a real exit to validate):
-  drive `MultihopSession::rekey` behind interior mutability (the datapath holds the
-  session via `Arc` under `&self`), keep a replay window PER active epoch during the
-  overlap (the window is per `(exit_id, epoch)`), reset the forward seq for the new
-  epoch, and add a `RekeyPolicy` (8-hour doctrine) timer. The fake exit also needs
-  to re-derive its receiver context on an epoch/encapsulated-key change for a
-  round-trip in-process test.
+The reference `warren-core` exit BUILDS AND RUNS LOCALLY with zero production
+dependencies, so it is the authoritative wire-compat oracle (strictly better than
+the in-repo fake). Build `cargo build -p warren-exit` in the `warren-core`
+checkout, then point `WARREN_EXIT_BIN` at the binary; the gated tests in
+`warren-transport`'s `real_exit_tests` spawn it in multihop echo mode
+(`--multihop --allow-anonymous-clients`, no subscription, no API, no root) and
+drive its real HPKE `SessionCache` with this SDK's `ClientSession`. This is what
+validated rekey live (epoch rotation, overlap window, per-epoch datapath). The
+echo harness covers the **datagram plane**; the items below need the exit's
+**allocator / DAITA termination mode**, which only runs under `--use-tun` (root /
+`CAP_NET_ADMIN`), so they are gated on a rooted exit run or prod, not on code:
+
 - Multipath / connection bonding. DONE: `warren_net::BondedPacketSink` (stripe
   send / merge recv) + facade `connect_multihop_bonded` / `start_proxy_multihop_bonded`.
   Coherence comes from every member using the same account identity, so a real
   exit's sticky allocator (keyed on `client_pubkey`, already in `IpRequest`) assigns
   the bundle ONE IP, no new wire format. The striping/merge logic is unit-tested and
   the bundle-of-one datapath is tested against the fake exit; the multi-member
-  sticky-IP coherence still needs a real-exit pass (the fake exit accepts one
-  connection).
+  sticky-IP coherence needs the exit's allocator mode (root + TUN) to validate.
+- DAITA full schedule. The `0xFF` cover-traffic send primitive is done; the
+  defended distribution (the maybenot state machine + its `DaitaConfig` negotiated
+  in the Setup/SetupAck handshake) needs the exit's full termination mode (root +
+  TUN), which also performs the handshake the echo harness skips.
 - OS-enforced killswitch + IPv6 leak block. Only the best-effort
   `ProxyOnlyKillSwitch` is implemented; the `OsEnforced` level and the v6 leak
   guard belong to the deferred privileged TUN backend (P6), not userland.
