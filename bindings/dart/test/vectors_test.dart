@@ -109,4 +109,27 @@ void main() {
       client.close();
     }
   });
+
+  test('async start_proxy (observer-less) errors on a dead host', () async {
+    // The full async object-returning method with Option args: start_proxy with
+    // a valid-format exit id + a bindable socks5 address but an unroutable API
+    // base. The directory fetch fails, so the RustFuture completes with an error
+    // (object-returning future via complete_u64). Validates the async object
+    // method + Option<RustBuffer> argument lowering without a live exit.
+    final client = WarrenFfiClientFfi.create(
+      ffi,
+      mnemonic: (((vectors['bip39'] as Map)['vectors'] as List).first
+          as Map)['mnemonic'] as String,
+      apiBase: 'https://127.0.0.1:1',
+      serverPubkeyPin: 'ab' * 32,
+    );
+    try {
+      await expectLater(
+        client.startProxy(exitIdHex: 'ab' * 16, socks5Listen: '127.0.0.1:0'),
+        throwsA(isA<Object>()),
+      );
+    } finally {
+      client.close();
+    }
+  });
 }

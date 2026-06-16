@@ -111,7 +111,11 @@ class WarrenIdentityFfi {
             lib.lookupFunction<_FutureCompleteU64C, _FutureCompleteU64Dart>(
                 'ffi_warren_sdk_ffi_rust_future_complete_u64'),
         _futureFree = lib.lookupFunction<_FutureFreeC, _FutureFreeDart>(
-            'ffi_warren_sdk_ffi_rust_future_free_u64');
+            'ffi_warren_sdk_ffi_rust_future_free_u64'),
+        _startProxy = lib.lookupFunction<_StartProxyC, _StartProxyDart>(
+            'uniffi_warren_sdk_ffi_fn_method_warrenfficlient_start_proxy'),
+        _proxyFree = lib.lookupFunction<_FreeObjC, _FreeObjDart>(
+            'uniffi_warren_sdk_ffi_fn_free_warrenffiproxy');
 
   /// Opens the library from `path` (the built cdylib).
   factory WarrenIdentityFfi.open(String path) =>
@@ -130,6 +134,18 @@ class WarrenIdentityFfi {
   final _FuturePollDart _futurePoll;
   final _FutureCompleteU64Dart _futureCompleteU64;
   final _FutureFreeDart _futureFree;
+  final _StartProxyDart _startProxy;
+  final _FreeObjDart _proxyFree;
+
+  /// A RustBuffer holding a single 0x00 byte: the uniffi lowering of `Option::None`.
+  _Lowered _lowerNone(ffi.Pointer<_RustCallStatus> status) {
+    final dataPtr = malloc<ffi.Uint8>(1);
+    dataPtr.value = 0;
+    final fb = calloc<_ForeignBytes>();
+    fb.ref.len = 1;
+    fb.ref.data = dataPtr;
+    return _Lowered(_fromBytes(fb.ref, status), dataPtr, fb);
+  }
 
   /// SS58 `wb…` address for a 64-hex pubkey.
   String ss58Encode(String pubkeyHex) => _callString(_ss58Encode, pubkeyHex);
@@ -295,6 +311,13 @@ typedef _FutureCompleteU64Dart = int Function(
 typedef _FutureFreeC = ffi.Void Function(ffi.Uint64);
 typedef _FutureFreeDart = void Function(int);
 
+// start_proxy(self, exit_id: RustBuffer, socks5: RustBuffer,
+//             options: Option<RustBuffer>, observer: Option<RustBuffer>) -> future
+typedef _StartProxyC = ffi.Uint64 Function(
+    ffi.Pointer<ffi.Void>, _RustBuffer, _RustBuffer, _RustBuffer, _RustBuffer);
+typedef _StartProxyDart = int Function(
+    ffi.Pointer<ffi.Void>, _RustBuffer, _RustBuffer, _RustBuffer, _RustBuffer);
+
 const int _rustFuturePollReady = 0;
 
 /// A live `WarrenFfiClient` over the native library, demonstrating the uniffi
@@ -344,6 +367,51 @@ class WarrenFfiClientFfi {
   Future<int> subscriptionExpiry() {
     final future = _ffi._subscriptionExpiry(_handle);
     return _driveU64Future(future);
+  }
+
+  /// Starts the non-root SOCKS5 proxy over a multihop tunnel to the exit with
+  /// `exitIdHex`, binding the listener at `socks5Listen`. Async object-returning
+  /// method with `options`/`observer` = None (the observer callback interface is
+  /// not bindable from Dart, see README). On success the returned proxy object is
+  /// freed immediately (the test only needs the call to reach the exit attempt).
+  /// Throws on a transport/server error (the validated path here).
+  Future<void> startProxy({
+    required String exitIdHex,
+    required String socks5Listen,
+  }) {
+    final status = calloc<_RustCallStatus>();
+    final lowered = <_Lowered>[];
+    int future;
+    try {
+      _RustBuffer lower(String s) {
+        final l = _ffi._lower(s, status);
+        _ffi._check(status, 'rustbuffer_from_bytes');
+        lowered.add(l);
+        return l.buffer;
+      }
+
+      final optionsNone = _ffi._lowerNone(status);
+      lowered.add(optionsNone);
+      final observerNone = _ffi._lowerNone(status);
+      lowered.add(observerNone);
+      future = _ffi._startProxy(_handle, lower(exitIdHex), lower(socks5Listen),
+          optionsNone.buffer, observerNone.buffer);
+    } finally {
+      for (final l in lowered) {
+        malloc.free(l.dataPtr);
+        calloc.free(l.foreignBytes);
+      }
+      calloc.free(status);
+    }
+    // On success the future yields a WarrenFfiProxy handle (u64); free it.
+    return _driveU64Future(future).then((proxyHandle) {
+      final s = calloc<_RustCallStatus>();
+      try {
+        _ffi._proxyFree(ffi.Pointer<ffi.Void>.fromAddress(proxyHandle), s);
+      } finally {
+        calloc.free(s);
+      }
+    });
   }
 
   /// Releases the native object. Idempotent.

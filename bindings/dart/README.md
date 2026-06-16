@@ -19,18 +19,27 @@ PARTIAL, with the pure surface WORKING and validated.
   u64/Result marshaling ABI by hand, so the cross-language wire-compat contract is
   satisfied on the Dart side for every deterministic call.
 - The async + object ABI is ALSO proven by hand: `WarrenFfiClientFfi.create`
-  (the uniffi object constructor) plus `subscriptionExpiry()` (an async method
-  driven through the RustFuture poll/complete/free protocol with a
-  `NativeCallable` continuation). `dart test` validates it via the error path (an
-  unroutable host, no live server needed), exactly like the Rust FFI test. So the
-  full uniffi-0.31 ABI (String/record/u64/Result/object/async) works from Dart.
-- What is NOT yet bound by hand: the happy paths of the server-dependent calls
-  (`subscriptionExpiry` value, `fetchMultihopExits`, `redeemVoucher`) which need a
-  live API/exit to exercise, and the proxy lifecycle (`start_proxy*`, which use
-  uniffi callback interfaces). The complete generated surface still depends on a
-  correct generator (`uniffi-bindgen-dart` 0.1.3 crashes, see below) or
-  `flutter_rust_bridge`; the hand layer covers every shape needed to validate
-  wire-compat without a server in the meantime.
+  (the uniffi object constructor), `subscriptionExpiry()` (an async method driven
+  through the RustFuture poll/complete/free protocol with a `NativeCallable`
+  continuation), and `startProxy()` (an async OBJECT-returning method with
+  `Option<RustBuffer>` arguments). `dart test` validates each via the error path
+  (an unroutable host, no live server), exactly like the Rust FFI tests. So EVERY
+  uniffi-0.31 ABI shape works from Dart: String, record, multi-arg `Result`,
+  object, async future, and async object-returning method with optional args.
+- The ONE shape not bound is the `ConnectionObserver` CALLBACK INTERFACE (the
+  optional `observer` of `start_proxy*`). This is a FUNDAMENTAL Dart/uniffi
+  limitation, not missing effort: a uniffi callback method is invoked
+  SYNCHRONOUSLY from a Rust thread (here a tokio worker during the async dial) and
+  must set its out-status before returning, but Dart's FFI cannot service a
+  synchronous callback from a non-isolate thread (only `NativeCallable.listener`,
+  which is asynchronous, works cross-thread). This is exactly why
+  `uniffi-bindgen-dart` itself SKIPS `start_proxy*` ("unsupported signature"). The
+  observer-less `startProxy` above is bound and tested; reporting connection-state
+  events to Dart needs a different mechanism (poll a state-watch method, or
+  `flutter_rust_bridge`'s stream model) rather than a uniffi callback interface.
+- Server happy paths (`subscriptionExpiry` value, `fetchMultihopExits`,
+  `redeemVoucher` success) need a live API/exit to exercise, which the headless
+  dev sandbox lacks; the error paths above already prove the binding mechanics.
 
 The native library is built by `cargo build -p warren-sdk-ffi --release`. The
 hand-written layer needs only a Dart SDK (no Flutter); the full surface needs a
