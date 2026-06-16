@@ -545,14 +545,71 @@ async fn read_connect_target(client: &mut TcpStream) -> Result<Option<Target>, N
     Ok(parse_authority(authority))
 }
 
-/// Parses `host:port` into a [`Target`], keeping domain names for remote
-/// resolution. IPv6 literals use the `[addr]:port` form.
+/// Parses an HTTP `CONNECT` authority into a [`Target`], keeping domain names
+/// for remote resolution. IPv6 literals use the `[addr]:port` form; a bare
+/// (unbracketed) IPv6 literal or a zoned address is malformed in an authority
+/// and is rejected rather than coerced into a bogus domain name.
 fn parse_authority(authority: &str) -> Option<Target> {
+    // Bracketed IPv6 literal: `[addr]:port`. The address must be a real v6
+    // literal (a scope/zone id is not meaningful to a remote exit), so parse it
+    // strictly; anything else is rejected.
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, port) = rest.split_once("]:")?;
+        let ip: std::net::Ipv6Addr = host.parse().ok()?;
+        let port: u16 = port.parse().ok()?;
+        return Some(Target::Ip(std::net::SocketAddr::from((ip, port))));
+    }
     if let Ok(addr) = authority.parse::<std::net::SocketAddr>() {
         return Some(Target::Ip(addr));
     }
     let (host, port) = authority.rsplit_once(':')?;
+    // A remaining colon in the host means an unbracketed IPv6 literal, which is
+    // not a valid authority: reject it instead of producing a bogus domain.
+    if host.contains(':') {
+        return None;
+    }
     let port: u16 = port.parse().ok()?;
-    let host = host.trim_start_matches('[').trim_end_matches(']');
     Some(Target::Domain(host.to_owned(), port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_authority_ipv4_literal() {
+        assert_eq!(
+            parse_authority("1.2.3.4:443"),
+            Some(Target::Ip("1.2.3.4:443".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn parse_authority_bracketed_ipv6_literal() {
+        assert_eq!(
+            parse_authority("[2001:db8::1]:8080"),
+            Some(Target::Ip("[2001:db8::1]:8080".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn parse_authority_domain_keeps_the_name() {
+        assert_eq!(
+            parse_authority("example.com:443"),
+            Some(Target::Domain("example.com".to_owned(), 443))
+        );
+    }
+
+    #[test]
+    fn parse_authority_rejects_malformed_v6_authorities() {
+        // Zoned v6 literal: not meaningful to a remote exit.
+        assert_eq!(parse_authority("[fe80::1%eth0]:443"), None);
+        // Bracketed but no port.
+        assert_eq!(parse_authority("[::1]"), None);
+        // Unbracketed v6 literal: an invalid authority, must not become a domain.
+        assert_eq!(parse_authority("2001:db8::1:443"), None);
+        // Missing port / non-numeric port.
+        assert_eq!(parse_authority("example.com"), None);
+        assert_eq!(parse_authority("example.com:http"), None);
+    }
 }

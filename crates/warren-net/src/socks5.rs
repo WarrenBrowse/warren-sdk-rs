@@ -169,6 +169,11 @@ fn parse_address(buf: &[u8]) -> Result<(Target, usize), Socks5Error> {
         }
         0x03 => {
             let len = *buf.get(1).ok_or(Socks5Error::Truncated)? as usize;
+            // A zero-length domain is malformed: reject it at the codec rather
+            // than emitting an empty hostname that later fails opaquely in DNS.
+            if len == 0 {
+                return Err(Socks5Error::BadDomain);
+            }
             if buf.len() < 2 + len + 2 {
                 return Err(Socks5Error::Truncated);
             }
@@ -292,6 +297,15 @@ mod tests {
         // ATYP=domain with non-UTF-8 bytes must be rejected, not lossy-decoded:
         // a malformed client request never becomes a bogus target name.
         let mut buf = vec![0x05, 0x01, 0x00, 0x03, 0x02, 0xff, 0xfe];
+        buf.extend_from_slice(&80u16.to_be_bytes());
+        assert_eq!(parse_request(&buf), Err(Socks5Error::BadDomain));
+    }
+
+    #[test]
+    fn request_rejects_zero_length_domain() {
+        // ATYP=domain with len==0 is malformed: it must be rejected at the codec,
+        // not parsed into an empty hostname.
+        let mut buf = vec![0x05, 0x01, 0x00, 0x03, 0x00];
         buf.extend_from_slice(&80u16.to_be_bytes());
         assert_eq!(parse_request(&buf), Err(Socks5Error::BadDomain));
     }

@@ -792,4 +792,50 @@ mod tests {
         let lifetime = u32::from_be_bytes([last[8], last[9], last[10], last[11]]);
         assert_eq!(lifetime, 0, "shutdown issued a delete (lifetime 0)");
     }
+
+    #[tokio::test]
+    async fn delete_succeeds_when_the_gateway_acks_the_same_internal_port() {
+        let mut gw = FakeGateway::new(Behavior::Grant(40001));
+        delete(&mut gw, GW, MapProto::Tcp, 8080)
+            .await
+            .expect("delete acknowledged");
+        // The issued request is a Map with lifetime 0 for the named internal port.
+        let reqs = gw.requests.lock().unwrap();
+        let last = reqs.last().expect("a request was sent");
+        let lifetime = u32::from_be_bytes([last[8], last[9], last[10], last[11]]);
+        assert_eq!(lifetime, 0, "delete is a Map with lifetime 0");
+        let internal = u16::from_be_bytes([last[4], last[5]]);
+        assert_eq!(internal, 8080);
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_an_ack_for_a_different_internal_port() {
+        let mut gw = FakeGateway::new(Behavior::GrantWrongInternal(0));
+        let err = delete(&mut gw, GW, MapProto::Tcp, 8080).await.unwrap_err();
+        assert!(matches!(err, PortForwardError::UnexpectedReply));
+    }
+
+    #[tokio::test]
+    async fn delete_surfaces_a_gateway_rejection() {
+        let mut gw = FakeGateway::new(Behavior::Reject(ResultCode::NotAuthorized));
+        let err = delete(&mut gw, GW, MapProto::Tcp, 8080).await.unwrap_err();
+        assert!(matches!(
+            err,
+            PortForwardError::Gateway(ResultCode::NotAuthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn relay_to_local_returns_when_the_local_target_refuses() {
+        // The connect-failure branch must not panic or hang: bind then drop a
+        // listener so its port is refused, and relay to it with a closed-flow
+        // netstack stream. The relay should return promptly.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = listener.local_addr().unwrap();
+        drop(listener);
+        let stream = NetstackStream::closed_for_test();
+        tokio::time::timeout(Duration::from_secs(5), relay_to_local(stream, dead))
+            .await
+            .expect("relay_to_local returns on a refused target");
+    }
 }

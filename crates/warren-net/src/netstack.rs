@@ -235,6 +235,26 @@ pub struct NetstackStream {
     wake: Arc<Notify>,
 }
 
+#[cfg(test)]
+impl NetstackStream {
+    /// An already-closed stream (its peers dropped), for tests that only need a
+    /// stream value: reads hit EOF and writes fail. Used to exercise paths that
+    /// never touch the stream (for example a relay whose local connect refuses).
+    pub(crate) fn closed_for_test() -> Self {
+        let (write_tx, write_rx) = mpsc::channel(1);
+        drop(write_rx); // writer side has no receiver: writes fail
+        let (incoming_tx, incoming) = mpsc::channel(1);
+        drop(incoming_tx); // no sender: reads hit EOF
+        Self {
+            writes: PollSender::new(write_tx),
+            incoming,
+            leftover: Bytes::new(),
+            read_pos: 0,
+            wake: Arc::new(Notify::new()),
+        }
+    }
+}
+
 /// A tunnel-side listening port. Each [`accept`](Self::accept) yields the next
 /// inbound connection (the port-forwarding accept side).
 pub struct NetstackListener {
@@ -701,8 +721,11 @@ impl Engine {
         }
     }
 
-    /// Picks a free ephemeral local port, skipping ones already in use.
-    fn alloc_port(&mut self) -> u16 {
+    /// Picks a free ephemeral local port, skipping ones already in use, or
+    /// `None` if the entire ephemeral range is exhausted (>16k live flows).
+    /// Failing closed here is correct: reusing a live port would alias two flows
+    /// onto one 4-tuple and corrupt both when either is reaped.
+    fn alloc_port(&mut self) -> Option<u16> {
         for _ in 0..=(u16::MAX - EPHEMERAL_BASE) {
             let port = self.next_port;
             self.next_port = if port == u16::MAX {
@@ -711,11 +734,10 @@ impl Engine {
                 port + 1
             };
             if self.used_ports.insert(port) {
-                return port;
+                return Some(port);
             }
         }
-        // All ephemeral ports busy (>16k live conns): reuse anyway.
-        self.next_port
+        None
     }
 
     fn open(
@@ -730,7 +752,11 @@ impl Engine {
             tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
         );
         let handle = sockets.add(socket);
-        let local_port = self.alloc_port();
+        let Some(local_port) = self.alloc_port() else {
+            sockets.remove(handle);
+            let _ = cmd.reply.send(Err(NetError::ConnectFailed));
+            return;
+        };
 
         let sock = sockets.get_mut::<tcp::Socket<'_>>(handle);
         let remote = (to_smol_ip(cmd.addr.ip()), cmd.addr.port());
@@ -946,7 +972,11 @@ impl Engine {
         let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; DNS_BUFFER]);
         let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; DNS_BUFFER]);
         let handle = sockets.add(udp::Socket::new(rx, tx));
-        let local_port = self.alloc_port();
+        let Some(local_port) = self.alloc_port() else {
+            sockets.remove(handle);
+            let _ = cmd.reply.send(Err(NetError::ConnectFailed));
+            return;
+        };
         let sock = sockets.get_mut::<udp::Socket<'_>>(handle);
         let dst = IpEndpoint::new(IpAddress::from(self.dns_server), DNS_PORT);
         if sock.bind(local_port).is_err() || sock.send_slice(&query, dst).is_err() {
@@ -1045,7 +1075,11 @@ impl Engine {
             vec![0u8; UDP_FLOW_BUFFER],
         );
         let handle = sockets.add(udp::Socket::new(rx, tx));
-        let local_port = self.alloc_port();
+        let Some(local_port) = self.alloc_port() else {
+            sockets.remove(handle);
+            let _ = cmd.reply.send(Err(NetError::ConnectFailed));
+            return;
+        };
         let sock = sockets.get_mut::<udp::Socket<'_>>(handle);
         if sock.bind(local_port).is_err() {
             sockets.remove(handle);

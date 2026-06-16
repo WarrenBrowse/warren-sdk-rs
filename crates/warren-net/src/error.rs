@@ -11,6 +11,10 @@ pub enum NetError {
     #[error("tunnel error")]
     Tunnel(#[from] warren_transport::TunnelError),
     /// The multihop tunnel packet plane failed (seal/open/send/recv).
+    ///
+    /// Deliberately `#[source]`, not `#[from]` (unlike `Tunnel`): the multihop
+    /// datapath maps this explicitly at its call sites so a `?` in single-hop
+    /// code cannot silently absorb a multihop error into the wrong variant.
     #[error("multihop tunnel error")]
     Multihop(#[source] warren_transport::MultihopError),
     /// A local I/O error (proxy listener, TUN device).
