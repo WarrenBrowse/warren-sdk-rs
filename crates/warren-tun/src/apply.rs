@@ -52,7 +52,11 @@ fn run(argv: &[String], stdin: Option<&str>) -> io::Result<()> {
 ///
 /// The first `ip` invocation that fails.
 pub fn configure_interface(config: &TunConfig) -> io::Result<()> {
-    for argv in config.interface_up_commands() {
+    #[cfg(target_os = "macos")]
+    let cmds = config.interface_up_commands_macos();
+    #[cfg(not(target_os = "macos"))]
+    let cmds = config.interface_up_commands();
+    for argv in cmds {
         run(&argv, None)?;
     }
     Ok(())
@@ -65,7 +69,11 @@ pub fn configure_interface(config: &TunConfig) -> io::Result<()> {
 ///
 /// The first `ip route` invocation that fails.
 pub fn apply_routing(plan: &RoutingPlan, dev: &str, physical_gateway: IpAddr) -> io::Result<()> {
-    for argv in plan.to_ip_commands(dev, physical_gateway) {
+    #[cfg(target_os = "macos")]
+    let cmds = plan.to_macos_commands(dev, physical_gateway, "add");
+    #[cfg(not(target_os = "macos"))]
+    let cmds = plan.to_ip_commands(dev, physical_gateway);
+    for argv in cmds {
         run(&argv, None)?;
     }
     Ok(())
@@ -76,8 +84,25 @@ pub fn apply_routing(plan: &RoutingPlan, dev: &str, physical_gateway: IpAddr) ->
 /// # Errors
 ///
 /// If `nft` cannot be run or rejects the ruleset.
-pub fn apply_killswitch(plan: &KillswitchPlan) -> io::Result<()> {
-    run(&KillswitchPlan::nft_apply_argv(), Some(&plan.nftables))
+pub fn apply_killswitch(config: &TunConfig) -> io::Result<()> {
+    apply_killswitch_impl(config)
+}
+
+#[cfg(target_os = "macos")]
+fn apply_killswitch_impl(config: &TunConfig) -> io::Result<()> {
+    run(
+        &KillswitchPlan::pf_load_argv(),
+        Some(&KillswitchPlan::pf_rules(config)),
+    )?;
+    run(&KillswitchPlan::pf_enable_argv(), None)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn apply_killswitch_impl(config: &TunConfig) -> io::Result<()> {
+    run(
+        &KillswitchPlan::nft_apply_argv(),
+        Some(&KillswitchPlan::nftables(config).nftables),
+    )
 }
 
 /// Reverts the routes [`apply_routing`] installed (best-effort: a route already
@@ -85,16 +110,34 @@ pub fn apply_killswitch(plan: &KillswitchPlan) -> io::Result<()> {
 /// this with [`teardown_killswitch`] to fully restore the routing table on
 /// datapath shutdown.
 pub fn revert_routing(plan: &RoutingPlan, dev: &str, physical_gateway: IpAddr) {
-    for argv in plan.to_teardown_commands(dev, physical_gateway) {
+    #[cfg(target_os = "macos")]
+    let cmds = plan.to_macos_commands(dev, physical_gateway, "delete");
+    #[cfg(not(target_os = "macos"))]
+    let cmds = plan.to_teardown_commands(dev, physical_gateway);
+    for argv in cmds {
         let _ = run(&argv, None);
     }
 }
 
-/// Tears the killswitch table down, restoring normal output.
+/// Tears the killswitch down, restoring normal output. On macOS this flushes the
+/// rules and disables pf (back to the default unfiltered state); on Linux it
+/// deletes the nftables table.
 ///
 /// # Errors
 ///
-/// If `nft` cannot be run (a missing table is treated as success by the caller).
+/// If the teardown command cannot be run (a missing rule is treated as success
+/// by the caller).
 pub fn teardown_killswitch() -> io::Result<()> {
+    teardown_killswitch_impl()
+}
+
+#[cfg(target_os = "macos")]
+fn teardown_killswitch_impl() -> io::Result<()> {
+    let _ = run(&KillswitchPlan::pf_flush_argv(), None);
+    run(&KillswitchPlan::pf_disable_argv(), None)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn teardown_killswitch_impl() -> io::Result<()> {
     run(&KillswitchPlan::nft_teardown_argv(), None)
 }

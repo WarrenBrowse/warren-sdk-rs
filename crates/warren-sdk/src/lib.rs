@@ -63,13 +63,13 @@ mod proxy;
 mod store;
 mod supervisor;
 
+#[cfg(all(unix, feature = "experimental-tun"))]
+pub use client::TunDatapathHandle;
 pub use client::{
     DefaultClient, GenerationStore, InMemoryGenerationStore, ServerKeyStore, WarrenClient,
     WarrenClientBuilder,
 };
 pub use error::{BuildError, SdkError};
-#[cfg(all(unix, feature = "experimental-tun"))]
-pub use client::TunDatapathHandle;
 pub use proxy::{ProxyForwarder, ProxyHandle, TunnelState};
 pub use store::{FileGenerationStore, FileServerKeyStore};
 pub use supervisor::SupervisedProxyHandle;

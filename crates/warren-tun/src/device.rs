@@ -244,6 +244,9 @@ mod macos {
     use std::os::fd::{FromRawFd, OwnedFd};
 
     const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
+    // getsockopt(SYSPROTO_CONTROL, UTUN_OPT_IFNAME) returns the kernel-assigned
+    // interface name (for example "utun7"); not exported by the `libc` crate.
+    const UTUN_OPT_IFNAME: libc::c_int = 2;
 
     /// An owned macOS `utun` control-socket file descriptor.
     #[derive(Debug)]
@@ -302,6 +305,31 @@ mod macos {
                 return Err(io::Error::last_os_error());
             }
             Ok(Self { fd })
+        }
+
+        /// Returns the kernel-assigned interface name (for example `utun7`),
+        /// needed to install routes against this device.
+        pub fn name(&self) -> io::Result<String> {
+            use std::os::fd::AsRawFd;
+            let mut buf = [0u8; libc::IFNAMSIZ + 1];
+            let mut len = buf.len() as libc::socklen_t;
+            // SAFETY: `fd` is valid; getsockopt writes at most `len` bytes into
+            // `buf` and updates `len`. Level and option are the documented utun
+            // control name query.
+            let rc = unsafe {
+                libc::getsockopt(
+                    self.fd.as_raw_fd(),
+                    libc::SYSPROTO_CONTROL,
+                    UTUN_OPT_IFNAME,
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    &mut len,
+                )
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
         }
     }
 

@@ -77,6 +77,36 @@ impl TunConfig {
     }
 }
 
+impl TunConfig {
+    /// macOS: the `ifconfig` argv that addresses the point-to-point `utun` and
+    /// brings it up BEFORE routing. `utun` is point-to-point, so the peer is the
+    /// in-tunnel gateway (`10.66.0.1`). Pure (no exec); unit-tested.
+    #[must_use]
+    pub fn interface_up_commands_macos(&self) -> Vec<Vec<String>> {
+        let (v4, _) = self.ipv4;
+        let gateway = Ipv4Addr::new(10, 66, 0, 1);
+        let mut cmds = vec![vec![
+            "ifconfig".to_owned(),
+            self.name.clone(),
+            "inet".to_owned(),
+            v4.to_string(),
+            gateway.to_string(),
+            "mtu".to_owned(),
+            self.mtu.to_string(),
+            "up".to_owned(),
+        ]];
+        if let Some((v6, prefix)) = self.ipv6 {
+            cmds.push(vec![
+                "ifconfig".to_owned(),
+                self.name.clone(),
+                "inet6".to_owned(),
+                format!("{v6}/{prefix}"),
+            ]);
+        }
+        cmds
+    }
+}
+
 /// A single routing operation in a [`RoutingPlan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteOp {
@@ -194,6 +224,51 @@ impl RoutingPlan {
             })
             .collect()
     }
+
+    /// Renders the plan as macOS `route` argv vectors, in order. `add` (apply) or
+    /// `delete` (teardown) is chosen by `verb`. Pure (no exec); unit-tested.
+    #[must_use]
+    pub fn to_macos_commands(
+        &self,
+        dev: &str,
+        physical_gateway: IpAddr,
+        verb: &str,
+    ) -> Vec<Vec<String>> {
+        self.ops
+            .iter()
+            .map(|op| match op {
+                RouteOp::PinExitToPhysical(ip) => {
+                    let family = if ip.is_ipv6() { "-inet6" } else { "-inet" };
+                    vec![
+                        "route".to_owned(),
+                        "-n".to_owned(),
+                        verb.to_owned(),
+                        family.to_owned(),
+                        "-host".to_owned(),
+                        ip.to_string(),
+                        physical_gateway.to_string(),
+                    ]
+                }
+                RouteOp::RouteViaTun { cidr } => {
+                    let family = if cidr.contains(':') {
+                        "-inet6"
+                    } else {
+                        "-inet"
+                    };
+                    vec![
+                        "route".to_owned(),
+                        "-n".to_owned(),
+                        verb.to_owned(),
+                        family.to_owned(),
+                        "-net".to_owned(),
+                        cidr.clone(),
+                        "-interface".to_owned(),
+                        dev.to_owned(),
+                    ]
+                }
+            })
+            .collect()
+    }
 }
 
 /// A killswitch ruleset: only the tunnel and the carrier path to the exit are
@@ -252,6 +327,56 @@ impl KillswitchPlan {
             .iter()
             .map(|s| (*s).to_owned())
             .collect()
+    }
+
+    /// macOS: a pf ruleset that fails closed. Default-drops all output, then
+    /// passes loopback, the TUN device, and UDP to the exit on the physical link.
+    /// `block out all` also stops any v6 leak when v6 is not tunneled. Pure (no
+    /// exec); unit-tested.
+    #[must_use]
+    pub fn pf_rules(config: &TunConfig) -> String {
+        let exit_ip = config.exit_endpoint.ip();
+        let exit_port = config.exit_endpoint.port();
+        let mut s = String::new();
+        s.push_str("set block-policy drop\n");
+        s.push_str("block out all\n");
+        s.push_str("pass out quick on lo0 all\n");
+        s.push_str(&format!("pass out quick on {} all\n", config.name));
+        s.push_str(&format!(
+            "pass out quick proto udp from any to {exit_ip} port {exit_port}\n"
+        ));
+        s
+    }
+
+    /// macOS: argv that loads the pf ruleset from stdin (`pfctl -f -`).
+    #[must_use]
+    pub fn pf_load_argv() -> Vec<String> {
+        ["pfctl", "-f", "-"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect()
+    }
+
+    /// macOS: argv that enables pf (`pfctl -e`).
+    #[must_use]
+    pub fn pf_enable_argv() -> Vec<String> {
+        ["pfctl", "-e"].iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// macOS: argv that flushes the loaded rules (`pfctl -F rules`).
+    #[must_use]
+    pub fn pf_flush_argv() -> Vec<String> {
+        ["pfctl", "-F", "rules"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect()
+    }
+
+    /// macOS: argv that disables pf (`pfctl -d`), restoring the default
+    /// (unfiltered) state on a host where pf was off, the macOS default.
+    #[must_use]
+    pub fn pf_disable_argv() -> Vec<String> {
+        ["pfctl", "-d"].iter().map(|s| (*s).to_owned()).collect()
     }
 }
 
@@ -411,6 +536,70 @@ mod tests {
             KillswitchPlan::nft_teardown_argv(),
             ["nft", "delete", "table", "inet", "warren_killswitch"]
         );
+    }
+
+    #[test]
+    fn macos_interface_up_uses_ifconfig_point_to_point() {
+        let cmds = v4_config().interface_up_commands_macos();
+        assert_eq!(
+            cmds[0],
+            vec![
+                "ifconfig",
+                "warren0",
+                "inet",
+                "10.66.0.2",
+                "10.66.0.1",
+                "mtu",
+                "1280",
+                "up"
+            ]
+        );
+        assert_eq!(cmds.len(), 1, "v4-only: a single ifconfig line");
+    }
+
+    #[test]
+    fn macos_routes_pin_the_exit_then_capture_via_interface() {
+        let gw = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let add = RoutingPlan::split_default(&v4_config()).to_macos_commands("utun7", gw, "add");
+        assert_eq!(
+            add[0],
+            vec![
+                "route",
+                "-n",
+                "add",
+                "-inet",
+                "-host",
+                "203.0.113.9",
+                "192.168.1.1"
+            ]
+        );
+        assert_eq!(
+            add[1],
+            vec![
+                "route",
+                "-n",
+                "add",
+                "-inet",
+                "-net",
+                "0.0.0.0/1",
+                "-interface",
+                "utun7"
+            ]
+        );
+        let del = RoutingPlan::split_default(&v4_config()).to_macos_commands("utun7", gw, "delete");
+        assert_eq!(del[0][2], "delete");
+        assert_eq!(add.len(), del.len());
+    }
+
+    #[test]
+    fn macos_pf_rules_fail_closed_and_allow_lo_tun_and_exit() {
+        let pf = KillswitchPlan::pf_rules(&v4_config());
+        assert!(pf.contains("block out all"));
+        assert!(pf.contains("pass out quick on lo0 all"));
+        assert!(pf.contains("pass out quick on warren0 all"));
+        assert!(pf.contains("pass out quick proto udp from any to 203.0.113.9 port 51820"));
+        assert_eq!(KillswitchPlan::pf_load_argv(), ["pfctl", "-f", "-"]);
+        assert_eq!(KillswitchPlan::pf_disable_argv(), ["pfctl", "-d"]);
     }
 
     #[test]

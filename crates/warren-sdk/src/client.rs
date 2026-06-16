@@ -580,7 +580,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         exit: &VerifiedExit,
         tun_name: &str,
     ) -> Result<TunDatapathHandle, SdkError> {
-        use warren_tun::{KillswitchPlan, RoutingPlan, TunConfig};
+        use warren_tun::{RoutingPlan, TunConfig};
 
         let sink = self.connect_multihop(exit).await?;
         let session = sink.session();
@@ -588,8 +588,16 @@ impl<T: HttpTransport> WarrenClient<T> {
         // /32 host address on the tunnel; the split-default routes capture the
         // rest. v6 is added only when the exit assigned one.
         let mtu = u16::try_from(session.max_inner_payload()).unwrap_or(1280);
+        let device = warren_tun::device::open_tun(tun_name).map_err(SdkError::Tun)?;
+        // The kernel assigns the interface name on macOS (the requested `tun_name`
+        // may be empty), so read it back; on Linux the name is what we asked for.
+        #[cfg(target_os = "macos")]
+        let dev_name = device.name().map_err(SdkError::Tun)?;
+        #[cfg(not(target_os = "macos"))]
+        let dev_name = tun_name.to_owned();
+
         let config = TunConfig {
-            name: tun_name.to_owned(),
+            name: dev_name.clone(),
             mtu,
             ipv4: (ipv4, 32),
             ipv6: session.assigned_ipv6().map(|v6| (v6, 128)),
@@ -597,14 +605,22 @@ impl<T: HttpTransport> WarrenClient<T> {
             dns: vec![std::net::Ipv4Addr::new(10, 66, 0, 1).into()],
         };
 
-        let device = warren_tun::device::open_tun(tun_name).map_err(SdkError::Tun)?;
         let gateway = warren_tun::gateway::discover_default_gateway().map_err(SdkError::Tun)?;
         // Bring the device up + address it BEFORE routing (a fresh TUN is down).
         warren_tun::apply::configure_interface(&config).map_err(SdkError::Tun)?;
         let routing = RoutingPlan::split_default(&config);
-        warren_tun::apply::apply_routing(&routing, tun_name, gateway).map_err(SdkError::Tun)?;
-        warren_tun::apply::apply_killswitch(&KillswitchPlan::nftables(&config))
-            .map_err(SdkError::Tun)?;
+        // Fail-safe: if routing or the killswitch fails mid-setup, revert what was
+        // applied before returning, so a partial setup never strands the host with
+        // a captured default route or a closed killswitch and no handle to undo it.
+        if let Err(e) = warren_tun::apply::apply_routing(&routing, &dev_name, gateway) {
+            warren_tun::apply::revert_routing(&routing, &dev_name, gateway);
+            return Err(SdkError::Tun(e));
+        }
+        if let Err(e) = warren_tun::apply::apply_killswitch(&config) {
+            warren_tun::apply::revert_routing(&routing, &dev_name, gateway);
+            let _ = warren_tun::apply::teardown_killswitch();
+            return Err(SdkError::Tun(e));
+        }
 
         let (tun_sink, bridge) =
             warren_net::tun_channels(device, warren_tun::Framing::for_target_os(), config.mtu);
@@ -614,7 +630,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             driver,
             pump,
             routing,
-            tun_name: tun_name.to_owned(),
+            tun_name: dev_name,
             gateway,
         })
     }

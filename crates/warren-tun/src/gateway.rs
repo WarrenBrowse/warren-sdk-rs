@@ -31,13 +31,34 @@ pub fn parse_default_gateway(ip_route_output: &str) -> Option<IpAddr> {
     None
 }
 
-/// Discovers the host's default gateway by running `ip route show default`.
-/// EXPERIMENTAL, feature-gated (a process call against the live routing table).
+/// Parses the physical default gateway from macOS `netstat -rn` output: the first
+/// `default` route whose gateway column is an IP address. Interface-bound default
+/// routes (gateway shown as `utunN` or `link#N`, for example an active VPN) are
+/// skipped, so the physical next hop is found even behind another tunnel.
+#[must_use]
+pub fn parse_netstat_default_gateway(netstat_output: &str) -> Option<IpAddr> {
+    for line in netstat_output.lines() {
+        let mut tokens = line.split_whitespace();
+        if tokens.next() != Some("default") {
+            continue;
+        }
+        if let Some(gateway) = tokens.next()
+            && let Ok(ip) = gateway.parse::<IpAddr>()
+        {
+            return Some(ip);
+        }
+    }
+    None
+}
+
+/// Discovers the host's default gateway by running `ip route show default`
+/// (Linux). EXPERIMENTAL, feature-gated (a process call against the live routing
+/// table).
 ///
 /// # Errors
 ///
 /// If `ip` cannot be run, or no default route with a gateway is present.
-#[cfg(feature = "experimental-tun")]
+#[cfg(all(feature = "experimental-tun", target_os = "linux"))]
 pub fn discover_default_gateway() -> std::io::Result<IpAddr> {
     let out = std::process::Command::new("ip")
         .args(["route", "show", "default"])
@@ -47,6 +68,27 @@ pub fn discover_default_gateway() -> std::io::Result<IpAddr> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     parse_default_gateway(&text).ok_or_else(|| std::io::Error::other("no default gateway found"))
+}
+
+/// Discovers the host's default gateway by running `route -n get default`
+/// (macOS). EXPERIMENTAL, feature-gated.
+///
+/// # Errors
+///
+/// If `route` cannot be run, or no default route with a gateway is present.
+#[cfg(all(feature = "experimental-tun", target_os = "macos"))]
+pub fn discover_default_gateway() -> std::io::Result<IpAddr> {
+    // `netstat -rn` (not `route get default`) so the PHYSICAL gateway is found
+    // even when another VPN owns the top default route via an interface.
+    let out = std::process::Command::new("netstat")
+        .args(["-rn", "-f", "inet"])
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other("netstat -rn failed"));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_netstat_default_gateway(&text)
+        .ok_or_else(|| std::io::Error::other("no physical default gateway found"))
 }
 
 #[cfg(test)]
@@ -77,6 +119,26 @@ mod tests {
     fn returns_none_when_there_is_no_default_route() {
         let out = "10.0.0.0/24 dev eth0 proto kernel scope link src 10.0.0.5\n";
         assert_eq!(parse_default_gateway(out), None);
+    }
+
+    #[test]
+    fn macos_netstat_skips_a_vpn_default_and_finds_the_physical_gateway() {
+        // utun4 (a VPN) owns the top default; the physical en0 default is next.
+        let out = "Routing tables\n\
+                   Internet:\n\
+                   Destination        Gateway            Flags    Netif\n\
+                   default            utun4              UGScg    utun4\n\
+                   default            192.168.1.254      UGScIg   en0\n";
+        assert_eq!(
+            parse_netstat_default_gateway(out),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 254)))
+        );
+    }
+
+    #[test]
+    fn macos_netstat_none_when_only_interface_bound_defaults() {
+        let out = "default            utun4              UGScg    utun4\n";
+        assert_eq!(parse_netstat_default_gateway(out), None);
     }
 
     #[test]
