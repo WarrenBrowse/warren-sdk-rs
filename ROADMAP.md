@@ -218,12 +218,21 @@ pinned by golden vectors where a wire format is involved. warren-core
 - Client construction options (root pins, persistence, DAITA uplink defense) are
   exposed through the additive `with_options(FfiClientOptions)` constructor, so a
   new knob does not churn every binding signature.
-- Remaining: the first Dart/Flutter integration (and Kotlin/Swift/Python/Java),
-  consuming the generated bindings. Every binding replays the same `vectors/`.
-  Minor known gap: the per-proxy `dns_server` override (for `dns_disabled` exits,
-  a rare case) and the HTTP CONNECT listen address are not yet on the FFI proxy
-  start; the Rust facade has both. Surface them when a binding needs them rather
-  than churning every proxy-start signature pre-emptively.
+- Per-proxy knobs are now on the FFI: every `start_proxy*` takes an optional
+  `FfiProxyOptions` (`http_listen`, `dns_server`), so a binding reaches the HTTP
+  CONNECT listener and the in-tunnel DNS override the Rust facade already had.
+- Dart/Flutter binding STARTED (scaffold under `bindings/dart/`): the package
+  (`pubspec.yaml`), the reproducible generation script (`tool/generate.sh`, which
+  builds the cdylib and runs `uniffi-bindgen-dart`), the loader entrypoint
+  (`lib/warren_sdk.dart`), the golden-vector replay harness stub
+  (`test/vectors_test.dart`), and the integration guide (`README.md`: per-OS
+  native-library bundling + the API map). The generated bindings are not checked
+  in (reproduced from the Rust crate). Completing and VALIDATING it (running the
+  vectors + a device test) needs a Dart/Flutter toolchain, which the SDK dev
+  sandbox does not have.
+- Remaining: finish the Dart binding on a Flutter toolchain (generate, replay the
+  vectors, device-test), then the Kotlin/Swift/Python/Java integrations, each
+  replaying the same `vectors/`.
 
 ## Audit follow-ups (see AUDIT.md)
 

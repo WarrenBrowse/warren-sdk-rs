@@ -62,6 +62,15 @@ the pre-release `0.0.x` line.
   validating against a real exit with privilege remain to do (per CLAUDE.md, not
   possible from the dev sandbox).
 
+### Bindings
+
+- Dart/Flutter binding scaffold under `bindings/dart/`: package manifest, a
+  reproducible `tool/generate.sh` (build the cdylib, run `uniffi-bindgen-dart`),
+  the loader entrypoint, the golden-vector replay harness stub, and an
+  integration guide (per-OS native-library bundling + API map). Generated
+  bindings are reproduced from the Rust crate, not checked in; completing and
+  validating the binding needs a Dart/Flutter toolchain.
+
 ### Single-hop DAITA
 
 - The negotiated single-hop `SetupAck.daita_spec` is no longer discarded:
