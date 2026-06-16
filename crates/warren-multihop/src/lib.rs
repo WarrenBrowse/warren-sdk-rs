@@ -55,6 +55,14 @@ pub enum SessionError {
     /// HPKE setup or exporter failure.
     #[error("hpke error")]
     Hpke,
+    /// The frame's epoch is neither the current nor the retained overlap epoch
+    /// (a stale reverse frame past the overlap window, or a forward seal asked at
+    /// a non-current epoch). `epoch` is a protocol counter, not identity material.
+    #[error("unknown epoch {epoch}")]
+    UnknownEpoch {
+        /// The epoch that has no known sender context.
+        epoch: u32,
+    },
     /// AEAD seal/open failure (open: tampered ciphertext/AAD/tag or wrong key).
     #[error("aead error")]
     Aead,
@@ -242,10 +250,13 @@ impl ClientSession {
     }
 
     /// Seals `payload` into a frame for the client -> exit direction at the
-    /// current epoch (the `epoch` argument must be the current epoch).
+    /// current epoch. Forward frames are ALWAYS sealed at the current epoch; the
+    /// retained old epoch exists only to open reverse overlap frames, so `epoch`
+    /// must equal the current epoch (passed by the caller to stamp the frame).
     ///
     /// # Errors
     ///
+    /// [`SessionError::UnknownEpoch`] if `epoch` is not the current epoch,
     /// [`SessionError::Hpke`] on exporter failure, [`SessionError::Aead`] if
     /// encryption fails.
     pub fn seal(
@@ -254,7 +265,10 @@ impl ClientSession {
         epoch: u32,
         seq: u64,
     ) -> Result<WarrenMultihopFrame, SessionError> {
-        let ctx = self.ctx_for(epoch).ok_or(SessionError::Hpke)?;
+        if epoch != self.current.epoch {
+            return Err(SessionError::UnknownEpoch { epoch });
+        }
+        let ctx = &self.current;
         let key = Self::packet_key(ctx, epoch, seq, false)?;
         let aad = compose_aad(&self.exit_id, epoch, seq);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
@@ -281,8 +295,9 @@ impl ClientSession {
     /// # Errors
     ///
     /// [`SessionError::ExitIdMismatch`]/[`SessionError::UnsupportedVersion`] on a
-    /// foreign frame, [`SessionError::Hpke`] on an unknown epoch or exporter
-    /// failure, or [`SessionError::Aead`] if the tag does not verify.
+    /// foreign frame, [`SessionError::UnknownEpoch`] if the frame's epoch is past
+    /// the overlap window, [`SessionError::Hpke`] on exporter failure, or
+    /// [`SessionError::Aead`] if the tag does not verify.
     pub fn open_response(&self, frame: &WarrenMultihopFrame) -> Result<Vec<u8>, SessionError> {
         if frame.version != WARREN_HPKE_VERSION_V1 {
             return Err(SessionError::UnsupportedVersion);
@@ -290,7 +305,9 @@ impl ClientSession {
         if frame.exit_id != self.exit_id {
             return Err(SessionError::ExitIdMismatch);
         }
-        let ctx = self.ctx_for(frame.epoch).ok_or(SessionError::Hpke)?;
+        let ctx = self
+            .ctx_for(frame.epoch)
+            .ok_or(SessionError::UnknownEpoch { epoch: frame.epoch })?;
         let key = Self::packet_key(ctx, frame.epoch, frame.seq, true)?;
         let aad = compose_aad(&self.exit_id, frame.epoch, frame.seq);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
@@ -431,6 +448,40 @@ mod tests {
         let (_priv, pub_) = WarrenKem::gen_keypair(&mut rng);
         let pub_bytes: [u8; 32] = pub_.to_bytes().into();
         ClientSession::new(&pub_bytes, [0x5a; EXIT_ID_LEN], &mut rng).expect("session")
+    }
+
+    #[test]
+    fn seal_rejects_a_non_current_epoch() {
+        // Forward frames must always seal at the current epoch; asking for the
+        // retained old epoch (or any other) is a usage error, not a silent
+        // downgrade to a stale context.
+        let mut rng = ChaCha20Rng::seed_from_u64(21);
+        let mut session = test_session(21);
+        assert_eq!(session.rekey(&mut rng).unwrap(), 1);
+        // Epoch 0 is retained for the reverse overlap but must not seal forward.
+        assert!(matches!(
+            session.seal(b"stale-forward", 0, 0),
+            Err(SessionError::UnknownEpoch { epoch: 0 })
+        ));
+        // A wholly unknown future epoch is rejected too.
+        assert!(matches!(
+            session.seal(b"future", 9, 0),
+            Err(SessionError::UnknownEpoch { epoch: 9 })
+        ));
+        // The current epoch still seals.
+        assert!(session.seal(b"ok", 1, 0).is_ok());
+    }
+
+    #[test]
+    fn open_response_rejects_an_epoch_past_the_overlap() {
+        let session = test_session(22);
+        let mut frame = session.seal(b"x", 0, 0).unwrap();
+        // Forge an epoch the session never knew (no current, no overlap).
+        frame.epoch = 5;
+        assert!(matches!(
+            session.open_response(&frame),
+            Err(SessionError::UnknownEpoch { epoch: 5 })
+        ));
     }
 
     #[test]

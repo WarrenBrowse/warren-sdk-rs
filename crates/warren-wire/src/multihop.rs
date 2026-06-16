@@ -64,9 +64,14 @@ pub enum MultihopFrameError {
     /// postcard encode/decode failure.
     #[error("multihop frame codec error: {0}")]
     Codec(#[from] postcard::Error),
-    /// Encoded frame exceeds `MAX_FRAME_BYTES`.
+    /// Encoded frame exceeds `MAX_FRAME_BYTES` (on encode or decode).
     #[error("multihop frame too large")]
     TooLarge,
+    /// A valid frame was followed by unexpected trailing bytes. Rejected so the
+    /// "exactly one frame per buffer" invariant matches the sibling codecs and
+    /// warren-core (a frame must not smuggle extra bytes past the AAD binding).
+    #[error("trailing bytes after a valid multihop frame")]
+    TrailingBytes,
     /// `version` byte is not [`WARREN_HPKE_VERSION_V1`].
     #[error("unsupported multihop version: got {got}, expected {expected}")]
     UnsupportedVersion {
@@ -82,23 +87,35 @@ impl WarrenMultihopFrame {
     ///
     /// # Errors
     ///
-    /// [`MultihopFrameError::Codec`] if postcard encoding fails.
+    /// [`MultihopFrameError::Codec`] if postcard encoding fails, or
+    /// [`MultihopFrameError::TooLarge`] if the encoded frame would exceed
+    /// `MAX_FRAME_BYTES` (the cap is enforced symmetrically with [`Self::decode`]
+    /// so an over-budget frame fails at the sender, not silently at the peer).
     pub fn encode(&self) -> Result<Vec<u8>, MultihopFrameError> {
-        Ok(postcard::to_stdvec(self)?)
+        let bytes = postcard::to_stdvec(self)?;
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(MultihopFrameError::TooLarge);
+        }
+        Ok(bytes)
     }
 
-    /// Decodes a postcard frame, rejecting oversized input and wrong versions.
+    /// Decodes a postcard frame, rejecting oversized input, trailing bytes and
+    /// wrong versions.
     ///
     /// # Errors
     ///
     /// [`MultihopFrameError::TooLarge`] if longer than `MAX_FRAME_BYTES`,
-    /// [`MultihopFrameError::Codec`] on malformed input, or
+    /// [`MultihopFrameError::Codec`] on malformed input,
+    /// [`MultihopFrameError::TrailingBytes`] if extra bytes follow the frame, or
     /// [`MultihopFrameError::UnsupportedVersion`] on a wrong version byte.
     pub fn decode(bytes: &[u8]) -> Result<Self, MultihopFrameError> {
         if bytes.len() > MAX_FRAME_BYTES {
             return Err(MultihopFrameError::TooLarge);
         }
-        let frame: Self = postcard::from_bytes(bytes)?;
+        let (frame, rest): (Self, &[u8]) = postcard::take_from_bytes(bytes)?;
+        if !rest.is_empty() {
+            return Err(MultihopFrameError::TrailingBytes);
+        }
         if frame.version != WARREN_HPKE_VERSION_V1 {
             return Err(MultihopFrameError::UnsupportedVersion {
                 got: frame.version,
@@ -205,6 +222,32 @@ mod tests {
         assert!(matches!(
             WarrenMultihopFrame::decode(&big).unwrap_err(),
             MultihopFrameError::TooLarge
+        ));
+    }
+
+    #[test]
+    fn encode_rejects_oversized() {
+        // The cap is enforced on encode too, so an over-budget frame fails at the
+        // sender instead of being rejected as TooLarge by the peer's decode.
+        let frame = WarrenMultihopFrame {
+            ciphertext: vec![0u8; MAX_FRAME_BYTES],
+            ..sample()
+        };
+        assert!(matches!(
+            frame.encode().unwrap_err(),
+            MultihopFrameError::TooLarge
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        // Parity with decode_setup/try_decode_control: exactly one frame per
+        // buffer, no trailing smuggled bytes.
+        let mut bytes = sample().encode().expect("encode");
+        bytes.push(0xff);
+        assert!(matches!(
+            WarrenMultihopFrame::decode(&bytes).unwrap_err(),
+            MultihopFrameError::TrailingBytes
         ));
     }
 

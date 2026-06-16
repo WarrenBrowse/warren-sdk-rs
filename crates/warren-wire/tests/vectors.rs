@@ -2,7 +2,8 @@
 
 use serde::Deserialize;
 use warren_wire::{
-    DEVICE_ID_LEN, Setup, SetupAck, decode_setup, decode_setup_ack, encode_setup, encode_setup_ack,
+    DEVICE_ID_LEN, DaitaConfig, Setup, SetupAck, decode_setup, decode_setup_ack, encode_setup,
+    encode_setup_ack,
 };
 
 #[derive(Deserialize)]
@@ -41,7 +42,16 @@ struct SetupAckVec {
     exit_pubkey_hex: String,
     max_mtu: u16,
     multiconn_attached: bool,
+    #[serde(default)]
+    daita_spec: Option<DaitaSpecVec>,
     bytes_hex: String,
+}
+
+#[derive(Deserialize)]
+struct DaitaSpecVec {
+    machine_specs: Vec<String>,
+    max_padding_frac: f64,
+    max_blocking_frac: f64,
 }
 
 fn load() -> Vectors {
@@ -93,6 +103,11 @@ fn setup_ack_vectors_match() {
             .tunnel_ipv6_hex
             .as_ref()
             .map(|h| hex::decode(h).expect("hex").try_into().expect("16 bytes"));
+        let daita_spec = vec.daita_spec.as_ref().map(|d| DaitaConfig {
+            machine_specs: d.machine_specs.clone(),
+            max_padding_frac: d.max_padding_frac,
+            max_blocking_frac: d.max_blocking_frac,
+        });
         let a = SetupAck {
             protocol_version: vec.protocol_version,
             tunnel_ipv4: vec.tunnel_ipv4,
@@ -100,7 +115,7 @@ fn setup_ack_vectors_match() {
             exit_pubkey,
             max_mtu: vec.max_mtu,
             multiconn_attached: vec.multiconn_attached,
-            daita_spec: None,
+            daita_spec,
         };
         assert_eq!(
             hex::encode(encode_setup_ack(&a).expect("encode")),

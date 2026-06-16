@@ -380,4 +380,34 @@ mod tests {
             _ => unreachable!(),
         }
     }
+
+    #[test]
+    fn trailer_reserved_byte_is_ignored_on_decode() {
+        // The reserved byte (index 17) is forward-compatibility space: a future
+        // non-zero value must be ignored, not change the parsed budget.
+        let buf = [
+            0x00, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x12, 0x34, 0xab, 0xcd, 0x00, 0x00,
+            0x1c, 0x20, 0x03, 0xff, 0x00, 0x05,
+        ];
+        match parse_response(&buf).expect("parse") {
+            Response::Map { rate_limit, .. } => assert_eq!(
+                rate_limit,
+                Some(RateLimitInfo {
+                    attempts_remaining: 3,
+                    window_reset_secs: 5
+                })
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn unknown_result_code_maps_to_network_failure() {
+        // Pin the deliberately lossy mapping: an unknown/future result code is
+        // coerced to NetworkFailure (matches warren-core); changing this is a
+        // behavior change a test must catch.
+        assert_eq!(ResultCode::from_raw(0), ResultCode::Success);
+        assert_eq!(ResultCode::from_raw(99), ResultCode::NetworkFailure);
+        assert_eq!(ResultCode::from_raw(u16::MAX), ResultCode::NetworkFailure);
+    }
 }

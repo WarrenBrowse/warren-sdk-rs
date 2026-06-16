@@ -35,7 +35,23 @@
         "exit_pubkey_hex": "0000000000000000000000000000000000000000000000000000000000000000",
         "max_mtu": 1350,
         "multiconn_attached": true,
+        "daita_spec": null,
         "bytes_hex": "040a422a07000000000000000000000000000000000000000000000000000000000000000000c60a0100"
+      },
+      {
+        "_comment": "daita_spec Some: 0x01, then DaitaConfig: machine_specs Vec<String> (len varint + per-string len varint + utf8), max_padding_frac f64 (8 bytes LE IEEE-754), max_blocking_frac f64. Pins the f64 byte order across languages.",
+        "protocol_version": 4,
+        "tunnel_ipv4": [10, 66, 42, 7],
+        "tunnel_ipv6_hex": null,
+        "exit_pubkey_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+        "max_mtu": 1350,
+        "multiconn_attached": true,
+        "daita_spec": {
+          "machine_specs": ["AAA", "BB"],
+          "max_padding_frac": 0.5,
+          "max_blocking_frac": 0.25
+        },
+        "bytes_hex": "040a422a07000000000000000000000000000000000000000000000000000000000000000000c60a01010203414141024242000000000000e03f000000000000d03f"
       }
     ]
   }
