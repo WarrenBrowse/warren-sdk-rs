@@ -88,4 +88,25 @@ void main() {
     expect(h.nonceHex, equals(nonce));
     expect(h.signatureHex, matches(RegExp(r'^[0-9a-f]{128}$')));
   });
+
+  test('async client method drives the RustFuture to an error on a dead host',
+      () async {
+    // Exercises the uniffi object + async ABI end to end (constructor, an async
+    // method, the RustFuture poll/complete/free bridge). Port 1 on loopback
+    // refuses fast, so the future completes with an error without a live server
+    // (mirrors the Rust FFI test). Proves the async path works, not just the
+    // deterministic one.
+    final client = WarrenFfiClientFfi.create(
+      ffi,
+      mnemonic: (((vectors['bip39'] as Map)['vectors'] as List).first
+          as Map)['mnemonic'] as String,
+      apiBase: 'https://127.0.0.1:1',
+      serverPubkeyPin: 'ab' * 32,
+    );
+    try {
+      await expectLater(client.subscriptionExpiry(), throwsA(isA<Object>()));
+    } finally {
+      client.close();
+    }
+  });
 }

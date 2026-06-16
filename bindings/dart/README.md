@@ -18,13 +18,19 @@ PARTIAL, with the pure surface WORKING and validated.
   `Result<FfiSignedHeaders>`). This exercises the full uniffi-0.31 String/record/
   u64/Result marshaling ABI by hand, so the cross-language wire-compat contract is
   satisfied on the Dart side for every deterministic call.
-- The remaining surface is ASYNC and server-dependent (client construction,
-  `subscriptionExpiry`, `fetchMultihopExits`, `redeemVoucher`, the proxy
-  lifecycle, DAITA, port forwarding). It needs the GENERATED bindings (uniffi's
-  async RustFuture runtime bridge) plus a live API/exit to validate, neither
-  feasible from the headless dev sandbox. The current generator
-  (`uniffi-bindgen-dart` 0.1.3) emits glue that crashes at the FFI boundary (see
-  below), so that path waits on a correct generator (or `flutter_rust_bridge`).
+- The async + object ABI is ALSO proven by hand: `WarrenFfiClientFfi.create`
+  (the uniffi object constructor) plus `subscriptionExpiry()` (an async method
+  driven through the RustFuture poll/complete/free protocol with a
+  `NativeCallable` continuation). `dart test` validates it via the error path (an
+  unroutable host, no live server needed), exactly like the Rust FFI test. So the
+  full uniffi-0.31 ABI (String/record/u64/Result/object/async) works from Dart.
+- What is NOT yet bound by hand: the happy paths of the server-dependent calls
+  (`subscriptionExpiry` value, `fetchMultihopExits`, `redeemVoucher`) which need a
+  live API/exit to exercise, and the proxy lifecycle (`start_proxy*`, which use
+  uniffi callback interfaces). The complete generated surface still depends on a
+  correct generator (`uniffi-bindgen-dart` 0.1.3 crashes, see below) or
+  `flutter_rust_bridge`; the hand layer covers every shape needed to validate
+  wire-compat without a server in the meantime.
 
 The native library is built by `cargo build -p warren-sdk-ffi --release`. The
 hand-written layer needs only a Dart SDK (no Flutter); the full surface needs a

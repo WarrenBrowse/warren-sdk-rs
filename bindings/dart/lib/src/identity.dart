@@ -10,6 +10,7 @@
 //
 // This is intentionally narrow. The full surface (client, proxy, etc.) belongs
 // to the generated bindings once the generator is fixed.
+import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:io';
@@ -59,8 +60,8 @@ typedef _NoArgFnDart = _RustBuffer Function(ffi.Pointer<_RustCallStatus>);
 // sign_request(mnemonic, method, path, body, timestamp:u64, nonce) -> RustBuffer
 typedef _SignFnC = _RustBuffer Function(_RustBuffer, _RustBuffer, _RustBuffer,
     _RustBuffer, ffi.Uint64, _RustBuffer, ffi.Pointer<_RustCallStatus>);
-typedef _SignFnDart = _RustBuffer Function(_RustBuffer, _RustBuffer, _RustBuffer,
-    _RustBuffer, int, _RustBuffer, ffi.Pointer<_RustCallStatus>);
+typedef _SignFnDart = _RustBuffer Function(_RustBuffer, _RustBuffer,
+    _RustBuffer, _RustBuffer, int, _RustBuffer, ffi.Pointer<_RustCallStatus>);
 
 /// A generated identity (uniffi record `FfiIdentity`).
 class FfiIdentity {
@@ -96,7 +97,21 @@ class WarrenIdentityFfi {
         _generateIdentity = lib.lookupFunction<_NoArgFnC, _NoArgFnDart>(
             'uniffi_warren_sdk_ffi_fn_func_generate_identity'),
         _signRequest = lib.lookupFunction<_SignFnC, _SignFnDart>(
-            'uniffi_warren_sdk_ffi_fn_func_sign_request');
+            'uniffi_warren_sdk_ffi_fn_func_sign_request'),
+        _clientNew = lib.lookupFunction<_CtorC, _CtorDart>(
+            'uniffi_warren_sdk_ffi_fn_constructor_warrenfficlient_new'),
+        _clientFree = lib.lookupFunction<_FreeObjC, _FreeObjDart>(
+            'uniffi_warren_sdk_ffi_fn_free_warrenfficlient'),
+        _subscriptionExpiry = lib.lookupFunction<_AsyncMethodC,
+                _AsyncMethodDart>(
+            'uniffi_warren_sdk_ffi_fn_method_warrenfficlient_subscription_expiry'),
+        _futurePoll = lib.lookupFunction<_FuturePollC, _FuturePollDart>(
+            'ffi_warren_sdk_ffi_rust_future_poll_u64'),
+        _futureCompleteU64 =
+            lib.lookupFunction<_FutureCompleteU64C, _FutureCompleteU64Dart>(
+                'ffi_warren_sdk_ffi_rust_future_complete_u64'),
+        _futureFree = lib.lookupFunction<_FutureFreeC, _FutureFreeDart>(
+            'ffi_warren_sdk_ffi_rust_future_free_u64');
 
   /// Opens the library from `path` (the built cdylib).
   factory WarrenIdentityFfi.open(String path) =>
@@ -109,6 +124,12 @@ class WarrenIdentityFfi {
   final _StringFnDart _addressFromMnemonic;
   final _NoArgFnDart _generateIdentity;
   final _SignFnDart _signRequest;
+  final _CtorDart _clientNew;
+  final _FreeObjDart _clientFree;
+  final _AsyncMethodDart _subscriptionExpiry;
+  final _FuturePollDart _futurePoll;
+  final _FutureCompleteU64Dart _futureCompleteU64;
+  final _FutureFreeDart _futureFree;
 
   /// SS58 `wb…` address for a 64-hex pubkey.
   String ss58Encode(String pubkeyHex) => _callString(_ss58Encode, pubkeyHex);
@@ -238,6 +259,141 @@ class WarrenIdentityFfi {
       }
       throw StateError('warren-sdk-ffi $where failed (status code $code)');
     }
+  }
+}
+
+// --- Async + object surface (uniffi RustFuture bridge) ---
+
+// Constructor: (mnemonic, api_base, server_pubkey_pin, status) -> object handle.
+typedef _CtorC = ffi.Pointer<ffi.Void> Function(
+    _RustBuffer, _RustBuffer, _RustBuffer, ffi.Pointer<_RustCallStatus>);
+typedef _CtorDart = ffi.Pointer<ffi.Void> Function(
+    _RustBuffer, _RustBuffer, _RustBuffer, ffi.Pointer<_RustCallStatus>);
+
+typedef _FreeObjC = ffi.Void Function(
+    ffi.Pointer<ffi.Void>, ffi.Pointer<_RustCallStatus>);
+typedef _FreeObjDart = void Function(
+    ffi.Pointer<ffi.Void>, ffi.Pointer<_RustCallStatus>);
+
+// Async method: (self handle) -> RustFuture handle (u64).
+typedef _AsyncMethodC = ffi.Uint64 Function(ffi.Pointer<ffi.Void>);
+typedef _AsyncMethodDart = int Function(ffi.Pointer<ffi.Void>);
+
+// The uniffi RustFuture continuation callback: (data, poll_result).
+typedef _ContinuationC = ffi.Void Function(ffi.Uint64, ffi.Int8);
+
+typedef _FuturePollC = ffi.Void Function(
+    ffi.Uint64, ffi.Pointer<ffi.NativeFunction<_ContinuationC>>, ffi.Uint64);
+typedef _FuturePollDart = void Function(
+    int, ffi.Pointer<ffi.NativeFunction<_ContinuationC>>, int);
+
+typedef _FutureCompleteU64C = ffi.Uint64 Function(
+    ffi.Uint64, ffi.Pointer<_RustCallStatus>);
+typedef _FutureCompleteU64Dart = int Function(
+    int, ffi.Pointer<_RustCallStatus>);
+
+typedef _FutureFreeC = ffi.Void Function(ffi.Uint64);
+typedef _FutureFreeDart = void Function(int);
+
+const int _rustFuturePollReady = 0;
+
+/// A live `WarrenFfiClient` over the native library, demonstrating the uniffi
+/// object + async ABI by hand: construct the object, then drive an async method
+/// through the RustFuture poll/complete/free protocol with a `NativeCallable`
+/// continuation. Validated via the error path (an unroutable host), which needs
+/// no live server, exactly like the Rust FFI test.
+class WarrenFfiClientFfi {
+  WarrenFfiClientFfi._(this._ffi, this._handle);
+
+  /// Builds a client from a mnemonic, API base URL, and 64-hex server pin.
+  factory WarrenFfiClientFfi.create(
+    WarrenIdentityFfi ffi, {
+    required String mnemonic,
+    required String apiBase,
+    required String serverPubkeyPin,
+  }) {
+    final status = calloc<_RustCallStatus>();
+    final lowered = <_Lowered>[];
+    try {
+      _RustBuffer lower(String s) {
+        final l = ffi._lower(s, status);
+        ffi._check(status, 'rustbuffer_from_bytes');
+        lowered.add(l);
+        return l.buffer;
+      }
+
+      final handle = ffi._clientNew(
+          lower(mnemonic), lower(apiBase), lower(serverPubkeyPin), status);
+      ffi._check(status, 'WarrenFfiClient::new');
+      return WarrenFfiClientFfi._(ffi, handle);
+    } finally {
+      for (final l in lowered) {
+        malloc.free(l.dataPtr);
+        calloc.free(l.foreignBytes);
+      }
+      calloc.free(status);
+    }
+  }
+
+  final WarrenIdentityFfi _ffi;
+  final ffi.Pointer<ffi.Void> _handle;
+  bool _closed = false;
+
+  /// The subscription expiry (unix seconds). Async: drives the RustFuture to
+  /// completion. Throws on a transport/server error (the validated path here).
+  Future<int> subscriptionExpiry() {
+    final future = _ffi._subscriptionExpiry(_handle);
+    return _driveU64Future(future);
+  }
+
+  /// Releases the native object. Idempotent.
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    final status = calloc<_RustCallStatus>();
+    try {
+      _ffi._clientFree(_handle, status);
+    } finally {
+      calloc.free(status);
+    }
+  }
+
+  /// Polls `future` (a u64 RustFuture handle) to completion via a NativeCallable
+  /// continuation, then completes/frees it. Implements the uniffi async ABI.
+  Future<int> _driveU64Future(int future) {
+    final completer = Completer<int>();
+    late final ffi.NativeCallable<_ContinuationC> cb;
+
+    void finish() {
+      final status = calloc<_RustCallStatus>();
+      try {
+        final value = _ffi._futureCompleteU64(future, status);
+        final code = status.ref.code;
+        _ffi._futureFree(future);
+        cb.close();
+        if (code != 0) {
+          completer.completeError(
+              StateError('subscription_expiry failed (status code $code)'));
+        } else {
+          completer.complete(value);
+        }
+      } finally {
+        calloc.free(status);
+      }
+    }
+
+    void onPoll(int _, int pollResult) {
+      if (pollResult == _rustFuturePollReady) {
+        finish();
+      } else {
+        // Not ready yet: poll again, re-arming the same continuation.
+        _ffi._futurePoll(future, cb.nativeFunction, 0);
+      }
+    }
+
+    cb = ffi.NativeCallable<_ContinuationC>.listener(onPoll);
+    _ffi._futurePoll(future, cb.nativeFunction, 0);
+    return completer.future;
   }
 }
 
