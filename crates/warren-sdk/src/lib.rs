@@ -13,7 +13,8 @@
 //! let client = WarrenClient::builder()
 //!     .identity(identity)
 //!     .api_base("https://api.warrenbrowse.com")
-//!     .server_pubkey_pin("….hex….")
+//!     // The pinned server pubkey: 32 bytes (64 hex chars). Ship the real one.
+//!     .server_pubkey_pin("0000000000000000000000000000000000000000000000000000000000000000")
 //!     .build()?;
 //!
 //! // Fetch and verify the signed multihop directory (full PKI chain).

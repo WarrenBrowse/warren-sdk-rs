@@ -53,11 +53,20 @@ pub enum SdkError {
     /// Binding the local proxy listener failed.
     #[error("proxy listener bind failed")]
     Proxy(#[source] std::io::Error),
-    /// DAITA was enabled but its configuration could not be built (an unknown
-    /// machine name, an empty pool, or a maybenot framework error). The message
-    /// describes the cause; it carries no identity material.
-    #[error("DAITA configuration failed: {0}")]
-    Daita(String),
+    /// DAITA was enabled with a named machine that is not in the curated pool.
+    /// The machine name is a public protocol label, not identity material.
+    #[error("unknown DAITA machine: {name}")]
+    UnknownDaitaMachine {
+        /// The requested machine name (a curated-pool label).
+        name: String,
+    },
+    /// DAITA was enabled but the curated machine pool was empty (should not
+    /// happen with the built-in pool; surfaced rather than panicking).
+    #[error("the DAITA machine pool is empty")]
+    EmptyDaitaPool,
+    /// DAITA was enabled but the maybenot framework rejected the configuration.
+    #[error("DAITA framework configuration failed")]
+    DaitaConfig(#[source] warren_daita::DaitaError),
     /// The signed exit list is past its `expires_at` (anti-freeze / replay).
     #[error("signed exit list is expired")]
     StaleRelayList,

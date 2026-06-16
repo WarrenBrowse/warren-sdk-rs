@@ -248,6 +248,30 @@ pub fn sign_request(
     })
 }
 
+/// Optional client configuration for [`WarrenFfiClient::with_options`].
+///
+/// A future-proof bag of optional knobs so adding one does not churn the
+/// constructor signature (and every generated binding). All fields are
+/// optional: an all-default value is equivalent to [`WarrenFfiClient::new`].
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct FfiClientOptions {
+    /// Offline multihop-directory ROOT Ed25519 pubkey pins (64-hex). With at
+    /// least one, the operational cert must be signed by a pinned root.
+    #[uniffi(default = [])]
+    pub multihop_root_pubkey_pins: Vec<String>,
+    /// Directory to persist the anti-rollback floors and the TOFU server pin, so
+    /// they survive a restart. `None` keeps them in memory (reset each launch).
+    #[uniffi(default = None)]
+    pub state_dir: Option<String>,
+    /// Enable the DAITA uplink traffic-analysis defense on multihop tunnels.
+    #[uniffi(default = false)]
+    pub daita: bool,
+    /// Pin the DAITA uplink machine to a named curated-pool entry (for example
+    /// `tamaraw`); `None` lets the SDK pick. Implies `daita`.
+    #[uniffi(default = None)]
+    pub daita_machine: Option<String>,
+}
+
 /// A live Warren SDK client exposed across the FFI boundary.
 ///
 /// Wraps the default reqwest-backed [`DefaultClient`]. Async methods run on the
@@ -357,6 +381,58 @@ impl WarrenFfiClient {
             .server_key_store(Arc::new(key_store));
         for root in multihop_root_pubkey_pins {
             builder = builder.multihop_root_pubkey_pin(root);
+        }
+        let inner = builder.build().map_err(|e| FfiError::Client {
+            message: e.to_string(),
+        })?;
+        Ok(Arc::new(Self { inner }))
+    }
+
+    /// Builds a client with the full set of optional knobs in [`FfiClientOptions`]
+    /// (root pins, persistence, and the DAITA uplink defense). Prefer this over
+    /// the narrower constructors when a binding needs DAITA or several options at
+    /// once; an all-default `options` is equivalent to [`new`](Self::new).
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InvalidMnemonic`] for a bad phrase, or [`FfiError::Client`] if
+    /// a persistence `state_dir` cannot be created or read.
+    #[uniffi::constructor]
+    pub fn with_options(
+        mnemonic: String,
+        api_base: String,
+        server_pubkey_pin: String,
+        options: FfiClientOptions,
+    ) -> Result<Arc<Self>, FfiError> {
+        let identity =
+            WarrenIdentity::from_mnemonic(&mnemonic).map_err(|_| FfiError::InvalidMnemonic)?;
+        let mut builder = WarrenClient::builder()
+            .identity(identity)
+            .api_base(api_base)
+            .server_pubkey_pin(server_pubkey_pin);
+        for root in options.multihop_root_pubkey_pins {
+            builder = builder.multihop_root_pubkey_pin(root);
+        }
+        if let Some(state_dir) = options.state_dir.as_deref() {
+            let dir = std::path::Path::new(state_dir);
+            let io_err = |_| FfiError::Client {
+                message: "persistence state directory is not usable".to_owned(),
+            };
+            std::fs::create_dir_all(dir).map_err(io_err)?;
+            let relay_gen =
+                FileGenerationStore::new(dir.join("relay_generation")).map_err(io_err)?;
+            let mh_gen =
+                FileGenerationStore::new(dir.join("multihop_generation")).map_err(io_err)?;
+            let key_store = FileServerKeyStore::new(dir.join("server_key")).map_err(io_err)?;
+            builder = builder
+                .generation_store(Arc::new(relay_gen))
+                .multihop_generation_store(Arc::new(mh_gen))
+                .server_key_store(Arc::new(key_store));
+        }
+        if let Some(machine) = options.daita_machine {
+            builder = builder.daita_machine(machine);
+        } else if options.daita {
+            builder = builder.daita();
         }
         let inner = builder.build().map_err(|e| FfiError::Client {
             message: e.to_string(),
@@ -1052,6 +1128,51 @@ mod tests {
         .expect("valid build with persistence");
         assert_eq!(client.address(), id.address);
         assert!(state.is_dir(), "the state directory is created");
+    }
+
+    #[test]
+    fn client_with_options_threads_daita_and_persistence() {
+        let id = generate_identity();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("warren-state");
+        let client = WarrenFfiClient::with_options(
+            id.mnemonic.clone(),
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+            FfiClientOptions {
+                multihop_root_pubkey_pins: vec!["cd".repeat(32)],
+                state_dir: Some(state.to_string_lossy().into_owned()),
+                daita: true,
+                daita_machine: Some("tamaraw".to_owned()),
+            },
+        )
+        .expect("valid build with full options");
+        assert_eq!(client.address(), id.address);
+        assert!(state.is_dir(), "persistence state directory is created");
+    }
+
+    #[test]
+    fn client_with_options_defaults_match_the_basic_constructor() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::with_options(
+            id.mnemonic.clone(),
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+            FfiClientOptions::default(),
+        )
+        .expect("valid default build");
+        assert_eq!(client.address(), id.address);
+    }
+
+    #[test]
+    fn client_with_options_rejects_a_bad_mnemonic() {
+        let r = WarrenFfiClient::with_options(
+            "not a valid mnemonic".to_owned(),
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+            FfiClientOptions::default(),
+        );
+        assert!(matches!(r, Err(FfiError::InvalidMnemonic)));
     }
 
     #[tokio::test]

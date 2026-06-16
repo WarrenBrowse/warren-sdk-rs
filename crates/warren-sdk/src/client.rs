@@ -66,6 +66,27 @@ impl GenerationStore for InMemoryGenerationStore {
 }
 
 /// Builder for a [`WarrenClient`].
+///
+/// Start from [`WarrenClient::builder`], set an identity and a pinned server
+/// key, then [`build`](Self::build).
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn run() -> Result<(), warren_sdk::SdkError> {
+/// use warren_sdk::{WarrenClient, identity::WarrenIdentity};
+///
+/// let (identity, _mnemonic) = WarrenIdentity::generate();
+/// let client = WarrenClient::builder()
+///     .identity(identity)
+///     .api_base("https://api.warrenbrowse.com")
+///     .server_pubkey_pin("0000000000000000000000000000000000000000000000000000000000000000")
+///     .daita() // optional: traffic-analysis defense on the uplink
+///     .build()?;
+/// let _ = client.fetch_multihop_directory().await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct WarrenClientBuilder {
     pub(crate) identity: Option<WarrenIdentity>,
     pub(crate) api_base: String,
@@ -472,6 +493,10 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// # Errors
     ///
     /// [`SdkError::Multihop`] if the handshake, policy gate, or datapath fails.
+    /// When DAITA is enabled (see [`WarrenClientBuilder::daita`]):
+    /// [`SdkError::UnknownDaitaMachine`] if a named machine is not in the pool,
+    /// [`SdkError::EmptyDaitaPool`] if the pool is empty, or
+    /// [`SdkError::DaitaConfig`] if the maybenot framework rejects the config.
     pub async fn connect_multihop(
         &self,
         exit: &VerifiedExit,
@@ -498,13 +523,11 @@ impl<T: HttpTransport> WarrenClient<T> {
         let cfg = match &self.daita_machine {
             Some(name) => pool
                 .pick_named_os(name)
-                .ok_or_else(|| SdkError::Daita(format!("unknown DAITA machine '{name}'")))?,
-            None => pool
-                .pick_os()
-                .ok_or_else(|| SdkError::Daita("empty DAITA pool".to_owned()))?,
+                .ok_or_else(|| SdkError::UnknownDaitaMachine { name: name.clone() })?,
+            None => pool.pick_os().ok_or(SdkError::EmptyDaitaPool)?,
         };
         let state = warren_daita::DaitaState::from_config(&cfg, std::time::Instant::now())
-            .map_err(|e| SdkError::Daita(e.to_string()))?;
+            .map_err(SdkError::DaitaConfig)?;
         let session = Arc::new(session);
         let driver = warren_transport::DaitaDriver::new(Arc::clone(&session), state);
         let handle = driver.handle();

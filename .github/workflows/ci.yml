@@ -106,6 +106,8 @@ jobs:
           grep -q "class WarrenFfiClient" target/bindings/warren_sdk_ffi.py
           grep -q "def with_multihop_roots" target/bindings/warren_sdk_ffi.py
           grep -q "def with_persistence" target/bindings/warren_sdk_ffi.py
+          grep -q "def with_options" target/bindings/warren_sdk_ffi.py
+          grep -q "class FfiClientOptions" target/bindings/warren_sdk_ffi.py
           grep -q "async def subscription_expiry" target/bindings/warren_sdk_ffi.py
           grep -q "async def fetch_multihop_exits" target/bindings/warren_sdk_ffi.py
           grep -q "class FfiExit" target/bindings/warren_sdk_ffi.py

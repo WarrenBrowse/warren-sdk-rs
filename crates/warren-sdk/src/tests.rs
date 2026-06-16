@@ -402,6 +402,56 @@ async fn connect_multihop_with_daita_pads_the_uplink() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn connect_multihop_with_an_unknown_daita_machine_is_rejected() {
+    // A machine name outside the curated pool surfaces a typed, no-log error
+    // (the name is a public protocol label), after the handshake succeeded.
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let (addr, keys) = warren_test_support::spawn_fake_multihop_exit(exit_key).await;
+    let exit = fake_verified_exit(addr, &keys);
+
+    let (id, _m) = WarrenIdentity::generate();
+    let client = WarrenClient::builder()
+        .identity(id)
+        .api_base("https://api.example.test")
+        .allow_any_server_key()
+        .daita_machine("does-not-exist")
+        .build()
+        .expect("build");
+
+    match client.connect_multihop(&exit).await {
+        Err(SdkError::UnknownDaitaMachine { name }) => assert_eq!(name, "does-not-exist"),
+        Err(other) => panic!("expected UnknownDaitaMachine, got {other:?}"),
+        Ok(_) => panic!("unknown DAITA machine must fail"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn start_proxy_reports_a_listener_bind_failure() {
+    // A SOCKS5 listen address that cannot bind (already in use) surfaces as the
+    // documented SdkError::Proxy, before any tunnel work.
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let (addr, keys) = warren_test_support::spawn_fake_multihop_exit(exit_key).await;
+    let exit = fake_verified_exit(addr, &keys);
+
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let busy = occupied.local_addr().unwrap();
+    let cfg = warren_net::ProxyConfig {
+        socks5: busy,
+        http: None,
+        dns_server: None,
+    };
+
+    match test_client()
+        .start_proxy_multihop_supervised(&exit, &cfg)
+        .await
+    {
+        Err(SdkError::Proxy(_)) => {}
+        Err(other) => panic!("expected SdkError::Proxy, got {other:?}"),
+        Ok(_) => panic!("binding an occupied port must fail"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn supervised_proxy_reaches_connected_against_a_fake_exit() {
     // Full supervised facade wiring in process: bind listener, background
     // establish over the fake exit, report Connected on the state watch.
