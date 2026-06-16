@@ -210,6 +210,12 @@ mod linux {
             Ok(())
         }
     }
+
+    impl std::os::fd::AsRawFd for TunFd {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            std::os::fd::AsRawFd::as_raw_fd(&self.fd)
+        }
+    }
 }
 
 /// Opens a macOS `utun` device (EXPERIMENTAL, requires root). `name` of the form
@@ -336,6 +342,51 @@ mod macos {
             Ok(())
         }
     }
+
+    impl std::os::fd::AsRawFd for Utun {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            std::os::fd::AsRawFd::as_raw_fd(&self.fd)
+        }
+    }
+}
+
+/// Opens a Windows Wintun device (EXPERIMENTAL). NOT YET IMPLEMENTED: Wintun is a
+/// DLL-loaded API (`WintunCreateAdapter` / session ring buffers) that cannot be
+/// compile-checked or exercised from the dev sandbox, so this returns an
+/// `Unsupported` error rather than a fake implementation. The seam
+/// ([`RawTunDevice`], [`FramedTun`], the plans/applier) is OS-agnostic and ready
+/// for it.
+///
+/// # Errors
+///
+/// Always [`io::ErrorKind::Unsupported`] until a real Wintun backend lands.
+#[cfg(all(target_os = "windows", feature = "experimental-tun"))]
+pub fn open_tun(_name: &str) -> io::Result<std::convert::Infallible> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Wintun backend not yet implemented",
+    ))
+}
+
+/// Sets `O_NONBLOCK` on `fd` so an async driver can multiplex it (Unix). Used by
+/// the real-fd datapath loop; the framing/plan logic does not need it.
+///
+/// # Errors
+///
+/// The `fcntl` error if the flags cannot be read or set.
+#[cfg(all(unix, feature = "experimental-tun"))]
+pub fn set_nonblocking(fd: std::os::fd::RawFd) -> io::Result<()> {
+    // SAFETY: `F_GETFL`/`F_SETFL` take no pointer; `fd` is a caller-owned open fd.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: same as above; sets the non-blocking bit on the existing flags.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

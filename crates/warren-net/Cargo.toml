@@ -42,6 +42,9 @@ default = ["proxy"]
 proxy = ["dep:smoltcp"]
 tun = []
 killswitch = []
+# Enables the real-fd TUN datapath driver (the async duplex loop over a kernel
+# device); pulls warren-tun's privileged device open. EXPERIMENTAL, unvalidated.
+experimental-tun = ["warren-tun/experimental-tun"]
 
 [dev-dependencies]
 # `test-util` enables `start_paused` for the NAT-PMP retransmit/refresh tests.

@@ -112,6 +112,97 @@ impl<D: RawTunDevice> TunBridge<D> {
     }
 }
 
+/// The real-fd async duplex datapath loop (Unix), EXPERIMENTAL and feature-gated.
+///
+/// A kernel TUN fd is full-duplex, so one task multiplexes both directions with
+/// `tokio`'s `AsyncFd` readiness: on readable, drain inbound frames to the sink;
+/// in parallel, drain the egress channel to the device. The blocking `pump_*`
+/// primitives above are the tested core; this wires them to fd readiness. It
+/// needs a real device (and root), so it is compile-checked on Unix but NOT
+/// unit-tested and NOT yet validated against a real exit.
+#[cfg(all(unix, feature = "experimental-tun"))]
+impl<D> TunBridge<D>
+where
+    D: warren_tun::RawTunDevice + std::os::fd::AsRawFd + Send + 'static,
+{
+    /// Runs the duplex loop until the device errors fatally or the sink is
+    /// dropped (both channel directions closed).
+    ///
+    /// # Errors
+    ///
+    /// A fatal device read/write error (anything other than `WouldBlock`), or the
+    /// failure to register the fd with the async reactor.
+    pub async fn run(self) -> std::io::Result<()> {
+        use std::io::ErrorKind::WouldBlock;
+        use tokio::io::Interest;
+        use tokio::io::unix::AsyncFd;
+
+        // Destructure into disjoint locals so the two select arms borrow
+        // different fields (egress channel vs device/inbound) without conflict.
+        let TunBridge {
+            mut device,
+            framing,
+            mut read_buf,
+            inbound,
+            mut outbound,
+        } = self;
+
+        let raw = device.as_raw_fd();
+        warren_tun::device::set_nonblocking(raw)?;
+        // Register the bare fd for readiness only; `device` still owns and closes
+        // it. A newtype because AsyncFd needs an AsRawFd value of its own.
+        struct FdRef(std::os::fd::RawFd);
+        impl std::os::fd::AsRawFd for FdRef {
+            fn as_raw_fd(&self) -> std::os::fd::RawFd {
+                self.0
+            }
+        }
+        let afd = AsyncFd::with_interest(FdRef(raw), Interest::READABLE | Interest::WRITABLE)?;
+
+        loop {
+            tokio::select! {
+                // The device has bytes to read: drain ready frames to the sink.
+                guard = afd.readable() => {
+                    let mut guard = guard?;
+                    loop {
+                        match device.read_frame(&mut read_buf) {
+                            Ok(n) => {
+                                if let Some(packet) = framing.decode(&read_buf[..n])
+                                    && inbound.try_send(Bytes::from(packet)).is_err()
+                                    && inbound.is_closed()
+                                {
+                                    return Ok(()); // sink dropped
+                                }
+                            }
+                            Err(ref e) if e.kind() == WouldBlock => {
+                                guard.clear_ready();
+                                break;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                // An egress packet is queued: frame it and write it. A write
+                // WouldBlock waits for writability before retrying.
+                pkt = outbound.recv() => {
+                    let Some(packet) = pkt else { return Ok(()); }; // sink dropped
+                    if let Some(frame) = framing.encode(&packet) {
+                        loop {
+                            match device.write_frame(&frame) {
+                                Ok(()) => break,
+                                Err(ref e) if e.kind() == WouldBlock => {
+                                    afd.writable().await?.clear_ready();
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl PacketSink for TunPacketSink {
     async fn send_packet(&self, packet: &[u8]) -> Result<(), NetError> {
         self.to_device.send(packet.to_vec()).await.map_err(|_| {
