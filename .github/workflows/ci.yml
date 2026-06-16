@@ -70,7 +70,13 @@ jobs:
           - name: macos
             runner: [self-hosted, macOS, ARM64]
     steps:
+      # The golden vectors are a private submodule (warren-vectors); the test
+      # binaries read them at runtime, so this job needs them checked out.
+      # VECTORS_TOKEN is a PAT with read access to warren-sdk-rs + warren-vectors.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.VECTORS_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-nextest
@@ -147,7 +153,11 @@ jobs:
     name: cargo llvm-cov
     runs-on: [self-hosted, Linux, X64]
     steps:
+      # Coverage runs the test suite, which reads the golden vectors submodule.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.VECTORS_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: llvm-tools-preview

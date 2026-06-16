@@ -91,17 +91,30 @@ Applications depend only on `warren-sdk`:
 
 ## Build and test
 
+The golden vectors live in `vectors/`, which is a **git submodule** of the
+shared [`warren-vectors`](https://github.com/WarrenBrowse/warren-vectors)
+repository (a single source of truth reused by every sibling SDK, no
+duplication). Clone with submodules, or initialize them after cloning:
+
+```bash
+git clone --recurse-submodules git@github.com:WarrenBrowse/warren-sdk-rs.git
+# or, in an existing checkout:
+git submodule update --init
+```
+
 ```bash
 cargo build --workspace
-cargo test  --workspace
+cargo test  --workspace      # the test binaries read vectors/ at runtime
 cargo fmt   --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo deny  check
 ```
 
-The shared cross-language contracts live in `vectors/`. The
-`crates/warren-identity/tests/vectors.rs` test replays them; every other language
-SDK must replay the same files.
+The `crates/warren-identity/tests/vectors.rs` test (and the per-crate
+`tests/vectors.rs` files) replay the shared vectors; every other language SDK
+replays the same files. CI fetches the private submodule using a `VECTORS_TOKEN`
+secret (a PAT with read access to this repo and `warren-vectors`); set it as an
+org or repo secret for the `test` and `coverage` jobs.
 
 ## License
 
