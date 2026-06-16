@@ -73,6 +73,34 @@ pub fn tun_channels<D: RawTunDevice>(
     (sink, bridge)
 }
 
+/// Forwards one direction: read IP packets from `from` and send them to `to`,
+/// until either side's read/write fails (the tunnel or device closed).
+async fn pump<R: PacketSink, S: PacketSink>(from: &R, to: &S) -> Result<(), NetError> {
+    loop {
+        let packet = from.recv_packet().await?;
+        to.send_packet(&packet).await?;
+    }
+}
+
+/// Forwards raw IP packets in BOTH directions between two packet sinks until
+/// either side closes. This is the privileged TUN datapath glue: wire a
+/// [`TunPacketSink`] (device side) to a tunnel sink (for example
+/// [`MultihopPacketSink`](crate::MultihopPacketSink)) so packets flow
+/// `device <-> exit`. Generic over [`PacketSink`], so it is unit-tested over
+/// in-memory mock sinks (no device or live tunnel needed); the real datapath
+/// pairs it with a TUN bridge worker and a multihop session.
+///
+/// # Errors
+///
+/// The first [`NetError`] from either direction; the other direction is then
+/// cancelled (the datapath has stopped).
+pub async fn forward_bidirectional<A: PacketSink, B: PacketSink>(
+    device: A,
+    tunnel: B,
+) -> Result<(), NetError> {
+    tokio::try_join!(pump(&device, &tunnel), pump(&tunnel, &device)).map(|_| ())
+}
+
 impl<D: RawTunDevice> TunBridge<D> {
     /// Reads one frame from the device and forwards the deframed packet to the
     /// sink. Returns `Ok(false)` if the sink's receiver was dropped (stop).
@@ -314,5 +342,90 @@ mod tests {
     fn max_payload_reports_the_mtu() {
         let (sink, _bridge) = tun_channels(MockDevice::default(), Framing::Bare, 1280);
         assert_eq!(sink.max_payload(), 1280);
+    }
+
+    /// A channel-backed mock `PacketSink`: `recv_packet` pops `inbound`,
+    /// `send_packet` pushes `outbound`. Lets `forward_bidirectional` be tested
+    /// without a device or a live tunnel.
+    struct MockSink {
+        inbound: Mutex<mpsc::Receiver<Bytes>>,
+        outbound: mpsc::Sender<Vec<u8>>,
+    }
+
+    impl PacketSink for MockSink {
+        async fn send_packet(&self, packet: &[u8]) -> Result<(), NetError> {
+            self.outbound.send(packet.to_vec()).await.map_err(|_| {
+                NetError::Tun(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                ))
+            })
+        }
+
+        async fn recv_packet(&self) -> Result<Bytes, NetError> {
+            self.inbound.lock().await.recv().await.ok_or_else(|| {
+                NetError::Tun(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                ))
+            })
+        }
+
+        fn max_payload(&self) -> usize {
+            1280
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_bidirectional_relays_packets_both_ways() {
+        // device <-> tunnel: a packet read from the device must reach the tunnel,
+        // and a packet from the tunnel must reach the device.
+        let (dev_in_tx, dev_in_rx) = mpsc::channel::<Bytes>(8);
+        let (dev_out_tx, mut dev_out_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tun_in_tx, tun_in_rx) = mpsc::channel::<Bytes>(8);
+        let (tun_out_tx, mut tun_out_rx) = mpsc::channel::<Vec<u8>>(8);
+        let device = MockSink {
+            inbound: Mutex::new(dev_in_rx),
+            outbound: dev_out_tx,
+        };
+        let tunnel = MockSink {
+            inbound: Mutex::new(tun_in_rx),
+            outbound: tun_out_tx,
+        };
+
+        let task = tokio::spawn(forward_bidirectional(device, tunnel));
+
+        // Device -> tunnel.
+        dev_in_tx.send(Bytes::from(ipv4_packet())).await.unwrap();
+        assert_eq!(tun_out_rx.recv().await.unwrap(), ipv4_packet());
+
+        // Tunnel -> device.
+        let other = vec![0x45u8, 1, 2, 3];
+        tun_in_tx.send(Bytes::from(other.clone())).await.unwrap();
+        assert_eq!(dev_out_rx.recv().await.unwrap(), other);
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn forward_bidirectional_stops_when_a_side_closes() {
+        let (_dev_in_tx, dev_in_rx) = mpsc::channel::<Bytes>(1);
+        let (dev_out_tx, _dev_out_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (tun_in_tx, tun_in_rx) = mpsc::channel::<Bytes>(1);
+        let (tun_out_tx, _tun_out_rx) = mpsc::channel::<Vec<u8>>(1);
+        let device = MockSink {
+            inbound: Mutex::new(dev_in_rx),
+            outbound: dev_out_tx,
+        };
+        let tunnel = MockSink {
+            inbound: Mutex::new(tun_in_rx),
+            outbound: tun_out_tx,
+        };
+        // Drop the device's inbound sender: device.recv_packet errors, so the
+        // forwarder returns rather than hanging.
+        drop(_dev_in_tx);
+        drop(tun_in_tx);
+        let result = forward_bidirectional(device, tunnel).await;
+        assert!(matches!(result, Err(NetError::Tun(_))));
     }
 }
