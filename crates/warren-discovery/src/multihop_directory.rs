@@ -331,12 +331,6 @@ pub fn verify_multihop_directory(
     {
         return Err(DirectoryError::ServerPubkeyMismatch);
     }
-    // Anti-freeze: cap the validity window so a replayed/forged-but-signed
-    // directory cannot outlive revocation (caller still enforces expires_at).
-    if signed.expires_at.saturating_sub(signed.signed_at) > MAX_VALIDITY_SECS {
-        return Err(DirectoryError::ValidityTooLong);
-    }
-
     // (2) server envelope over the canonical preimage (typed, frozen order).
     let unsigned = UnsignedDirectory {
         version: signed.version,
@@ -353,6 +347,14 @@ pub fn verify_multihop_directory(
     server_pubkey
         .verify(&canonical, &sig64(&signed.signature_hex)?)
         .map_err(|_| DirectoryError::BadEnvelopeSignature)?;
+
+    // Anti-freeze: cap the validity window so a replayed/forged-but-signed
+    // directory cannot outlive revocation (caller still enforces expires_at).
+    // Checked only after the envelope signature so all anti-freeze decisions
+    // are made on authenticated fields (matching `verify_signed_relay_list`).
+    if signed.expires_at.saturating_sub(signed.signed_at) > MAX_VALIDITY_SECS {
+        return Err(DirectoryError::ValidityTooLong);
+    }
 
     // (3) operational certificate against the pinned root (empty = TOFU).
     let operational = vkey(&signed.operational_pubkey_hex)?;
@@ -810,5 +812,86 @@ mod tests {
             dir.exits.is_empty(),
             "node with a bad relay descriptor must be dropped"
         );
+    }
+
+    #[test]
+    fn directory_field_order_is_frozen() {
+        // The server envelope signs the canonical JSON of these structs, so a
+        // reordering of any field would silently break wire compatibility with
+        // warren-core. Pin the canonical substring order (parity with the signed
+        // relay list's field-order vector tests).
+        let (root, op, server) = (key(1), key(2), key(3));
+        let json = signed_directory_json(
+            &root,
+            &op,
+            &server,
+            vec![signed_node(&op, 10, "RO", 100)],
+            7,
+            99,
+        );
+        let order = [
+            r#""version":"#,
+            r#""nodes":["#,
+            // NodeEntry -> relay (RelayDescriptorSigned) field order.
+            r#""relay":{"#,
+            r#""relay_id":"#,
+            r#""relay_ed25519_pubkey":"#,
+            r#""endpoint":"#,
+            r#""signature":"#,
+            // NodeEntry -> exit (ExitDescriptorSigned) field order.
+            r#""exit":{"#,
+            r#""exit_id":"#,
+            r#""exit_ed25519_pubkey":"#,
+            r#""exit_x25519_multihop_pubkey":"#,
+            r#""endpoint":"#,
+            r#""signature":"#,
+            // NodeEntry tail.
+            r#""country":"#,
+            r#""city":"#,
+            r#""asn":"#,
+            r#""weight":"#,
+            r#""attestation_hex":"#,
+            // SignedDirectory tail.
+            r#""generation":"#,
+            r#""signed_at":"#,
+            r#""expires_at":"#,
+            r#""operational_pubkey_hex":"#,
+            r#""operational_cert_hex":"#,
+            r#""server_pubkey_hex":"#,
+            r#""signature_hex":"#,
+        ];
+        let mut last = 0usize;
+        for needle in order {
+            let pos = json[last..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle} in {json}"));
+            last += pos + needle.len();
+        }
+    }
+
+    #[test]
+    fn dns_disabled_round_trips_and_surfaces_on_the_verified_exit() {
+        // dns_disabled is a security-relevant flag (it gates DNS-over-tunnel) and
+        // is covered by the exit descriptor v2 preimage, so a `true` value must
+        // both verify and surface on the VerifiedExit.
+        let (root, op, server) = (key(1), key(2), key(3));
+        let mut node = signed_node(&op, 10, "RO", 100);
+        node.exit.dns_disabled = true;
+        // Re-sign the exit descriptor over the dns_disabled=1 preimage.
+        node.exit.signature = op_sign(
+            &op,
+            WARREN_PKI_OPERATIONAL_EXIT_V2,
+            &[
+                &node.exit.exit_id,
+                &node.exit.exit_x25519_multihop_pubkey,
+                &[1u8],
+            ],
+        );
+        let json = signed_directory_json(&root, &op, &server, vec![node], 1000, 1000 + 3600);
+        // When true, the byte is serialized; when false it is omitted (default).
+        assert!(json.contains("\"dns_disabled\":true"));
+        let dir = verify_multihop_directory(&json, &[&server_pin(&server)], &[]).unwrap();
+        assert_eq!(dir.exits.len(), 1);
+        assert!(dir.exits[0].dns_disabled);
     }
 }

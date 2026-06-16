@@ -113,3 +113,93 @@ fn ip_matches(ip: IpAvailability, relay: &Relay) -> bool {
         IpAvailability::Ipv6Only => relay.has_ipv6(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exit_id::ExitId;
+    use crate::relay::{Location, Relay};
+    use std::net::SocketAddr;
+
+    fn relay_with(addrs: &[&str], active: bool) -> Relay {
+        let addrs = addrs.iter().map(|a| a.parse::<SocketAddr>().unwrap());
+        Relay::new(
+            [0xab; 32],
+            ExitId::from_bytes([0xcd; 16]),
+            addrs.collect(),
+            Location::new("RO", "Bucharest"),
+            100,
+            active,
+        )
+    }
+
+    #[test]
+    fn ip_availability_filters_by_family() {
+        let v4 = relay_with(&["127.0.0.1:443"], true);
+        let v6 = relay_with(&["[2001:db8::1]:443"], true);
+        let dual = relay_with(&["127.0.0.1:443", "[2001:db8::1]:443"], true);
+
+        assert!(ExitQuery::any().matches(&v4));
+        assert!(ExitQuery::any().matches(&v6));
+
+        let v4_only = ExitQuery::any().with_ip_availability(IpAvailability::Ipv4Only);
+        assert!(v4_only.matches(&v4));
+        assert!(!v4_only.matches(&v6), "v6-only relay must be excluded");
+        assert!(v4_only.matches(&dual));
+
+        let v6_only = ExitQuery::any().with_ip_availability(IpAvailability::Ipv6Only);
+        assert!(!v6_only.matches(&v4), "v4-only relay must be excluded");
+        assert!(v6_only.matches(&v6));
+        assert!(v6_only.matches(&dual));
+    }
+
+    #[test]
+    fn inactive_relay_never_matches() {
+        let inactive = relay_with(&["127.0.0.1:443"], false);
+        assert!(!ExitQuery::any().matches(&inactive));
+    }
+
+    #[test]
+    fn require_ipv6_egress_excludes_non_egressing_relays() {
+        let no_egress = relay_with(&["[2001:db8::1]:443"], true);
+        let egress = relay_with(&["[2001:db8::1]:443"], true).with_ipv6_egress(true);
+
+        let q = ExitQuery::any().with_require_ipv6_egress(true);
+        assert!(!q.matches(&no_egress));
+        assert!(q.matches(&egress));
+        // Without the requirement, both pass.
+        assert!(ExitQuery::any().matches(&no_egress));
+    }
+
+    #[test]
+    fn location_constraint_matches_country_and_city_case_insensitively() {
+        let relay = relay_with(&["127.0.0.1:443"], true);
+        assert!(ExitQuery::country("ro").matches(&relay));
+        assert!(!ExitQuery::country("de").matches(&relay));
+        let city = ExitQuery::any().with_location(LocationConstraint::City {
+            country_code: "RO".to_owned(),
+            city: "bucharest".to_owned(),
+        });
+        assert!(city.matches(&relay));
+        let wrong_city = ExitQuery::any().with_location(LocationConstraint::City {
+            country_code: "RO".to_owned(),
+            city: "Cluj".to_owned(),
+        });
+        assert!(!wrong_city.matches(&relay));
+    }
+
+    #[test]
+    fn relay_accessors_reflect_construction() {
+        let relay = relay_with(&["127.0.0.1:443", "[2001:db8::1]:443"], true);
+        assert_eq!(relay.endpoint_id(), [0xab; 32]);
+        assert_eq!(relay.exit_id(), ExitId::from_bytes([0xcd; 16]));
+        assert_eq!(relay.weight(), 100);
+        assert!(relay.is_active());
+        assert!(relay.has_ipv4());
+        assert!(relay.has_ipv6());
+        assert!(!relay.ipv6_egress());
+        assert_eq!(relay.location().country_code(), "RO");
+        assert_eq!(relay.location().city(), "Bucharest");
+        assert_eq!(relay.addrs().len(), 2);
+    }
+}

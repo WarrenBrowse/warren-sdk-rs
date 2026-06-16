@@ -94,3 +94,22 @@ pub trait HttpTransport: Send + Sync {
         request: HttpRequest,
     ) -> impl std::future::Future<Output = Result<HttpResponse, TransportError>> + Send;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn method_as_str_is_the_uppercase_wire_name() {
+        // A wrong mapping here silently breaks every request signature.
+        assert_eq!(Method::Get.as_str(), "GET");
+        assert_eq!(Method::Post.as_str(), "POST");
+        assert_eq!(Method::Delete.as_str(), "DELETE");
+    }
+
+    #[test]
+    fn is_connect_distinguishes_the_retryable_case() {
+        assert!(TransportError::Connect("x".to_owned()).is_connect());
+        assert!(!TransportError::Io("x".to_owned()).is_connect());
+    }
+}

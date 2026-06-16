@@ -21,11 +21,17 @@ pub enum ClientError {
     #[error(transparent)]
     Transport(#[from] TransportError),
     /// The server returned a non-2xx status.
+    ///
+    /// `Display` renders only the status code: the body is kept for programmatic
+    /// inspection but is NOT in the message. No-log discipline: a server error
+    /// body may echo identity material (IP, pubkey), so callers must not log the
+    /// `body` field (or the struct via `{:?}`) in clear.
     #[error("server returned status {status}")]
     ServerStatus {
         /// HTTP status code.
         status: u16,
-        /// Response body (may carry a server error message).
+        /// Response body (may carry a server error message). See the no-log
+        /// caveat on this variant: do not log it.
         body: String,
     },
     /// The response body was not valid UTF-8.

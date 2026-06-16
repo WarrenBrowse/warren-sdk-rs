@@ -565,6 +565,93 @@ mod tests {
     }
 
     #[test]
+    fn invalid_pubkey_hex_is_rejected() {
+        // The server pubkey hex is decoded before any signature work; non-hex
+        // there must surface as InvalidHex, not a signature failure.
+        let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
+        let mut value: serde_json::Value = serde_json::to_value(&signed).unwrap();
+        value["server_pubkey_hex"] = serde_json::json!("zz".repeat(32));
+        let json = serde_json::to_string(&value).unwrap();
+        assert!(matches!(
+            verify_signed_relay_list(&json, None).unwrap_err(),
+            SignedError::InvalidHex
+        ));
+    }
+
+    #[test]
+    fn invalid_signature_hex_is_rejected() {
+        let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
+        let mut value: serde_json::Value = serde_json::to_value(&signed).unwrap();
+        value["signature_hex"] = serde_json::json!("0".repeat(127)); // odd length
+        let json = serde_json::to_string(&value).unwrap();
+        assert!(matches!(
+            verify_signed_relay_list(&json, None).unwrap_err(),
+            SignedError::InvalidHex
+        ));
+    }
+
+    #[test]
+    fn pubkey_not_on_curve_is_rejected() {
+        // A syntactically valid 32-byte hex string that is not a valid Ed25519
+        // point must surface as PubkeyNotOnCurve, distinct from InvalidHex.
+        let mut off_curve = [0u8; 32];
+        let mut found = false;
+        for i in 0..=u8::MAX {
+            off_curve[31] = i;
+            if VerifyingKey::from_bytes(&off_curve).is_err() {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "expected an off-curve 32-byte value to exist");
+        let json = format!(
+            r#"{{"version":6,"nodes":[],"generation":0,"signed_at":0,"expires_at":0,"server_pubkey_hex":"{}","signature_hex":"{}"}}"#,
+            hex::encode(off_curve),
+            "00".repeat(64)
+        );
+        assert!(matches!(
+            verify_signed_relay_list(&json, None).unwrap_err(),
+            SignedError::PubkeyNotOnCurve
+        ));
+    }
+
+    #[test]
+    fn invalid_node_id_is_rejected_after_a_valid_signature() {
+        let mut node = sample_node();
+        node.id = "not-an-id".to_owned(); // neither SS58 nor 32-byte hex
+        let signed = sign_relay_list(vec![node], &fixed_server_key(), 1, 1, 2);
+        let json = serde_json::to_string(&signed).unwrap();
+        assert!(matches!(
+            verify_signed_relay_list(&json, None).unwrap_err(),
+            SignedError::InvalidNodeId
+        ));
+    }
+
+    #[test]
+    fn invalid_endpoint_address_is_rejected() {
+        let mut node = sample_node();
+        node.endpoints[0].addr = "not-an-ip".to_owned();
+        let signed = sign_relay_list(vec![node], &fixed_server_key(), 1, 1, 2);
+        let json = serde_json::to_string(&signed).unwrap();
+        assert!(matches!(
+            verify_signed_relay_list(&json, None).unwrap_err(),
+            SignedError::InvalidEndpointAddress
+        ));
+    }
+
+    #[test]
+    fn multi_key_rotation_accepts_a_non_first_pinned_key() {
+        // Pinned-key rotation: the matching key is second in the set.
+        let key = fixed_server_key();
+        let signed = sign_relay_list(vec![sample_node()], &key, 1, 1, 2);
+        let json = serde_json::to_string(&signed).unwrap();
+        let wrong = hex::encode([0xff; 32]);
+        let right = hex::encode(key.verifying_key().as_bytes());
+        let v = verify_signed_relay_list_any(&json, &[&wrong, &right]).expect("verify");
+        assert_eq!(v.relays.relays().len(), 1);
+    }
+
+    #[test]
     fn node_id_accepts_ss58_and_hex() {
         assert_eq!(
             decode_node_id(&hex::encode([0xab; 32])).unwrap(),
