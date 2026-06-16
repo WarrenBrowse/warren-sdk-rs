@@ -379,11 +379,16 @@ echo harness covers the **datagram plane**. The exit's full termination mode
   the client pads its uplink from its own pool, the exit pads the downlink). The
   single-hop negotiated `SetupAck.daita_spec` is a frozen wire format pinned by a
   byte-exact golden vector (`vectors/handshake.json`, including the IEEE-754 `f64`
-  caps); wiring it into the single-hop datapath is deferred only because single-hop
-  is test-only (production requires multihop). DAITA is now also reachable from the
-  FFI via `WarrenFfiClient::with_options(FfiClientOptions { daita, daita_machine,
-  .. })`. What a later milestone could still add: the single-hop datapath wiring
-  above, and a longer-horizon defended-distribution effectiveness study (research,
+  caps). It is now CONSUMED, not discarded: `ClientSession` stores it and exposes
+  `negotiated_daita()` + `build_daita_state()` (the negotiated spec flows wire ->
+  typed config -> a runnable maybenot `DaitaState`), plus the
+  `send_cover_traffic()` primitive (the `0xFF` dummy). Auto-pumping the negotiated
+  single-hop schedule on the datapath reuses these primitives and the
+  `DaitaDriver` machinery; it stays gated on real-exit validation of the single-hop
+  `0xFF`-drop because production uses multihop (single-hop is test-only). DAITA is
+  also reachable from the FFI via `WarrenFfiClient::with_options(FfiClientOptions {
+  daita, daita_machine, .. })`. A later milestone could still add the auto-pump
+  above and a longer-horizon defended-distribution effectiveness study (research,
   not wire).
 - OS-enforced killswitch + IPv6 leak block. Only the best-effort
   `ProxyOnlyKillSwitch` is implemented; the `OsEnforced` level and the v6 leak

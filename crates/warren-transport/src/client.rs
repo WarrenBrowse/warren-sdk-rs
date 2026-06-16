@@ -319,8 +319,27 @@ impl ClientTunnel {
             assigned_ipv6: ack.tunnel_ipv6.map(Ipv6Addr::from),
             assigned_max_mtu: ack.max_mtu,
             exit_pubkey,
+            negotiated_daita: ack.daita_spec,
         })
     }
+}
+
+/// First byte of a DAITA cover (dummy) datagram. Not a valid IP version nibble
+/// (4 or 6), so the exit drops it; same convention as the multihop data plane.
+const DAITA_DUMMY_FIRST_BYTE: u8 = 0xFF;
+
+/// Converts a negotiated wire DAITA spec into a runnable maybenot state. Shared
+/// by [`ClientSession::build_daita_state`] and its tests.
+fn daita_state_from_spec(
+    spec: &warren_wire::DaitaConfig,
+    start_time: std::time::Instant,
+) -> Result<warren_daita::DaitaState, warren_daita::DaitaError> {
+    let cfg = warren_daita::DaitaConfig::from_specs(
+        spec.machine_specs.clone(),
+        spec.max_padding_frac,
+        spec.max_blocking_frac,
+    );
+    warren_daita::DaitaState::from_config(&cfg, start_time)
 }
 
 /// An established tunnel session over which IP packets travel as QUIC datagrams.
@@ -333,6 +352,10 @@ pub struct ClientSession {
     assigned_ipv6: Option<Ipv6Addr>,
     assigned_max_mtu: u16,
     exit_pubkey: [u8; 32],
+    /// The DAITA machine spec the exit negotiated in the `SetupAck`, if any.
+    /// Single-hop DAITA is negotiated (unlike the client-unilateral multihop
+    /// path): the exit dictates the schedule both sides run.
+    negotiated_daita: Option<warren_wire::DaitaConfig>,
 }
 
 impl ClientSession {
@@ -358,6 +381,52 @@ impl ClientSession {
     #[must_use]
     pub fn exit_pubkey(&self) -> [u8; 32] {
         self.exit_pubkey
+    }
+
+    /// The DAITA machine spec the exit negotiated in the `SetupAck`, if DAITA was
+    /// enabled for this single-hop session (`None` if the exit disabled it).
+    #[must_use]
+    pub fn negotiated_daita(&self) -> Option<&warren_wire::DaitaConfig> {
+        self.negotiated_daita.as_ref()
+    }
+
+    /// Builds a [`warren_daita::DaitaState`] from the exit-negotiated spec, ready
+    /// to drive cover traffic on this session. Returns `None` if the exit did not
+    /// negotiate DAITA.
+    ///
+    /// # Errors
+    ///
+    /// [`warren_daita::DaitaError`] if a negotiated machine spec is unparseable or
+    /// a cap is out of range (the maybenot framework rejects the configuration).
+    #[must_use]
+    pub fn build_daita_state(
+        &self,
+        start_time: std::time::Instant,
+    ) -> Option<Result<warren_daita::DaitaState, warren_daita::DaitaError>> {
+        let spec = self.negotiated_daita.as_ref()?;
+        Some(daita_state_from_spec(spec, start_time))
+    }
+
+    /// The largest inner payload a cover datagram can carry on the current path.
+    #[must_use]
+    pub fn max_inner_payload(&self) -> usize {
+        const BASE_MTU: usize = 1280;
+        self.conn.max_datagram_size().unwrap_or(BASE_MTU)
+    }
+
+    /// Sends one DAITA cover (dummy) datagram: a `0xFF` tag followed by
+    /// `padding_len` zero bytes. The exit drops it (the first byte is not a valid
+    /// IP version), so it shapes traffic without reaching the destination.
+    ///
+    /// # Errors
+    ///
+    /// [`TunnelError::SendDatagram`] if the datagram is too large or the
+    /// connection is closing.
+    pub fn send_cover_traffic(&self, padding_len: usize) -> Result<(), TunnelError> {
+        let mut dummy = Vec::with_capacity(padding_len + 1);
+        dummy.push(DAITA_DUMMY_FIRST_BYTE);
+        dummy.resize(padding_len + 1, 0u8);
+        self.send_datagram(dummy)
     }
 
     /// The largest datagram payload the current path can carry, if known.
@@ -410,6 +479,34 @@ impl ClientSession {
 mod tests {
     use super::*;
     use std::error::Error;
+
+    #[test]
+    fn negotiated_daita_spec_builds_a_runnable_state() {
+        // The negotiated single-hop spec must flow from the wire DaitaConfig into
+        // a runnable maybenot DaitaState (consuming the SetupAck.daita_spec that
+        // was previously discarded). Use a real curated machine spec.
+        let machine = warren_daita::DaitaPool::default_pool()
+            .pick_named_os("tamaraw")
+            .expect("tamaraw is in the pool");
+        let spec = warren_wire::DaitaConfig {
+            machine_specs: machine.machine_specs.clone(),
+            max_padding_frac: machine.max_padding_frac,
+            max_blocking_frac: machine.max_blocking_frac,
+        };
+        let state = daita_state_from_spec(&spec, std::time::Instant::now())
+            .expect("a valid negotiated spec builds a state");
+        assert!(state.is_enabled());
+    }
+
+    #[test]
+    fn an_unparseable_negotiated_machine_spec_is_an_error() {
+        let spec = warren_wire::DaitaConfig {
+            machine_specs: vec!["not-a-valid-machine".to_owned()],
+            max_padding_frac: 0.1,
+            max_blocking_frac: 0.1,
+        };
+        assert!(daita_state_from_spec(&spec, std::time::Instant::now()).is_err());
+    }
 
     #[test]
     fn local_ip_for_a_loopback_endpoint_is_loopback() {
