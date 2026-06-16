@@ -158,4 +158,35 @@ void main() {
       client.close();
     }
   });
+
+  // Server-dependent HAPPY PATH: runs only when pointed at a reachable exit via
+  // env (a subscribed account), otherwise skipped so the offline suite stays
+  // green. This is the one-command validation of a value-returning async call:
+  //   WARREN_LIVE_MNEMONIC="..." WARREN_LIVE_API="https://api.warrenbrowse.com" \
+  //     dart test
+  final liveMnemonic = Platform.environment['WARREN_LIVE_MNEMONIC'];
+  final liveApi = Platform.environment['WARREN_LIVE_API'];
+  const livePin =
+      '4c2c9253c426ae4db4cc88703f9ac802a020420c7fea6479c87af530ada72c3e';
+  test(
+    'live subscriptionExpiry returns a value (server happy path)',
+    () async {
+      final client = WarrenFfiClientFfi.create(
+        ffi,
+        mnemonic: liveMnemonic!,
+        apiBase: liveApi!,
+        serverPubkeyPin: Platform.environment['WARREN_LIVE_PIN'] ?? livePin,
+      );
+      try {
+        final expiry = await client.subscriptionExpiry();
+        expect(expiry, greaterThan(0),
+            reason: 'a subscribed account has a future expiry');
+      } finally {
+        client.close();
+      }
+    },
+    skip: (liveMnemonic == null || liveApi == null)
+        ? 'set WARREN_LIVE_MNEMONIC + WARREN_LIVE_API to run against a live exit'
+        : false,
+  );
 }
