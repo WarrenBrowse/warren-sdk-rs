@@ -68,6 +68,8 @@ pub use client::{
     WarrenClientBuilder,
 };
 pub use error::{BuildError, SdkError};
+#[cfg(all(unix, feature = "experimental-tun"))]
+pub use client::TunDatapathHandle;
 pub use proxy::{ProxyForwarder, ProxyHandle, TunnelState};
 pub use store::{FileGenerationStore, FileServerKeyStore};
 pub use supervisor::SupervisedProxyHandle;
