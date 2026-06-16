@@ -2672,6 +2672,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "warren-tun"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "warren-wire"
 version = "0.0.1"
 dependencies = [

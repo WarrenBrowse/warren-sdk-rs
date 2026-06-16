@@ -43,6 +43,31 @@ the pre-release `0.0.x` line.
   defense (and root pins + persistence) to foreign bindings via a future-proof
   options record, so mobile consumers can enable traffic-analysis defense. The
   generated bindings are CI grep-guarded for the new surface.
+- All `start_proxy*` methods take an optional `FfiProxyOptions` (HTTP CONNECT
+  listen address, in-tunnel DNS override), so foreign bindings reach the per-proxy
+  `ProxyConfig.http` / `dns_server` knobs the Rust facade already had.
+
+### Privileged TUN backend (P6, experimental, NOT real-exit validated)
+
+- New `warren-tun` crate: the foundation for the optional privileged TUN backend.
+  Ships only the device-and-root-free, unit-tested parts: OS-agnostic TUN framing
+  (`frame`), the routing/killswitch PLAN computation (`plan`: split-default
+  capture preserving the carrier route to the exit, an nftables killswitch with a
+  v6 leak block), and the `TunIo` device seam + `FramedTun` adapter (`device`).
+  The Linux device open (`/dev/net/tun` + `TUNSETIFF`) is behind the
+  `experimental-tun` feature with hand-audited `unsafe` and `SAFETY` docs; the
+  crate's manifest downgrades `unsafe_code` to `deny` and admits unsafe only under
+  that feature (mirroring the `warren-sdk-ffi` boundary exception). The default
+  build pulls no new dependency and is unsafe-free. Applying the plans and
+  validating against a real exit with privilege remain to do (per CLAUDE.md, not
+  possible from the dev sandbox).
+
+### Single-hop DAITA
+
+- The negotiated single-hop `SetupAck.daita_spec` is no longer discarded:
+  `warren_transport::ClientSession` exposes `negotiated_daita()` and
+  `build_daita_state()` (wire spec -> runnable maybenot state) plus the
+  `send_cover_traffic()` `0xFF`-dummy primitive.
 
 - The multihop directory root-key pin is now enforced. `WarrenClientBuilder`
   gained `multihop_root_pubkey_pin`, and when at least one root is pinned the

@@ -62,19 +62,30 @@ pinned by golden vectors where a wire format is involved. warren-core
 - Non-root `netstack` backend first: userspace TCP/IP (smoltcp) plus a local
   SOCKS5 and HTTP CONNECT proxy, feature-complete on Linux, macOS and Windows.
 - Then the privileged `tun` backend: real TUN per OS, split-default routing, DNS
-  push, killswitch (nft / pf / WFP). DEFERRED (not started, by decision
-  2026-06-15: the non-root proxy mode covers userland today). Key constraint for
-  whoever starts it: `warren-net` is `unsafe_code = forbid`, and opening the TUN
-  device (`/dev/net/tun` ioctl / utun / Wintun) needs `unsafe`. Two viable routes,
-  to pick first: (a) depend on a vetted TUN crate (e.g. `tun-rs`), which wraps the
-  unsafe but adds a dependency to clear through `cargo deny` (license / advisory /
-  supply-chain) in this security-sensitive crate; or (b) a dedicated
-  `warren-tun-sys` crate with a documented `unsafe` exception, mirroring the
-  `warren-sdk-ffi` precedent, with zero third-party deps but hand-audited unsafe.
-  Routing/DNS/killswitch are then per-OS (netlink or shelling to `ip`/`nft` on
-  Linux). Per CLAUDE.md the whole backend must be validated against a real exit
-  with privilege before it can be claimed done; it cannot be validated from the
-  dev sandbox.
+  push, killswitch (nft / pf / WFP). FOUNDATION STARTED, NOT YET REAL-EXIT
+  VALIDATED. Route (b) was taken: a dedicated `warren-tun` crate with a documented
+  `unsafe` exception (its manifest downgrades `unsafe_code` to `deny` and the
+  crate-level `cfg_attr` admits unsafe only under the `experimental-tun` feature,
+  mirroring the `warren-sdk-ffi` precedent). What landed (all testable WITHOUT a
+  device or root, and unit-tested):
+  - `warren_tun::frame`: OS-agnostic TUN framing (macOS `utun` 4-byte
+    address-family prefix vs bare-IP on Linux/Windows) + IP-version detection.
+  - `warren_tun::plan`: the routing PLAN (`RoutingPlan::split_default`, the
+    `0.0.0.0/1`+`128.0.0.0/1` capture that preserves the pinned carrier route to
+    the exit, plus the v6 halves) and the killswitch PLAN
+    (`KillswitchPlan::nftables`: default-drop, allow only lo/tun/exit-carrier, v6
+    leak block when v6 is not tunneled). Computing the policy is separated from
+    applying it precisely so it is testable without privilege.
+  - `warren_tun::device`: the `TunIo` seam + `FramedTun` adapter (tested over an
+    in-memory mock), and the Linux `open_tun` (`/dev/net/tun` + `TUNSETIFF`,
+    `IFF_NO_PI`) behind `experimental-tun` with hand-audited `unsafe` + `SAFETY`
+    docs (compile-checked on the Linux target; NOT run, it needs root).
+  Remaining (and per CLAUDE.md cannot be done from the dev sandbox, so it stays
+  unvalidated): macOS `utun` / Windows Wintun device open, wiring the device into
+  warren-net's `PacketSink`, applying the routing/killswitch plans (the privileged
+  applier), and end-to-end validation against a real exit with privilege. The
+  `warren-net` crate itself stays `unsafe_code = forbid`; all unsafe lives in
+  `warren-tun` behind the feature.
 
 ## P7: port forwarding
 
