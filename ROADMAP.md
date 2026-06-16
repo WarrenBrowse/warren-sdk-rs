@@ -109,9 +109,14 @@ pinned by golden vectors where a wire format is involved. warren-core
     `start_proxy_multihop`. Composes `connect_multihop` -> `open_tun` -> build
     `TunConfig` from the `IpAssign` -> apply the routing + killswitch plans ->
     `tun_channels` + `TunBridge::run` + `forward_bidirectional`, returning a
-    `TunDatapathHandle` (drop = abort the tasks = tear down). Cross-checked on
-    Linux + macOS. So the FULL privileged datapath is now wired end to end FROM
-    THE FACADE; only privileged runtime execution on a real device + exit is left.
+    `TunDatapathHandle`. Cross-checked on Linux + macOS. Its `Drop` completes the
+    LIFECYCLE: it aborts the datapath tasks AND reverts the routing
+    (`apply::revert_routing` -> `ip route del`, the symmetric teardown of
+    `to_ip_commands`, unit-tested) and drops the killswitch table, leaving the host
+    as found. So the FULL privileged datapath is wired end to end FROM THE FACADE,
+    including teardown; only privileged runtime execution on a real device + exit
+    is left, and `cargo run -p warren-sdk --example live_tun --features
+    experimental-tun` (run as root with the exit reachable) is the harness for it.
   - `warren_net::tun_sink::TunBridge::run` (Unix, feature-gated): the production
     async duplex loop over a REAL fd (tokio `AsyncFd` + `O_NONBLOCK`, multiplexing
     read/write on the full-duplex fd, calling the tested `pump_*_once`).
