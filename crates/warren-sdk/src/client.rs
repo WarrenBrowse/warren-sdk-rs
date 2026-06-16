@@ -579,6 +579,8 @@ impl<T: HttpTransport> WarrenClient<T> {
 
         let device = warren_tun::device::open_tun(tun_name).map_err(SdkError::Tun)?;
         let gateway = warren_tun::gateway::discover_default_gateway().map_err(SdkError::Tun)?;
+        // Bring the device up + address it BEFORE routing (a fresh TUN is down).
+        warren_tun::apply::configure_interface(&config).map_err(SdkError::Tun)?;
         let routing = RoutingPlan::split_default(&config);
         warren_tun::apply::apply_routing(&routing, tun_name, gateway).map_err(SdkError::Tun)?;
         warren_tun::apply::apply_killswitch(&KillswitchPlan::nftables(&config))

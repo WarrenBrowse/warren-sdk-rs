@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use std::net::IpAddr;
 use std::process::{Command, Stdio};
 
-use crate::plan::{KillswitchPlan, RoutingPlan};
+use crate::plan::{KillswitchPlan, RoutingPlan, TunConfig};
 
 /// Runs `argv`, optionally feeding `stdin`, and maps a non-zero exit to an error.
 ///
@@ -42,6 +42,20 @@ fn run(argv: &[String], stdin: Option<&str>) -> io::Result<()> {
             argv[0]
         )))
     }
+}
+
+/// Configures the TUN interface BEFORE routing: assigns the tunnel address(es),
+/// sets the MTU, and brings the link up (a freshly opened device is down and
+/// unaddressed, so routes via it do nothing until this runs).
+///
+/// # Errors
+///
+/// The first `ip` invocation that fails.
+pub fn configure_interface(config: &TunConfig) -> io::Result<()> {
+    for argv in config.interface_up_commands() {
+        run(&argv, None)?;
+    }
+    Ok(())
 }
 
 /// Applies `plan` to the `dev` device, pinning the exit carrier route to

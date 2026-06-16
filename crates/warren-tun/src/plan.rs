@@ -29,6 +29,54 @@ pub struct TunConfig {
     pub dns: Vec<IpAddr>,
 }
 
+impl TunConfig {
+    /// Renders the `ip` argv that brings the device UP and configures it BEFORE
+    /// routing: assign the tunnel address(es), set the MTU, and set the link up.
+    /// A TUN device created by `open_tun` exists but is down and unaddressed, so
+    /// routes via it do nothing until this runs. Pure (no exec); unit-tested.
+    #[must_use]
+    pub fn interface_up_commands(&self) -> Vec<Vec<String>> {
+        let (v4, v4_prefix) = self.ipv4;
+        let mut cmds = vec![vec![
+            "ip".to_owned(),
+            "addr".to_owned(),
+            "add".to_owned(),
+            format!("{v4}/{v4_prefix}"),
+            "dev".to_owned(),
+            self.name.clone(),
+        ]];
+        if let Some((v6, v6_prefix)) = self.ipv6 {
+            cmds.push(vec![
+                "ip".to_owned(),
+                "-6".to_owned(),
+                "addr".to_owned(),
+                "add".to_owned(),
+                format!("{v6}/{v6_prefix}"),
+                "dev".to_owned(),
+                self.name.clone(),
+            ]);
+        }
+        cmds.push(vec![
+            "ip".to_owned(),
+            "link".to_owned(),
+            "set".to_owned(),
+            "dev".to_owned(),
+            self.name.clone(),
+            "mtu".to_owned(),
+            self.mtu.to_string(),
+        ]);
+        cmds.push(vec![
+            "ip".to_owned(),
+            "link".to_owned(),
+            "set".to_owned(),
+            "dev".to_owned(),
+            self.name.clone(),
+            "up".to_owned(),
+        ]);
+        cmds
+    }
+}
+
 /// A single routing operation in a [`RoutingPlan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteOp {
@@ -268,6 +316,40 @@ mod tests {
             ks.nftables
                 .contains("ip daddr 203.0.113.9 udp dport 51820 accept")
         );
+    }
+
+    #[test]
+    fn interface_up_commands_address_then_mtu_then_up() {
+        let cmds = v4_config().interface_up_commands();
+        assert_eq!(
+            cmds[0],
+            vec!["ip", "addr", "add", "10.66.0.2/16", "dev", "warren0"]
+        );
+        assert_eq!(
+            cmds[1],
+            vec!["ip", "link", "set", "dev", "warren0", "mtu", "1280"]
+        );
+        assert_eq!(cmds[2], vec!["ip", "link", "set", "dev", "warren0", "up"]);
+        assert_eq!(cmds.len(), 3, "v4-only: addr, mtu, up");
+    }
+
+    #[test]
+    fn interface_up_commands_add_v6_address_when_assigned() {
+        let mut cfg = v4_config();
+        cfg.ipv6 = Some((Ipv6Addr::new(0xfd66, 0, 0, 0, 0, 0, 0, 2), 64));
+        let cmds = cfg.interface_up_commands();
+        assert!(cmds.iter().any(|c| c
+            == &vec![
+                "ip".to_owned(),
+                "-6".to_owned(),
+                "addr".to_owned(),
+                "add".to_owned(),
+                "fd66::2/64".to_owned(),
+                "dev".to_owned(),
+                "warren0".to_owned()
+            ]));
+        // up is still last.
+        assert_eq!(cmds.last().unwrap().last().unwrap(), "up");
     }
 
     #[test]
