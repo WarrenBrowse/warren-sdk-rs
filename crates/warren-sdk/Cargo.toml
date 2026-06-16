@@ -37,6 +37,12 @@ experimental-tun = ["dep:warren-tun", "warren-net/experimental-tun"]
 [package.metadata.docs.rs]
 all-features = true
 
+# The privileged TUN validation harness builds only with the feature (and runs
+# only with root + a device + a live exit). Skipped by a plain `cargo build`.
+[[example]]
+name = "live_tun"
+required-features = ["experimental-tun"]
+
 [dev-dependencies]
 tokio = { workspace = true }
 ed25519-dalek = { workspace = true }
