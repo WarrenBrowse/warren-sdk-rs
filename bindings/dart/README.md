@@ -25,9 +25,23 @@ be claimed to work end to end until it has run against a real exit on a device.
 That script builds the release cdylib (`cargo build -p warren-sdk-ffi --release`)
 and runs `uniffi-bindgen-dart` against it, writing the Dart surface into
 `lib/src/generated/`. `lib/warren_sdk.dart` re-exports it and centralizes loading
-the native library. Pin the `uniffi-bindgen-dart` version to the one matching the
-`uniffi` crate version in `crates/warren-sdk-ffi/Cargo.toml`; a mismatch produces
-ABI-incompatible glue.
+the native library.
+
+### Blocker: generator version lock
+
+`warren-sdk-ffi` uses **uniffi 0.31**. External uniffi bindgens are pinned to the
+uniffi runtime's metadata format; the published `uniffi-bindgen-dart` (0.1.x)
+targets an OLDER uniffi and cannot consume a 0.31 library (it fails on the
+metadata version, or emits ABI-incompatible glue). So the Dart binding cannot be
+generated today with the off-the-shelf tool. Two ways forward, both needing a
+Dart/Flutter toolchain to complete and validate:
+
+1. Use a uniffi-0.31-compatible Dart generator once one is published (then run
+   `tool/generate.sh` unchanged), or
+2. Switch this binding to `flutter_rust_bridge`, which does its own codegen and
+   does not depend on the uniffi metadata format.
+
+Do not commit bindings produced by a mismatched generator.
 
 ## Bundling the native library
 
