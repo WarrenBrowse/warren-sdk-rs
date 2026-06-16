@@ -66,6 +66,16 @@ pub fn apply_killswitch(plan: &KillswitchPlan) -> io::Result<()> {
     run(&KillswitchPlan::nft_apply_argv(), Some(&plan.nftables))
 }
 
+/// Reverts the routes [`apply_routing`] installed (best-effort: a route already
+/// gone is not fatal, so individual `ip route del` failures are ignored). Pair
+/// this with [`teardown_killswitch`] to fully restore the routing table on
+/// datapath shutdown.
+pub fn revert_routing(plan: &RoutingPlan, dev: &str, physical_gateway: IpAddr) {
+    for argv in plan.to_teardown_commands(dev, physical_gateway) {
+        let _ = run(&argv, None);
+    }
+}
+
 /// Tears the killswitch table down, restoring normal output.
 ///
 /// # Errors

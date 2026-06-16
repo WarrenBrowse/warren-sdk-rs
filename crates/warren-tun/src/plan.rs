@@ -112,6 +112,40 @@ impl RoutingPlan {
             })
             .collect()
     }
+
+    /// Renders the `ip route del` argv that REVERTS [`Self::to_ip_commands`], so
+    /// the datapath restores the routing table on shutdown. Pure (no exec); the
+    /// applier runs each best-effort (a missing route on teardown is not fatal).
+    #[must_use]
+    pub fn to_teardown_commands(&self, dev: &str, physical_gateway: IpAddr) -> Vec<Vec<String>> {
+        self.ops
+            .iter()
+            .map(|op| match op {
+                RouteOp::PinExitToPhysical(ip) => {
+                    let host = match ip {
+                        IpAddr::V4(v4) => format!("{v4}/32"),
+                        IpAddr::V6(v6) => format!("{v6}/128"),
+                    };
+                    vec![
+                        "ip".to_owned(),
+                        "route".to_owned(),
+                        "del".to_owned(),
+                        host,
+                        "via".to_owned(),
+                        physical_gateway.to_string(),
+                    ]
+                }
+                RouteOp::RouteViaTun { cidr } => vec![
+                    "ip".to_owned(),
+                    "route".to_owned(),
+                    "del".to_owned(),
+                    cidr.clone(),
+                    "dev".to_owned(),
+                    dev.to_owned(),
+                ],
+            })
+            .collect()
+    }
 }
 
 /// A killswitch ruleset: only the tunnel and the carrier path to the exit are
@@ -261,6 +295,31 @@ mod tests {
             vec!["ip", "route", "replace", "128.0.0.0/1", "dev", "warren0"]
         );
         assert_eq!(cmds.len(), 3, "v4-only config emits exactly three routes");
+    }
+
+    #[test]
+    fn routing_teardown_argv_reverts_each_added_route() {
+        let gw = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let plan = RoutingPlan::split_default(&v4_config());
+        let down = plan.to_teardown_commands("warren0", gw);
+        // Same routes as the apply, but `del` instead of `replace`.
+        assert_eq!(
+            down[0],
+            vec!["ip", "route", "del", "203.0.113.9/32", "via", "192.168.1.1"]
+        );
+        assert_eq!(
+            down[1],
+            vec!["ip", "route", "del", "0.0.0.0/1", "dev", "warren0"]
+        );
+        assert_eq!(down.len(), plan.ops.len());
+        // Apply uses `replace`, teardown uses `del`: symmetric op count.
+        let up = plan.to_ip_commands("warren0", gw);
+        assert_eq!(up.len(), down.len());
+        for (u, d) in up.iter().zip(&down) {
+            assert_eq!(u[1], "route");
+            assert_eq!(u[2], "replace");
+            assert_eq!(d[2], "del");
+        }
     }
 
     #[test]

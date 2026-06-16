@@ -579,12 +579,8 @@ impl<T: HttpTransport> WarrenClient<T> {
 
         let device = warren_tun::device::open_tun(tun_name).map_err(SdkError::Tun)?;
         let gateway = warren_tun::gateway::discover_default_gateway().map_err(SdkError::Tun)?;
-        warren_tun::apply::apply_routing(
-            &RoutingPlan::split_default(&config),
-            tun_name,
-            gateway,
-        )
-        .map_err(SdkError::Tun)?;
+        let routing = RoutingPlan::split_default(&config);
+        warren_tun::apply::apply_routing(&routing, tun_name, gateway).map_err(SdkError::Tun)?;
         warren_tun::apply::apply_killswitch(&KillswitchPlan::nftables(&config))
             .map_err(SdkError::Tun)?;
 
@@ -592,7 +588,13 @@ impl<T: HttpTransport> WarrenClient<T> {
             warren_net::tun_channels(device, warren_tun::Framing::for_target_os(), config.mtu);
         let driver = tokio::spawn(bridge.run());
         let pump = tokio::spawn(warren_net::forward_bidirectional(tun_sink, sink));
-        Ok(TunDatapathHandle { driver, pump })
+        Ok(TunDatapathHandle {
+            driver,
+            pump,
+            routing,
+            tun_name: tun_name.to_owned(),
+            gateway,
+        })
     }
 
     /// Starts the non-root proxy datapath over a multihop tunnel to `exit`. Same
@@ -843,12 +845,20 @@ pub(crate) fn now_unix_secs() -> u64 {
 pub struct TunDatapathHandle {
     driver: tokio::task::JoinHandle<std::io::Result<()>>,
     pump: tokio::task::JoinHandle<Result<(), warren_net::NetError>>,
+    routing: warren_tun::RoutingPlan,
+    tun_name: String,
+    gateway: std::net::IpAddr,
 }
 
 #[cfg(all(unix, feature = "experimental-tun"))]
 impl Drop for TunDatapathHandle {
     fn drop(&mut self) {
+        // Stop the datapath tasks (closes the device + tunnel), then restore the
+        // routing table and drop the killswitch so the host is left as found.
+        // Best-effort: a route/table already gone on teardown is not an error.
         self.driver.abort();
         self.pump.abort();
+        warren_tun::apply::revert_routing(&self.routing, &self.tun_name, self.gateway);
+        let _ = warren_tun::apply::teardown_killswitch();
     }
 }
