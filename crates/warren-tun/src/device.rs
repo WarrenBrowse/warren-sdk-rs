@@ -212,6 +212,132 @@ mod linux {
     }
 }
 
+/// Opens a macOS `utun` device (EXPERIMENTAL, requires root). `name` of the form
+/// `utunN` requests that unit; anything else lets the kernel pick a free unit.
+/// Compiled only under the `experimental-tun` feature.
+///
+/// NOT YET VALIDATED against a real exit: do not rely on this in production.
+///
+/// # Errors
+///
+/// An OS error if the control socket cannot be opened or connected.
+#[cfg(all(target_os = "macos", feature = "experimental-tun"))]
+pub fn open_tun(name: &str) -> io::Result<macos::Utun> {
+    // utun control unit U creates utun(U-1); unit 0 = kernel picks a free one.
+    let unit = name
+        .strip_prefix("utun")
+        .and_then(|n| n.parse::<u32>().ok())
+        .map_or(0, |n| n + 1);
+    macos::Utun::open(unit)
+}
+
+#[cfg(all(target_os = "macos", feature = "experimental-tun"))]
+mod macos {
+    use super::RawTunDevice;
+    use std::io;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
+
+    /// An owned macOS `utun` control-socket file descriptor.
+    #[derive(Debug)]
+    pub struct Utun {
+        fd: OwnedFd,
+    }
+
+    impl Utun {
+        /// Opens the `utun` control socket and connects it to `unit` (0 = auto).
+        pub fn open(unit: u32) -> io::Result<Self> {
+            use std::os::fd::AsRawFd;
+
+            // SAFETY: a plain socket(2) with constant arguments; the return is an
+            // fd (>= 0) or -1 on error, checked immediately. No pointers.
+            let raw =
+                unsafe { libc::socket(libc::PF_SYSTEM, libc::SOCK_DGRAM, libc::SYSPROTO_CONTROL) };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `raw` is a fresh, owned, valid socket fd from the call above;
+            // ownership is transferred exactly once into `OwnedFd`.
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+            // Resolve the utun control id by name.
+            let mut info: libc::ctl_info = unsafe { std::mem::zeroed() };
+            let name = UTUN_CONTROL_NAME;
+            // ctl_name is a fixed C char array; copy the NUL-terminated name in.
+            for (dst, src) in info.ctl_name.iter_mut().zip(name.iter()) {
+                *dst = *src as libc::c_char;
+            }
+            // SAFETY: `fd` is valid; `&mut info` is a correctly typed, fully
+            // initialized `ctl_info` the ioctl fills in (writes `ctl_id`).
+            let rc = unsafe { libc::ioctl(fd.as_raw_fd(), libc::CTLIOCGINFO, &mut info) };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            let addr = libc::sockaddr_ctl {
+                sc_len: std::mem::size_of::<libc::sockaddr_ctl>() as u8,
+                sc_family: libc::AF_SYSTEM as u8,
+                ss_sysaddr: libc::AF_SYS_CONTROL as u16,
+                sc_id: info.ctl_id,
+                sc_unit: unit,
+                sc_reserved: [0; 5],
+            };
+            // SAFETY: `fd` is valid; `&addr` is a fully initialized `sockaddr_ctl`
+            // and the length matches its size, as connect(2) requires.
+            let rc = unsafe {
+                libc::connect(
+                    fd.as_raw_fd(),
+                    std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+                    std::mem::size_of::<libc::sockaddr_ctl>() as libc::socklen_t,
+                )
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self { fd })
+        }
+    }
+
+    impl RawTunDevice for Utun {
+        fn read_frame(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            use std::os::fd::AsRawFd;
+            // SAFETY: `buf` is a valid writable slice of `buf.len()` bytes; the fd
+            // is open for the lifetime of `self`. read(2) writes at most that many
+            // bytes and returns the count or a negative error.
+            let n = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                )
+            };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(n as usize)
+        }
+
+        fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+            use std::os::fd::AsRawFd;
+            // SAFETY: `frame` is a valid readable slice of `frame.len()` bytes; the
+            // fd is open for the lifetime of `self`. write(2) reads at most that
+            // many bytes and returns the count or a negative error.
+            let n = unsafe {
+                libc::write(
+                    self.fd.as_raw_fd(),
+                    frame.as_ptr().cast::<libc::c_void>(),
+                    frame.len(),
+                )
+            };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

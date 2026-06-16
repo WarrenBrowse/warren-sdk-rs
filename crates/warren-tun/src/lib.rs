@@ -39,6 +39,8 @@
 //! `warren-sdk-ffi` boundary-exception precedent.
 #![cfg_attr(feature = "experimental-tun", allow(unsafe_code))]
 
+#[cfg(feature = "experimental-tun")]
+pub mod apply;
 pub mod device;
 pub mod frame;
 pub mod plan;

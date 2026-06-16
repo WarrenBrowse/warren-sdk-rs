@@ -75,6 +75,43 @@ impl RoutingPlan {
         }
         Self { ops }
     }
+
+    /// Renders the plan as `ip route` argv vectors for the Linux applier, in
+    /// order. `physical_gateway` is the pre-existing default gateway on the
+    /// physical link (discovered at runtime) the exit carrier route pins to.
+    ///
+    /// This is pure (no process is run): the applier executes each argv. Kept
+    /// separate so the exact commands are unit-testable without privilege.
+    #[must_use]
+    pub fn to_ip_commands(&self, dev: &str, physical_gateway: IpAddr) -> Vec<Vec<String>> {
+        self.ops
+            .iter()
+            .map(|op| match op {
+                RouteOp::PinExitToPhysical(ip) => {
+                    let host = match ip {
+                        IpAddr::V4(v4) => format!("{v4}/32"),
+                        IpAddr::V6(v6) => format!("{v6}/128"),
+                    };
+                    vec![
+                        "ip".to_owned(),
+                        "route".to_owned(),
+                        "replace".to_owned(),
+                        host,
+                        "via".to_owned(),
+                        physical_gateway.to_string(),
+                    ]
+                }
+                RouteOp::RouteViaTun { cidr } => vec![
+                    "ip".to_owned(),
+                    "route".to_owned(),
+                    "replace".to_owned(),
+                    cidr.clone(),
+                    "dev".to_owned(),
+                    dev.to_owned(),
+                ],
+            })
+            .collect()
+    }
 }
 
 /// A killswitch ruleset: only the tunnel and the carrier path to the exit are
@@ -116,6 +153,23 @@ impl KillswitchPlan {
         }
         s.push_str("  }\n}\n");
         Self { nftables: s }
+    }
+
+    /// The argv that loads this ruleset, reading it from stdin (`nft -f -`). The
+    /// applier feeds [`Self::nftables`] to the child's stdin. Pure (no exec).
+    #[must_use]
+    pub fn nft_apply_argv() -> Vec<String> {
+        vec!["nft".to_owned(), "-f".to_owned(), "-".to_owned()]
+    }
+
+    /// The argv that tears the ruleset down (`nft delete table inet
+    /// warren_killswitch`), restoring normal output. Pure (no exec).
+    #[must_use]
+    pub fn nft_teardown_argv() -> Vec<String> {
+        ["nft", "delete", "table", "inet", "warren_killswitch"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect()
     }
 }
 
@@ -179,6 +233,42 @@ mod tests {
         assert!(
             ks.nftables
                 .contains("ip daddr 203.0.113.9 udp dport 51820 accept")
+        );
+    }
+
+    #[test]
+    fn routing_plan_renders_ip_route_argv_in_order() {
+        let gw = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let cmds = RoutingPlan::split_default(&v4_config()).to_ip_commands("warren0", gw);
+        assert_eq!(
+            cmds[0],
+            vec![
+                "ip",
+                "route",
+                "replace",
+                "203.0.113.9/32",
+                "via",
+                "192.168.1.1"
+            ],
+            "the exit carrier pin is emitted first, via the physical gateway"
+        );
+        assert_eq!(
+            cmds[1],
+            vec!["ip", "route", "replace", "0.0.0.0/1", "dev", "warren0"]
+        );
+        assert_eq!(
+            cmds[2],
+            vec!["ip", "route", "replace", "128.0.0.0/1", "dev", "warren0"]
+        );
+        assert_eq!(cmds.len(), 3, "v4-only config emits exactly three routes");
+    }
+
+    #[test]
+    fn killswitch_apply_and_teardown_argv_are_stable() {
+        assert_eq!(KillswitchPlan::nft_apply_argv(), ["nft", "-f", "-"]);
+        assert_eq!(
+            KillswitchPlan::nft_teardown_argv(),
+            ["nft", "delete", "table", "inet", "warren_killswitch"]
         );
     }
 

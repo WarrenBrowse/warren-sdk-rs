@@ -77,15 +77,23 @@ pinned by golden vectors where a wire format is involved. warren-core
     leak block when v6 is not tunneled). Computing the policy is separated from
     applying it precisely so it is testable without privilege.
   - `warren_tun::device`: the `TunIo` seam + `FramedTun` adapter (tested over an
-    in-memory mock), and the Linux `open_tun` (`/dev/net/tun` + `TUNSETIFF`,
-    `IFF_NO_PI`) behind `experimental-tun` with hand-audited `unsafe` + `SAFETY`
-    docs (compile-checked on the Linux target; NOT run, it needs root).
-  Remaining (and per CLAUDE.md cannot be done from the dev sandbox, so it stays
-  unvalidated): macOS `utun` / Windows Wintun device open, wiring the device into
-  warren-net's `PacketSink`, applying the routing/killswitch plans (the privileged
-  applier), and end-to-end validation against a real exit with privilege. The
-  `warren-net` crate itself stays `unsafe_code = forbid`; all unsafe lives in
-  `warren-tun` behind the feature.
+    in-memory mock), and the per-OS device open behind `experimental-tun` with
+    hand-audited `unsafe` + `SAFETY` docs: Linux `open_tun` (`/dev/net/tun` +
+    `TUNSETIFF`, `IFF_NO_PI`) and macOS `open_tun` (the `utun` control socket:
+    `PF_SYSTEM`/`SYSPROTO_CONTROL`, `CTLIOCGINFO`, `connect` with `sockaddr_ctl`).
+    Both compile-checked (Linux via cross-clippy, macOS natively); NOT run, they
+    need root.
+  - `warren_tun::plan` argv builders + `warren_tun::apply` (feature-gated): the
+    routing plan renders `ip route replace` argv (`RoutingPlan::to_ip_commands`,
+    unit-tested for exact argv) and the killswitch renders `nft -f -` apply /
+    `nft delete table` teardown argv (unit-tested); `apply` is the thin
+    `std::process::Command` executor that runs them (privileged, untestable here).
+  Remaining (per CLAUDE.md cannot be done from the dev sandbox, so it stays
+  unvalidated): Windows Wintun device open, wiring the blocking device fd into
+  warren-net's async `PacketSink` (needs a real device to be meaningful), runtime
+  default-gateway discovery, and end-to-end validation against a real exit with
+  privilege. The `warren-net` crate itself stays `unsafe_code = forbid`; all
+  unsafe lives in `warren-tun` behind the feature.
 
 ## P7: port forwarding
 
