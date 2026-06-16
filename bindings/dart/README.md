@@ -34,9 +34,14 @@ PARTIAL, with the pure surface WORKING and validated.
   synchronous callback from a non-isolate thread (only `NativeCallable.listener`,
   which is asynchronous, works cross-thread). This is exactly why
   `uniffi-bindgen-dart` itself SKIPS `start_proxy*` ("unsupported signature"). The
-  observer-less `startProxy` above is bound and tested; reporting connection-state
-  events to Dart needs a different mechanism (poll a state-watch method, or
-  `flutter_rust_bridge`'s stream model) rather than a uniffi callback interface.
+  observer-less `startProxy`/`startProxySupervised` are bound and tested, and the
+  state-watch ALTERNATIVE is implemented: `WarrenFfiSupervisedProxyFfi.state()`
+  (a sync `FfiConnectionState` enum getter) lets Dart POLL connection state with
+  no callback interface. (`start_proxy_supervised` fetches the directory before
+  returning, so instantiating the proxy handle to call `state()` needs a reachable
+  API, like every server-dependent happy path; the binding is validated via the
+  error path.) For push-style events, `flutter_rust_bridge`'s stream model is the
+  other option.
 - Server happy paths (`subscriptionExpiry` value, `fetchMultihopExits`,
   `redeemVoucher` success) need a live API/exit to exercise, which the headless
   dev sandbox lacks; the error paths above already prove the binding mechanics.

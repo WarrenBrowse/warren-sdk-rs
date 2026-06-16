@@ -132,4 +132,30 @@ void main() {
       client.close();
     }
   });
+
+  test('async start_proxy_supervised errors on a dead host', () async {
+    // The supervised proxy is the host of the pollable state() (the state-watch
+    // alternative to the Dart-incompatible ConnectionObserver). It fetches the
+    // multihop directory before returning, so against an unroutable API it errors
+    // (no handle is produced). This validates the async object-method binding;
+    // exercising state()/socks5Address needs a reachable API to instantiate the
+    // proxy (the state() enum binding is present and correct, but the handle is
+    // unreachable without a live exit, like every server-dependent happy path).
+    final client = WarrenFfiClientFfi.create(
+      ffi,
+      mnemonic: (((vectors['bip39'] as Map)['vectors'] as List).first
+          as Map)['mnemonic'] as String,
+      apiBase: 'https://127.0.0.1:1',
+      serverPubkeyPin: 'ab' * 32,
+    );
+    try {
+      await expectLater(
+        client.startProxySupervised(
+            exitIdHex: 'ab' * 16, socks5Listen: '127.0.0.1:0'),
+        throwsA(isA<Object>()),
+      );
+    } finally {
+      client.close();
+    }
+  });
 }

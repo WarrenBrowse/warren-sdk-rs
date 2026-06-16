@@ -115,7 +115,14 @@ class WarrenIdentityFfi {
         _startProxy = lib.lookupFunction<_StartProxyC, _StartProxyDart>(
             'uniffi_warren_sdk_ffi_fn_method_warrenfficlient_start_proxy'),
         _proxyFree = lib.lookupFunction<_FreeObjC, _FreeObjDart>(
-            'uniffi_warren_sdk_ffi_fn_free_warrenffiproxy');
+            'uniffi_warren_sdk_ffi_fn_free_warrenffiproxy'),
+        _startProxySupervised = lib.lookupFunction<_StartProxyC,
+                _StartProxyDart>(
+            'uniffi_warren_sdk_ffi_fn_method_warrenfficlient_start_proxy_supervised'),
+        _supervisedState = lib.lookupFunction<_EnumGetterC, _EnumGetterDart>(
+            'uniffi_warren_sdk_ffi_fn_method_warrenffisupervisedproxy_state'),
+        _supervisedFree = lib.lookupFunction<_FreeObjC, _FreeObjDart>(
+            'uniffi_warren_sdk_ffi_fn_free_warrenffisupervisedproxy');
 
   /// Opens the library from `path` (the built cdylib).
   factory WarrenIdentityFfi.open(String path) =>
@@ -136,6 +143,9 @@ class WarrenIdentityFfi {
   final _FutureFreeDart _futureFree;
   final _StartProxyDart _startProxy;
   final _FreeObjDart _proxyFree;
+  final _StartProxyDart _startProxySupervised;
+  final _EnumGetterDart _supervisedState;
+  final _FreeObjDart _supervisedFree;
 
   /// A RustBuffer holding a single 0x00 byte: the uniffi lowering of `Option::None`.
   _Lowered _lowerNone(ffi.Pointer<_RustCallStatus> status) {
@@ -318,7 +328,56 @@ typedef _StartProxyC = ffi.Uint64 Function(
 typedef _StartProxyDart = int Function(
     ffi.Pointer<ffi.Void>, _RustBuffer, _RustBuffer, _RustBuffer, _RustBuffer);
 
+// state(self) -> RustBuffer (the FfiConnectionState enum, a u32 discriminant).
+typedef _EnumGetterC = _RustBuffer Function(
+    ffi.Pointer<ffi.Void>, ffi.Pointer<_RustCallStatus>);
+typedef _EnumGetterDart = _RustBuffer Function(
+    ffi.Pointer<ffi.Void>, ffi.Pointer<_RustCallStatus>);
+
 const int _rustFuturePollReady = 0;
+
+/// Connection state of a supervised proxy (uniffi enum `FfiConnectionState`).
+/// The state-watch alternative to the (Dart-incompatible) `ConnectionObserver`
+/// callback interface: poll [`WarrenFfiSupervisedProxyFfi.state`].
+enum FfiConnectionState { connecting, connected, reconnecting, failed }
+
+/// A live supervised proxy over the native library: its [state] is pollable
+/// (no callback interface needed).
+class WarrenFfiSupervisedProxyFfi {
+  WarrenFfiSupervisedProxyFfi._(this._ffi, this._handle);
+  final WarrenIdentityFfi _ffi;
+  final ffi.Pointer<ffi.Void> _handle;
+  bool _closed = false;
+
+  /// The current connection state (synchronous; safe to poll).
+  FfiConnectionState state() {
+    final status = calloc<_RustCallStatus>();
+    try {
+      final buf = _ffi._supervisedState(_handle, status);
+      _ffi._check(status, 'WarrenFfiSupervisedProxy::state');
+      // uniffi lowers a fieldless enum as a 1-based u32 discriminant (BE).
+      final bytes = Uint8List.fromList(buf.data.asTypedList(buf.len));
+      final disc = ByteData.sublistView(bytes).getUint32(0, Endian.big);
+      _ffi._free(buf, status);
+      _ffi._check(status, 'rustbuffer_free');
+      return FfiConnectionState.values[disc - 1];
+    } finally {
+      calloc.free(status);
+    }
+  }
+
+  /// Releases the native object. Idempotent.
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    final status = calloc<_RustCallStatus>();
+    try {
+      _ffi._supervisedFree(_handle, status);
+    } finally {
+      calloc.free(status);
+    }
+  }
+}
 
 /// A live `WarrenFfiClient` over the native library, demonstrating the uniffi
 /// object + async ABI by hand: construct the object, then drive an async method
@@ -414,6 +473,45 @@ class WarrenFfiClientFfi {
     });
   }
 
+  /// Starts the self-healing supervised proxy (observer = None) and returns a
+  /// handle whose [`state`](WarrenFfiSupervisedProxyFfi.state) is POLLABLE: the
+  /// Dart-friendly alternative to the (Dart-incompatible) `ConnectionObserver`
+  /// callback interface. Binds the listeners then connects in the background, so
+  /// this resolves even against an unreachable exit (the supervisor reports the
+  /// state via `state()`).
+  Future<WarrenFfiSupervisedProxyFfi> startProxySupervised({
+    required String exitIdHex,
+    required String socks5Listen,
+  }) {
+    final status = calloc<_RustCallStatus>();
+    final lowered = <_Lowered>[];
+    int future;
+    try {
+      _RustBuffer lower(String s) {
+        final l = _ffi._lower(s, status);
+        _ffi._check(status, 'rustbuffer_from_bytes');
+        lowered.add(l);
+        return l.buffer;
+      }
+
+      final optionsNone = _ffi._lowerNone(status);
+      lowered.add(optionsNone);
+      final observerNone = _ffi._lowerNone(status);
+      lowered.add(observerNone);
+      future = _ffi._startProxySupervised(_handle, lower(exitIdHex),
+          lower(socks5Listen), optionsNone.buffer, observerNone.buffer);
+    } finally {
+      for (final l in lowered) {
+        malloc.free(l.dataPtr);
+        calloc.free(l.foreignBytes);
+      }
+      calloc.free(status);
+    }
+    return _driveU64Future(future).then((handle) =>
+        WarrenFfiSupervisedProxyFfi._(
+            _ffi, ffi.Pointer<ffi.Void>.fromAddress(handle)));
+  }
+
   /// Releases the native object. Idempotent.
   void close() {
     if (_closed) return;
@@ -441,7 +539,7 @@ class WarrenFfiClientFfi {
         cb.close();
         if (code != 0) {
           completer.completeError(
-              StateError('subscription_expiry failed (status code $code)'));
+              StateError('async FFI call failed (status code $code)'));
         } else {
           completer.complete(value);
         }
