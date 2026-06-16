@@ -74,13 +74,23 @@ impl DaitaDriver {
             return;
         }
         loop {
+            // Arm the wake waiter BEFORE snapshotting the deadline so the wait is
+            // race-free: `enable()` registers this future, so any `notify_one`
+            // issued by a datapath event after this point is guaranteed to wake
+            // THIS iteration (not just leave a permit whose delivery races the
+            // deadline read). Without it, an event arming a closer timer between
+            // the deadline read and the select could be missed for one cycle.
+            let wake = self.wake.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+
             let deadline = self.lock().sleep_deadline(Instant::now());
             let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
             tokio::pin!(sleep);
             tokio::select! {
                 () = &mut sleep => {}
                 // An event armed a (possibly closer) timer: re-arm on the new deadline.
-                () = self.wake.notified() => continue,
+                () = &mut wake => continue,
                 () = stop.notified() => return,
             }
 

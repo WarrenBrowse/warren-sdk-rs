@@ -488,7 +488,14 @@ impl MultihopSession {
         path.saturating_sub(warren_wire::MULTIHOP_FRAME_MAX_OVERHEAD)
     }
 
-    /// The underlying quinn connection (for advanced callers / the pump).
+    /// The underlying quinn connection, for read-only inspection (stats, RTT,
+    /// path MTU) and the datagram pump's lifecycle wiring.
+    ///
+    /// INVARIANT: callers MUST NOT send raw datagrams on this connection. Every
+    /// uplink datagram has to be a sealed [`WarrenMultihopFrame`] produced by
+    /// [`Self::send_packet`] / [`Self::send_cover_traffic`]; a raw send would put
+    /// cleartext on the wire and break the HPKE confidentiality the exit relies
+    /// on. Use the sealing methods for all writes.
     #[must_use]
     pub fn connection(&self) -> &quinn::Connection {
         &self.conn
@@ -642,8 +649,14 @@ impl MultihopSession {
             if frame.exit_id != self.exit_id {
                 continue;
             }
-            // Verify-then-record: probe the window, open (authenticate), then
-            // commit the seq. A frame failing any step is dropped, never fatal.
+            // Probe-open-record. The cheap pre-`check` lets a replayed frame be
+            // dropped WITHOUT spending an AEAD open (a replay-flood DoS guard);
+            // the open then authenticates; only an authenticated frame advances
+            // the window via `check_and_record`. recv_packet has a single consumer
+            // (the datapath pump), so the gap between the pre-check and the record
+            // is not contended; were it ever multi-consumer, two callers could
+            // both open one seq before one loses the record (correct, just one
+            // wasted open). A frame failing any step is dropped, never fatal.
             {
                 // Recover rather than panic on a poisoned lock: the replay window
                 // is plain integer state and stays consistent across a panic, and a
@@ -1198,6 +1211,31 @@ mod real_exit_tests {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    #[test]
+    fn multihop_error_display_never_leaks_the_source_detail() {
+        // No-log discipline: the top-level Display is a static label; the wrapped
+        // source (which may carry an address) is reachable via `source()` for
+        // debugging but must never appear in the rendered message.
+        let secret = "10.66.13.37:51820";
+        let io = std::io::Error::other(format!("connect to {secret} refused"));
+        let bind = MultihopError::Bind(io);
+        assert!(
+            !bind.to_string().contains(secret),
+            "Bind leaked the address: {bind}"
+        );
+
+        let setup_io = MultihopError::SetupIo {
+            context: "open setup stream",
+            source: format!("peer {secret} reset").into(),
+        };
+        assert!(
+            !setup_io.to_string().contains(secret),
+            "SetupIo leaked the address: {setup_io}"
+        );
+        // The static context label is fine (it is a step name, not identity).
+        assert!(setup_io.to_string().contains("open setup stream"));
+    }
 
     #[test]
     fn rekey_policy_doctrine_is_eight_hours_with_five_second_overlap() {

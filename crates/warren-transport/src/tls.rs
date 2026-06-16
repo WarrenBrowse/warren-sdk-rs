@@ -197,9 +197,24 @@ impl rustls::server::ResolvesServerCert for RpkResolver {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct RpkSigner {
     key: SigningKey,
+}
+
+// Manual Debug (never derive on a secret-holding type): render only a short
+// prefix of the public verifying key, never the secret scalar, so a stray
+// `{:?}` cannot leak it.
+impl std::fmt::Debug for RpkSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pk = self.key.verifying_key();
+        let b = pk.as_bytes();
+        write!(
+            f,
+            "RpkSigner {{ public_key: {:02x}{:02x}{:02x}{:02x}.. }}",
+            b[0], b[1], b[2], b[3]
+        )
+    }
 }
 
 impl RpkSigner {
