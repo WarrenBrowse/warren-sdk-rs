@@ -1,26 +1,23 @@
 /// Warren SDK, Dart/Flutter binding.
 ///
-/// The public entrypoint. The API is generated from the Rust `warren-sdk-ffi`
-/// surface by `tool/generate.sh` (uniffi-bindgen-dart) into `lib/src/generated/`
-/// (not checked in); this file re-exports it, so an app imports only
-/// `package:warren_sdk/warren_sdk.dart`.
+/// Two layers:
 ///
-/// The generated code loads the native library by name; bundle the per-OS
-/// artifact (libwarren_sdk_ffi.so / .dylib / .dll) with the app (jniLibs on
-/// Android, the embedded Frameworks dylib on iOS/macOS) so the dynamic loader
-/// finds it.
+///  - `src/identity.dart` (exported below): a small, WORKING hand-written FFI for
+///    the pure identity surface (ss58 encode/decode, address-from-mnemonic),
+///    validated by the golden-vector test in `test/`. It exists because the
+///    current `uniffi-bindgen-dart` (0.1.3) output crashes at the FFI boundary
+///    (see README.md), so the pure surface is bound by hand until a correct
+///    generator (or `flutter_rust_bridge`) is in place.
+///  - the full async surface (client construction, the account/discovery calls,
+///    the proxy lifecycle, DAITA, port forwarding) comes from the GENERATED
+///    bindings produced by `tool/generate.sh` into `src/generated/`; that file is
+///    re-exported here once it is generated with a correct generator.
 ///
-/// KNOWN GENERATOR LIMITATION: uniffi-bindgen-dart 0.1.3 skips the three
-/// `start_proxy*` methods (their async + `ConnectionObserver` callback-interface
-/// signature is unsupported by that generator), so the proxy LIFECYCLE is not
-/// yet reachable from Dart. Everything else generates: client construction
-/// (including `withOptions` / DAITA), the account/discovery calls, and the pure
-/// identity helpers. Resolve by tracking the generator upstream or adding an
-/// observer-free proxy-start method for the Dart surface.
-///
-/// Like every sibling-language SDK, this binding MUST replay the shared golden
-/// vectors in the repo's `vectors/` directory to prove byte-for-byte wire
-/// compatibility. See `test/` for the harness.
+/// Bundle the per-OS native artifact (libwarren_sdk_ffi.so / .dylib / .dll) with
+/// the app so the dynamic loader finds it.
 library warren_sdk;
 
-export 'src/generated/warren_sdk_ffi.dart';
+export 'src/identity.dart';
+
+// Once a correct generator emits `src/generated/warren_sdk_ffi.dart`, add:
+//   export 'src/generated/warren_sdk_ffi.dart';
