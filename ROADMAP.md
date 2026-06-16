@@ -231,18 +231,22 @@ pinned by golden vectors where a wire format is involved. warren-core
 - Per-proxy knobs are now on the FFI: every `start_proxy*` takes an optional
   `FfiProxyOptions` (`http_listen`, `dns_server`), so a binding reaches the HTTP
   CONNECT listener and the in-tunnel DNS override the Rust facade already had.
-- Dart/Flutter binding STARTED (scaffold under `bindings/dart/`): the package
-  (`pubspec.yaml`), the reproducible generation script (`tool/generate.sh`, which
-  builds the cdylib and runs `uniffi-bindgen-dart`), the loader entrypoint
-  (`lib/warren_sdk.dart`), the golden-vector replay harness stub
-  (`test/vectors_test.dart`), and the integration guide (`README.md`: per-OS
-  native-library bundling + the API map). The generated bindings are not checked
-  in (reproduced from the Rust crate). Completing and VALIDATING it (running the
-  vectors + a device test) needs a Dart/Flutter toolchain, which the SDK dev
-  sandbox does not have.
-- Remaining: finish the Dart binding on a Flutter toolchain (generate, replay the
-  vectors, device-test), then the Kotlin/Swift/Python/Java integrations, each
-  replaying the same `vectors/`.
+- Dart/Flutter binding STARTED + the generator empirically tested (scaffold under
+  `bindings/dart/`): the package (`pubspec.yaml`), the reproducible
+  `tool/generate.sh` (builds the cdylib, runs `uniffi-bindgen-dart --crate
+  warren_sdk_ffi`, applies documented patches for known codegen bugs), the loader
+  re-export (`lib/warren_sdk.dart`), a REAL golden-vector replay test over the
+  cdylib (`test/vectors_test.dart`), and the integration guide (`README.md`).
+  Finding (2026-06-16): `uniffi-bindgen-dart` 0.1.3 DOES build against uniffi 0.31
+  and generates, but is unusable for this surface: it skips the `start_proxy*`
+  methods (callback-interface), mis-types `is_tunnel_active`'s future, double-
+  prefixes two symbol families, and after patching those it CRASHES at the FFI
+  boundary (ABI-incompatible RustBuffer marshaling on the first call). So the
+  blocker is the generator's correctness, not version compatibility. Generated
+  bindings are not checked in.
+- Remaining: a fixed uniffi-0.31 Dart generator (or `flutter_rust_bridge`) to make
+  `tool/generate.sh` + `dart test` pass, then the Kotlin/Swift/Python/Java
+  integrations, each replaying the same `vectors/`.
 
 ## Audit follow-ups (see AUDIT.md)
 

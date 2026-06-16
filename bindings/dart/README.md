@@ -27,21 +27,40 @@ and runs `uniffi-bindgen-dart` against it, writing the Dart surface into
 `lib/src/generated/`. `lib/warren_sdk.dart` re-exports it and centralizes loading
 the native library.
 
-### Blocker: generator version lock
+### Generator status (empirically tested 2026-06-16)
 
-`warren-sdk-ffi` uses **uniffi 0.31**. External uniffi bindgens are pinned to the
-uniffi runtime's metadata format; the published `uniffi-bindgen-dart` (0.1.x)
-targets an OLDER uniffi and cannot consume a 0.31 library (it fails on the
-metadata version, or emits ABI-incompatible glue). So the Dart binding cannot be
-generated today with the off-the-shelf tool. Two ways forward, both needing a
-Dart/Flutter toolchain to complete and validate:
+`warren-sdk-ffi` uses **uniffi 0.31**, and `uniffi-bindgen-dart` 0.1.3 builds
+against `uniffi_bindgen ^0.31`, so the versions match and it DOES generate.
+However, running it against the built cdylib surfaced a chain of generator
+defects that make 0.1.3 unusable for this surface as-is:
 
-1. Use a uniffi-0.31-compatible Dart generator once one is published (then run
-   `tool/generate.sh` unchanged), or
-2. Switch this binding to `flutter_rust_bridge`, which does its own codegen and
-   does not depend on the uniffi metadata format.
+1. It skips the three `start_proxy*` methods ("unsupported signature": the async +
+   `ConnectionObserver` callback-interface form). The proxy lifecycle is then
+   unreachable from Dart.
+2. `is_tunnel_active` is generated with an `int` return where `Future<bool>` is
+   expected (one analyzer error).
+3. Two symbol-namespace defects: the `ffi_*` family is double-prefixed
+   (`ffi_uniffi_warren_sdk_ffi_*`, fixed by passing `--crate warren_sdk_ffi`), and
+   the function family carries a bogus `ffibuffer_` infix
+   (`uniffi_ffibuffer_warren_sdk_ffi_fn_func_*` vs the real
+   `uniffi_warren_sdk_ffi_fn_func_*`).
+4. After patching 1-3, the package analyzes clean (`No issues found!`) but the
+   FIRST native call CRASHES inside the Rust function
+   (`uniffi_warren_sdk_ffi_fn_func_ss58_encode+0x84`): the argument marshaling
+   (`RustBuffer` lowering) is ABI-incompatible.
 
-Do not commit bindings produced by a mismatched generator.
+So 0.1.3 cannot produce a working binding for warren-sdk-ffi today. The scaffold,
+the generation script, and `test/vectors_test.dart` (a real golden-vector replay
+over the cdylib) are correct and ready; they pass once a generator emits
+ABI-correct glue. Two ways forward, both needing a Dart toolchain to finish:
+
+1. A fixed/newer uniffi-0.31-compatible Dart generator (re-run `tool/generate.sh`,
+   which applies the documented patches for the known codegen bugs), or
+2. Switch this binding to `flutter_rust_bridge` (its own codegen, no dependence on
+   the uniffi metadata ABI).
+
+Do NOT commit the bindings 0.1.3 produces: they analyze but crash at the FFI
+boundary.
 
 ## Bundling the native library
 
