@@ -97,3 +97,52 @@ interface. The `warren-sdk-ffi` crate exposes the identity helpers, an async
 `WarrenFfiProxy` handle; the Python and Kotlin bindings are generated and
 grep-checked in CI. It is the one crate that relaxes `unsafe_code` from `forbid`
 to `deny` for uniffi's generated scaffolding (documented in the crate).
+
+## Decision record: how sibling-language SDKs consume this core
+
+The phrase "the same SDK is reimplemented in TypeScript, Dart, Python, Kotlin,
+Swift and Java" must not be read as "reimplement the tunnel in six languages."
+The defensible boundary is **control plane vs datapath**, and it dictates what is
+reimplemented per language versus what is reused from this Rust core.
+
+**Control plane** (low frequency, deterministic, fully pinned by `vectors/`):
+identity (BIP39 -> Ed25519, SS58), request signing, the signed HTTP account API,
+signed-relay-list verification, exit selection, subscription and voucher flows,
+and event/state orchestration. This layer is a candidate for a pure per-language
+reimplementation, because it is exactly what the golden vectors freeze and it
+carries no line-rate or OS-privilege concern.
+
+**Datapath** (line rate, per-packet crypto, OS privilege): QUIC (including
+DATAGRAM frames, RFC 9221), the TLS 1.3 raw-public-key handshake (RFC 7250),
+HPKE multihop sealing, per-packet AEAD, the smoltcp userspace netstack, and the
+per-OS TUN device with its firewall killswitch. This layer is **always reused as
+native code**, never reimplemented per language. Three facts force this:
+
+1. There is no production-grade pure-language QUIC + TLS-1.3-RPK + userspace
+   TCP/IP stack in Dart/TS/Python/etc.; reimplementing quinn/rustls/smoltcp per
+   language multiplies the wire-compat surface far beyond Warren's own frames.
+2. Per-packet AEAD in a GC'd language caps throughput well below the Rust core,
+   so serious implementations bind a native crypto library anyway.
+3. On mobile the datapath must run inside a native network-extension process
+   (iOS `NEPacketTunnelProvider`, Android `VpnService`); the UI/control layer
+   talks to it over a platform channel. A "full Dart" tunnel is therefore
+   structurally impossible on the platforms that matter most.
+
+This is the universal industry pattern: a single native datapath core (Mullvad
+and Cloudflare WARP in Rust, Tailscale in Go) wrapped by thin per-platform
+layers. This repository is that core for Warren.
+
+**Recommended target for the Dart/Flutter SDK: hybrid.** It lives in the sibling
+repository `warren-sdk-dart` and reuses this engine; it is not implemented here.
+
+- Datapath: this Rust core via `flutter_rust_bridge` in-process (proxy mode), and
+  via a privileged out-of-process component for the system-VPN mode (a desktop
+  daemon or a mobile network extension embedding this engine). See
+  `warren-sdk-dart/ARCHITECTURE.md` and its decision records for the full design.
+- Control plane: reused over the same FFI rather than reimplemented in Dart,
+  since the crypto is already vector-locked here and need not be re-audited in a
+  seventh language. The tunnel is reused either way.
+
+This engine keeps its `uniffi` surface (`warren-sdk-ffi`) for the non-Flutter
+consumers (Python, Kotlin, Swift). Flutter uses `flutter_rust_bridge` instead, so
+no hand-written Dart binding lives in this repository.

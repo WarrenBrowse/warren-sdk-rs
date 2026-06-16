@@ -255,31 +255,19 @@ pinned by golden vectors where a wire format is involved. warren-core
 - Per-proxy knobs are now on the FFI: every `start_proxy*` takes an optional
   `FfiProxyOptions` (`http_listen`, `dns_server`), so a binding reaches the HTTP
   CONNECT listener and the in-tunnel DNS override the Rust facade already had.
-- Dart/Flutter binding STARTED + the generator empirically tested (scaffold under
-  `bindings/dart/`): the package (`pubspec.yaml`), the reproducible
-  `tool/generate.sh` (builds the cdylib, runs `uniffi-bindgen-dart --crate
-  warren_sdk_ffi`, applies documented patches for known codegen bugs), the loader
-  re-export (`lib/warren_sdk.dart`), a REAL golden-vector replay test over the
-  cdylib (`test/vectors_test.dart`), and the integration guide (`README.md`).
-  Finding (2026-06-16): `uniffi-bindgen-dart` 0.1.3 DOES build against uniffi 0.31
-  and generates, but is unusable for this surface: it skips the `start_proxy*`
-  methods (callback-interface), mis-types `is_tunnel_active`'s future, double-
-  prefixes two symbol families, and after patching those it CRASHES at the FFI
-  boundary (ABI-incompatible RustBuffer marshaling on the first call). So the
-  blocker is the generator's correctness, not version compatibility. Generated
-  bindings are not checked in.
-  WORKING hand-written layer (`lib/src/identity.dart`): rather than ship the broken
-  generator output, the full uniffi-0.31 ABI is bound by hand and PROVEN against
-  the real cdylib by `dart test` (6 green): String (ss58 encode/decode,
-  address-from-mnemonic, replaying `vectors/identity.json`), record
-  (`generateIdentity`), multi-arg `Result` (`signRequest`), and the object + async
-  RustFuture bridge (`WarrenFfiClientFfi.create` + `subscriptionExpiry`, validated
-  via the error path on an unroutable host). Every ABI shape works from Dart; only
-  the server-dependent happy paths and the proxy callback-interface surface await a
-  correct generator + a live exit.
-- Remaining: a fixed uniffi-0.31 Dart generator (or `flutter_rust_bridge`) to make
-  `tool/generate.sh` + `dart test` pass, then the Kotlin/Swift/Python/Java
-  integrations, each replaying the same `vectors/`.
+- Dart/Flutter SDK: moved to the sibling repository `warren-sdk-dart`, which
+  reuses this engine through `flutter_rust_bridge` (in-process proxy mode) and a
+  privileged out-of-process component (system-VPN mode). The hand-written
+  `bindings/dart/` scaffold that briefly lived here was removed once that repo
+  existed; its golden-vector replay migrates to `warren-sdk-dart` P1.
+  Finding that motivated the move (2026-06-16): `uniffi-bindgen-dart` 0.1.3 builds
+  against uniffi 0.31 but is unusable for this surface (skips the callback-interface
+  `start_proxy*` methods, mis-types a future, double-prefixes symbol families, and
+  crashes at the FFI boundary on the first call). So Flutter uses
+  `flutter_rust_bridge`, not uniffi-for-Dart. The `uniffi` surface here stays for
+  the non-Flutter consumers.
+- Remaining: the Kotlin/Swift/Python/Java integrations over `warren-sdk-ffi`, each
+  replaying the same `vectors/`.
 
 ## Audit follow-ups (see AUDIT.md)
 

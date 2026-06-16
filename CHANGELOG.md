@@ -7,6 +7,14 @@ the pre-release `0.0.x` line.
 
 ## [Unreleased]
 
+### Removed
+
+- The hand-written Dart binding under `bindings/dart/` is removed. The Dart and
+  Flutter SDK now lives in the sibling repository `warren-sdk-dart` and reuses
+  this engine through `flutter_rust_bridge`, so no Dart code remains here. The
+  `uniffi` surface (`warren-sdk-ffi`) is unchanged and still serves the
+  non-Flutter consumers (Python, Kotlin, Swift).
+
 ### Security
 
 - The signed multi-hop directory now verifies the server envelope signature
