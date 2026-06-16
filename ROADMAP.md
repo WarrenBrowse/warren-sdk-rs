@@ -251,6 +251,15 @@ pinned by golden vectors where a wire format is involved. warren-core
   boundary (ABI-incompatible RustBuffer marshaling on the first call). So the
   blocker is the generator's correctness, not version compatibility. Generated
   bindings are not checked in.
+  WORKING hand-written layer (`lib/src/identity.dart`): rather than ship the broken
+  generator output, the full uniffi-0.31 ABI is bound by hand and PROVEN against
+  the real cdylib by `dart test` (6 green): String (ss58 encode/decode,
+  address-from-mnemonic, replaying `vectors/identity.json`), record
+  (`generateIdentity`), multi-arg `Result` (`signRequest`), and the object + async
+  RustFuture bridge (`WarrenFfiClientFfi.create` + `subscriptionExpiry`, validated
+  via the error path on an unroutable host). Every ABI shape works from Dart; only
+  the server-dependent happy paths and the proxy callback-interface surface await a
+  correct generator + a live exit.
 - Remaining: a fixed uniffi-0.31 Dart generator (or `flutter_rust_bridge`) to make
   `tool/generate.sh` + `dart test` pass, then the Kotlin/Swift/Python/Java
   integrations, each replaying the same `vectors/`.
