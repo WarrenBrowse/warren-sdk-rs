@@ -238,8 +238,31 @@ Deferred (tracked, not blocking):
   are addressed together in P9 when the tunnel FFI surface is exported.
 - IPv6 datapath: the netstack engine is IPv4-only, so an assigned v6 is not yet
   routed (the v6 bind branch is also untested). Tracked with the per-OS datapath.
-- The DNS-disabled (`dns_disabled`) downgrade defense is not consumed
-  (`VerifiedExit` omits the field); revisit if/when the SDK gates on DNS.
 - CI runner labels could add a custom org label (e.g. `warren`) to pin jobs to
   the intended self-hosted hosts; left as a recommendation pending confirmation
   of the live runners' label sets (changing labels blind could unschedule jobs).
+
+(The earlier "DNS-disabled downgrade defense not consumed" and "IPv6 datapath is
+IPv4-only" deferrals are now resolved: `VerifiedExit` carries `dns_disabled` and
+the facade fails closed via `SdkError::ExitDnsDisabled`; the netstack routes an
+assigned v6 address. See ROADMAP P6.)
+
+## Hardening pass 2026-06-16 (whole-codebase quality sweep)
+
+A second full review (five parallel per-crate reviewers) after the userland and
+DAITA work. The cryptographic core and the facade surface were again found solid
+(unsafe-free, no secret logging, faithful to warren-core); findings were mostly
+medium/low. Resolved in this pass:
+
+| Sev | Finding | Status |
+|---|---|---|
+| HIGH | Multi-hop directory checked the validity-window cap on UNVERIFIED data (before the envelope signature), unlike the signed relay list. | FIXED. The anti-freeze check now runs after `server_pubkey.verify`, so a tampered `expires_at` surfaces as `BadEnvelopeSignature`, not `ValidityTooLong`. |
+| HIGH | SOCKS5 codec accepted a zero-length domain; HTTP CONNECT mishandled bracketless/zoned/portless IPv6 authorities (coerced to bogus domains). | FIXED. Empty domain rejected at the codec; `parse_authority` parses the `[v6]:port` form strictly and rejects malformed v6 authorities. Direct tests added. |
+| HIGH | Documented error variants without a triggering test (signed-list `InvalidHex`/`PubkeyNotOnCurve`/`InvalidNodeId`/`InvalidEndpointAddress`; `query.rs`/`relay.rs` selectors untested; NAT-PMP `delete`). | FIXED. Direct tests added for each; `transport.rs` (`Method::as_str`, `is_connect`) covered. |
+| MED | Netstack `alloc_port` aliased a live port under ephemeral exhaustion. | FIXED. `alloc_port` returns `Option`; callers fail closed with `ConnectFailed`. |
+| MED | Multi-hop frame decode ignored trailing bytes; size cap was decode-only. | FIXED. `take_from_bytes` + `TrailingBytes`; cap enforced on encode too. |
+| MED | `SessionError::Hpke` overloaded the unknown-epoch case; `seal` silently accepted the retained old epoch for forward frames. | FIXED. Distinct `UnknownEpoch`; `seal` rejects a non-current epoch. |
+| MED | DAITA pump read the next deadline before registering its wake waiter (check-then-wait). | FIXED. `Notified::enable()` before the deadline snapshot makes the wait race-free. |
+| MED | FFI could not reach the DAITA uplink defense. | FIXED. `with_options(FfiClientOptions)` exposes DAITA (and roots + persistence); CI grep-guards the new surface. |
+| LOW | `SdkError::Daita(String)` was the one stringly-typed variant; `RpkSigner` derived `Debug` on a secret-holding type; crate/builder doc examples carried a bogus pin. | FIXED. Typed `UnknownDaitaMachine`/`EmptyDaitaPool`/`DaitaConfig`; manual `RpkSigner` Debug (public-key prefix only); realistic example pins + a builder `# Examples`. |
+| LOW | `SetupAck.daita_spec` (frozen, with `f64` caps) had no byte-exact vector; NAT-PMP reserved-byte and unknown-result-code behavior unpinned; `ServerStatus.body` lacked a no-log caveat. | FIXED. Byte-exact `daita_spec` golden vector; reserved-byte-ignored and unknown-code-maps tests; no-log caveat documented. |

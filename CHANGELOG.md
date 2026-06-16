@@ -9,6 +9,41 @@ the pre-release `0.0.x` line.
 
 ### Security
 
+- The signed multi-hop directory now verifies the server envelope signature
+  BEFORE applying the validity-window (anti-freeze) cap, matching the signed
+  relay list, so every anti-freeze decision is made on authenticated fields (a
+  tampered `expires_at` can no longer mask a `BadEnvelopeSignature`).
+- The SOCKS5 codec rejects a zero-length domain, and the HTTP `CONNECT` authority
+  parser rejects malformed IPv6 authorities (unbracketed, zoned, or portless)
+  instead of coercing them into a bogus domain name.
+- The userspace netstack fails closed on ephemeral-port exhaustion (>16k live
+  flows) rather than aliasing two flows onto one port.
+- The multi-hop dispatch frame decoder rejects trailing bytes (parity with the
+  setup/control codecs), and the size cap is enforced symmetrically on encode.
+
+### Hardening and quality
+
+- `warren_multihop::SessionError` gained a distinct `UnknownEpoch` variant
+  (previously folded into `Hpke`), and `ClientSession::seal` now rejects a
+  non-current epoch (forward frames only ever seal at the current epoch; the
+  retained old epoch is reverse-overlap only).
+- The DAITA pump (`DaitaDriver::run`) arms its wake waiter before snapshotting
+  the next deadline (`Notified::enable`), making the timer wait race-free against
+  concurrent datapath events.
+- `SdkError::Daita(String)` was modeled into the typed
+  `UnknownDaitaMachine` / `EmptyDaitaPool` / `DaitaConfig` variants.
+- The TLS `RpkSigner` now renders only a public-key prefix in `Debug` (manual,
+  never derived on a secret-holding type).
+- A byte-exact golden vector for a populated `SetupAck.daita_spec` (pinning the
+  IEEE-754 `f64` encoding) was added under `vectors/handshake.json`.
+
+### FFI
+
+- `WarrenFfiClient::with_options(.., FfiClientOptions)` exposes the DAITA uplink
+  defense (and root pins + persistence) to foreign bindings via a future-proof
+  options record, so mobile consumers can enable traffic-analysis defense. The
+  generated bindings are CI grep-guarded for the new surface.
+
 - The multihop directory root-key pin is now enforced. `WarrenClientBuilder`
   gained `multihop_root_pubkey_pin`, and when at least one root is pinned the
   directory's operational certificate must be signed by a pinned root (the

@@ -196,8 +196,15 @@ pinned by golden vectors where a wire format is involved. warren-core
   a stable address, forwarding `ConnectionState` to the observer. Argument-
   validation paths are unit-tested; the supervisor core is covered by the facade
   unit tests. All new exports are CI grep-guarded in the generated bindings.
+- Client construction options (root pins, persistence, DAITA uplink defense) are
+  exposed through the additive `with_options(FfiClientOptions)` constructor, so a
+  new knob does not churn every binding signature.
 - Remaining: the first Dart/Flutter integration (and Kotlin/Swift/Python/Java),
   consuming the generated bindings. Every binding replays the same `vectors/`.
+  Minor known gap: the per-proxy `dns_server` override (for `dns_disabled` exits,
+  a rare case) and the HTTP CONNECT listen address are not yet on the FFI proxy
+  start; the Rust facade has both. Surface them when a binding needs them rather
+  than churning every proxy-start signature pre-emptively.
 
 ## Audit follow-ups (see AUDIT.md)
 
@@ -369,9 +376,15 @@ echo harness covers the **datagram plane**. The exit's full termination mode
   `connect_multihop`). Validated against the real DAITA-active exit: the driver
   emits the maybenot-scheduled padding and the exit accepts it (multihop DAITA is
   client-unilateral, so there is no negotiated `DaitaConfig` to parse on this path;
-  the client pads its uplink from its own pool, the exit pads the downlink). What a
-  later milestone could still add: single-hop `SetupAck.daita_spec` parsing, and a
-  longer-horizon defended-distribution effectiveness study (research, not wire).
+  the client pads its uplink from its own pool, the exit pads the downlink). The
+  single-hop negotiated `SetupAck.daita_spec` is a frozen wire format pinned by a
+  byte-exact golden vector (`vectors/handshake.json`, including the IEEE-754 `f64`
+  caps); wiring it into the single-hop datapath is deferred only because single-hop
+  is test-only (production requires multihop). DAITA is now also reachable from the
+  FFI via `WarrenFfiClient::with_options(FfiClientOptions { daita, daita_machine,
+  .. })`. What a later milestone could still add: the single-hop datapath wiring
+  above, and a longer-horizon defended-distribution effectiveness study (research,
+  not wire).
 - OS-enforced killswitch + IPv6 leak block. Only the best-effort
   `ProxyOnlyKillSwitch` is implemented; the `OsEnforced` level and the v6 leak
   guard belong to the deferred privileged TUN backend (P6), not userland.
