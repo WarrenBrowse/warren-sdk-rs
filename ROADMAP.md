@@ -78,11 +78,13 @@ pinned by golden vectors where a wire format is involved. warren-core
     applying it precisely so it is testable without privilege.
   - `warren_tun::device`: the `TunIo` seam + `FramedTun` adapter (tested over an
     in-memory mock), and the per-OS device open behind `experimental-tun` with
-    hand-audited `unsafe` + `SAFETY` docs: Linux `open_tun` (`/dev/net/tun` +
-    `TUNSETIFF`, `IFF_NO_PI`) and macOS `open_tun` (the `utun` control socket:
-    `PF_SYSTEM`/`SYSPROTO_CONTROL`, `CTLIOCGINFO`, `connect` with `sockaddr_ctl`).
-    Both compile-checked (Linux via cross-clippy, macOS natively); NOT run, they
-    need root.
+    hand-audited `unsafe` + `SAFETY` docs for ALL THREE platforms: Linux
+    `open_tun` (`/dev/net/tun` + `TUNSETIFF`, `IFF_NO_PI`), macOS `open_tun` (the
+    `utun` control socket: `PF_SYSTEM`/`SYSPROTO_CONTROL`, `CTLIOCGINFO`,
+    `connect` with `sockaddr_ctl`), and Windows `open_tun` (Wintun via raw
+    `LoadLibraryW`/`GetProcAddress`, `WintunCreateAdapter`/`StartSession`/ring
+    receive+send, no third-party deps). All compile-checked (Linux + Windows via
+    cross-`check`, macOS natively); NOT run, they need privilege + a real device.
   - `warren_tun::plan` argv builders + `warren_tun::apply` (feature-gated): the
     routing plan renders `ip route replace` argv (`RoutingPlan::to_ip_commands`,
     unit-tested for exact argv) and the killswitch renders `nft -f -` apply /
@@ -98,12 +100,17 @@ pinned by golden vectors where a wire format is involved. warren-core
   - `warren_tun::gateway::parse_default_gateway`: parses `ip route show default`
     to find the physical gateway the carrier route pins to. Pure + unit-tested;
     the `discover_default_gateway()` process call is feature-gated.
+  - `warren_net::tun_sink::TunBridge::run` (Unix, feature-gated): the production
+    async duplex loop over a REAL fd (tokio `AsyncFd` + `O_NONBLOCK`, multiplexing
+    read/write on the full-duplex fd, calling the tested `pump_*_once`).
+    Compile-checked on Linux + macOS; NOT run (needs a real device).
   Remaining (per CLAUDE.md cannot be done from the dev sandbox, so it stays
-  unvalidated): the production duplex loop driver for a REAL fd (set `O_NONBLOCK`
-  + tokio `AsyncFd`, or two dup'd threads, since a kernel TUN fd is full-duplex;
-  the tested `pump_*_once` primitives are what it calls), Windows Wintun, and
-  end-to-end validation against a real exit with privilege. All unsafe lives in
-  `warren-tun` behind the feature.
+  unvalidated): end-to-end validation against a real exit with privilege (root +
+  a real device + the exit), and applying the routing/killswitch plans live. The
+  CODE for every layer (3 device opens, the duplex driver, the applier, the
+  plans, the gateway probe, the PacketSink bridge) now exists and compiles on its
+  target; only privileged runtime validation is outstanding. All unsafe lives in
+  `warren-tun` behind the feature; `warren-net` stays `unsafe_code = forbid`.
 
 ## P7: port forwarding
 

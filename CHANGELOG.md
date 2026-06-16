@@ -68,9 +68,21 @@ the pre-release `0.0.x` line.
   `tun_channels` returns a channel-backed `TunPacketSink` plus a `TunBridge`
   worker (`pump_inbound_once`/`pump_outbound_once`), unit-tested end to end over
   an in-memory mock device. `warren-net` stays `unsafe_code = forbid`.
-- Still to do (per CLAUDE.md, not possible from the dev sandbox): the real-fd
-  duplex loop driver, Windows Wintun, and end-to-end validation against a real
-  exit with privilege.
+- The real-fd async duplex datapath driver landed (`warren_net::tun_sink::
+  TunBridge::run`, Unix, feature-gated): tokio `AsyncFd` + `O_NONBLOCK` multiplexes
+  read/write over the full-duplex fd and calls the tested `pump_*_once`.
+  Compile-checked on Linux + macOS.
+- Windows Wintun device open landed (`warren_tun::device` Windows path, raw
+  `LoadLibraryW`/`GetProcAddress` + Wintun adapter/session ring I/O, no
+  third-party deps), cross-compile-checked on the Windows target. So all three
+  per-OS device backends now compile on their targets.
+- The Dart binding's pure identity surface WORKS: a small hand-written FFI
+  (`bindings/dart/lib/src/identity.dart`) over the cdylib, with `dart test`
+  replaying `vectors/identity.json` byte-for-byte (the generated bindings remain
+  blocked by the upstream generator's ABI bug).
+- Still to do (per CLAUDE.md, not possible from the dev sandbox): end-to-end
+  validation of the privileged datapath against a real exit with root + a device,
+  and the generated Dart full-surface bindings (a correct generator).
 
 ### Bindings
 

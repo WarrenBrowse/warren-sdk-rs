@@ -350,22 +350,192 @@ mod macos {
     }
 }
 
-/// Opens a Windows Wintun device (EXPERIMENTAL). NOT YET IMPLEMENTED: Wintun is a
-/// DLL-loaded API (`WintunCreateAdapter` / session ring buffers) that cannot be
-/// compile-checked or exercised from the dev sandbox, so this returns an
-/// `Unsupported` error rather than a fake implementation. The seam
-/// ([`RawTunDevice`], [`FramedTun`], the plans/applier) is OS-agnostic and ready
-/// for it.
+/// Opens a Windows Wintun device named `name` (EXPERIMENTAL, requires the
+/// `wintun.dll` runtime and Administrator). Compiled only under the
+/// `experimental-tun` feature. Cross-compile-checked on the Windows target but
+/// NOT run (no Windows host or `wintun.dll` in the dev sandbox), so it is NOT YET
+/// validated. Wintun delivers bare IP packets, matching [`Framing::Bare`].
 ///
 /// # Errors
 ///
-/// Always [`io::ErrorKind::Unsupported`] until a real Wintun backend lands.
+/// An OS error if `wintun.dll` cannot be loaded, a required export is missing, or
+/// the adapter/session cannot be created.
 #[cfg(all(target_os = "windows", feature = "experimental-tun"))]
-pub fn open_tun(_name: &str) -> io::Result<std::convert::Infallible> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Wintun backend not yet implemented",
-    ))
+pub fn open_tun(name: &str) -> io::Result<windows::WintunDevice> {
+    windows::WintunDevice::open(name)
+}
+
+#[cfg(all(target_os = "windows", feature = "experimental-tun"))]
+mod windows {
+    use super::RawTunDevice;
+    use std::ffi::c_void;
+    use std::io;
+
+    // Minimal raw bindings (no third-party deps, matching this crate's stance).
+    // `cargo check` does not link, so the windows target compile-checks these.
+    #[allow(non_snake_case)]
+    unsafe extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *const c_void;
+        fn FreeLibrary(module: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    const ERROR_NO_MORE_ITEMS: u32 = 259;
+    /// Ring-buffer capacity (bytes), must be a power of two within Wintun's range.
+    const RING_CAPACITY: u32 = 0x40_0000;
+
+    type CreateAdapterFn =
+        unsafe extern "system" fn(*const u16, *const u16, *const c_void) -> *mut c_void;
+    type CloseAdapterFn = unsafe extern "system" fn(*mut c_void);
+    type StartSessionFn = unsafe extern "system" fn(*mut c_void, u32) -> *mut c_void;
+    type EndSessionFn = unsafe extern "system" fn(*mut c_void);
+    type ReceivePacketFn = unsafe extern "system" fn(*mut c_void, *mut u32) -> *mut u8;
+    type ReleaseReceiveFn = unsafe extern "system" fn(*mut c_void, *const u8);
+    type AllocateSendFn = unsafe extern "system" fn(*mut c_void, u32) -> *mut u8;
+    type SendPacketFn = unsafe extern "system" fn(*mut c_void, *const u8);
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Loads `proc` from `dll`, erroring if the export is missing.
+    fn proc(dll: *mut c_void, name: &[u8]) -> io::Result<*const c_void> {
+        // SAFETY: `dll` is a valid module handle; `name` is a NUL-terminated
+        // ASCII byte string. GetProcAddress returns null on a missing export.
+        let p = unsafe { GetProcAddress(dll, name.as_ptr()) };
+        if p.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "wintun export not found",
+            ));
+        }
+        Ok(p)
+    }
+
+    /// An owned Wintun adapter + session and the resolved DLL entry points.
+    pub struct WintunDevice {
+        dll: *mut c_void,
+        adapter: *mut c_void,
+        session: *mut c_void,
+        receive: ReceivePacketFn,
+        release: ReleaseReceiveFn,
+        allocate: AllocateSendFn,
+        send: SendPacketFn,
+        end_session: EndSessionFn,
+        close_adapter: CloseAdapterFn,
+    }
+
+    impl WintunDevice {
+        pub fn open(name: &str) -> io::Result<Self> {
+            // SAFETY: `wintun.dll` name is NUL-terminated; null return = not found.
+            let dll = unsafe { LoadLibraryW(wide("wintun.dll").as_ptr()) };
+            if dll.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "wintun.dll not found",
+                ));
+            }
+            // Resolve every entry point up front, then transmute to fn pointers.
+            // SAFETY: each pointer is a valid, non-null export of the matching
+            // Wintun ABI; transmuting a code pointer to its declared fn type is
+            // the documented way to call a GetProcAddress result.
+            let create: CreateAdapterFn =
+                unsafe { std::mem::transmute(proc(dll, b"WintunCreateAdapter\0")?) };
+            let start: StartSessionFn =
+                unsafe { std::mem::transmute(proc(dll, b"WintunStartSession\0")?) };
+            let device = unsafe {
+                let adapter = create(
+                    wide(name).as_ptr(),
+                    wide("Warren").as_ptr(),
+                    std::ptr::null(),
+                );
+                if adapter.is_null() {
+                    let err = GetLastError();
+                    FreeLibrary(dll);
+                    return Err(io::Error::from_raw_os_error(err as i32));
+                }
+                let session = start(adapter, RING_CAPACITY);
+                if session.is_null() {
+                    let err = GetLastError();
+                    let close: CloseAdapterFn =
+                        std::mem::transmute(proc(dll, b"WintunCloseAdapter\0")?);
+                    close(adapter);
+                    FreeLibrary(dll);
+                    return Err(io::Error::from_raw_os_error(err as i32));
+                }
+                Self {
+                    dll,
+                    adapter,
+                    session,
+                    receive: std::mem::transmute(proc(dll, b"WintunReceivePacket\0")?),
+                    release: std::mem::transmute(proc(dll, b"WintunReleaseReceivePacket\0")?),
+                    allocate: std::mem::transmute(proc(dll, b"WintunAllocateSendPacket\0")?),
+                    send: std::mem::transmute(proc(dll, b"WintunSendPacket\0")?),
+                    end_session: std::mem::transmute(proc(dll, b"WintunEndSession\0")?),
+                    close_adapter: std::mem::transmute(proc(dll, b"WintunCloseAdapter\0")?),
+                }
+            };
+            Ok(device)
+        }
+    }
+
+    impl RawTunDevice for WintunDevice {
+        fn read_frame(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let mut size: u32 = 0;
+            // SAFETY: `session` is a live Wintun session; `receive` returns a
+            // pointer to `size` bytes owned by the ring (released below) or null.
+            let pkt = unsafe { (self.receive)(self.session, &mut size) };
+            if pkt.is_null() {
+                // No packet ready maps to WouldBlock so the async driver can wait.
+                let err = unsafe { GetLastError() };
+                return if err == ERROR_NO_MORE_ITEMS {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "no packet"))
+                } else {
+                    Err(io::Error::from_raw_os_error(err as i32))
+                };
+            }
+            let n = (size as usize).min(buf.len());
+            // SAFETY: `pkt` points to `size` valid bytes; we copy at most `n`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(pkt, buf.as_mut_ptr(), n);
+                (self.release)(self.session, pkt);
+            }
+            Ok(n)
+        }
+
+        fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+            // SAFETY: allocate a send slot of the frame's size; null = ring full.
+            let slot = unsafe { (self.allocate)(self.session, frame.len() as u32) };
+            if slot.is_null() {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "send ring full"));
+            }
+            // SAFETY: `slot` points to `frame.len()` writable bytes owned by the
+            // ring until `send` hands it to the driver.
+            unsafe {
+                std::ptr::copy_nonoverlapping(frame.as_ptr(), slot, frame.len());
+                (self.send)(self.session, slot);
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for WintunDevice {
+        fn drop(&mut self) {
+            // SAFETY: tear down in reverse order of creation; all handles are live
+            // until here, and the DLL outlives the calls.
+            unsafe {
+                (self.end_session)(self.session);
+                (self.close_adapter)(self.adapter);
+                FreeLibrary(self.dll);
+            }
+        }
+    }
+
+    // The handles are owned by this struct and only used behind `&mut self`.
+    // SAFETY: Wintun sessions are safe to move between threads; the device is
+    // never aliased (it lives in one TunBridge).
+    unsafe impl Send for WintunDevice {}
 }
 
 /// Sets `O_NONBLOCK` on `fd` so an async driver can multiplex it (Unix). Used by
