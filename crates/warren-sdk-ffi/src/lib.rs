@@ -272,6 +272,53 @@ pub struct FfiClientOptions {
     pub daita_machine: Option<String>,
 }
 
+/// Optional per-proxy knobs for the `start_proxy*` methods.
+///
+/// Both default to `None`: pass `None` for the record (or leave the fields
+/// unset) to keep the SOCKS5-only datapath resolving DNS at the exit gateway.
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct FfiProxyOptions {
+    /// Also bind an HTTP `CONNECT` proxy at this address (for example
+    /// `127.0.0.1:0` for an ephemeral port). `None` binds SOCKS5 only.
+    #[uniffi(default = None)]
+    pub http_listen: Option<String>,
+    /// Resolve DNS over the tunnel at this IPv4 address (port 53 implied) instead
+    /// of the exit gateway (`10.66.0.1`). Needed for an exit that runs no
+    /// in-tunnel DNS forwarder (`dns_disabled`). The override still egresses over
+    /// the tunnel, never the host resolver. `None` uses the gateway forwarder.
+    #[uniffi(default = None)]
+    pub dns_server: Option<String>,
+}
+
+/// Builds a [`ProxyConfig`] from the bound SOCKS5 address and the optional
+/// per-proxy knobs, parsing the override addresses and surfacing a clear error.
+fn build_proxy_config(
+    socks5: SocketAddr,
+    options: Option<FfiProxyOptions>,
+) -> Result<ProxyConfig, FfiError> {
+    let options = options.unwrap_or_default();
+    let http = match options.http_listen {
+        Some(a) => Some(a.parse::<SocketAddr>().map_err(|_| FfiError::Client {
+            message: "invalid http listen address".to_owned(),
+        })?),
+        None => None,
+    };
+    let dns_server = match options.dns_server {
+        Some(a) => Some(
+            a.parse::<std::net::Ipv4Addr>()
+                .map_err(|_| FfiError::Client {
+                    message: "invalid dns server address".to_owned(),
+                })?,
+        ),
+        None => None,
+    };
+    Ok(ProxyConfig {
+        socks5,
+        http,
+        dns_server,
+    })
+}
+
 /// A live Warren SDK client exposed across the FFI boundary.
 ///
 /// Wraps the default reqwest-backed [`DefaultClient`]. Async methods run on the
@@ -578,26 +625,23 @@ impl WarrenFfiClient {
     /// # Errors
     ///
     /// [`FfiError::InvalidHex`] for a malformed `exit_id_hex`; [`FfiError::Client`]
-    /// for a bad listen address, an exit id absent from the verified directory,
-    /// or a connect/datapath failure; [`FfiError::ServerStatus`] on a non-2xx
-    /// API reply.
+    /// for a bad SOCKS5/HTTP/DNS address in the arguments or `options`, an exit id
+    /// absent from the verified directory, or a connect/datapath failure;
+    /// [`FfiError::ServerStatus`] on a non-2xx API reply.
     pub async fn start_proxy(
         &self,
         exit_id_hex: String,
         socks5_listen: String,
+        options: Option<FfiProxyOptions>,
         observer: Option<Box<dyn ConnectionObserver>>,
     ) -> Result<Arc<WarrenFfiProxy>, FfiError> {
-        // Validate both arguments before any network so caller mistakes fail
+        // Validate every argument before any network so caller mistakes fail
         // fast and cheaply (and before any state is reported).
         let want = hex16(&exit_id_hex)?;
         let socks5: SocketAddr = socks5_listen.parse().map_err(|_| FfiError::Client {
             message: "invalid socks5 listen address".to_owned(),
         })?;
-        let cfg = ProxyConfig {
-            socks5,
-            http: None,
-            dns_server: None,
-        };
+        let cfg = build_proxy_config(socks5, options)?;
 
         // Forward each supervisor transition to the foreign observer (if any),
         // ignoring states this binding does not yet model (non_exhaustive).
@@ -656,17 +700,14 @@ impl WarrenFfiClient {
         &self,
         exit_id_hex: String,
         socks5_listen: String,
+        options: Option<FfiProxyOptions>,
         observer: Option<Box<dyn ConnectionObserver>>,
     ) -> Result<Arc<WarrenFfiSupervisedProxy>, FfiError> {
         let want = hex16(&exit_id_hex)?;
         let socks5: SocketAddr = socks5_listen.parse().map_err(|_| FfiError::Client {
             message: "invalid socks5 listen address".to_owned(),
         })?;
-        let cfg = ProxyConfig {
-            socks5,
-            http: None,
-            dns_server: None,
-        };
+        let cfg = build_proxy_config(socks5, options)?;
         // Pick the exit once up front so a bad id fails fast; the supervisor then
         // reconnects to this same exit across drops.
         let exit = self
@@ -703,6 +744,7 @@ impl WarrenFfiClient {
         &self,
         exit_id_hexes: Vec<String>,
         socks5_listen: String,
+        options: Option<FfiProxyOptions>,
         observer: Option<Box<dyn ConnectionObserver>>,
     ) -> Result<Arc<WarrenFfiSupervisedProxy>, FfiError> {
         let wanted: Vec<[u8; 16]> = exit_id_hexes
@@ -712,11 +754,7 @@ impl WarrenFfiClient {
         let socks5: SocketAddr = socks5_listen.parse().map_err(|_| FfiError::Client {
             message: "invalid socks5 listen address".to_owned(),
         })?;
-        let cfg = ProxyConfig {
-            socks5,
-            http: None,
-            dns_server: None,
-        };
+        let cfg = build_proxy_config(socks5, options)?;
         // Resolve the candidates once, preserving the caller's priority order.
         let directory = self
             .inner
@@ -1294,7 +1332,7 @@ mod tests {
         )
         .expect("valid build");
         let r = client
-            .start_proxy("not-hex".to_owned(), "127.0.0.1:0".to_owned(), None)
+            .start_proxy("not-hex".to_owned(), "127.0.0.1:0".to_owned(), None, None)
             .await;
         assert!(matches!(r, Err(FfiError::InvalidHex(_))));
     }
@@ -1313,9 +1351,67 @@ mod tests {
                 "ab".repeat(16),
                 "definitely not an address".to_owned(),
                 None,
+                None,
             )
             .await;
         assert!(matches!(r, Err(FfiError::Client { .. })));
+    }
+
+    #[tokio::test]
+    async fn start_proxy_rejects_bad_option_addresses_before_any_network() {
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(
+            id.mnemonic,
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+        )
+        .expect("valid build");
+        // A malformed HTTP listen address in the options fails fast.
+        let r = client
+            .start_proxy(
+                "ab".repeat(16),
+                "127.0.0.1:0".to_owned(),
+                Some(FfiProxyOptions {
+                    http_listen: Some("not an address".to_owned()),
+                    dns_server: None,
+                }),
+                None,
+            )
+            .await;
+        assert!(matches!(r, Err(FfiError::Client { .. })));
+        // A malformed DNS server address fails fast too.
+        let r = client
+            .start_proxy(
+                "ab".repeat(16),
+                "127.0.0.1:0".to_owned(),
+                Some(FfiProxyOptions {
+                    http_listen: None,
+                    dns_server: Some("nope".to_owned()),
+                }),
+                None,
+            )
+            .await;
+        assert!(matches!(r, Err(FfiError::Client { .. })));
+    }
+
+    #[test]
+    fn build_proxy_config_threads_optional_overrides() {
+        let socks5: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+        let cfg = build_proxy_config(
+            socks5,
+            Some(FfiProxyOptions {
+                http_listen: Some("127.0.0.1:8080".to_owned()),
+                dns_server: Some("10.66.0.1".to_owned()),
+            }),
+        )
+        .expect("valid options");
+        assert_eq!(cfg.socks5, socks5);
+        assert_eq!(cfg.http, Some("127.0.0.1:8080".parse().unwrap()));
+        assert_eq!(cfg.dns_server, Some("10.66.0.1".parse().unwrap()));
+        // None options leave the SOCKS5-only gateway-DNS default.
+        let plain = build_proxy_config(socks5, None).expect("default");
+        assert_eq!(plain.http, None);
+        assert_eq!(plain.dns_server, None);
     }
 
     #[tokio::test]
@@ -1328,7 +1424,7 @@ mod tests {
         )
         .expect("valid build");
         let r = client
-            .start_proxy_supervised("not-hex".to_owned(), "127.0.0.1:0".to_owned(), None)
+            .start_proxy_supervised("not-hex".to_owned(), "127.0.0.1:0".to_owned(), None, None)
             .await;
         assert!(matches!(r, Err(FfiError::InvalidHex(_))));
     }
@@ -1346,6 +1442,7 @@ mod tests {
             .start_proxy_supervised(
                 "ab".repeat(16),
                 "definitely not an address".to_owned(),
+                None,
                 None,
             )
             .await;
@@ -1366,6 +1463,7 @@ mod tests {
                 vec!["ab".repeat(16), "not-hex".to_owned()],
                 "127.0.0.1:0".to_owned(),
                 None,
+                None,
             )
             .await;
         assert!(matches!(r, Err(FfiError::InvalidHex(_))));
@@ -1384,6 +1482,7 @@ mod tests {
             .start_proxy_supervised_failover(
                 vec!["ab".repeat(16)],
                 "definitely not an address".to_owned(),
+                None,
                 None,
             )
             .await;
@@ -1408,7 +1507,7 @@ mod tests {
         )
         .expect("valid build");
         let r = client
-            .start_proxy("ab".repeat(16), "127.0.0.1:0".to_owned(), None)
+            .start_proxy("ab".repeat(16), "127.0.0.1:0".to_owned(), None, None)
             .await;
         assert!(matches!(
             r,
@@ -1443,6 +1542,7 @@ mod tests {
             .start_proxy(
                 "ab".repeat(16),
                 "127.0.0.1:0".to_owned(),
+                None,
                 Some(Box::new(observer)),
             )
             .await;
