@@ -536,6 +536,65 @@ impl<T: HttpTransport> WarrenClient<T> {
         Ok(MultihopPacketSink::from_arc(session, Some(handle)))
     }
 
+    /// Starts the PRIVILEGED TUN datapath over a multihop tunnel to `exit`:
+    /// opens a kernel TUN device named `tun_name`, applies the split-default
+    /// routing and the killswitch, and forwards raw IP packets between the device
+    /// and the sealed tunnel. This is the one-call entry for full-OS capture, the
+    /// privileged analogue of [`Self::start_proxy_multihop`].
+    ///
+    /// EXPERIMENTAL, Unix-only, requires root / `CAP_NET_ADMIN`, and is NOT YET
+    /// validated against a real exit (per CLAUDE.md that needs a real device +
+    /// privilege; it cannot be exercised from a headless CI). Behind the
+    /// `experimental-tun` feature. It composes already-tested pieces:
+    /// [`Self::connect_multihop`], `warren_tun::device::open_tun`, the
+    /// routing/killswitch applier, `warren_net::tun_channels` +
+    /// `TunBridge::run`, and `warren_net::forward_bidirectional`.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::Multihop`] if the tunnel handshake fails, or [`SdkError::Tun`]
+    /// if the device cannot be opened or the routing/killswitch cannot be applied.
+    #[cfg(all(unix, feature = "experimental-tun"))]
+    pub async fn start_tun_multihop(
+        &self,
+        exit: &VerifiedExit,
+        tun_name: &str,
+    ) -> Result<TunDatapathHandle, SdkError> {
+        use warren_tun::{KillswitchPlan, RoutingPlan, TunConfig};
+
+        let sink = self.connect_multihop(exit).await?;
+        let session = sink.session();
+        let ipv4 = session.assigned_ipv4();
+        // /32 host address on the tunnel; the split-default routes capture the
+        // rest. v6 is added only when the exit assigned one.
+        let mtu = u16::try_from(session.max_inner_payload()).unwrap_or(1280);
+        let config = TunConfig {
+            name: tun_name.to_owned(),
+            mtu,
+            ipv4: (ipv4, 32),
+            ipv6: session.assigned_ipv6().map(|v6| (v6, 128)),
+            exit_endpoint: exit.endpoint,
+            dns: vec![std::net::Ipv4Addr::new(10, 66, 0, 1).into()],
+        };
+
+        let device = warren_tun::device::open_tun(tun_name).map_err(SdkError::Tun)?;
+        let gateway = warren_tun::gateway::discover_default_gateway().map_err(SdkError::Tun)?;
+        warren_tun::apply::apply_routing(
+            &RoutingPlan::split_default(&config),
+            tun_name,
+            gateway,
+        )
+        .map_err(SdkError::Tun)?;
+        warren_tun::apply::apply_killswitch(&KillswitchPlan::nftables(&config))
+            .map_err(SdkError::Tun)?;
+
+        let (tun_sink, bridge) =
+            warren_net::tun_channels(device, warren_tun::Framing::for_target_os(), config.mtu);
+        let driver = tokio::spawn(bridge.run());
+        let pump = tokio::spawn(warren_net::forward_bidirectional(tun_sink, sink));
+        Ok(TunDatapathHandle { driver, pump })
+    }
+
     /// Starts the non-root proxy datapath over a multihop tunnel to `exit`. Same
     /// shape as [`Self::start_proxy`] but every packet is HPKE-sealed, so it
     /// works against production exits.
@@ -772,4 +831,24 @@ pub(crate) fn now_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Handle to a running privileged TUN datapath (from
+/// [`WarrenClient::start_tun_multihop`]). Dropping it stops the datapath: both
+/// background tasks are aborted, which closes the device and the tunnel.
+///
+/// EXPERIMENTAL, Unix-only, behind the `experimental-tun` feature.
+#[cfg(all(unix, feature = "experimental-tun"))]
+#[derive(Debug)]
+pub struct TunDatapathHandle {
+    driver: tokio::task::JoinHandle<std::io::Result<()>>,
+    pump: tokio::task::JoinHandle<Result<(), warren_net::NetError>>,
+}
+
+#[cfg(all(unix, feature = "experimental-tun"))]
+impl Drop for TunDatapathHandle {
+    fn drop(&mut self) {
+        self.driver.abort();
+        self.pump.abort();
+    }
 }

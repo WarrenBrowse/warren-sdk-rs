@@ -2620,6 +2620,7 @@ dependencies = [
  "warren-net",
  "warren-test-support",
  "warren-transport",
+ "warren-tun",
 ]
 
 [[package]]

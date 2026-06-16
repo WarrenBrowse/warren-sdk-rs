@@ -53,6 +53,10 @@ pub enum SdkError {
     /// Binding the local proxy listener failed.
     #[error("proxy listener bind failed")]
     Proxy(#[source] std::io::Error),
+    /// The privileged TUN datapath could not be set up (device open, routing or
+    /// killswitch application). EXPERIMENTAL, only from `start_tun_multihop`.
+    #[error("tun datapath setup failed")]
+    Tun(#[source] std::io::Error),
     /// DAITA was enabled with a named machine that is not in the curated pool.
     /// The machine name is a public protocol label, not identity material.
     #[error("unknown DAITA machine: {name}")]
