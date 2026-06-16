@@ -103,10 +103,15 @@ pinned by golden vectors where a wire format is involved. warren-core
   - `warren_net::forward_bidirectional(device_sink, tunnel_sink)`: the datapath
     glue that forwards raw IP packets both ways between any two `PacketSink`s, so
     a `TunPacketSink` (device) wires to a `MultihopPacketSink` (tunnel). Generic
-    over `PacketSink`, unit-tested over mock sinks (both directions + close). With
-    this, the FULL privileged datapath exists in code end to end: open device ->
-    `tun_channels` -> spawn `TunBridge::run` -> `forward_bidirectional` to the
-    multihop session. Only runtime execution on a real device + exit is left.
+    over `PacketSink`, unit-tested over mock sinks (both directions + close).
+  - `WarrenClient::start_tun_multihop(exit, tun_name)` (facade, `experimental-tun`,
+    Unix): the ONE-CALL privileged datapath entry, the analogue of
+    `start_proxy_multihop`. Composes `connect_multihop` -> `open_tun` -> build
+    `TunConfig` from the `IpAssign` -> apply the routing + killswitch plans ->
+    `tun_channels` + `TunBridge::run` + `forward_bidirectional`, returning a
+    `TunDatapathHandle` (drop = abort the tasks = tear down). Cross-checked on
+    Linux + macOS. So the FULL privileged datapath is now wired end to end FROM
+    THE FACADE; only privileged runtime execution on a real device + exit is left.
   - `warren_net::tun_sink::TunBridge::run` (Unix, feature-gated): the production
     async duplex loop over a REAL fd (tokio `AsyncFd` + `O_NONBLOCK`, multiplexing
     read/write on the full-duplex fd, calling the tested `pump_*_once`).
