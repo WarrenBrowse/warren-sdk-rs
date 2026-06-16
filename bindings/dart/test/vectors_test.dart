@@ -55,4 +55,37 @@ void main() {
           reason: 'addressFromMnemonic(<mnemonic>)');
     }
   });
+
+  test('generateIdentity returns a self-consistent record', () {
+    // Record lift over the FFI: the returned mnemonic must re-derive the same
+    // address, and the pubkey must SS58-encode to it.
+    final id = ffi.generateIdentity();
+    expect(id.mnemonic.split(' ').length, equals(12));
+    expect(id.address, startsWith('wb'));
+    expect(ffi.addressFromMnemonic(id.mnemonic), equals(id.address));
+    expect(ffi.ss58Encode(id.publicKeyHex), equals(id.address));
+  });
+
+  test('signRequest round-trips a deterministic record', () {
+    // A multi-argument call returning a Result<record>: the signer's pubkey must
+    // equal the mnemonic's address, the clock + nonce echo, and the signature is
+    // a 128-hex Ed25519 signature. (The frozen signature vector keys on a raw
+    // seed, which the mnemonic-based FFI cannot take, so we pin shape + identity.)
+    final bip = (vectors['bip39'] as Map)['vectors'] as List;
+    final mnemonic = (bip.first as Map)['mnemonic'] as String;
+    final address = (bip.first as Map)['address'] as String;
+    const nonce = '09090909090909090909090909090909';
+    final h = ffi.signRequest(
+      mnemonic: mnemonic,
+      method: 'POST',
+      path: '/v1/register',
+      body: '{"voucher":"abc"}',
+      timestamp: 1700000000,
+      nonceHex: nonce,
+    );
+    expect(h.pubkeySs58, equals(address));
+    expect(h.timestamp, equals(1700000000));
+    expect(h.nonceHex, equals(nonce));
+    expect(h.signatureHex, matches(RegExp(r'^[0-9a-f]{128}$')));
+  });
 }
