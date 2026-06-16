@@ -95,6 +95,7 @@ pub struct WarrenClientBuilder {
     pub(crate) multihop_root_pubkey_pins: Vec<String>,
     pub(crate) allow_any_server_key: bool,
     pub(crate) auto_local_ip: bool,
+    pub(crate) wants_ipv6: bool,
     pub(crate) daita: bool,
     pub(crate) daita_machine: Option<String>,
     pub(crate) generation_store: Arc<dyn GenerationStore>,
@@ -159,6 +160,18 @@ impl WarrenClientBuilder {
     #[must_use]
     pub fn auto_local_ip(mut self) -> Self {
         self.auto_local_ip = true;
+        self
+    }
+
+    /// Requests a dual-stack IPv6 address from the exit on multihop tunnels.
+    ///
+    /// Off by default. When enabled the client asks the exit for an IPv6
+    /// allocation; an exit that serves no v6 simply echoes none and the tunnel
+    /// stays v4-only, so this is always safe to enable. When the exit does grant
+    /// v6, the datapath routes IPv6 egress through the tunnel.
+    #[must_use]
+    pub fn request_ipv6(mut self) -> Self {
+        self.wants_ipv6 = true;
         self
     }
 
@@ -271,6 +284,7 @@ impl WarrenClientBuilder {
             server_pubkey_pin: pin,
             multihop_root_pubkey_pins: self.multihop_root_pubkey_pins,
             auto_local_ip: self.auto_local_ip,
+            wants_ipv6: self.wants_ipv6,
             daita: self.daita,
             daita_machine: self.daita_machine,
             generation_store: self.generation_store,
@@ -294,6 +308,8 @@ pub struct WarrenClient<T> {
     pub(crate) multihop_root_pubkey_pins: Vec<String>,
     /// Pin the QUIC endpoint to the default-route source IP for each exit.
     pub(crate) auto_local_ip: bool,
+    /// Request a dual-stack IPv6 allocation from the exit on multihop tunnels.
+    pub(crate) wants_ipv6: bool,
     /// Enable DAITA uplink cover traffic on multihop tunnels.
     pub(crate) daita: bool,
     /// Pin DAITA to a named curated machine (else a random pool pick).
@@ -318,6 +334,7 @@ impl WarrenClient<()> {
             multihop_root_pubkey_pins: Vec::new(),
             allow_any_server_key: false,
             auto_local_ip: false,
+            wants_ipv6: false,
             daita: false,
             daita_machine: None,
             generation_store: Arc::new(InMemoryGenerationStore::default()),
@@ -504,6 +521,9 @@ impl<T: HttpTransport> WarrenClient<T> {
         let mut tunnel = MultihopClientTunnel::new(self.signing.clone());
         if self.auto_local_ip {
             tunnel = tunnel.with_auto_local_ip();
+        }
+        if self.wants_ipv6 {
+            tunnel = tunnel.with_ipv6(true);
         }
         let session = tunnel
             .connect(
@@ -702,10 +722,11 @@ impl<T: HttpTransport> WarrenClient<T> {
         let signing = self.signing.clone();
         let exit = exit.clone();
         let auto_local_ip = self.auto_local_ip;
+        let wants_ipv6 = self.wants_ipv6;
         self.spawn_supervised(cfg, move || {
             let signing = signing.clone();
             let exit = exit.clone();
-            async move { establish_multihop(signing, &exit, auto_local_ip).await }
+            async move { establish_multihop(signing, &exit, auto_local_ip, wants_ipv6).await }
         })
         .await
     }
@@ -738,6 +759,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         let signing = self.signing.clone();
         let exits = exits.to_vec();
         let auto_local_ip = self.auto_local_ip;
+        let wants_ipv6 = self.wants_ipv6;
         // Shared cursor: advanced only on a failed attempt, so a working exit is
         // kept (stable egress) and a broken one is rotated past on the next try.
         let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -747,7 +769,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             let cursor = Arc::clone(&cursor);
             async move {
                 let idx = cursor.load(Ordering::Relaxed) % exits.len();
-                match establish_multihop(signing, &exits[idx], auto_local_ip).await {
+                match establish_multihop(signing, &exits[idx], auto_local_ip, wants_ipv6).await {
                     Ok(tunnel) => Ok(tunnel),
                     Err(e) => {
                         cursor.fetch_add(1, Ordering::Relaxed);

@@ -197,10 +197,14 @@ pub(crate) async fn establish_multihop(
     signing: warren_identity::ed25519_dalek::SigningKey,
     exit: &VerifiedExit,
     auto_local_ip: bool,
+    wants_ipv6: bool,
 ) -> Result<EstablishedTunnel<MultihopPacketSink>, SdkError> {
     let mut tunnel = MultihopClientTunnel::new(signing);
     if auto_local_ip {
         tunnel = tunnel.with_auto_local_ip();
+    }
+    if wants_ipv6 {
+        tunnel = tunnel.with_ipv6(true);
     }
     let session = tunnel
         .connect(

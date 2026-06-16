@@ -603,6 +603,28 @@ fn builder_constructs_with_identity() {
 }
 
 #[test]
+fn request_ipv6_is_off_by_default_and_opt_in() {
+    let (id, _m) = WarrenIdentity::generate();
+    let default = WarrenClient::builder()
+        .identity(id)
+        .api_base("https://api.example.test")
+        .allow_any_server_key()
+        .build()
+        .expect("build");
+    assert!(!default.wants_ipv6, "IPv6 must be opt-in");
+
+    let (id2, _m2) = WarrenIdentity::generate();
+    let enabled = WarrenClient::builder()
+        .identity(id2)
+        .api_base("https://api.example.test")
+        .allow_any_server_key()
+        .request_ipv6()
+        .build()
+        .expect("build");
+    assert!(enabled.wants_ipv6);
+}
+
+#[test]
 fn build_requires_identity() {
     let result = WarrenClient::builder()
         .api_base("https://api.example.test")
