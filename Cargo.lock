@@ -2598,6 +2598,7 @@ dependencies = [
  "tokio-util",
  "warren-test-support",
  "warren-transport",
+ "warren-tun",
  "warren-wire",
 ]
 

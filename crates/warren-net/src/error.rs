@@ -20,6 +20,10 @@ pub enum NetError {
     /// A local I/O error (proxy listener, TUN device).
     #[error("io error")]
     Io(#[source] std::io::Error),
+    /// The privileged TUN datapath failed (the device worker stopped, or a frame
+    /// could not be framed/deframed).
+    #[error("tun datapath error")]
+    Tun(#[source] std::io::Error),
     /// A SOCKS5 protocol error on the proxy inbound.
     #[error("socks5 error")]
     Socks5(#[from] crate::socks5::Socks5Error),

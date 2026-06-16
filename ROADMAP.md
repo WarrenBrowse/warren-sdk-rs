@@ -88,12 +88,22 @@ pinned by golden vectors where a wire format is involved. warren-core
     unit-tested for exact argv) and the killswitch renders `nft -f -` apply /
     `nft delete table` teardown argv (unit-tested); `apply` is the thin
     `std::process::Command` executor that runs them (privileged, untestable here).
+  - `warren_net::tun_sink`: the TUN device is wired into the async `PacketSink`
+    seam. `tun_channels(device, framing, mtu)` returns a `TunPacketSink` (channel
+    ends implementing `PacketSink`) and a `TunBridge` (owns the `RawTunDevice`,
+    with `pump_inbound_once`/`pump_outbound_once` shuttling framed packets).
+    Unit-tested end to end over an in-memory mock device (both directions, the
+    utun header, and worker-gone errors). `warren-net` stays `unsafe_code =
+    forbid`; the bridge is safe over any `RawTunDevice`.
+  - `warren_tun::gateway::parse_default_gateway`: parses `ip route show default`
+    to find the physical gateway the carrier route pins to. Pure + unit-tested;
+    the `discover_default_gateway()` process call is feature-gated.
   Remaining (per CLAUDE.md cannot be done from the dev sandbox, so it stays
-  unvalidated): Windows Wintun device open, wiring the blocking device fd into
-  warren-net's async `PacketSink` (needs a real device to be meaningful), runtime
-  default-gateway discovery, and end-to-end validation against a real exit with
-  privilege. The `warren-net` crate itself stays `unsafe_code = forbid`; all
-  unsafe lives in `warren-tun` behind the feature.
+  unvalidated): the production duplex loop driver for a REAL fd (set `O_NONBLOCK`
+  + tokio `AsyncFd`, or two dup'd threads, since a kernel TUN fd is full-duplex;
+  the tested `pump_*_once` primitives are what it calls), Windows Wintun, and
+  end-to-end validation against a real exit with privilege. All unsafe lives in
+  `warren-tun` behind the feature.
 
 ## P7: port forwarding
 

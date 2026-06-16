@@ -13,6 +13,11 @@ publish.workspace = true
 warren-transport = { path = "../warren-transport" }
 # NAT-PMP wire codec for the port-forwarding client (RFC 6886 + Warren trailer).
 warren-wire = { path = "../warren-wire" }
+# TUN framing + device seam for the privileged-datapath packet sink. Default
+# features only (no `experimental-tun`): warren-net stays unsafe-free; the safe
+# channel bridge here works over any `RawTunDevice`, the real device is opened by
+# warren-tun behind its feature.
+warren-tun = { path = "../warren-tun" }
 bytes = { workspace = true }
 tokio = { workspace = true }
 tokio-util = "0.7"

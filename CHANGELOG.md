@@ -58,9 +58,19 @@ the pre-release `0.0.x` line.
   `experimental-tun` feature with hand-audited `unsafe` and `SAFETY` docs; the
   crate's manifest downgrades `unsafe_code` to `deny` and admits unsafe only under
   that feature (mirroring the `warren-sdk-ffi` boundary exception). The default
-  build pulls no new dependency and is unsafe-free. Applying the plans and
-  validating against a real exit with privilege remain to do (per CLAUDE.md, not
-  possible from the dev sandbox).
+  build pulls no new dependency and is unsafe-free.
+- The privileged applier landed (feature-gated): `RoutingPlan::to_ip_commands`
+  (`ip route replace` argv) and `KillswitchPlan::nft_apply_argv`/`nft_teardown_argv`
+  (both unit-tested for the exact argv), executed by `warren_tun::apply`; plus
+  the macOS `utun` device open and `gateway::parse_default_gateway` (parses `ip
+  route show default`, unit-tested).
+- `warren_net::tun_sink` wires the TUN device into the async `PacketSink`:
+  `tun_channels` returns a channel-backed `TunPacketSink` plus a `TunBridge`
+  worker (`pump_inbound_once`/`pump_outbound_once`), unit-tested end to end over
+  an in-memory mock device. `warren-net` stays `unsafe_code = forbid`.
+- Still to do (per CLAUDE.md, not possible from the dev sandbox): the real-fd
+  duplex loop driver, Windows Wintun, and end-to-end validation against a real
+  exit with privilege.
 
 ### Bindings
 

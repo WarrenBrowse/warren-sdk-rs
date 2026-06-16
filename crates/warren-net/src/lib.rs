@@ -38,6 +38,7 @@ pub mod portforward;
 pub mod proxy;
 pub mod sink;
 pub mod socks5;
+pub mod tun_sink;
 
 #[cfg(feature = "proxy")]
 pub use dns::{DnsError, RecordType, encode_query, parse_response};
@@ -57,6 +58,7 @@ pub use portforward::{
 #[cfg(feature = "proxy")]
 pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy, UdpConnector, UdpFlow};
 pub use sink::{BondedPacketSink, MultihopPacketSink, PacketSink, QuicPacketSink};
+pub use tun_sink::{TunBridge, TunPacketSink, tun_channels};
 /// The NAT-PMP mapping protocol selector (TCP or UDP), re-exported from the wire
 /// codec so callers can name it without depending on `warren-wire` directly.
 pub use warren_wire::natpmp::MapProto;

@@ -43,8 +43,10 @@
 pub mod apply;
 pub mod device;
 pub mod frame;
+pub mod gateway;
 pub mod plan;
 
-pub use device::{FramedTun, TunIo};
+pub use device::{FramedTun, RawTunDevice, TunIo};
 pub use frame::{Framing, PacketFamily};
+pub use gateway::parse_default_gateway;
 pub use plan::{KillswitchPlan, RouteOp, RoutingPlan, TunConfig};
