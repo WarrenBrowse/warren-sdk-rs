@@ -357,10 +357,12 @@ impl KillswitchPlan {
             .collect()
     }
 
-    /// macOS: argv that enables pf (`pfctl -e`).
+    /// macOS: argv that enables pf with `pfctl -E` (reference-counted), which
+    /// succeeds whether pf was already enabled or not, unlike `-e` (which errors
+    /// if pf is already running, for example under another VPN).
     #[must_use]
     pub fn pf_enable_argv() -> Vec<String> {
-        ["pfctl", "-e"].iter().map(|s| (*s).to_owned()).collect()
+        ["pfctl", "-E"].iter().map(|s| (*s).to_owned()).collect()
     }
 
     /// macOS: argv that flushes the loaded rules (`pfctl -F rules`).

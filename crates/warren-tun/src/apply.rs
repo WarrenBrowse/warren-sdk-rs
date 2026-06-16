@@ -22,6 +22,10 @@ use crate::plan::{KillswitchPlan, RoutingPlan, TunConfig};
 fn run(argv: &[String], stdin: Option<&str>) -> io::Result<()> {
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
+    // Discard the child's stdout/stderr: success/failure is read from the exit
+    // status, and inheriting a parent pipe that is no longer drained would kill
+    // the child with SIGPIPE when it writes (for example pfctl warnings).
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
     if stdin.is_some() {
         cmd.stdin(Stdio::piped());
     }
