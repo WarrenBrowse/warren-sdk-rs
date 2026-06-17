@@ -240,8 +240,30 @@ fn verify_operational_cert(
     root.verify(&payload, cert).is_ok()
 }
 
-/// Verifies an exit descriptor under the operational key (`/v2` then `/v1`).
-fn exit_descriptor_ok(operational: &VerifyingKey, d: &ExitDescriptorSigned) -> bool {
+/// Outcome of verifying an exit descriptor under the operational key.
+enum ExitAttestation {
+    /// `/v2` verified: `dns_disabled` is bound under the signature, trustworthy.
+    Attested {
+        /// The signed value of the `dns_disabled` bit.
+        dns_disabled: bool,
+    },
+    /// Only legacy `/v1` verified: `dns_disabled` is NOT covered by the
+    /// signature (the `/v1` preimage omits the dns byte), so it is advisory.
+    Unattested,
+    /// Neither PKI context verified the descriptor.
+    Rejected,
+}
+
+/// Verifies an exit descriptor under the operational key (`/v2` then `/v1`),
+/// reporting whether `dns_disabled` was covered by the signature. The `/v2` and
+/// `/v1` contexts use distinct domain-separation tags, so a `/v1` signature can
+/// never satisfy the `/v2` verifier: a descriptor that only validates under
+/// `/v1` carries an unauthenticated `dns_disabled` bit (mirrors warren-core
+/// `verify_exit_descriptor_with_dns_attestation`).
+fn exit_descriptor_attestation(
+    operational: &VerifyingKey,
+    d: &ExitDescriptorSigned,
+) -> ExitAttestation {
     let sig = Signature::from_bytes(&d.signature);
     let mut v2 = Vec::with_capacity(WARREN_PKI_OPERATIONAL_EXIT_V2.len() + 16 + 32 + 1);
     v2.extend_from_slice(WARREN_PKI_OPERATIONAL_EXIT_V2);
@@ -249,13 +271,18 @@ fn exit_descriptor_ok(operational: &VerifyingKey, d: &ExitDescriptorSigned) -> b
     v2.extend_from_slice(&d.exit_x25519_multihop_pubkey);
     v2.push(u8::from(d.dns_disabled));
     if operational.verify(&v2, &sig).is_ok() {
-        return true;
+        return ExitAttestation::Attested {
+            dns_disabled: d.dns_disabled,
+        };
     }
     let mut v1 = Vec::with_capacity(WARREN_PKI_OPERATIONAL_EXIT_V1.len() + 16 + 32);
     v1.extend_from_slice(WARREN_PKI_OPERATIONAL_EXIT_V1);
     v1.extend_from_slice(&d.exit_id);
     v1.extend_from_slice(&d.exit_x25519_multihop_pubkey);
-    operational.verify(&v1, &sig).is_ok()
+    if operational.verify(&v1, &sig).is_ok() {
+        return ExitAttestation::Unattested;
+    }
+    ExitAttestation::Rejected
 }
 
 /// Verifies a relay (entry) descriptor under the operational key:
@@ -294,14 +321,24 @@ fn node_attestation_ok(operational: &VerifyingKey, n: &NodeEntry) -> bool {
         .is_ok()
 }
 
-/// True iff every operational-signed part of `n` verifies: the relay descriptor,
-/// the exit descriptor, AND the geo+identity attestation. A node failing any
-/// check is not vouched by the offline key and is dropped (matches warren-core
-/// `node_fully_vouched`).
-fn node_fully_vouched(operational: &VerifyingKey, n: &NodeEntry) -> bool {
-    relay_descriptor_ok(operational, &n.relay)
-        && exit_descriptor_ok(operational, &n.exit)
-        && node_attestation_ok(operational, n)
+/// Verifies every operational-signed part of `n` (relay descriptor, exit
+/// descriptor, geo+identity attestation) and, when fully vouched, returns the
+/// effective `dns_disabled` to trust. A node failing any check is dropped
+/// (matches warren-core `node_fully_vouched`).
+///
+/// Downgrade-attack defense on `dns_disabled`: when only the legacy `/v1` exit
+/// signature verifies, the bit is unauthenticated. A `/v1`-only descriptor
+/// advertising `dns_disabled = true` is a suspected downgrade and is dropped
+/// (warren-core refuses the dial); otherwise the bit is forced to `false`.
+fn node_effective_dns_disabled(operational: &VerifyingKey, n: &NodeEntry) -> Option<bool> {
+    if !relay_descriptor_ok(operational, &n.relay) || !node_attestation_ok(operational, n) {
+        return None;
+    }
+    match exit_descriptor_attestation(operational, &n.exit) {
+        ExitAttestation::Attested { dns_disabled } => Some(dns_disabled),
+        ExitAttestation::Unattested if !n.exit.dns_disabled => Some(false),
+        ExitAttestation::Unattested | ExitAttestation::Rejected => None,
+    }
 }
 
 /// Verifies the directory and returns the trusted exits.
@@ -374,16 +411,18 @@ pub fn verify_multihop_directory(
     let exits = signed
         .nodes
         .into_iter()
-        .filter(|n| node_fully_vouched(&operational, n))
-        .map(|n| VerifiedExit {
-            exit_id: n.exit.exit_id,
-            exit_ed25519_pubkey: n.exit.exit_ed25519_pubkey,
-            exit_x25519_multihop_pubkey: n.exit.exit_x25519_multihop_pubkey,
-            endpoint: n.exit.endpoint,
-            country: n.country,
-            city: n.city,
-            weight: n.weight,
-            dns_disabled: n.exit.dns_disabled,
+        .filter_map(|n| {
+            let dns_disabled = node_effective_dns_disabled(&operational, &n)?;
+            Some(VerifiedExit {
+                exit_id: n.exit.exit_id,
+                exit_ed25519_pubkey: n.exit.exit_ed25519_pubkey,
+                exit_x25519_multihop_pubkey: n.exit.exit_x25519_multihop_pubkey,
+                endpoint: n.exit.endpoint,
+                country: n.country,
+                city: n.city,
+                weight: n.weight,
+                dns_disabled,
+            })
         })
         .collect();
 
@@ -867,6 +906,54 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {needle} in {json}"));
             last += pos + needle.len();
         }
+    }
+
+    /// Re-signs a node's exit descriptor under the legacy `/v1` payload (which
+    /// does NOT cover `dns_disabled`), advertising `dns_disabled_advertised` on
+    /// the wire. Models a directory served before the `/v2` dns attestation.
+    fn signed_node_v1(
+        op: &SigningKey,
+        tag: u8,
+        country: &str,
+        asn: u32,
+        dns_disabled_advertised: bool,
+    ) -> NodeEntry {
+        let mut n = signed_node(op, tag, country, asn);
+        n.exit.dns_disabled = dns_disabled_advertised;
+        n.exit.signature = op_sign(
+            op,
+            WARREN_PKI_OPERATIONAL_EXIT_V1,
+            &[&n.exit.exit_id, &n.exit.exit_x25519_multihop_pubkey],
+        );
+        n
+    }
+
+    #[test]
+    fn v1_only_descriptor_with_dns_disabled_false_verifies_as_false() {
+        // A legacy /v1 descriptor (no dns attestation) advertising the default
+        // dns_disabled=false is still accepted, surfacing dns_disabled=false.
+        let (root, op, server) = (key(1), key(2), key(3));
+        let node = signed_node_v1(&op, 10, "RO", 100, false);
+        let json = signed_directory_json(&root, &op, &server, vec![node], 1000, 1000 + 3600);
+        let dir = verify_multihop_directory(&json, &[&server_pin(&server)], &[]).unwrap();
+        assert_eq!(dir.exits.len(), 1, "legacy v1 descriptor is still accepted");
+        assert!(!dir.exits[0].dns_disabled);
+    }
+
+    #[test]
+    fn v1_only_descriptor_advertising_dns_disabled_true_is_dropped() {
+        // Downgrade-attack defense: a /v1 signature does not cover dns_disabled,
+        // so a descriptor that only validates under /v1 yet advertises
+        // dns_disabled=true is a suspected downgrade and must be dropped (parity
+        // with warren-core, which refuses the dial on an Unattested true bit).
+        let (root, op, server) = (key(1), key(2), key(3));
+        let node = signed_node_v1(&op, 10, "RO", 100, true);
+        let json = signed_directory_json(&root, &op, &server, vec![node], 1000, 1000 + 3600);
+        let dir = verify_multihop_directory(&json, &[&server_pin(&server)], &[]).unwrap();
+        assert!(
+            dir.exits.is_empty(),
+            "unattested dns_disabled=true node must be dropped"
+        );
     }
 
     #[test]
