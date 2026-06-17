@@ -84,22 +84,8 @@ the pre-release `0.0.x` line.
   `LoadLibraryW`/`GetProcAddress` + Wintun adapter/session ring I/O, no
   third-party deps), cross-compile-checked on the Windows target. So all three
   per-OS device backends now compile on their targets.
-- The Dart binding's pure identity surface WORKS: a small hand-written FFI
-  (`bindings/dart/lib/src/identity.dart`) over the cdylib, with `dart test`
-  replaying `vectors/identity.json` byte-for-byte (the generated bindings remain
-  blocked by the upstream generator's ABI bug).
 - Still to do (per CLAUDE.md, not possible from the dev sandbox): end-to-end
-  validation of the privileged datapath against a real exit with root + a device,
-  and the generated Dart full-surface bindings (a correct generator).
-
-### Bindings
-
-- Dart/Flutter binding scaffold under `bindings/dart/`: package manifest, a
-  reproducible `tool/generate.sh` (build the cdylib, run `uniffi-bindgen-dart`),
-  the loader entrypoint, the golden-vector replay harness stub, and an
-  integration guide (per-OS native-library bundling + API map). Generated
-  bindings are reproduced from the Rust crate, not checked in; completing and
-  validating the binding needs a Dart/Flutter toolchain.
+  validation of the privileged datapath against a real exit with root + a device.
 
 ### Single-hop DAITA
 
