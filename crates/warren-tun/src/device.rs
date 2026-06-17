@@ -468,10 +468,18 @@ mod windows {
             // SAFETY: each pointer is a valid, non-null export of the matching
             // Wintun ABI; transmuting a code pointer to its declared fn type is
             // the documented way to call a GetProcAddress result.
-            let create: CreateAdapterFn =
-                unsafe { std::mem::transmute(proc(dll, b"WintunCreateAdapter\0")?) };
-            let start: StartSessionFn =
-                unsafe { std::mem::transmute(proc(dll, b"WintunStartSession\0")?) };
+            let create = unsafe {
+                std::mem::transmute::<*const c_void, CreateAdapterFn>(proc(
+                    dll,
+                    b"WintunCreateAdapter\0",
+                )?)
+            };
+            let start = unsafe {
+                std::mem::transmute::<*const c_void, StartSessionFn>(proc(
+                    dll,
+                    b"WintunStartSession\0",
+                )?)
+            };
             let device = unsafe {
                 let adapter = create(
                     wide(name).as_ptr(),
@@ -486,8 +494,10 @@ mod windows {
                 let session = start(adapter, RING_CAPACITY);
                 if session.is_null() {
                     let err = GetLastError();
-                    let close: CloseAdapterFn =
-                        std::mem::transmute(proc(dll, b"WintunCloseAdapter\0")?);
+                    let close = std::mem::transmute::<*const c_void, CloseAdapterFn>(proc(
+                        dll,
+                        b"WintunCloseAdapter\0",
+                    )?);
                     close(adapter);
                     FreeLibrary(dll);
                     return Err(io::Error::from_raw_os_error(err as i32));
@@ -496,12 +506,30 @@ mod windows {
                     dll,
                     adapter,
                     session,
-                    receive: std::mem::transmute(proc(dll, b"WintunReceivePacket\0")?),
-                    release: std::mem::transmute(proc(dll, b"WintunReleaseReceivePacket\0")?),
-                    allocate: std::mem::transmute(proc(dll, b"WintunAllocateSendPacket\0")?),
-                    send: std::mem::transmute(proc(dll, b"WintunSendPacket\0")?),
-                    end_session: std::mem::transmute(proc(dll, b"WintunEndSession\0")?),
-                    close_adapter: std::mem::transmute(proc(dll, b"WintunCloseAdapter\0")?),
+                    receive: std::mem::transmute::<*const c_void, ReceivePacketFn>(proc(
+                        dll,
+                        b"WintunReceivePacket\0",
+                    )?),
+                    release: std::mem::transmute::<*const c_void, ReleaseReceiveFn>(proc(
+                        dll,
+                        b"WintunReleaseReceivePacket\0",
+                    )?),
+                    allocate: std::mem::transmute::<*const c_void, AllocateSendFn>(proc(
+                        dll,
+                        b"WintunAllocateSendPacket\0",
+                    )?),
+                    send: std::mem::transmute::<*const c_void, SendPacketFn>(proc(
+                        dll,
+                        b"WintunSendPacket\0",
+                    )?),
+                    end_session: std::mem::transmute::<*const c_void, EndSessionFn>(proc(
+                        dll,
+                        b"WintunEndSession\0",
+                    )?),
+                    close_adapter: std::mem::transmute::<*const c_void, CloseAdapterFn>(proc(
+                        dll,
+                        b"WintunCloseAdapter\0",
+                    )?),
                 }
             };
             Ok(device)

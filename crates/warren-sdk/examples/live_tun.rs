@@ -19,19 +19,25 @@
 //!      egress (e.g. `curl https://checkip.amazonaws.com` should show the exit's
 //!      IP, and `ip route` should show the split-default capture).
 //!
-//! Dropping the returned handle tears the datapath down (the routing/killswitch
-//! are NOT auto-reverted yet: that teardown is the next item once this is
-//! validated live).
+//! Dropping the returned handle tears the datapath down and reverts the routing
+//! and killswitch (the handle restores them on drop, and `start_tun_multihop`
+//! itself fail-safe reverts a partial setup).
+//!
+//! The privileged datapath (`start_tun_multihop`) is Unix-only and behind the
+//! `experimental-tun` feature, so this example is a no-op stub elsewhere (it must
+//! still compile under `--all-targets --all-features` on every target).
 
-use warren_sdk::WarrenClient;
-use warren_sdk::identity::WarrenIdentity;
-
-const API_BASE: &str = "https://api.warrenbrowse.com";
-const SERVER_PUBKEY_PIN: &str = "4c2c9253c426ae4db4cc88703f9ac802a020420c7fea6479c87af530ada72c3e";
-const TUN_NAME: &str = "warren0";
-
+#[cfg(all(unix, feature = "experimental-tun"))]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use warren_sdk::WarrenClient;
+    use warren_sdk::identity::WarrenIdentity;
+
+    const API_BASE: &str = "https://api.warrenbrowse.com";
+    const SERVER_PUBKEY_PIN: &str =
+        "4c2c9253c426ae4db4cc88703f9ac802a020420c7fea6479c87af530ada72c3e";
+    const TUN_NAME: &str = "warren0";
+
     let phrase = std::env::var("WARREN_MNEMONIC")
         .map_err(|_| "set WARREN_MNEMONIC to a subscribed account's 12 words")?;
     let identity = WarrenIdentity::from_mnemonic(phrase.trim())?;
@@ -69,4 +75,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(handle);
     println!("datapath torn down.");
     Ok(())
+}
+
+#[cfg(not(all(unix, feature = "experimental-tun")))]
+fn main() {
+    eprintln!(
+        "live_tun requires a Unix host built with --features experimental-tun \
+         (the privileged TUN datapath is Unix-only)"
+    );
 }
