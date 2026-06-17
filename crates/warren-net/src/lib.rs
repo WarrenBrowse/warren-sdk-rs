@@ -21,9 +21,10 @@
 //! What is implemented and tested today: the [`PacketSink`] seam and its QUIC
 //! implementation ([`QuicPacketSink`]), the SOCKS5 codec and proxy server, the
 //! smoltcp userspace netstack and its tunnel connector ([`TunnelConnector`]),
-//! the leak-level model ([`KillSwitchLevel`]), and [`ConnectMode`] selection.
-//! The per-OS TUN devices, routing/DNS plumbing and OS firewall killswitch are
-//! feature-gated work tracked in the roadmap.
+//! the leak-level model ([`KillSwitchLevel`]), and the proxy datapath config
+//! ([`ProxyConfig`]). The per-OS TUN devices, routing/DNS plumbing and OS
+//! firewall killswitch are feature-gated work tracked in the roadmap (the TUN
+//! datapath config lives in the `warren-tun` crate).
 
 #[cfg(feature = "proxy")]
 pub mod dns;
@@ -44,7 +45,7 @@ pub mod tun_sink;
 pub use dns::{DnsError, RecordType, encode_query, parse_response};
 pub use error::NetError;
 pub use killswitch::{KillSwitch, KillSwitchLevel, ProxyOnlyKillSwitch};
-pub use mode::{ConnectMode, ProxyConfig, TunConfig};
+pub use mode::ProxyConfig;
 #[cfg(feature = "proxy")]
 pub use netstack::{
     Ipv6Addressing, NetstackConfig, NetstackListener, NetstackStream, NetstackUdpSocket,

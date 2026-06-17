@@ -1,26 +1,6 @@
-//! Datapath selection: the non-root proxy mode (default) or the privileged TUN
-//! mode.
+//! Configuration for the non-root proxy datapath.
 
 use std::net::{Ipv4Addr, SocketAddr};
-
-/// How the SDK captures application traffic and feeds it to the tunnel.
-#[derive(Debug, Clone)]
-pub enum ConnectMode {
-    /// Non-root: expose a local SOCKS5 (and optional HTTP CONNECT) proxy.
-    /// Feature-complete on Linux, macOS and Windows without elevated
-    /// privileges. This is the default.
-    Proxy(ProxyConfig),
-    /// Privileged: capture all OS traffic via a TUN device with split-default
-    /// routing, DNS push and a killswitch. Requires root/admin (or `CAP_NET_ADMIN`
-    /// on Linux). Built per OS behind the `tun` feature.
-    Tun(TunConfig),
-}
-
-impl Default for ConnectMode {
-    fn default() -> Self {
-        ConnectMode::Proxy(ProxyConfig::default())
-    }
-}
 
 /// Configuration for the non-root proxy datapath.
 ///
@@ -52,13 +32,4 @@ impl Default for ProxyConfig {
             dns_server: None,
         }
     }
-}
-
-/// Configuration for the privileged TUN datapath.
-#[derive(Debug, Clone, Default)]
-pub struct TunConfig {
-    /// Desired TUN interface name (OS may adjust). Empty means OS default.
-    pub interface_name: String,
-    /// Whether to install a killswitch alongside the tunnel.
-    pub killswitch: bool,
 }
