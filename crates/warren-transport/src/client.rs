@@ -191,7 +191,7 @@ impl From<QuicDialError> for TunnelError {
 }
 
 /// Builder for an identity-bound client tunnel.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientTunnel {
     signing_key: SigningKey,
     features: u32,
@@ -199,6 +199,24 @@ pub struct ClientTunnel {
     device_id: [u8; DEVICE_ID_LEN],
     bind_local_ip: Option<SocketAddr>,
     auto_local_ip: bool,
+}
+
+// Manual Debug (no-log discipline): render only a short public-key prefix and the
+// non-sensitive flags. The signing key is secret, and `bind_local_ip` is the
+// user's own address, so neither is printed.
+impl std::fmt::Debug for ClientTunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let b = self.signing_key.verifying_key().to_bytes();
+        f.debug_struct("ClientTunnel")
+            .field(
+                "public_key",
+                &format_args!("{:02x}{:02x}{:02x}{:02x}..", b[0], b[1], b[2], b[3]),
+            )
+            .field("features", &self.features)
+            .field("daita_support", &self.daita_support)
+            .field("auto_local_ip", &self.auto_local_ip)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClientTunnel {
@@ -343,7 +361,6 @@ fn daita_state_from_spec(
 }
 
 /// An established tunnel session over which IP packets travel as QUIC datagrams.
-#[derive(Debug)]
 pub struct ClientSession {
     // Held so the endpoint outlives the connection.
     _endpoint: quinn::Endpoint,
@@ -356,6 +373,24 @@ pub struct ClientSession {
     /// Single-hop DAITA is negotiated (unlike the client-unilateral multihop
     /// path): the exit dictates the schedule both sides run.
     negotiated_daita: Option<warren_wire::DaitaConfig>,
+}
+
+// Manual Debug (no-log discipline): the quinn `conn` renders the peer/local
+// socket addresses (the user's real outbound IP and the exit IP), and the
+// assigned tunnel IPs are address material, so none are printed. Only the exit
+// public-key prefix and non-sensitive parameters are shown.
+impl std::fmt::Debug for ClientSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let b = &self.exit_pubkey;
+        f.debug_struct("ClientSession")
+            .field(
+                "exit_pubkey",
+                &format_args!("{:02x}{:02x}{:02x}{:02x}..", b[0], b[1], b[2], b[3]),
+            )
+            .field("assigned_max_mtu", &self.assigned_max_mtu)
+            .field("daita", &self.negotiated_daita.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClientSession {
