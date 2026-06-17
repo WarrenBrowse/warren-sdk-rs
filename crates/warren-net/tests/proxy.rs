@@ -133,6 +133,32 @@ async fn http_connect_relays_bytes_to_upstream() {
     assert_eq!(&got, b"warren-http");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn http_connect_forwards_pipelined_early_data() {
+    // A client that pipelines payload in the SAME write as the CONNECT head: the
+    // bytes after `\r\n\r\n` are read while scanning the head and must still reach
+    // the upstream (regression for the chunked head reader).
+    let echo = spawn_echo().await;
+    let proxy = spawn_http_proxy().await;
+
+    let mut client = TcpStream::connect(proxy).await.expect("connect proxy");
+    let req = format!("CONNECT {echo} HTTP/1.1\r\nHost: {echo}\r\n\r\nearly-bytes");
+    client.write_all(req.as_bytes()).await.unwrap();
+
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        client.read_exact(&mut byte).await.unwrap();
+        head.push(byte[0]);
+    }
+    assert!(String::from_utf8_lossy(&head).starts_with("HTTP/1.1 200"));
+
+    // The early payload was echoed back through the tunnel without a second write.
+    let mut got = [0u8; 11];
+    client.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"early-bytes");
+}
+
 /// A UDP flow backed by a real local UDP socket, standing in for the netstack
 /// flow so the relay loop is testable without a tunnel.
 struct LocalUdpFlow {

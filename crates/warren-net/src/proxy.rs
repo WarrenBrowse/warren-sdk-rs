@@ -486,7 +486,7 @@ async fn handle_connect<C: Connector>(
     mut client: TcpStream,
     connector: &C,
 ) -> Result<(), NetError> {
-    let target = match read_connect_target(&mut client).await? {
+    let (target, early_data) = match read_connect_target(&mut client).await? {
         Some(t) => t,
         None => {
             let _ = client
@@ -508,27 +508,43 @@ async fn handle_connect<C: Connector>(
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await
         .map_err(NetError::Io)?;
+    // A pipelining client may have sent tunnel bytes right after the head; they
+    // were read while scanning for the terminator, so forward them before the
+    // bidirectional copy takes over.
+    if !early_data.is_empty() {
+        upstream.write_all(&early_data).await.map_err(NetError::Io)?;
+    }
     tokio::io::copy_bidirectional(&mut client, &mut upstream)
         .await
         .map_err(NetError::Io)?;
     Ok(())
 }
 
-/// Reads the CONNECT request head and returns the target, or `None` if the
-/// method is not CONNECT or the head is malformed.
-async fn read_connect_target(client: &mut TcpStream) -> Result<Option<Target>, NetError> {
+/// Reads the CONNECT request head and returns the target plus any tunnel bytes
+/// already received after the head (`\r\n\r\n`), or `None` if the method is not
+/// CONNECT or the head is malformed.
+///
+/// Reads in chunks rather than one byte per syscall; any bytes past the head
+/// terminator are returned so the caller can replay them to the upstream.
+async fn read_connect_target(
+    client: &mut TcpStream,
+) -> Result<Option<(Target, Vec<u8>)>, NetError> {
     let mut head = Vec::with_capacity(256);
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        let n = client.read(&mut byte).await.map_err(NetError::Io)?;
+    let mut chunk = [0u8; 256];
+    let head_len = loop {
+        let n = client.read(&mut chunk).await.map_err(NetError::Io)?;
         if n == 0 {
             return Ok(None); // connection closed before a full head
         }
-        head.push(byte[0]);
+        head.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
         if head.len() > MAX_HTTP_HEAD {
             return Ok(None);
         }
-    }
+    };
+    let early_data = head.split_off(head_len);
     let text = match std::str::from_utf8(&head) {
         Ok(t) => t,
         Err(_) => return Ok(None),
@@ -542,7 +558,7 @@ async fn read_connect_target(client: &mut TcpStream) -> Result<Option<Target>, N
         Some(a) => a,
         None => return Ok(None),
     };
-    Ok(parse_authority(authority))
+    Ok(parse_authority(authority).map(|target| (target, early_data)))
 }
 
 /// Parses an HTTP `CONNECT` authority into a [`Target`], keeping domain names
