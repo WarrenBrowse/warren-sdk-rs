@@ -5,7 +5,7 @@
 //! the mnemonic alone reproduces the identity. Any future second factor comes
 //! from an upper layer (local keyring), never from BIP39.
 
-use bip39::Mnemonic;
+use bip39::{Language, Mnemonic};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Errors from parsing or generating a BIP39 mnemonic.
@@ -43,7 +43,11 @@ pub fn generate() -> String {
 ///
 /// BIP39 parsing error (unknown word, invalid length, bad checksum).
 pub fn seed_from_mnemonic(mnemonic: &str) -> Result<Zeroizing<[u8; 32]>, MnemonicError> {
-    let parsed = Mnemonic::parse(mnemonic)?;
+    // Pin English explicitly: `Mnemonic::parse` auto-detects the language from
+    // the bip39 crate's enabled features, so enabling another wordlist feature
+    // would silently change which words decode and therefore the derived seed
+    // (the identity). The frozen contract is English-only.
+    let parsed = Mnemonic::parse_in_normalized(Language::English, mnemonic)?;
     let mut full_seed = parsed.to_seed_normalized("");
     let mut seed32 = Zeroizing::new([0u8; 32]);
     seed32.copy_from_slice(&full_seed[..32]);
@@ -88,6 +92,20 @@ mod tests {
         let s1 = seed_from_mnemonic(TEST_MNEMONIC_24_ZERO).expect("valid m1");
         let s2 = seed_from_mnemonic(m2).expect("valid m2");
         assert_ne!(*s1, *s2);
+    }
+
+    #[test]
+    fn seed_from_mnemonic_pins_the_english_derivation_bytes() {
+        // Golden lock on the exact 32-byte seed (BIP39 PBKDF2-SHA512, empty
+        // passphrase, first 32 bytes). Any change to the language pin or the
+        // derivation would flip these bytes and break every existing identity.
+        const EXPECTED: [u8; 32] = [
+            0x40, 0x8b, 0x28, 0x5c, 0x12, 0x38, 0x36, 0x00, 0x4f, 0x4b, 0x88, 0x42, 0xc8, 0x93,
+            0x24, 0xc1, 0xf0, 0x13, 0x82, 0x45, 0x0c, 0x0d, 0x43, 0x9a, 0xf3, 0x45, 0xba, 0x7f,
+            0xc4, 0x9a, 0xcf, 0x70,
+        ];
+        let seed = seed_from_mnemonic(TEST_MNEMONIC_24_ZERO).expect("valid mnemonic");
+        assert_eq!(*seed, EXPECTED);
     }
 
     #[test]
