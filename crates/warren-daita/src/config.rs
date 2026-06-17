@@ -1,18 +1,22 @@
-//! The wire-level DAITA configuration and its errors.
+//! The DAITA driver configuration and its errors.
 
 use serde::{Deserialize, Serialize};
 
-/// DAITA v2 negotiated configuration, as it rides the wire.
+/// DAITA v2 configuration driving the local framework.
 ///
-/// On the single-hop path the exit selects one of these and ships it in the
-/// handshake `SetupAck`; on the multihop path the client picks its own from the
+/// This is the DRIVER-side input, not the wire codec: the frozen on-the-wire
+/// type is `warren_wire::DaitaConfig` (carried in the handshake `SetupAck`), and
+/// the transport converts it into this struct via [`DaitaConfig::from_specs`].
+/// The fields mirror the wire type one-for-one. On the single-hop path the exit
+/// selects the config; on the multihop path the client picks its own from the
 /// curated [`DaitaPool`](crate::DaitaPool) (the exit pads the reverse direction
 /// independently). Either way the machines are carried as the exact base64
-/// strings produced by `maybenot::Machine::serialize`, so both peers
-/// reconstruct byte-identical defenses.
+/// strings produced by `maybenot::Machine::serialize`, so both peers reconstruct
+/// byte-identical defenses.
 ///
-/// The field order is the frozen postcard layout shared with warren-core: a
-/// `Vec<String>` then two `f64`s. `deny_unknown_fields` matches the reference.
+/// The serde derive exists for local persistence/diagnostics by an embedder; it
+/// is never the wire encoder (that lives in `warren-wire`). `deny_unknown_fields`
+/// matches the reference type's strictness.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaitaConfig {

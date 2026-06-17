@@ -1238,6 +1238,25 @@ mod tests {
     }
 
     #[test]
+    fn client_with_options_enables_daita_without_a_named_machine() {
+        // The daita=true / daita_machine=None branch (SDK picks the machine) is
+        // distinct from the named-machine branch and must build.
+        let id = generate_identity();
+        let client = WarrenFfiClient::with_options(
+            id.mnemonic.clone(),
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+            FfiClientOptions {
+                daita: true,
+                daita_machine: None,
+                ..FfiClientOptions::default()
+            },
+        )
+        .expect("valid build with DAITA on and no named machine");
+        assert_eq!(client.address(), id.address);
+    }
+
+    #[test]
     fn client_with_options_defaults_match_the_basic_constructor() {
         let id = generate_identity();
         let client = WarrenFfiClient::with_options(
