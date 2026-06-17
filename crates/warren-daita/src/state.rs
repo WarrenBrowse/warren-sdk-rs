@@ -486,3 +486,142 @@ fn timer_from_maybenot(timer: maybenot::Timer) -> DaitaTimer {
         maybenot::Timer::All => DaitaTimer::Both,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn disabled_state() -> DaitaState {
+        DaitaState::from_config(&DaitaConfig::disabled(), Instant::now()).expect("disabled builds")
+    }
+
+    fn mid(raw: usize) -> MachineId {
+        MachineId::from_raw(raw)
+    }
+
+    #[test]
+    fn disabled_state_is_inert() {
+        let mut s = disabled_state();
+        let now = Instant::now();
+        assert!(!s.is_enabled());
+        assert_eq!(s.machines_count(), 0);
+        // Every event entry point is a no-op with no framework driving machines.
+        assert!(
+            s.fire_events(&[DaitaEvent::NormalSent, DaitaEvent::TunnelSent], now)
+                .is_empty()
+        );
+        s.on_real_uplink_sent(now);
+        s.on_downlink_received(false, now);
+        s.on_downlink_received(true, now);
+        assert_eq!(s.next_timer(), None);
+        assert!(s.drain_expired(now).is_empty());
+        assert_eq!(s.sleep_deadline(now), now + DAITA_PLACEHOLDER_SLEEP);
+        assert_eq!(s.metrics(), DaitaMetrics::default());
+    }
+
+    #[test]
+    fn send_padding_arms_an_action_timer_that_drains_once_due() {
+        let mut s = disabled_state();
+        let now = Instant::now();
+        let m = mid(0);
+        let timeout = Duration::from_millis(10);
+        s.apply_action(
+            DaitaAction::SendPadding {
+                machine: m,
+                timeout,
+                bypass: false,
+                replace: false,
+            },
+            now,
+        );
+        assert_eq!(s.next_timer(), Some(now + timeout));
+        assert!(s.drain_expired(now).is_empty(), "not yet due");
+        assert_eq!(
+            s.drain_expired(now + timeout),
+            vec![m],
+            "due: the machine is returned so the caller emits a dummy"
+        );
+        assert_eq!(s.metrics().padding_fired, 1);
+        assert_eq!(s.next_timer(), None, "the action timer is consumed");
+    }
+
+    #[test]
+    fn block_outgoing_fires_a_begin_then_an_end() {
+        let mut s = disabled_state();
+        let now = Instant::now();
+        let m = mid(1);
+        s.apply_action(
+            DaitaAction::BlockOutgoing {
+                machine: m,
+                timeout: Duration::from_millis(5),
+                duration: Duration::from_millis(20),
+                bypass: false,
+                replace: false,
+            },
+            now,
+        );
+        let fired = s.drain_expired(now + Duration::from_millis(5));
+        assert_eq!(fired, vec![m], "the block action timer is returned");
+        assert_eq!(s.metrics().blocking_begins, 1);
+        assert_eq!(
+            s.next_timer(),
+            Some(now + Duration::from_millis(25)),
+            "the block-end instant is armed and surfaced"
+        );
+        let ends = s.drain_expired(now + Duration::from_millis(25));
+        assert!(ends.is_empty(), "block-end fires no dummy");
+        assert_eq!(s.metrics().blocking_ends, 1);
+        assert_eq!(s.next_timer(), None);
+    }
+
+    #[test]
+    fn cancel_clears_the_action_timer() {
+        let mut s = disabled_state();
+        let now = Instant::now();
+        let m = mid(2);
+        s.apply_action(
+            DaitaAction::SendPadding {
+                machine: m,
+                timeout: Duration::from_millis(10),
+                bypass: false,
+                replace: false,
+            },
+            now,
+        );
+        s.apply_action(
+            DaitaAction::Cancel {
+                machine: m,
+                timer: DaitaTimer::Action,
+            },
+            now,
+        );
+        assert_eq!(s.next_timer(), None, "the action timer was cancelled");
+        assert!(s.drain_expired(now + Duration::from_millis(10)).is_empty());
+    }
+
+    #[test]
+    fn update_timer_arms_only_the_internal_timer_that_next_timer_ignores() {
+        let mut s = disabled_state();
+        let now = Instant::now();
+        let m = mid(3);
+        s.apply_action(
+            DaitaAction::UpdateTimer {
+                machine: m,
+                duration: Duration::from_millis(10),
+                replace: true,
+            },
+            now,
+        );
+        // The internal timer is deliberately NOT surfaced by next_timer (it is
+        // tracked but inert, matching warren-core); cancelling it must not panic.
+        assert_eq!(s.next_timer(), None);
+        s.apply_action(
+            DaitaAction::Cancel {
+                machine: m,
+                timer: DaitaTimer::Internal,
+            },
+            now,
+        );
+        assert_eq!(s.next_timer(), None);
+    }
+}
