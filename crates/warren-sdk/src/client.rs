@@ -551,6 +551,11 @@ impl<T: HttpTransport> WarrenClient<T> {
         let session = Arc::new(session);
         let driver = warren_transport::DaitaDriver::new(Arc::clone(&session), state);
         let handle = driver.handle();
+        // The `stop` notify is intentionally never signaled here: the returned sink
+        // and this clone hold the only `session` Arcs, so once the datapath drops
+        // them the QUIC tunnel closes and the driver's next cover send errors,
+        // ending the loop. The notify just satisfies `run`'s signature (the
+        // explicit-stop path is for callers that hold their own handle).
         let stop = Arc::new(tokio::sync::Notify::new());
         tokio::spawn(driver.run(stop));
         Ok(MultihopPacketSink::from_arc(session, Some(handle)))
