@@ -87,11 +87,19 @@ impl WarrenMultihopFrame {
     ///
     /// # Errors
     ///
-    /// [`MultihopFrameError::Codec`] if postcard encoding fails, or
-    /// [`MultihopFrameError::TooLarge`] if the encoded frame would exceed
-    /// `MAX_FRAME_BYTES` (the cap is enforced symmetrically with [`Self::decode`]
-    /// so an over-budget frame fails at the sender, not silently at the peer).
+    /// [`MultihopFrameError::UnsupportedVersion`] if `version` is not
+    /// [`WARREN_HPKE_VERSION_V1`], [`MultihopFrameError::Codec`] if postcard
+    /// encoding fails, or [`MultihopFrameError::TooLarge`] if the encoded frame
+    /// would exceed `MAX_FRAME_BYTES`. The version and size checks are enforced
+    /// symmetrically with [`Self::decode`] so a malformed frame fails at the
+    /// sender, not silently at the peer.
     pub fn encode(&self) -> Result<Vec<u8>, MultihopFrameError> {
+        if self.version != WARREN_HPKE_VERSION_V1 {
+            return Err(MultihopFrameError::UnsupportedVersion {
+                got: self.version,
+                expected: WARREN_HPKE_VERSION_V1,
+            });
+        }
         let bytes = postcard::to_stdvec(self)?;
         if bytes.len() > MAX_FRAME_BYTES {
             return Err(MultihopFrameError::TooLarge);
@@ -169,11 +177,27 @@ mod tests {
 
     #[test]
     fn decode_rejects_wrong_version() {
-        let mut f = sample();
-        f.version = 0x02;
-        let bytes = f.encode().unwrap();
+        // Corrupt the version byte directly: encode now refuses a non-v1 frame, so
+        // the wrong-version wire bytes are forged by flipping the leading byte.
+        let mut bytes = sample().encode().unwrap();
+        bytes[0] = 0x02;
         assert!(matches!(
             WarrenMultihopFrame::decode(&bytes).unwrap_err(),
+            MultihopFrameError::UnsupportedVersion {
+                got: 0x02,
+                expected: 0x01
+            }
+        ));
+    }
+
+    #[test]
+    fn encode_rejects_wrong_version() {
+        // Symmetric with decode: a frame stamped with a non-v1 version must fail
+        // at the sender rather than emit bytes the peer would reject.
+        let mut f = sample();
+        f.version = 0x02;
+        assert!(matches!(
+            f.encode().unwrap_err(),
             MultihopFrameError::UnsupportedVersion {
                 got: 0x02,
                 expected: 0x01
