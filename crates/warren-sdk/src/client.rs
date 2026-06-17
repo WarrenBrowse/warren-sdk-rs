@@ -641,8 +641,9 @@ impl<T: HttpTransport> WarrenClient<T> {
     ///
     /// # Errors
     ///
-    /// [`SdkError::Multihop`] from the tunnel, or [`SdkError::Proxy`] if the
-    /// local listener cannot bind.
+    /// [`SdkError::ExitDnsDisabled`] if the exit runs no DNS forwarder and no
+    /// resolver override is set, [`SdkError::Multihop`] from the tunnel, or
+    /// [`SdkError::Proxy`] if the local listener cannot bind.
     pub async fn start_proxy_multihop(
         &self,
         exit: &VerifiedExit,
@@ -727,8 +728,10 @@ impl<T: HttpTransport> WarrenClient<T> {
     ///
     /// # Errors
     ///
-    /// [`SdkError::Proxy`] if a local listener cannot bind. Tunnel establishment
-    /// happens in the background, so connect failures surface as state, not here.
+    /// [`SdkError::ExitDnsDisabled`] if the exit runs no DNS forwarder and no
+    /// resolver override is set, or [`SdkError::Proxy`] if a local listener cannot
+    /// bind. Tunnel establishment happens in the background, so connect failures
+    /// surface as state, not here.
     pub async fn start_proxy_multihop_supervised(
         &self,
         exit: &VerifiedExit,

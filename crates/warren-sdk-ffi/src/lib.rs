@@ -3,8 +3,9 @@
 //! Every function uses plain, owned, generic-free types and a serializable
 //! [`FfiError`], the shape `uniffi` generates Swift/Kotlin/Python/Ruby bindings
 //! from (and that `flutter_rust_bridge` can consume for Dart). The bindings are
-//! produced by the `uniffi-bindgen` binary in `src/bin/` against the built
-//! `cdylib`; see the crate README for the generate commands.
+//! produced by running the `uniffi-bindgen` binary in `src/bin/` against the
+//! built `cdylib` (for example `cargo run --bin uniffi-bindgen -- generate
+//! --library <cdylib> --language <swift|kotlin|python> --out-dir <dir>`).
 //!
 //! Two surfaces are exported: the pure, deterministic identity functions (shared
 //! by every sibling-language SDK and validated against `vectors/`), and a
