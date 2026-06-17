@@ -270,6 +270,18 @@ pub struct FfiClientOptions {
     /// `tamaraw`); `None` lets the SDK pick. Implies `daita`.
     #[uniffi(default = None)]
     pub daita_machine: Option<String>,
+    /// Alternative API hostnames (bare DNS names) tried in order when the primary
+    /// host fails to connect (anti-censorship fallback). Empty = primary only.
+    #[uniffi(default = [])]
+    pub api_alternative_hosts: Vec<String>,
+    /// Request a dual-stack IPv6 allocation from the exit on multihop tunnels.
+    /// Always safe: an exit that serves no v6 simply stays v4-only.
+    #[uniffi(default = false)]
+    pub request_ipv6: bool,
+    /// Pin the QUIC source IP to the default-route address per exit (multi-NIC
+    /// determinism). Off by default (the OS chooses the source).
+    #[uniffi(default = false)]
+    pub auto_local_ip: bool,
 }
 
 /// Optional per-proxy knobs for the `start_proxy*` methods.
@@ -480,6 +492,15 @@ impl WarrenFfiClient {
             builder = builder.daita_machine(machine);
         } else if options.daita {
             builder = builder.daita();
+        }
+        if !options.api_alternative_hosts.is_empty() {
+            builder = builder.api_alternative_hosts(options.api_alternative_hosts);
+        }
+        if options.request_ipv6 {
+            builder = builder.request_ipv6();
+        }
+        if options.auto_local_ip {
+            builder = builder.auto_local_ip();
         }
         let inner = builder.build().map_err(|e| FfiError::Client {
             message: e.to_string(),
@@ -1182,11 +1203,37 @@ mod tests {
                 state_dir: Some(state.to_string_lossy().into_owned()),
                 daita: true,
                 daita_machine: Some("tamaraw".to_owned()),
+                api_alternative_hosts: vec!["mirror.example.test".to_owned()],
+                request_ipv6: true,
+                auto_local_ip: true,
             },
         )
         .expect("valid build with full options");
         assert_eq!(client.address(), id.address);
         assert!(state.is_dir(), "persistence state directory is created");
+    }
+
+    #[test]
+    fn client_with_options_threads_censorship_and_dualstack_knobs() {
+        // The anti-censorship mirror hosts and the dual-stack / multi-NIC knobs
+        // must be reachable from the FFI surface (regression: they were SDK-only).
+        let id = generate_identity();
+        let client = WarrenFfiClient::with_options(
+            id.mnemonic.clone(),
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+            FfiClientOptions {
+                api_alternative_hosts: vec![
+                    "mirror-a.example.test".to_owned(),
+                    "mirror-b.example.test".to_owned(),
+                ],
+                request_ipv6: true,
+                auto_local_ip: true,
+                ..FfiClientOptions::default()
+            },
+        )
+        .expect("valid build with censorship + dual-stack options");
+        assert_eq!(client.address(), id.address);
     }
 
     #[test]
