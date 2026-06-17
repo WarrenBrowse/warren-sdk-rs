@@ -173,6 +173,14 @@ impl DaitaFramework {
 /// Per-machine timer slot. `action` drives the next `SendPadding`/`BlockOutgoing`
 /// expiry; `block_end_at` schedules the matching `BlockingEnd`; `internal` is the
 /// state-machine timer some machines re-trigger on.
+///
+/// `internal` is deliberately tracked but NOT drained: [`DaitaState::next_timer`]
+/// and [`DaitaState::drain_expired`] ignore it, so no `TimerEnd` is fed back to
+/// maybenot on its expiry. This mirrors warren-core's reference driver exactly
+/// (it likewise only arms/cancels `internal` and never reads it). Driving the
+/// internal timer here would change the curated machines' padding output and
+/// diverge from the reference: if it is ever wired up, it must land in
+/// warren-core first and be mirrored, not added unilaterally here.
 #[derive(Debug, Default, Clone, Copy)]
 struct MachineTimers {
     action: Option<Instant>,

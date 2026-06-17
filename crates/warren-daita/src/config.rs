@@ -81,6 +81,17 @@ pub enum DaitaError {
     #[error("invalid DAITA fractions (padding/blocking must be in 0.0..=1.0)")]
     InvalidFraction,
     /// The maybenot framework refused the configuration.
+    ///
+    /// Defensive: with the current maybenot (2.2.x) this is unreachable from
+    /// [`DaitaState::from_config`](crate::DaitaState::from_config), the only
+    /// constructor. The
+    /// framework's only failure modes are the padding/blocking fraction caps
+    /// (already rejected as [`InvalidFraction`](Self::InvalidFraction) before the
+    /// framework is built) and per-machine validation (already enforced by
+    /// `maybenot::Machine::from_str`, surfaced as
+    /// [`InvalidMachine`](Self::InvalidMachine)). The variant is kept so a future
+    /// maybenot that adds new framework-level checks surfaces here rather than
+    /// panicking; it therefore has no unit test by construction.
     #[error("DAITA framework rejected the configuration")]
     Framework(String),
 }
