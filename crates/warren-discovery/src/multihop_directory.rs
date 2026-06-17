@@ -178,6 +178,20 @@ pub struct VerifiedDirectory {
     pub signed_at: u64,
     /// Unix epoch seconds after which it is stale.
     pub expires_at: u64,
+    /// Nodes dropped because they were not fully vouched (bad relay/exit
+    /// descriptor, bad attestation, or an unattested `dns_disabled = true`).
+    /// Surfaced for diagnostics, matching warren-core; a non-zero value on an
+    /// otherwise-valid directory signals a tampered or partially-stale fleet.
+    pub dropped: usize,
+}
+
+impl VerifiedDirectory {
+    /// True if `now_unix_secs` is at or past the signed expiry (anti-freeze).
+    /// Mirrors [`VerifiedRelayList::is_expired`](crate::VerifiedRelayList::is_expired).
+    #[must_use]
+    pub fn is_expired(&self, now_unix_secs: u64) -> bool {
+        now_unix_secs >= self.expires_at
+    }
 }
 
 /// Errors verifying the multi-hop directory.
@@ -408,7 +422,8 @@ pub fn verify_multihop_directory(
 
     // (4) every operational-signed part of each node (relay descriptor, exit
     // descriptor, geo+RPK attestation); drop any node not fully vouched.
-    let exits = signed
+    let node_count = signed.nodes.len();
+    let exits: Vec<VerifiedExit> = signed
         .nodes
         .into_iter()
         .filter_map(|n| {
@@ -427,6 +442,7 @@ pub fn verify_multihop_directory(
         .collect();
 
     Ok(VerifiedDirectory {
+        dropped: node_count - exits.len(),
         exits,
         generation: signed.generation,
         signed_at: signed.signed_at,
@@ -810,6 +826,18 @@ mod tests {
         let dir = verify_multihop_directory(&json, &[&server_pin(&server)], &[]).unwrap();
         assert_eq!(dir.exits.len(), 1, "the forged-exit node must be dropped");
         assert_eq!(dir.exits[0].country, "RO");
+        assert_eq!(dir.dropped, 1, "the dropped count surfaces the rejected node");
+    }
+
+    #[test]
+    fn directory_is_expired_at_the_expiry_boundary() {
+        let (root, op, server) = (key(1), key(2), key(3));
+        let nodes = vec![signed_node(&op, 10, "RO", 100)];
+        let json = signed_directory_json(&root, &op, &server, nodes, 1000, 1000 + 3600);
+        let dir = verify_multihop_directory(&json, &[&server_pin(&server)], &[]).unwrap();
+        assert!(!dir.is_expired(4599), "one second before expiry is still fresh");
+        assert!(dir.is_expired(4600), "at expires_at the directory is stale");
+        assert_eq!(dir.dropped, 0, "a fully-vouched fleet drops nothing");
     }
 
     #[test]
