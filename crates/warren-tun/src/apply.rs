@@ -20,7 +20,12 @@ use crate::plan::{KillswitchPlan, RoutingPlan, TunConfig};
 ///
 /// The spawn error, or [`io::ErrorKind::Other`] if the command exits non-zero.
 fn run(argv: &[String], stdin: Option<&str>) -> io::Result<()> {
-    let mut cmd = Command::new(&argv[0]);
+    // Guard the slice index: a caller passing an empty argv is a bug, but it must
+    // surface as a recoverable error, not a panic mid-teardown.
+    let program = argv
+        .first()
+        .ok_or_else(|| io::Error::other("empty command argv"))?;
+    let mut cmd = Command::new(program);
     cmd.args(&argv[1..]);
     // Discard the child's stdout/stderr: success/failure is read from the exit
     // status, and inheriting a parent pipe that is no longer drained would kill
@@ -41,10 +46,7 @@ fn run(argv: &[String], stdin: Option<&str>) -> io::Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(format!(
-            "{} exited with {status}",
-            argv[0]
-        )))
+        Err(io::Error::other(format!("{program} exited with {status}")))
     }
 }
 
@@ -152,4 +154,17 @@ fn teardown_killswitch_impl() -> io::Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn teardown_killswitch_impl() -> io::Result<()> {
     run(&KillswitchPlan::nft_teardown_argv(), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_rejects_an_empty_argv_without_panicking() {
+        // The slice guard must turn a bug (empty argv) into a recoverable error
+        // before any indexing or spawn happens.
+        let err = run(&[], None).unwrap_err();
+        assert!(err.to_string().contains("empty command argv"));
+    }
 }
