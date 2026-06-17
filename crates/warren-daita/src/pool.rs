@@ -149,3 +149,70 @@ impl PoolEntry {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seeded() -> StdRng {
+        StdRng::from_seed([7u8; 32])
+    }
+
+    #[test]
+    fn default_pool_has_the_five_curated_families_in_order() {
+        let pool = DaitaPool::default_pool();
+        assert_eq!(pool.len(), 5);
+        assert!(!pool.is_empty());
+        assert_eq!(
+            pool.entry_names(),
+            [
+                "netflow",
+                "tamaraw",
+                "front",
+                "interspace_server",
+                "scrambler_server"
+            ]
+        );
+    }
+
+    #[test]
+    fn pick_with_name_returns_a_curated_family_and_a_built_config() {
+        let pool = DaitaPool::default_pool();
+        let mut rng = seeded();
+        let (name, cfg) = pool.pick_with_name(&mut rng).expect("non-empty pool picks");
+        assert!(pool.entry_names().contains(&name));
+        assert!(cfg.is_enabled(), "a picked machine yields an enabled config");
+    }
+
+    #[test]
+    fn pick_named_finds_every_family_and_rejects_an_unknown_name() {
+        let pool = DaitaPool::default_pool();
+        let mut rng = seeded();
+        for name in pool.entry_names() {
+            assert!(
+                pool.pick_named(name, &mut rng).is_some(),
+                "named family {name} must build"
+            );
+        }
+        assert!(pool.pick_named("does-not-exist", &mut rng).is_none());
+    }
+
+    #[test]
+    fn pick_os_yields_a_config_from_the_default_pool() {
+        assert!(DaitaPool::default_pool().pick_os().is_some());
+    }
+
+    #[test]
+    fn an_empty_pool_picks_nothing() {
+        // The default pool is always populated, so the `None` arms of the pickers
+        // are only reachable for a deliberately empty pool (crate-internal).
+        let pool = DaitaPool { entries: Vec::new() };
+        let mut rng = seeded();
+        assert!(pool.is_empty());
+        assert_eq!(pool.len(), 0);
+        assert!(pool.pick(&mut rng).is_none());
+        assert!(pool.pick_with_name(&mut rng).is_none());
+        assert!(pool.pick_named("netflow", &mut rng).is_none());
+        assert!(pool.pick_os().is_none());
+    }
+}
