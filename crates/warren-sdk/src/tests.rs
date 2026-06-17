@@ -530,6 +530,23 @@ async fn start_proxy_multihop_bonded_with_one_member_connects() {
     assert_eq!(handle.state(), TunnelState::Connected);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_multihop_bonded_treats_zero_members_as_one() {
+    // Direct test of the bonding builder's `n.max(1)` guard: requesting zero
+    // members must still produce a single-member bundle (one real tunnel), not an
+    // empty sink. The fake exit serves exactly one connection, so n=1-effective is
+    // what this can assert in-process.
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let (addr, keys) = warren_test_support::spawn_fake_multihop_exit(exit_key).await;
+    let exit = fake_verified_exit(addr, &keys);
+    let bonded = test_client()
+        .connect_multihop_bonded(&exit, 0)
+        .await
+        .expect("bonded connect over the fake exit");
+    assert_eq!(bonded.len(), 1, "n=0 is clamped to a single member");
+    assert!(!bonded.is_empty());
+}
+
 #[tokio::test]
 async fn start_proxy_multihop_refuses_a_dns_disabled_exit_without_a_resolver() {
     // The guard must fire before any connect attempt, so an unroutable address
