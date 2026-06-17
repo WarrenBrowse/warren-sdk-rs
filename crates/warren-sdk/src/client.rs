@@ -240,12 +240,17 @@ impl WarrenClientBuilder {
     ///
     /// # Errors
     ///
-    /// [`BuildError::MissingIdentity`] if no identity was set, or
+    /// [`BuildError::MissingIdentity`] if no identity was set,
     /// [`BuildError::UnpinnedServerKey`] if neither a pin nor
-    /// [`allow_any_server_key`](Self::allow_any_server_key) was set.
+    /// [`allow_any_server_key`](Self::allow_any_server_key) was set, or
+    /// [`BuildError::TransportInit`] if the bundled HTTP transport cannot
+    /// initialize (a broken TLS backend).
     #[cfg(feature = "reqwest-transport")]
     pub fn build(self) -> Result<WarrenClient<ReqwestTransport>, BuildError> {
-        self.build_with_transport(ReqwestTransport::new())
+        // Fallible construction (no panic across the FFI boundary): a broken TLS
+        // stack surfaces as BuildError::TransportInit instead of unwinding.
+        let transport = ReqwestTransport::try_new().map_err(|_| BuildError::TransportInit)?;
+        self.build_with_transport(transport)
     }
 
     /// Builds the client with a caller-provided transport.

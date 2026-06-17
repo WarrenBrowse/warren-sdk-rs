@@ -105,4 +105,8 @@ pub enum BuildError {
     /// No server pubkey pin was set and pinning was not explicitly waived.
     #[error("no server pubkey pin set; call server_pubkey_pin(..) or allow_any_server_key()")]
     UnpinnedServerKey,
+    /// The default reqwest transport could not initialize its TLS/HTTP stack.
+    /// Surfaced instead of panicking so an FFI embedder gets a recoverable error.
+    #[error("the default HTTP transport could not be initialized")]
+    TransportInit,
 }

@@ -22,26 +22,42 @@ pub struct ReqwestTransport {
 }
 
 impl ReqwestTransport {
-    /// Builds a transport with the default Warren timeouts.
+    /// Builds a transport with the default Warren timeouts, returning an error
+    /// instead of panicking if the underlying TLS/HTTP stack fails to initialize.
     ///
-    /// # Panics
+    /// Prefer this over [`new`](Self::new) on the FFI path: a panic would unwind
+    /// across the boundary, while this surfaces a recoverable error.
     ///
-    /// Panics if the underlying TLS stack fails to initialize, which indicates
-    /// a broken build environment rather than a runtime condition.
-    #[must_use]
-    pub fn new() -> Self {
-        let build = |sni: bool| {
+    /// # Errors
+    ///
+    /// [`TransportError::Io`] if the HTTP client cannot be built (a broken TLS
+    /// backend; never happens with a working ring/rustls build). The reqwest
+    /// cause is not propagated (no-log discipline).
+    pub fn try_new() -> Result<Self, TransportError> {
+        let build = |sni: bool| -> Result<reqwest::Client, TransportError> {
             reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(15))
                 .tls_sni(sni)
                 .build()
-                .expect("reqwest client builds with a working TLS backend")
+                .map_err(|_| TransportError::Io("tls/http client initialization failed".to_owned()))
         };
-        Self {
-            client: build(true),
-            client_no_sni: build(false),
-        }
+        Ok(Self {
+            client: build(true)?,
+            client_no_sni: build(false)?,
+        })
+    }
+
+    /// Builds a transport with the default Warren timeouts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying TLS stack fails to initialize, which indicates
+    /// a broken build environment rather than a runtime condition. Use
+    /// [`try_new`](Self::try_new) to handle that case without unwinding.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::try_new().expect("reqwest client builds with a working TLS backend")
     }
 }
 
@@ -103,6 +119,14 @@ impl HttpTransport for ReqwestTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_new_builds_a_transport_in_a_working_environment() {
+        // The fallible constructor must succeed with a normal ring/rustls build;
+        // `new()` is just this with an expect, so this also covers the happy path
+        // of the panic-free FFI construction route.
+        assert!(ReqwestTransport::try_new().is_ok());
+    }
 
     #[test]
     fn methods_map_to_their_reqwest_equivalents() {
