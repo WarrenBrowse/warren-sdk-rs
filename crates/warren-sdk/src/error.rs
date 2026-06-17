@@ -91,7 +91,8 @@ pub enum SdkError {
     Build(#[from] BuildError),
 }
 
-/// Reasons [`WarrenClientBuilder::build`] can reject a configuration.
+/// Reasons [`WarrenClientBuilder::build`](crate::WarrenClientBuilder::build) can
+/// reject a configuration.
 ///
 /// Returned instead of panicking so an FFI embedder gets a recoverable error
 /// rather than an unwind across the language boundary.

@@ -435,7 +435,8 @@ impl Default for RekeyPolicy {
 /// `WarrenMultihopFrame`s over QUIC datagrams.
 ///
 /// The session can rotate its HPKE epoch in place ([`rekey`](Self::rekey)) while
-/// the datapath keeps sealing under `&self`: the inner [`ClientSession`] sits
+/// the datapath keeps sealing under `&self`: the inner
+/// [`ClientSession`](warren_multihop::ClientSession) sits
 /// behind an `RwLock` (seals take a read lock, a rekey takes the write lock), so
 /// no datagram is sealed against a half-rotated context.
 pub struct MultihopSession {

@@ -2,10 +2,10 @@
 //!
 //! A real kernel TUN device does packet-atomic I/O: each read returns exactly one
 //! frame, each write submits exactly one frame. [`RawTunDevice`] models that, and
-//! [`FramedTun`] layers the per-OS [`Framing`](crate::Framing) on top so the
+//! [`FramedTun`] layers the per-OS [`Framing`] on top so the
 //! datapath above always speaks bare IP packets ([`TunIo`]).
 //!
-//! The actual per-OS device open ([`open_tun`]) is compiled ONLY under the
+//! The actual per-OS device open (`open_tun`) is compiled ONLY under the
 //! `experimental-tun` feature and is NOT exercised by any test (it needs root and
 //! a real kernel device). The framing adapter IS tested, over an in-memory mock.
 

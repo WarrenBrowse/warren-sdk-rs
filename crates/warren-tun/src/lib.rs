@@ -21,7 +21,7 @@
 //!   without privilege.
 //! - [`device`]: the device seam ([`device::TunIo`]) and a framing adapter over
 //!   any byte stream ([`device::FramedTun`]), unit-tested over an in-memory mock.
-//!   The actual per-OS device open ([`device::open_tun`]) is compiled ONLY under
+//!   The actual per-OS device open (`device::open_tun`) is compiled ONLY under
 //!   the `experimental-tun` feature and is NOT exercised by any test (it needs
 //!   root and a real kernel device).
 //!

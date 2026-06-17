@@ -85,6 +85,11 @@ missing_docs = "warn"
 unreachable_pub = "warn"
 rust_2018_idioms = { level = "deny", priority = -1 }
 
+[workspace.lints.rustdoc]
+# A broken doc link is a silent rot: deny it so a renamed symbol fails the doc
+# build instead of shipping a dead reference.
+broken_intra_doc_links = "deny"
+
 [workspace.lints.clippy]
 correctness = { level = "deny", priority = -1 }
 suspicious = { level = "warn", priority = -1 }

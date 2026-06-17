@@ -18,7 +18,8 @@ pub(crate) struct EstablishedTunnel<S> {
 }
 
 /// A self-healing proxy datapath (see
-/// [`WarrenClient::start_proxy_multihop_supervised`]). The local proxy
+/// [`WarrenClient::start_proxy_multihop_supervised`](crate::WarrenClient::start_proxy_multihop_supervised)).
+/// The local proxy
 /// address(es) stay stable while the supervisor rebuilds the tunnel across drops.
 /// Dropping the handle stops the supervisor and the datapath.
 pub struct SupervisedProxyHandle {
