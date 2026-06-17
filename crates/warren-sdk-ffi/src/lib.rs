@@ -393,19 +393,17 @@ impl WarrenFfiClient {
         server_pubkey_pin: String,
         multihop_root_pubkey_pins: Vec<String>,
     ) -> Result<Arc<Self>, FfiError> {
-        let identity =
-            WarrenIdentity::from_mnemonic(&mnemonic).map_err(|_| FfiError::InvalidMnemonic)?;
-        let mut builder = WarrenClient::builder()
-            .identity(identity)
-            .api_base(api_base)
-            .server_pubkey_pin(server_pubkey_pin);
-        for root in multihop_root_pubkey_pins {
-            builder = builder.multihop_root_pubkey_pin(root);
-        }
-        let inner = builder.build().map_err(|e| FfiError::Client {
-            message: e.to_string(),
-        })?;
-        Ok(Arc::new(Self { inner }))
+        // Thin wrapper over with_options: the option bag is the single place that
+        // wires roots, persistence and DAITA, so there is one code path to audit.
+        Self::with_options(
+            mnemonic,
+            api_base,
+            server_pubkey_pin,
+            FfiClientOptions {
+                multihop_root_pubkey_pins,
+                ..FfiClientOptions::default()
+            },
+        )
     }
 
     /// Like [`with_multihop_roots`](Self::with_multihop_roots) but also persists
@@ -426,31 +424,18 @@ impl WarrenFfiClient {
         multihop_root_pubkey_pins: Vec<String>,
         state_dir: String,
     ) -> Result<Arc<Self>, FfiError> {
-        let identity =
-            WarrenIdentity::from_mnemonic(&mnemonic).map_err(|_| FfiError::InvalidMnemonic)?;
-        let dir = std::path::Path::new(&state_dir);
-        let io_err = |_| FfiError::Client {
-            message: "persistence state directory is not usable".to_owned(),
-        };
-        std::fs::create_dir_all(dir).map_err(io_err)?;
-        let relay_gen = FileGenerationStore::new(dir.join("relay_generation")).map_err(io_err)?;
-        let mh_gen = FileGenerationStore::new(dir.join("multihop_generation")).map_err(io_err)?;
-        let key_store = FileServerKeyStore::new(dir.join("server_key")).map_err(io_err)?;
-
-        let mut builder = WarrenClient::builder()
-            .identity(identity)
-            .api_base(api_base)
-            .server_pubkey_pin(server_pubkey_pin)
-            .generation_store(Arc::new(relay_gen))
-            .multihop_generation_store(Arc::new(mh_gen))
-            .server_key_store(Arc::new(key_store));
-        for root in multihop_root_pubkey_pins {
-            builder = builder.multihop_root_pubkey_pin(root);
-        }
-        let inner = builder.build().map_err(|e| FfiError::Client {
-            message: e.to_string(),
-        })?;
-        Ok(Arc::new(Self { inner }))
+        // Thin wrapper over with_options (see with_multihop_roots): persistence
+        // store wiring lives only in with_options, never duplicated here.
+        Self::with_options(
+            mnemonic,
+            api_base,
+            server_pubkey_pin,
+            FfiClientOptions {
+                multihop_root_pubkey_pins,
+                state_dir: Some(state_dir),
+                ..FfiClientOptions::default()
+            },
+        )
     }
 
     /// Builds a client with the full set of optional knobs in [`FfiClientOptions`]
