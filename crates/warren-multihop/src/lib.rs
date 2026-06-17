@@ -56,6 +56,11 @@ pub enum SessionError {
     /// HPKE setup or exporter failure.
     #[error("hpke error")]
     Hpke,
+    /// A rekey was requested but the `u32` epoch counter would overflow, so the
+    /// session cannot rotate without risking nonce reuse on a stale epoch. Mirrors
+    /// warren-core, which fails the rekey rather than saturating the counter.
+    #[error("rekey failed: {0}")]
+    RekeyFailed(&'static str),
     /// The frame's epoch is neither the current nor the retained overlap epoch
     /// (a stale reverse frame past the overlap window, or a forward seal asked at
     /// a non-current epoch). `epoch` is a protocol counter, not identity material.
@@ -211,9 +216,15 @@ impl ClientSession {
     ///
     /// # Errors
     ///
-    /// [`SessionError::Hpke`] if the fresh `setup_sender` fails.
+    /// [`SessionError::Hpke`] if the fresh `setup_sender` fails;
+    /// [`SessionError::RekeyFailed`] if the `u32` epoch counter would overflow
+    /// (rotating would otherwise reuse a stale epoch and risk nonce reuse).
     pub fn rekey<R: CryptoRng + RngCore>(&mut self, rng: &mut R) -> Result<u32, SessionError> {
-        let next_epoch = self.current.epoch.saturating_add(1);
+        let next_epoch = self
+            .current
+            .epoch
+            .checked_add(1)
+            .ok_or(SessionError::RekeyFailed("epoch counter overflowed u32"))?;
         let next = Self::derive_epoch(&self.exit_x25519, next_epoch, rng)?;
         self.old = Some(std::mem::replace(&mut self.current, next));
         Ok(next_epoch)
@@ -453,6 +464,20 @@ mod tests {
         let (_priv, pub_) = WarrenKem::gen_keypair(&mut rng);
         let pub_bytes: [u8; 32] = pub_.to_bytes().into();
         ClientSession::new(&pub_bytes, [0x5a; EXIT_ID_LEN], &mut rng).expect("session")
+    }
+
+    #[test]
+    fn rekey_fails_closed_when_the_epoch_counter_would_overflow() {
+        // At the u32 ceiling, rekey must refuse rather than saturate: saturating
+        // would re-derive the SAME MAX epoch and risk per-packet nonce reuse.
+        // Mirrors warren-core's checked_add + RekeyFailed.
+        let mut rng = ChaCha20Rng::seed_from_u64(99);
+        let mut session = test_session(99);
+        session.current.epoch = u32::MAX;
+        assert!(matches!(
+            session.rekey(&mut rng),
+            Err(SessionError::RekeyFailed(_))
+        ));
     }
 
     #[test]
