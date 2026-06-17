@@ -99,3 +99,53 @@ impl HttpTransport for ReqwestTransport {
         Ok(HttpResponse { status, body })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn methods_map_to_their_reqwest_equivalents() {
+        assert_eq!(to_reqwest_method(Method::Get), reqwest::Method::GET);
+        assert_eq!(to_reqwest_method(Method::Post), reqwest::Method::POST);
+        assert_eq!(to_reqwest_method(Method::Delete), reqwest::Method::DELETE);
+    }
+
+    #[tokio::test]
+    async fn execute_classifies_a_refused_connection_as_a_connect_error() {
+        // Port 1 on loopback refuses immediately, so this drives the real send
+        // path and the `is_connect` classification that triggers host fallback.
+        // The error must NOT leak the address (no-log discipline).
+        let transport = ReqwestTransport::new();
+        let request = HttpRequest {
+            method: Method::Get,
+            url: "http://127.0.0.1:1/".to_owned(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            use_sni: true,
+        };
+        let err = transport.execute(request).await.unwrap_err();
+        match err {
+            TransportError::Connect(msg) => {
+                assert!(!msg.contains("127.0.0.1"), "must not leak the address");
+            }
+            other => panic!("expected a Connect error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_uses_the_no_sni_client_when_sni_is_disabled() {
+        // The SNI-less fallback client must also be wired into execute; a refused
+        // connection through it still classifies as a connect error.
+        let transport = ReqwestTransport::new();
+        let request = HttpRequest {
+            method: Method::Post,
+            url: "http://127.0.0.1:1/".to_owned(),
+            headers: vec![("x-test".to_owned(), "1".to_owned())],
+            body: b"body".to_vec(),
+            use_sni: false,
+        };
+        let err = transport.execute(request).await.unwrap_err();
+        assert!(matches!(err, TransportError::Connect(_)), "got {err:?}");
+    }
+}
