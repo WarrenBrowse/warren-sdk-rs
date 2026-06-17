@@ -50,6 +50,38 @@ fn run(argv: &[String], stdin: Option<&str>) -> io::Result<()> {
     }
 }
 
+/// Runs `argv` and returns its captured stdout, mapping a non-zero exit to an
+/// error. Used for the read-only pf snapshot commands (`pfctl -s info`/`-sr`).
+///
+/// # Errors
+///
+/// The spawn error, or [`io::ErrorKind::Other`] if the command exits non-zero.
+#[cfg(target_os = "macos")]
+fn run_capture(argv: &[String]) -> io::Result<String> {
+    let program = argv
+        .first()
+        .ok_or_else(|| io::Error::other("empty command argv"))?;
+    let out = Command::new(program)
+        .args(&argv[1..])
+        .stderr(Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "{program} exited with {}",
+            out.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Where the pre-apply pf snapshot is saved so teardown can restore it. Kept in
+/// root-owned `/var/run` (not world-writable `/tmp`): the killswitch only runs
+/// as root, and a non-root-writable directory denies a symlink-swap on the path.
+#[cfg(target_os = "macos")]
+fn pf_backup_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/run/warren-killswitch-pf-backup.conf")
+}
+
 /// Configures the TUN interface BEFORE routing: assigns the tunnel address(es),
 /// sets the MTU, and brings the link up (a freshly opened device is down and
 /// unaddressed, so routes via it do nothing until this runs).
@@ -104,6 +136,22 @@ pub fn apply_killswitch(config: &TunConfig) -> io::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn apply_killswitch_impl(config: &TunConfig) -> io::Result<()> {
+    // Snapshot pf's prior state BEFORE touching it, so teardown restores the
+    // pre-existing ruleset and enable-state instead of wiping them (the old
+    // teardown ran `pfctl -F rules` + `-d`, clobbering any host firewall config
+    // and fighting pf's `-E` refcount when another VPN was already running).
+    //
+    // Best-effort and non-fatal: the read-only `pfctl -s info`/`-sr` snapshot
+    // never blocks installing the killswitch. If it fails, teardown finds no
+    // backup and falls back to the old flush+disable. The killswitch rules and
+    // `-E` enable below are unchanged, so this cannot weaken the active block.
+    if let Ok(info) = run_capture(&KillswitchPlan::pf_show_info_argv())
+        && let Ok(rules) = run_capture(&KillswitchPlan::pf_show_rules_argv())
+    {
+        let was_enabled = KillswitchPlan::pf_status_is_enabled(&info);
+        let backup = format!("{}{}", KillswitchPlan::pf_backup_header(was_enabled), rules);
+        let _ = std::fs::write(pf_backup_path(), backup);
+    }
     run(
         &KillswitchPlan::pf_load_argv(),
         Some(&KillswitchPlan::pf_rules(config)),
@@ -147,8 +195,32 @@ pub fn teardown_killswitch() -> io::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn teardown_killswitch_impl() -> io::Result<()> {
-    let _ = run(&KillswitchPlan::pf_flush_argv(), None);
-    run(&KillswitchPlan::pf_disable_argv(), None)
+    let path = pf_backup_path();
+    match std::fs::read_to_string(&path) {
+        Ok(backup) => {
+            // Restore the captured ruleset (pfctl ignores the `#` header comment),
+            // returning the host's filter rules to their pre-apply state instead
+            // of flushing them to empty.
+            let restore = run(
+                &KillswitchPlan::pf_restore_argv(&path.to_string_lossy()),
+                None,
+            );
+            // Only disable pf if it was OFF before we enabled it. If it was
+            // already on (e.g. another VPN owns it), `pfctl -E` was
+            // reference-counted, so leaving it enabled respects that owner.
+            if !KillswitchPlan::parse_pf_backup_was_enabled(&backup) {
+                let _ = run(&KillswitchPlan::pf_disable_argv(), None);
+            }
+            let _ = std::fs::remove_file(&path);
+            restore
+        }
+        // No snapshot (it failed or never ran): fall back to the old best-effort
+        // teardown rather than leaving Warren's block rules loaded.
+        Err(_) => {
+            let _ = run(&KillswitchPlan::pf_flush_argv(), None);
+            run(&KillswitchPlan::pf_disable_argv(), None)
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

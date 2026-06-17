@@ -398,7 +398,69 @@ impl KillswitchPlan {
     pub fn pf_disable_argv() -> Vec<String> {
         ["pfctl", "-d"].iter().map(|s| (*s).to_owned()).collect()
     }
+
+    /// macOS: argv that prints pf status (`pfctl -s info`), whose first line is
+    /// `Status: Enabled`/`Disabled`. Captured before apply to learn whether pf
+    /// was already running, so teardown does not disable a pf another tool owns.
+    #[must_use]
+    pub fn pf_show_info_argv() -> Vec<String> {
+        ["pfctl", "-s", "info"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect()
+    }
+
+    /// macOS: argv that dumps the current filter ruleset (`pfctl -sr`). Captured
+    /// before apply so teardown can restore it instead of flushing to empty.
+    #[must_use]
+    pub fn pf_show_rules_argv() -> Vec<String> {
+        ["pfctl", "-sr"].iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// macOS: argv that loads a ruleset from `path` (`pfctl -f <path>`). Used at
+    /// teardown to restore the snapshot taken at apply.
+    #[must_use]
+    pub fn pf_restore_argv(path: &str) -> Vec<String> {
+        vec!["pfctl".to_owned(), "-f".to_owned(), path.to_owned()]
+    }
+
+    /// True if a `pfctl -s info` dump reports pf as enabled. The dump's first
+    /// line is `Status: Enabled ...` or `Status: Disabled`; anything else (an
+    /// unexpected format) is treated as not-enabled so teardown errs toward
+    /// disabling rather than leaving a pf we may have enabled running.
+    #[must_use]
+    pub fn pf_status_is_enabled(info_stdout: &str) -> bool {
+        info_stdout
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Status:"))
+            .is_some_and(|rest| rest.trim_start().starts_with("Enabled"))
+    }
+
+    /// The comment line prepended to the saved ruleset recording whether pf was
+    /// already enabled before apply. `pfctl` ignores `#` comments, so the backup
+    /// file is still directly reloadable with
+    /// [`pf_restore_argv`](Self::pf_restore_argv).
+    #[must_use]
+    pub fn pf_backup_header(was_enabled: bool) -> String {
+        format!("{PF_BACKUP_ENABLED_PREFIX}{was_enabled}\n")
+    }
+
+    /// Reads back the enable-state recorded by
+    /// [`pf_backup_header`](Self::pf_backup_header). A missing/unparseable header
+    /// reads as `false` (teardown then disables pf, the conservative choice on a
+    /// host whose prior state we cannot prove).
+    #[must_use]
+    pub fn parse_pf_backup_was_enabled(backup: &str) -> bool {
+        backup
+            .lines()
+            .find_map(|l| l.strip_prefix(PF_BACKUP_ENABLED_PREFIX))
+            .map(|v| v.trim() == "true")
+            .unwrap_or(false)
+    }
 }
+
+/// Comment prefix recording pf's pre-apply enable-state in the saved ruleset.
+const PF_BACKUP_ENABLED_PREFIX: &str = "# warren-pf-was-enabled=";
 
 #[cfg(test)]
 mod tests {
@@ -638,6 +700,45 @@ mod tests {
         assert!(pf.contains("pass out quick proto udp from any to 203.0.113.9 port 51820"));
         assert_eq!(KillswitchPlan::pf_load_argv(), ["pfctl", "-f", "-"]);
         assert_eq!(KillswitchPlan::pf_disable_argv(), ["pfctl", "-d"]);
+    }
+
+    #[test]
+    fn pf_snapshot_restore_argv_are_stable() {
+        assert_eq!(KillswitchPlan::pf_show_info_argv(), ["pfctl", "-s", "info"]);
+        assert_eq!(KillswitchPlan::pf_show_rules_argv(), ["pfctl", "-sr"]);
+        assert_eq!(
+            KillswitchPlan::pf_restore_argv("/var/run/x.conf"),
+            ["pfctl", "-f", "/var/run/x.conf"]
+        );
+    }
+
+    #[test]
+    fn pf_status_parser_reads_enabled_and_disabled() {
+        assert!(KillswitchPlan::pf_status_is_enabled(
+            "Status: Enabled for 0 days 00:01:02           Debug: Urgent\n"
+        ));
+        assert!(!KillswitchPlan::pf_status_is_enabled("Status: Disabled\n"));
+        // Leading whitespace (some pfctl builds indent) must still parse.
+        assert!(KillswitchPlan::pf_status_is_enabled("  Status: Enabled\n"));
+        // An unexpected dump errs toward not-enabled (teardown then disables).
+        assert!(!KillswitchPlan::pf_status_is_enabled("garbage output"));
+    }
+
+    #[test]
+    fn pf_backup_header_round_trips_the_enable_state() {
+        for was_enabled in [true, false] {
+            let header = KillswitchPlan::pf_backup_header(was_enabled);
+            // The saved ruleset is the header followed by the captured rules.
+            let backup = format!("{header}pass out all\nblock in all\n");
+            assert_eq!(
+                KillswitchPlan::parse_pf_backup_was_enabled(&backup),
+                was_enabled
+            );
+        }
+        // A backup with no header (e.g. a raw ruleset) reads as not-enabled.
+        assert!(!KillswitchPlan::parse_pf_backup_was_enabled(
+            "pass out all\n"
+        ));
     }
 
     #[test]
