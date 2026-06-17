@@ -826,7 +826,10 @@ mod tests {
         let dir = verify_multihop_directory(&json, &[&server_pin(&server)], &[]).unwrap();
         assert_eq!(dir.exits.len(), 1, "the forged-exit node must be dropped");
         assert_eq!(dir.exits[0].country, "RO");
-        assert_eq!(dir.dropped, 1, "the dropped count surfaces the rejected node");
+        assert_eq!(
+            dir.dropped, 1,
+            "the dropped count surfaces the rejected node"
+        );
     }
 
     #[test]
@@ -835,7 +838,10 @@ mod tests {
         let nodes = vec![signed_node(&op, 10, "RO", 100)];
         let json = signed_directory_json(&root, &op, &server, nodes, 1000, 1000 + 3600);
         let dir = verify_multihop_directory(&json, &[&server_pin(&server)], &[]).unwrap();
-        assert!(!dir.is_expired(4599), "one second before expiry is still fresh");
+        assert!(
+            !dir.is_expired(4599),
+            "one second before expiry is still fresh"
+        );
         assert!(dir.is_expired(4600), "at expires_at the directory is stale");
         assert_eq!(dir.dropped, 0, "a fully-vouched fleet drops nothing");
     }
