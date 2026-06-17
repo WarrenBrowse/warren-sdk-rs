@@ -752,7 +752,7 @@ mod real_exit_tests {
     use std::process::{Child, Command, Stdio};
     use std::time::Duration;
 
-    use warren_multihop::ClientSession;
+    use warren_multihop::{ClientSession, SessionError};
 
     /// Frozen BIP39 test vector. The exit derives BOTH its Ed25519 QUIC RPK
     /// (via the identity HKDF) and its long-lived X25519 multihop key from this
@@ -928,23 +928,27 @@ mod real_exit_tests {
             echo_roundtrip(&conn, &session, new_epoch, seq, &payload).await;
         }
 
-        // Overlap window: the exit keeps the previous encapsulated_key's session
-        // briefly (its cache TTL), so an in-flight OLD-epoch frame still opens.
-        echo_roundtrip(
-            &conn,
-            &session,
-            0,
-            100,
-            b"old-epoch frame in the overlap window",
-        )
-        .await;
+        // The overlap window keeps the OLD epoch openable for in-flight REVERSE
+        // frames the exit already sealed under it; it does NOT let the client
+        // seal a fresh FORWARD frame at the retired epoch. Forward frames are
+        // always sealed at the current epoch, so sealing at epoch 0 after the
+        // rotation is refused, overlap window or not (stamping epoch 0 onto a
+        // frame keyed by the epoch-1 context would be undecryptable garbage).
+        assert!(
+            matches!(
+                session.seal(b"forward seal at retired epoch", 0, 100),
+                Err(SessionError::UnknownEpoch { epoch: 0 })
+            ),
+            "forward frames must only seal at the current epoch, never the retired one"
+        );
 
-        // Closing the overlap drops the old context client-side: sealing at the
-        // retired epoch is now refused (no key material to reuse a stale nonce).
+        // Closing the overlap is client-side bookkeeping (it drops the old
+        // context used to open reverse stragglers); forward seals at the retired
+        // epoch stay refused either way.
         session.prune_old_epoch();
         assert!(
             session.seal(b"after prune", 0, 101).is_err(),
-            "old epoch must be unusable once the overlap window is pruned"
+            "old epoch must remain unusable for forward seals after the overlap is pruned"
         );
 
         // The current epoch is unaffected by the prune.
