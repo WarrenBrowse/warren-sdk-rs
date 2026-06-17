@@ -25,7 +25,10 @@ pub struct TunConfig {
     /// The exit's public UDP endpoint: traffic to it must keep using the physical
     /// link (otherwise the tunnel would route its own carrier packets into itself).
     pub exit_endpoint: SocketAddr,
-    /// DNS servers to push (resolved over the tunnel).
+    /// DNS servers the exit assigned, to be pushed as the system resolvers
+    /// (queried over the tunnel). Carried from the IP assignment but NOT yet
+    /// consumed: the experimental TUN apply path has no DNS-push step yet, so this
+    /// is reserved for that roadmap item rather than read today.
     pub dns: Vec<IpAddr>,
 }
 
