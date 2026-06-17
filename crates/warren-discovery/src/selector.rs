@@ -105,8 +105,18 @@ impl ExitSelector {
 
 /// Weighted random pick over a non-empty candidate slice.
 fn weighted_pick<'a, R: Rng + ?Sized>(candidates: &[&'a Relay], rng: &mut R) -> &'a Relay {
-    let total: u64 = candidates.iter().map(|r| r.weight()).sum();
-    debug_assert!(total > 0, "weighted_pick requires positive total weight");
+    // Saturating sum: the weights come from a signed-but-server-controlled list,
+    // so a hostile (yet validly signed) list with enormous weights must not
+    // overflow the total (a debug panic, or a release wrap that corrupts the
+    // roll). Saturating at u64::MAX keeps the pick well-defined.
+    let total: u64 = candidates
+        .iter()
+        .fold(0u64, |acc, r| acc.saturating_add(r.weight()));
+    if total == 0 {
+        // All weights zero: there is nothing to weight by, so pick the first
+        // deterministically rather than panicking in `gen_range(0..0)`.
+        return candidates[0];
+    }
     let mut roll = rng.gen_range(0..total);
     for relay in candidates {
         let w = relay.weight();
@@ -125,6 +135,28 @@ mod tests {
     use crate::exit_id::ExitId;
     use crate::query::LocationConstraint;
     use crate::relay::Location;
+
+    #[test]
+    fn weighted_pick_saturates_instead_of_overflowing_on_huge_weights() {
+        // Two near-u64::MAX weights sum past u64; the pick must not panic
+        // (debug overflow) and must still return a candidate.
+        let a = relay("FR", "Paris", u64::MAX, true);
+        let b = relay("DE", "Berlin", u64::MAX, true);
+        let cands = [&a, &b];
+        let mut rng = StdRng::seed_from_u64(1);
+        let picked = weighted_pick(&cands, &mut rng);
+        assert!(std::ptr::eq(picked, &a) || std::ptr::eq(picked, &b));
+    }
+
+    #[test]
+    fn weighted_pick_handles_all_zero_weights_without_panicking() {
+        // A degenerate all-zero-weight slice must not hit gen_range(0..0).
+        let a = relay("FR", "Paris", 0, true);
+        let b = relay("DE", "Berlin", 0, true);
+        let cands = [&a, &b];
+        let mut rng = StdRng::seed_from_u64(1);
+        assert!(std::ptr::eq(weighted_pick(&cands, &mut rng), &a));
+    }
 
     fn relay(country: &str, city: &str, weight: u64, active: bool) -> Relay {
         Relay::new(
