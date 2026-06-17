@@ -551,13 +551,26 @@ mod windows {
                     Err(io::Error::from_raw_os_error(err as i32))
                 };
             }
-            let n = (size as usize).min(buf.len());
-            // SAFETY: `pkt` points to `size` valid bytes; we copy at most `n`.
+            let size = size as usize;
+            // An oversized frame must not be silently truncated into the caller's
+            // buffer: that would hand up a corrupt, half-copied IP packet with no
+            // signal (the unix read paths return the whole frame and cannot
+            // truncate this way). Release the ring slot, then surface it.
+            if size > buf.len() {
+                // SAFETY: `pkt` is the live ring slot returned above; release it
+                // before returning so the ring does not leak the entry.
+                unsafe { (self.release)(self.session, pkt) };
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tun frame larger than read buffer",
+                ));
+            }
+            // SAFETY: `pkt` points to `size` valid bytes and `size <= buf.len()`.
             unsafe {
-                std::ptr::copy_nonoverlapping(pkt, buf.as_mut_ptr(), n);
+                std::ptr::copy_nonoverlapping(pkt, buf.as_mut_ptr(), size);
                 (self.release)(self.session, pkt);
             }
-            Ok(n)
+            Ok(size)
         }
 
         fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
