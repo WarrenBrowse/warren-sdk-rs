@@ -512,7 +512,10 @@ async fn handle_connect<C: Connector>(
     // were read while scanning for the terminator, so forward them before the
     // bidirectional copy takes over.
     if !early_data.is_empty() {
-        upstream.write_all(&early_data).await.map_err(NetError::Io)?;
+        upstream
+            .write_all(&early_data)
+            .await
+            .map_err(NetError::Io)?;
     }
     tokio::io::copy_bidirectional(&mut client, &mut upstream)
         .await
