@@ -181,7 +181,10 @@ mod tests {
         let mut rng = seeded();
         let (name, cfg) = pool.pick_with_name(&mut rng).expect("non-empty pool picks");
         assert!(pool.entry_names().contains(&name));
-        assert!(cfg.is_enabled(), "a picked machine yields an enabled config");
+        assert!(
+            cfg.is_enabled(),
+            "a picked machine yields an enabled config"
+        );
     }
 
     #[test]
@@ -206,7 +209,9 @@ mod tests {
     fn an_empty_pool_picks_nothing() {
         // The default pool is always populated, so the `None` arms of the pickers
         // are only reachable for a deliberately empty pool (crate-internal).
-        let pool = DaitaPool { entries: Vec::new() };
+        let pool = DaitaPool {
+            entries: Vec::new(),
+        };
         let mut rng = seeded();
         assert!(pool.is_empty());
         assert_eq!(pool.len(), 0);
