@@ -117,6 +117,11 @@ impl From<FfiMapProto> for MapProto {
 #[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiIdentity {
     /// The 12-word BIP39 mnemonic (secret).
+    ///
+    /// This is NOT zeroized: uniffi marshals it as a plain string that the
+    /// foreign side copies out of Rust memory, so the secret's lifecycle is the
+    /// embedder's responsibility (store it in the platform keystore and drop this
+    /// record promptly; Rust cannot wipe the foreign copy).
     pub mnemonic: String,
     /// The canonical SS58 `wb…` address.
     pub address: String,

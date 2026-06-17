@@ -241,7 +241,10 @@ pub fn decode_setup_ack(buf: &[u8]) -> Result<SetupAck, ProtocolError> {
         });
     }
     // The exit controls the DAITA fractions; reject out-of-range values before
-    // any padding/blocking runtime could act on them.
+    // any padding/blocking runtime could act on them. This gate is intentionally
+    // STRICTER than warren-core's decoder (which does not range-check here): the
+    // SDK fails closed on a hostile/malformed `SetupAck` rather than trusting the
+    // framework to clamp. Locked by `decode_rejects_out_of_range_daita_fractions`.
     if let Some(spec) = &a.daita_spec
         && !spec.fractions_valid()
     {
