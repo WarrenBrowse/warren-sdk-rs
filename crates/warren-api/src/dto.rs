@@ -7,7 +7,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// `POST /v1/register` request (unsigned).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RegisterAccountRequest {
     /// Ed25519 public key to bind, as a Warren SS58 address (`wb…`).
     pub pubkey_ss58: String,
@@ -16,6 +16,23 @@ pub struct RegisterAccountRequest {
     /// Optional referral code (`wref-<16hex>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub referral_code: Option<String>,
+}
+
+// The voucher secret is a bearer credential (80 bits of entropy, the sole proof
+// to redeem a subscription): never render it in logs or panics. Mirrors
+// warren-core's redacting Debug for this DTO.
+impl fmt::Debug for RegisterAccountRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RegisterAccountRequest")
+            .field("pubkey_ss58", &self.pubkey_ss58)
+            .field("voucher_secret", &"<redacted>")
+            // Presence is safe to log; the value is withheld.
+            .field(
+                "referral_code",
+                &self.referral_code.as_deref().map(|_| "<present>"),
+            )
+            .finish()
+    }
 }
 
 /// `POST /v1/register` response.
@@ -202,6 +219,40 @@ pub struct SupportReportResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_request_debug_redacts_the_voucher_secret() {
+        let req = RegisterAccountRequest {
+            pubkey_ss58: "wbPUBKEY".to_owned(),
+            voucher_secret: "ABCD-EFGH-JKMN-PQRS".to_owned(),
+            referral_code: Some("wref-0123456789abcdef".to_owned()),
+        };
+        let rendered = format!("{req:?}");
+        assert!(
+            !rendered.contains("ABCD-EFGH-JKMN-PQRS"),
+            "the bearer voucher secret must never appear in Debug output"
+        );
+        assert!(
+            !rendered.contains("wref-0123456789abcdef"),
+            "the referral code value must be withheld"
+        );
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("<present>"));
+        // The pubkey is public and kept for debugging correlation.
+        assert!(rendered.contains("wbPUBKEY"));
+    }
+
+    #[test]
+    fn register_request_debug_marks_absent_referral_as_none() {
+        let req = RegisterAccountRequest {
+            pubkey_ss58: "wbPUBKEY".to_owned(),
+            voucher_secret: "secret".to_owned(),
+            referral_code: None,
+        };
+        let rendered = format!("{req:?}");
+        assert!(rendered.contains("None"));
+        assert!(!rendered.contains("<present>"));
+    }
 
     #[test]
     fn check_apple_payment_debug_redacts_the_jws() {
