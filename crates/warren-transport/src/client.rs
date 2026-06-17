@@ -276,11 +276,20 @@ impl ClientTunnel {
         self.signing_key.verifying_key().to_bytes()
     }
 
-    /// Connects to an exit and completes the Setup/SetupAck handshake.
+    /// Connects to an exit and completes the bare Setup/SetupAck handshake.
     ///
     /// `exit_pubkey` is the exit's expected Ed25519 identity (from discovery);
     /// it is encoded into the SNI and re-checked against the authenticated peer
     /// key after the handshake.
+    ///
+    /// # Production reality
+    ///
+    /// Production warren-core exits read an HPKE-sealed multihop frame as the
+    /// first frame on every connection and reject a bare [`Setup`] with `malformed
+    /// setup frame`. This single-hop path therefore only completes against the
+    /// in-repo fake exits and test harnesses; the live datapath is
+    /// [`MultihopClientTunnel`](crate::MultihopClientTunnel). Use this only for
+    /// local/test exits, not to reach a real exit.
     ///
     /// # Errors
     ///
