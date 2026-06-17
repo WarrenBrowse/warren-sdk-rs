@@ -429,3 +429,83 @@ mod tests {
         assert!(matches!(result, Err(NetError::Tun(_))));
     }
 }
+
+/// Tests for the real-fd duplex loop (`TunBridge::run`). Gated like the method
+/// itself; a `UnixStream` pair stands in for the kernel TUN fd so the `AsyncFd`
+/// readiness wiring and shutdown paths run with no device and no root. The peer
+/// end stays alive and silent, so the device fd is never spuriously readable and
+/// the loop terminates only via the egress channel closing (a clean EOF on a
+/// stream would otherwise read `Ok(0)` forever, which a kernel TUN fd never
+/// does).
+#[cfg(all(unix, feature = "experimental-tun"))]
+#[cfg(test)]
+mod run_loop_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, RawFd};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    /// A [`RawTunDevice`] over one end of a `UnixStream` pair: a real, pollable
+    /// fd that `run`'s `AsyncFd` can register without a kernel device.
+    struct FdDevice(UnixStream);
+    impl RawTunDevice for FdDevice {
+        fn read_frame(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+        fn write_frame(&mut self, frame: &[u8]) -> std::io::Result<()> {
+            self.0.write_all(frame)
+        }
+    }
+    impl AsRawFd for FdDevice {
+        fn as_raw_fd(&self) -> RawFd {
+            self.0.as_raw_fd()
+        }
+    }
+
+    #[tokio::test]
+    async fn run_returns_ok_when_the_sink_is_dropped() {
+        let (dev_end, _peer) = UnixStream::pair().expect("socketpair");
+        let (sink, bridge) = tun_channels(FdDevice(dev_end), Framing::Bare, 1500);
+        let handle = tokio::spawn(bridge.run());
+
+        // Dropping the sink closes the egress sender; `outbound.recv()` then
+        // resolves to `None` and the loop exits cleanly.
+        drop(sink);
+
+        let res = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run must terminate promptly after the sink drops")
+            .expect("run task joins");
+        assert!(res.is_ok(), "clean shutdown must return Ok, got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn run_forwards_a_readable_device_frame_to_the_sink() {
+        let (dev_end, mut peer) = UnixStream::pair().expect("socketpair");
+        let (sink, bridge) = tun_channels(FdDevice(dev_end), Framing::Bare, 1500);
+        let handle = tokio::spawn(bridge.run());
+
+        // A minimal well-formed IPv4 header (version/IHL = 0x45, total length 20).
+        let packet = [
+            0x45u8, 0, 0, 20, 0, 0, 0, 0, 64, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+        ];
+        peer.write_all(&packet)
+            .expect("write makes the device fd readable");
+
+        let got = tokio::time::timeout(Duration::from_secs(5), sink.recv_packet())
+            .await
+            .expect("the forwarded packet arrives")
+            .expect("recv_packet ok");
+        assert_eq!(
+            &got[..],
+            &packet[..],
+            "run must deframe and forward the packet"
+        );
+
+        // Keep `peer` alive (no EOF); drop the sink to end the loop.
+        drop(sink);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        drop(peer);
+    }
+}
