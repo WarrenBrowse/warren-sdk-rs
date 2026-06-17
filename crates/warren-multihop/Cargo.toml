@@ -36,6 +36,12 @@ rand_chacha = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+# Direct postcard access for the datapath bench's grow-vs-presize comparison.
+postcard = { workspace = true }
+
+[[bench]]
+name = "datapath"
+harness = false
 
 [lints]
 workspace = true

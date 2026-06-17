@@ -2576,6 +2576,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hpke",
+ "postcard",
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
  "serde",

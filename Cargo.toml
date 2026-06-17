@@ -108,3 +108,9 @@ needless_pass_by_value = "warn"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+# Benchmarks run with production codegen (LTO + single codegen unit) so the
+# numbers reflect release behavior, with debug symbols kept for profiling.
+[profile.bench]
+inherits = "release"
+debug = true
