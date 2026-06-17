@@ -73,6 +73,14 @@ pub fn configure_interface(config: &TunConfig) -> io::Result<()> {
 ///
 /// The first `ip route` invocation that fails.
 pub fn apply_routing(plan: &RoutingPlan, dev: &str, physical_gateway: IpAddr) -> io::Result<()> {
+    // Fail closed on an address-family mismatch: pinning a v6 exit to a v4
+    // next-hop (or vice-versa) is rejected by the kernel and would otherwise
+    // leave the routing table half-applied (some routes in, the exit pin not).
+    if !plan.gateway_family_matches(physical_gateway) {
+        return Err(io::Error::other(
+            "physical gateway address family does not match the exit endpoint",
+        ));
+    }
     #[cfg(target_os = "macos")]
     let cmds = plan.to_macos_commands(dev, physical_gateway, "add");
     #[cfg(not(target_os = "macos"))]

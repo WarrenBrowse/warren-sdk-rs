@@ -272,6 +272,21 @@ impl RoutingPlan {
             })
             .collect()
     }
+
+    /// True when every exit-pin in the plan shares `gateway`'s address family.
+    ///
+    /// A `route ... -inet6 <v6 host> <v4 gateway>` (and the Linux `ip route`
+    /// equivalent) is rejected by the kernel, so the caller MUST fail closed when
+    /// this is `false` rather than emit a broken next-hop that leaves routing
+    /// half-applied. The physical-gateway discovery is IPv4-only today, so a v6
+    /// exit endpoint currently has no valid next-hop to pin.
+    #[must_use]
+    pub fn gateway_family_matches(&self, gateway: IpAddr) -> bool {
+        self.ops.iter().all(|op| match op {
+            RouteOp::PinExitToPhysical(ip) => ip.is_ipv6() == gateway.is_ipv6(),
+            RouteOp::RouteViaTun { .. } => true,
+        })
+    }
 }
 
 /// A killswitch ruleset: only the tunnel and the carrier path to the exit are
@@ -399,6 +414,24 @@ mod tests {
             exit_endpoint: "203.0.113.9:51820".parse().unwrap(),
             dns: vec![IpAddr::V4(Ipv4Addr::new(10, 66, 0, 1))],
         }
+    }
+
+    #[test]
+    fn gateway_family_matches_for_a_v4_exit_and_v4_gateway() {
+        let plan = RoutingPlan::split_default(&v4_config());
+        assert!(plan.gateway_family_matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+    }
+
+    #[test]
+    fn gateway_family_mismatch_for_a_v6_exit_pinned_to_a_v4_gateway() {
+        // A v6 exit endpoint with the IPv4-only physical gateway is a family
+        // mismatch the kernel would reject; the guard must flag it so
+        // apply_routing fails closed. The same exit with a v6 gateway matches.
+        let mut cfg = v4_config();
+        cfg.exit_endpoint = "[2001:db8::9]:51820".parse().unwrap();
+        let plan = RoutingPlan::split_default(&cfg);
+        assert!(!plan.gateway_family_matches(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(plan.gateway_family_matches(IpAddr::V6("2001:db8::1".parse().unwrap())));
     }
 
     #[test]
