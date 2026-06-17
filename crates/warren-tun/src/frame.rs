@@ -28,10 +28,11 @@ impl PacketFamily {
 
     /// The macOS `utun` 4-byte address-family header value for this family.
     ///
-    /// macOS writes `AF_INET` / `AF_INET6` in HOST byte order; the constants are
-    /// `AF_INET = 2` and (on Darwin) `AF_INET6 = 30`. ASSUMED, NOT YET VALIDATED
-    /// against a real device: the round trip below is self-consistent regardless,
-    /// but the exact `AF_INET6` value must be confirmed on a real macOS exit run.
+    /// The constants are `AF_INET = 2` and (on Darwin) `AF_INET6 = 30`. The kernel
+    /// serializes this word in NETWORK byte order (it applies `ntohl`/`htonl`), so
+    /// [`Framing`] encodes/decodes it big-endian. A host-order header is rejected
+    /// by the kernel and silently breaks the datapath; see
+    /// `darwin_utun_header_is_network_byte_order`.
     #[must_use]
     pub const fn darwin_af(self) -> u32 {
         match self {
@@ -57,8 +58,8 @@ pub enum Framing {
     /// Bare IP packet, no header (Linux `/dev/net/tun` without `IFF_NO_PI`
     /// handled separately, Windows Wintun).
     Bare,
-    /// macOS `utun`: a 4-byte address-family word (host byte order) precedes the
-    /// IP packet.
+    /// macOS `utun`: a 4-byte address-family word (network byte order) precedes
+    /// the IP packet.
     DarwinUtun,
 }
 
@@ -83,7 +84,7 @@ impl Framing {
             Self::DarwinUtun => {
                 let family = PacketFamily::detect(packet)?;
                 let mut out = Vec::with_capacity(4 + packet.len());
-                out.extend_from_slice(&family.darwin_af().to_ne_bytes());
+                out.extend_from_slice(&family.darwin_af().to_be_bytes());
                 out.extend_from_slice(packet);
                 Some(out)
             }
@@ -98,7 +99,7 @@ impl Framing {
             Self::Bare => Some(frame.to_vec()),
             Self::DarwinUtun => {
                 let header: [u8; 4] = frame.get(..4)?.try_into().ok()?;
-                PacketFamily::from_darwin_af(u32::from_ne_bytes(header))?;
+                PacketFamily::from_darwin_af(u32::from_be_bytes(header))?;
                 Some(frame[4..].to_vec())
             }
         }
@@ -156,7 +157,7 @@ mod tests {
     fn darwin_decode_rejects_a_short_or_unknown_header() {
         assert_eq!(Framing::DarwinUtun.decode(&[0x00, 0x00]), None);
         // Family header 99 is not a recognized address family.
-        let mut bad = 99u32.to_ne_bytes().to_vec();
+        let mut bad = 99u32.to_be_bytes().to_vec();
         bad.extend_from_slice(&ipv4_packet());
         assert_eq!(Framing::DarwinUtun.decode(&bad), None);
     }
@@ -166,5 +167,33 @@ mod tests {
         for fam in [PacketFamily::V4, PacketFamily::V6] {
             assert_eq!(PacketFamily::from_darwin_af(fam.darwin_af()), Some(fam));
         }
+    }
+
+    #[test]
+    fn darwin_utun_header_is_network_byte_order() {
+        // The macOS utun kernel reads/writes the 4-byte family word with
+        // ntohl/htonl, so the wire bytes are big-endian (AF_INET = 2 -> the value
+        // lands in the LAST byte). A host-order header is rejected by the kernel,
+        // which silently breaks the datapath. Pin the exact on-wire bytes so the
+        // contract cannot regress to native order on a little-endian Mac.
+        let v4 = Framing::DarwinUtun.encode(&ipv4_packet()).unwrap();
+        assert_eq!(&v4[..4], &[0x00, 0x00, 0x00, 0x02], "AF_INET, big-endian");
+        let v6 = Framing::DarwinUtun.encode(&ipv6_packet()).unwrap();
+        assert_eq!(
+            &v6[..4],
+            &[0x00, 0x00, 0x00, 0x1e],
+            "AF_INET6 (30), big-endian"
+        );
+
+        // The kernel delivers reads in the same big-endian framing.
+        let mut framed = vec![0x00, 0x00, 0x00, 0x02];
+        framed.extend_from_slice(&ipv4_packet());
+        assert_eq!(Framing::DarwinUtun.decode(&framed).unwrap(), ipv4_packet());
+
+        // A host-order (little-endian) header must NOT decode: it is exactly the
+        // bug that stops packets flowing, so treat it as an unknown family.
+        let mut host_order = vec![0x02, 0x00, 0x00, 0x00];
+        host_order.extend_from_slice(&ipv4_packet());
+        assert_eq!(Framing::DarwinUtun.decode(&host_order), None);
     }
 }

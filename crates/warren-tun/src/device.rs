@@ -636,8 +636,8 @@ mod tests {
     #[test]
     fn framed_tun_applies_and_strips_the_utun_header() {
         let mut dev = MockDevice::default();
-        // An inbound utun frame: 4-byte AF header + the IP packet.
-        let mut inbound = PacketFamily::V4.darwin_af().to_ne_bytes().to_vec();
+        // An inbound utun frame: 4-byte AF header (network byte order) + packet.
+        let mut inbound = PacketFamily::V4.darwin_af().to_be_bytes().to_vec();
         inbound.extend_from_slice(&ipv4_packet());
         dev.inbound.push_back(inbound);
 
