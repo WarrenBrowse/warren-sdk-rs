@@ -85,6 +85,11 @@ pinned by golden vectors where a wire format is involved. warren-core
     `LoadLibraryW`/`GetProcAddress`, `WintunCreateAdapter`/`StartSession`/ring
     receive+send, no third-party deps). All compile-checked (Linux + Windows via
     cross-`check`, macOS natively); NOT run, they need privilege + a real device.
+    Windows is the DEVICE LAYER ONLY: there is no Windows routing/killswitch plan
+    (`plan` emits Unix `ip`/`route`/`pfctl`/`nft` argv) and the facade
+    (`start_tun_multihop`) is `#[cfg(unix)]`, so the Windows `open_tun` is not yet
+    reachable as an end-to-end tunnel. Routing + killswitch + facade are the
+    remaining Windows datapath work.
   - `warren_tun::plan` argv builders + `warren_tun::apply` (feature-gated): the
     routing plan renders `ip route replace` argv (`RoutingPlan::to_ip_commands`,
     unit-tested for exact argv) and the killswitch renders `nft -f -` apply /

@@ -384,6 +384,15 @@ mod macos {
 /// NOT run (no Windows host or `wintun.dll` in the dev sandbox), so it is NOT YET
 /// validated. Wintun delivers bare IP packets, matching [`Framing::Bare`].
 ///
+/// # Not yet a datapath
+///
+/// This is only the device layer. There is no Windows routing/killswitch plan
+/// (`crate::plan` emits `ip`/`route`/`pfctl`/`nft` argv for Unix only) and the
+/// SDK facade that drives a tunnel (`start_tun_multihop`) is `#[cfg(unix)]`, so
+/// nothing calls this end to end yet. Opening the device here does not produce a
+/// working tunnel; the routing, killswitch and facade wiring are the remaining
+/// Windows work (tracked in `ROADMAP.md`).
+///
 /// # Errors
 ///
 /// An OS error if `wintun.dll` cannot be loaded, a required export is missing, or
