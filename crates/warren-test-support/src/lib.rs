@@ -162,12 +162,15 @@ pub async fn spawn_netstack_exit(exit_key: SigningKey) -> (SocketAddr, [u8; 32])
             .await
             .expect("conn");
         let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
-        let _ = decode_setup(
+        // Panic on a malformed Setup like the sibling helpers: swallowing it would
+        // hand back a valid SetupAck and mask a real client-side encoding bug.
+        decode_setup(
             &recv
                 .read_to_end(MAX_SETUP_FRAME_BYTES)
                 .await
                 .expect("setup"),
-        );
+        )
+        .expect("decode setup");
         let ack = SetupAck {
             protocol_version: PROTOCOL_VERSION,
             tunnel_ipv4: [10, 66, 0, 2],

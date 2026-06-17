@@ -39,7 +39,10 @@
 //! `warren-sdk-ffi` boundary-exception precedent.
 #![cfg_attr(feature = "experimental-tun", allow(unsafe_code))]
 
-#[cfg(feature = "experimental-tun")]
+// Unix-only: the applier shells out to `ip`/`route`/`pfctl`/`nft`, and its only
+// caller (`start_tun_multihop`) is `#[cfg(unix)]`. Gating it here keeps the
+// Linux/macOS codepath from compiling on a Windows build with the feature.
+#[cfg(all(unix, feature = "experimental-tun"))]
 pub mod apply;
 pub mod device;
 pub mod frame;

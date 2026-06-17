@@ -59,6 +59,13 @@ pub enum IdentityError {
 ///
 /// The HKDF salt and info are frozen constants. Never modify without bumping
 /// the version (`identity/v2`).
+///
+/// # Secret handling
+///
+/// The `seed` is borrowed, not consumed: the caller owns its lifetime and must
+/// zeroize it (pass a `Zeroizing<[u8; 32]>` or wipe it after use). Internally
+/// the derived secret bytes are zeroized before returning; only the caller's
+/// seed buffer is outside this function's guarantee.
 #[must_use]
 pub fn derive_node_key(seed: &[u8; 32]) -> SigningKey {
     let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT_IDENTITY_V1), seed);

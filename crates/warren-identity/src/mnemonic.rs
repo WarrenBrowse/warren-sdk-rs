@@ -13,6 +13,12 @@ use zeroize::{Zeroize, Zeroizing};
 #[non_exhaustive]
 pub enum MnemonicError {
     /// Invalid BIP39 mnemonic (unexpected length, unknown word, bad checksum).
+    ///
+    /// The `bip39::Error` Display forwarded here is positions/indices only (for
+    /// example `UnknownWord` carries the word index, never the word string), so
+    /// it leaks no mnemonic material. If a future bip39 bump starts echoing the
+    /// offending word, this `{0}` forward would breach the no-log discipline and
+    /// must be redacted then.
     #[error("invalid BIP39 mnemonic: {0}")]
     Invalid(#[from] bip39::Error),
 }
