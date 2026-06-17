@@ -31,6 +31,7 @@ use hpke::kdf::HkdfSha256;
 use hpke::kem::X25519HkdfSha256;
 use hpke::{Deserializable, Kem as KemTrait, OpModeS, Serializable, setup_sender};
 use rand_core::{CryptoRng, RngCore};
+use zeroize::Zeroizing;
 
 use warren_wire::WARREN_HPKE_AAD_V1;
 use warren_wire::multihop::{EXIT_ID_LEN, WARREN_HPKE_VERSION_V1, WarrenMultihopFrame};
@@ -129,8 +130,8 @@ struct EpochCtx {
 ///
 /// A [`rekey`](ClientSession::rekey) runs a fresh KEM (new encapsulated key) and
 /// bumps the epoch, keeping the previous context in an overlap slot so reverse
-/// frames still sealed under the old epoch open until [`prune_old_epoch`] is
-/// called. Wire-identical to warren-core: rekey introduces no new frame type, it
+/// frames still sealed under the old epoch open until
+/// [`prune_old_epoch`](ClientSession::prune_old_epoch) is called. Wire-identical to warren-core: rekey introduces no new frame type, it
 /// reuses the frame's `epoch` + `encapsulated_key` fields.
 pub struct ClientSession {
     exit_x25519: [u8; 32],
@@ -235,16 +236,20 @@ impl ClientSession {
     }
 
     /// Derives the per-packet key for `(epoch, seq, direction)` from `ctx`.
+    ///
+    /// Returned in a [`Zeroizing`] so the symmetric key is wiped when the caller
+    /// drops it, never lingering on the stack after the AEAD op (secret hygiene,
+    /// matches warren-core).
     fn packet_key(
         ctx: &EpochCtx,
         epoch: u32,
         seq: u64,
         reverse: bool,
-    ) -> Result<[u8; 32], SessionError> {
-        let mut key = [0u8; PER_PACKET_KEY_LEN];
+    ) -> Result<Zeroizing<[u8; 32]>, SessionError> {
+        let mut key = Zeroizing::new([0u8; PER_PACKET_KEY_LEN]);
         let (info, n) = compose_export_info(epoch, seq, reverse);
         ctx.ctx
-            .export(&info[..n], &mut key)
+            .export(&info[..n], &mut *key)
             .map_err(|_| SessionError::Hpke)?;
         Ok(key)
     }
@@ -271,7 +276,7 @@ impl ClientSession {
         let ctx = &self.current;
         let key = Self::packet_key(ctx, epoch, seq, false)?;
         let aad = compose_aad(&self.exit_id, epoch, seq);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(key.as_slice()));
         let mut buf = payload.to_vec();
         let tag = cipher
             .encrypt_in_place_detached(Nonce::from_slice(&NONCE_ZERO_12), &aad, &mut buf)
@@ -310,7 +315,7 @@ impl ClientSession {
             .ok_or(SessionError::UnknownEpoch { epoch: frame.epoch })?;
         let key = Self::packet_key(ctx, frame.epoch, frame.seq, true)?;
         let aad = compose_aad(&self.exit_id, frame.epoch, frame.seq);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(key.as_slice()));
         let mut buf = frame.ciphertext.clone();
         cipher
             .decrypt_in_place_detached(
