@@ -428,4 +428,171 @@ mod tests {
         make_client_config(&key, default_crypto_provider(), &[b"h3"]).expect("client config");
         make_server_config(&key, default_crypto_provider(), &[b"h3"]).expect("server config");
     }
+
+    /// Builds the end-entity "certificate" rustls presents for a raw public key:
+    /// the bare Ed25519 SubjectPublicKeyInfo, exactly as `RpkResolver` emits it.
+    fn spki_cert(pubkey: &[u8; 32]) -> CertificateDer<'static> {
+        let spki = rustls::sign::public_key_to_spki(&alg_id::ED25519, pubkey);
+        CertificateDer::from(spki.to_vec())
+    }
+
+    /// The RPK verifier ignores the timestamp (raw keys carry no validity
+    /// window); any value works.
+    fn a_time() -> UnixTime {
+        UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_700_000_000))
+    }
+
+    #[test]
+    fn pubkey_from_certs_recovers_the_spki_key() {
+        let pk = [0x11; 32];
+        let cert = spki_cert(&pk);
+        assert_eq!(pubkey_from_certs(std::slice::from_ref(&cert)), Some(pk));
+    }
+
+    #[test]
+    fn pubkey_from_certs_rejects_empty_chain() {
+        assert_eq!(pubkey_from_certs(&[]), None);
+    }
+
+    #[test]
+    fn pubkey_from_certs_rejects_wrong_length() {
+        let cert = CertificateDer::from(vec![0u8; 10]);
+        assert_eq!(pubkey_from_certs(std::slice::from_ref(&cert)), None);
+    }
+
+    #[test]
+    fn pubkey_from_certs_rejects_bad_spki_prefix() {
+        // Correct length but a corrupted ASN.1 prefix (e.g. a non-Ed25519 key):
+        // the prefix guard must reject it rather than splice 32 arbitrary bytes.
+        let mut bytes = vec![0u8; ED25519_SPKI_LEN];
+        bytes[0] = 0x31; // valid SPKI starts 0x30 (SEQUENCE)
+        let cert = CertificateDer::from(bytes);
+        assert_eq!(pubkey_from_certs(std::slice::from_ref(&cert)), None);
+    }
+
+    #[test]
+    fn sni_decode_rejects_empty_label() {
+        // The suffix on its own leaves an empty pubkey label.
+        let name = name::SUFFIX.to_owned();
+        assert!(name::decode(&name).is_none());
+    }
+
+    #[test]
+    fn sni_decode_rejects_multi_label() {
+        // An extra dotted label before the canonical name is not a bare pubkey.
+        let valid = name::encode(&[0u8; 32]);
+        assert!(name::decode(&format!("extra.{valid}")).is_none());
+    }
+
+    #[test]
+    fn sni_decode_rejects_non_base32_label() {
+        // 'z' is outside the base32hex (BASE32_DNSSEC) alphabet (max symbol 'v').
+        let name = format!("zzzz{}", name::SUFFIX);
+        assert!(name::decode(&name).is_none());
+    }
+
+    #[test]
+    fn sni_decode_rejects_wrong_decoded_length() {
+        // A well-formed base32 label that decodes to fewer than 32 bytes.
+        let short = data_encoding::BASE32_DNSSEC.encode(&[0u8; 4]);
+        let name = format!("{short}{}", name::SUFFIX);
+        assert!(name::decode(&name).is_none());
+    }
+
+    #[test]
+    fn server_verifier_accepts_matching_raw_key() {
+        let pk = [0x22; 32];
+        let cert = spki_cert(&pk);
+        let enc = name::encode(&pk);
+        let sni = ServerName::try_from(enc.as_str()).unwrap();
+        ServerVerifier
+            .verify_server_cert(&cert, &[], &sni, &[], a_time())
+            .expect("a cert matching the SNI-encoded pubkey verifies");
+    }
+
+    #[test]
+    fn server_verifier_rejects_non_dns_name() {
+        let pk = [0x22; 32];
+        let cert = spki_cert(&pk);
+        // An IP server name is not the base32 pubkey carrier Warren requires.
+        let sni = ServerName::try_from("127.0.0.1").unwrap();
+        let err = ServerVerifier
+            .verify_server_cert(&cert, &[], &sni, &[], a_time())
+            .unwrap_err();
+        assert!(matches!(err, rustls::Error::UnsupportedNameType));
+    }
+
+    #[test]
+    fn server_verifier_rejects_undecodable_sni() {
+        let pk = [0x22; 32];
+        let cert = spki_cert(&pk);
+        // A valid DNS name that is not a Warren exit SNI.
+        let sni = ServerName::try_from("example.com").unwrap();
+        let err = ServerVerifier
+            .verify_server_cert(&cert, &[], &sni, &[], a_time())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            rustls::Error::InvalidCertificate(CertificateError::NotValidForName)
+        ));
+    }
+
+    #[test]
+    fn server_verifier_rejects_non_empty_intermediates() {
+        let pk = [0x22; 32];
+        let cert = spki_cert(&pk);
+        let enc = name::encode(&pk);
+        let sni = ServerName::try_from(enc.as_str()).unwrap();
+        let intermediate = spki_cert(&[0x33; 32]);
+        let err = ServerVerifier
+            .verify_server_cert(
+                &cert,
+                std::slice::from_ref(&intermediate),
+                &sni,
+                &[],
+                a_time(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer)
+        ));
+    }
+
+    #[test]
+    fn server_verifier_rejects_spki_pubkey_mismatch() {
+        // The SNI pins pubkey A, but the presented raw key is pubkey B: the
+        // primary MITM defense (a substituted exit key) must be rejected.
+        let cert = spki_cert(&[0x44; 32]);
+        let enc = name::encode(&[0x22; 32]);
+        let sni = ServerName::try_from(enc.as_str()).unwrap();
+        let err = ServerVerifier
+            .verify_server_cert(&cert, &[], &sni, &[], a_time())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer)
+        ));
+    }
+
+    #[test]
+    fn client_verifier_accepts_bare_raw_key() {
+        let cert = spki_cert(&[0x55; 32]);
+        ClientVerifier
+            .verify_client_cert(&cert, &[], a_time())
+            .expect("a bare raw public key with no chain verifies");
+    }
+
+    #[test]
+    fn client_verifier_rejects_non_empty_intermediates() {
+        let cert = spki_cert(&[0x55; 32]);
+        let intermediate = spki_cert(&[0x66; 32]);
+        let err = ClientVerifier
+            .verify_client_cert(&cert, std::slice::from_ref(&intermediate), a_time())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer)
+        ));
+    }
 }
