@@ -768,12 +768,15 @@ impl<T: HttpTransport> WarrenClient<T> {
         if exits.is_empty() {
             return Err(SdkError::NoMultihopExit);
         }
-        // No candidate can resolve names without a forwarder or an override.
-        if cfg.dns_server.is_none() && exits.iter().all(|e| e.dns_disabled) {
+        // Without a DNS override, an exit that runs no in-tunnel forwarder
+        // (`dns_disabled`) cannot resolve names, so drop such exits from the
+        // rotation: otherwise failover could silently land on one and break name
+        // resolution. With an override every exit can resolve, so keep them all.
+        let exits = dns_capable_candidates(exits, cfg.dns_server.is_some());
+        if exits.is_empty() {
             return Err(SdkError::ExitDnsDisabled);
         }
         let signing = self.signing.clone();
-        let exits = exits.to_vec();
         let auto_local_ip = self.auto_local_ip;
         let wants_ipv6 = self.wants_ipv6;
         // Shared cursor: advanced only on a failed attempt, so a working exit is
@@ -848,6 +851,22 @@ fn warren_api_default_base() -> String {
 #[cfg(not(feature = "reqwest-transport"))]
 fn warren_api_default_base() -> String {
     String::new()
+}
+
+/// The failover candidates that can resolve DNS over the tunnel: with a
+/// `dns_server` override every exit qualifies, otherwise only exits that run the
+/// in-tunnel forwarder (`!dns_disabled`). Keeps failover from rotating onto an
+/// exit that would silently break name resolution (the per-rotation analogue of
+/// [`ensure_dns_reachable`]).
+pub(crate) fn dns_capable_candidates(
+    exits: &[VerifiedExit],
+    has_dns_override: bool,
+) -> Vec<VerifiedExit> {
+    if has_dns_override {
+        exits.to_vec()
+    } else {
+        exits.iter().filter(|e| !e.dns_disabled).cloned().collect()
+    }
 }
 
 /// Fails closed when an exit runs no DNS forwarder and the caller supplied no

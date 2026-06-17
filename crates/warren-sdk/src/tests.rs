@@ -648,3 +648,53 @@ fn build_refuses_unpinned_unless_explicit() {
         Err(crate::error::BuildError::UnpinnedServerKey)
     ));
 }
+
+/// Builds a `VerifiedExit` with a chosen `dns_disabled` flag (other fields are
+/// placeholders; only `dns_disabled` matters for the candidate filter).
+fn exit_with_dns(dns_disabled: bool) -> VerifiedExit {
+    VerifiedExit {
+        exit_id: [0u8; 16],
+        exit_ed25519_pubkey: [0u8; 32],
+        exit_x25519_multihop_pubkey: [0u8; 32],
+        endpoint: "127.0.0.1:443".parse().unwrap(),
+        country: "ZZ".to_owned(),
+        city: "Test".to_owned(),
+        weight: 100,
+        dns_disabled,
+    }
+}
+
+#[test]
+fn dns_capable_candidates_excludes_dns_disabled_without_an_override() {
+    // A mixed list with no override must drop the dns_disabled exit so failover
+    // never rotates onto one and silently breaks name resolution.
+    let exits = [exit_with_dns(false), exit_with_dns(true)];
+    let kept = crate::client::dns_capable_candidates(&exits, false);
+    assert_eq!(kept.len(), 1);
+    assert!(!kept[0].dns_disabled);
+}
+
+#[test]
+fn dns_capable_candidates_keeps_all_when_an_override_is_set() {
+    // With a dns_server override every exit can resolve, so none are dropped.
+    let exits = [exit_with_dns(false), exit_with_dns(true)];
+    let kept = crate::client::dns_capable_candidates(&exits, true);
+    assert_eq!(kept.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failover_refuses_an_all_dns_disabled_list_without_an_override() {
+    // After filtering, no DNS-capable candidate remains, so the supervisor fails
+    // closed rather than starting a datapath that cannot resolve names.
+    let client = test_client();
+    let exits = [exit_with_dns(true), exit_with_dns(true)];
+    let cfg = warren_net::ProxyConfig {
+        socks5: "127.0.0.1:0".parse().unwrap(),
+        http: None,
+        dns_server: None,
+    };
+    let result = client
+        .start_proxy_multihop_supervised_failover(&exits, &cfg)
+        .await;
+    assert!(matches!(result, Err(SdkError::ExitDnsDisabled)));
+}
