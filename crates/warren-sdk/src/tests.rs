@@ -61,22 +61,29 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
     let task = {
         let cycles = Arc::clone(&cycles);
         tokio::spawn(async move {
-            supervise_proxy(socks_listener, None, None, state_tx, move || {
-                let kill_tx = kill_tx.clone();
-                let cycles = Arc::clone(&cycles);
-                async move {
-                    let close = Arc::new(tokio::sync::Notify::new());
-                    let _ = kill_tx.send(Arc::clone(&close));
-                    cycles.fetch_add(1, Ordering::SeqCst);
-                    Ok::<_, SdkError>(EstablishedTunnel {
-                        sink: ClosableSink { close },
-                        local_ip: "10.66.0.2".parse().unwrap(),
-                        prefix: 24,
-                        gateway: "10.66.0.1".parse().unwrap(),
-                        ipv6: None,
-                    })
-                }
-            })
+            supervise_proxy(
+                socks_listener,
+                None,
+                None,
+                state_tx,
+                tokio::sync::watch::channel(None).0,
+                move || {
+                    let kill_tx = kill_tx.clone();
+                    let cycles = Arc::clone(&cycles);
+                    async move {
+                        let close = Arc::new(tokio::sync::Notify::new());
+                        let _ = kill_tx.send(Arc::clone(&close));
+                        cycles.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, SdkError>(EstablishedTunnel {
+                            sink: ClosableSink { close },
+                            local_ip: "10.66.0.2".parse().unwrap(),
+                            prefix: 24,
+                            gateway: "10.66.0.1".parse().unwrap(),
+                            ipv6: None,
+                        })
+                    }
+                },
+            )
             .await;
         })
     };
@@ -107,6 +114,137 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death() {
+    use crate::supervisor::supervise_proxy;
+
+    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+    let (forwarder_tx, mut forwarder_rx) = tokio::sync::watch::channel(None);
+    let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let task = tokio::spawn(async move {
+        supervise_proxy(
+            socks_listener,
+            None,
+            None,
+            state_tx,
+            forwarder_tx,
+            move || {
+                let kill_tx = kill_tx.clone();
+                async move {
+                    let close = Arc::new(tokio::sync::Notify::new());
+                    let _ = kill_tx.send(Arc::clone(&close));
+                    Ok::<_, SdkError>(EstablishedTunnel {
+                        sink: ClosableSink { close },
+                        local_ip: "10.66.0.2".parse().unwrap(),
+                        prefix: 24,
+                        gateway: "10.66.0.1".parse().unwrap(),
+                        ipv6: None,
+                    })
+                }
+            },
+        )
+        .await;
+    });
+
+    // A forwarder is published once the first tunnel is up.
+    let kill1 = tokio::time::timeout(std::time::Duration::from_secs(5), kill_rx.recv())
+        .await
+        .expect("first connect")
+        .expect("kill handle");
+    forwarder_rx.changed().await.unwrap();
+    assert!(
+        forwarder_rx.borrow_and_update().is_some(),
+        "forwarder present while connected"
+    );
+
+    // On tunnel death it is cleared before the reconnect backoff.
+    kill1.notify_one();
+    forwarder_rx.changed().await.unwrap();
+    assert!(
+        forwarder_rx.borrow_and_update().is_none(),
+        "forwarder cleared when the tunnel dies"
+    );
+
+    task.abort();
+}
+
+#[tokio::test]
+async fn supervise_forward_remaps_across_epochs_and_clears_on_drop() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use crate::supervisor::{ExternalPort, supervise_forward};
+
+    #[derive(Clone)]
+    struct FakeForwarder(u16);
+
+    struct FakePort {
+        external: u16,
+        dropped: Arc<AtomicBool>,
+    }
+    impl ExternalPort for FakePort {
+        fn external_port(&self) -> u16 {
+            self.external
+        }
+    }
+    impl Drop for FakePort {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let (fwd_tx, fwd_rx) = tokio::sync::watch::channel::<Option<FakeForwarder>>(None);
+    let (ext_tx, mut ext_rx) = tokio::sync::watch::channel::<Option<u16>>(None);
+    let establishes = Arc::new(AtomicUsize::new(0));
+    let first_dropped = Arc::new(AtomicBool::new(false));
+
+    let task = {
+        let establishes = Arc::clone(&establishes);
+        let first_dropped = Arc::clone(&first_dropped);
+        tokio::spawn(async move {
+            supervise_forward(fwd_rx, ext_tx, move |f: FakeForwarder| {
+                let establishes = Arc::clone(&establishes);
+                let dropped = Arc::clone(&first_dropped);
+                async move {
+                    establishes.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, SdkError>(FakePort {
+                        external: f.0,
+                        dropped,
+                    })
+                }
+            })
+            .await;
+        })
+    };
+
+    // Epoch 1: the forwarder grants external port 5000.
+    fwd_tx.send(Some(FakeForwarder(5000))).unwrap();
+    ext_rx.changed().await.unwrap();
+    assert_eq!(*ext_rx.borrow(), Some(5000));
+
+    // Tunnel dies: the mapping is torn down and the external port cleared.
+    fwd_tx.send(None).unwrap();
+    ext_rx.changed().await.unwrap();
+    assert_eq!(*ext_rx.borrow(), None);
+    assert!(
+        first_dropped.load(Ordering::SeqCst),
+        "the previous mapping is dropped on disconnect"
+    );
+
+    // Epoch 2: a fresh forwarder re-establishes, possibly on a new port.
+    fwd_tx.send(Some(FakeForwarder(6001))).unwrap();
+    ext_rx.changed().await.unwrap();
+    assert_eq!(*ext_rx.borrow(), Some(6001));
+    assert_eq!(
+        establishes.load(Ordering::SeqCst),
+        2,
+        "re-established once per connected epoch"
+    );
+
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn supervisor_serves_both_socks_and_http_listeners() {
     // Exercises the dual-listener serve epoch (the `select!` two-branch path):
     // both stable addresses accept once the tunnel is up.
@@ -123,6 +261,7 @@ async fn supervisor_serves_both_socks_and_http_listeners() {
             Some(http_listener),
             None,
             state_tx,
+            tokio::sync::watch::channel(None).0,
             move || {
                 let keep_open = Arc::clone(&keep_open);
                 async move {
@@ -159,26 +298,33 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
     let keep_open = Arc::new(tokio::sync::Notify::new());
 
     let task = tokio::spawn(async move {
-        supervise_proxy(socks_listener, None, None, state_tx, move || {
-            let cursor = Arc::clone(&cursor);
-            let ok_tx = ok_tx.clone();
-            let keep_open = Arc::clone(&keep_open);
-            async move {
-                let idx = cursor.load(Ordering::Relaxed) % 2;
-                if idx == 0 {
-                    cursor.fetch_add(1, Ordering::Relaxed); // rotate past the broken exit
-                    return Err(SdkError::NoMultihopExit);
+        supervise_proxy(
+            socks_listener,
+            None,
+            None,
+            state_tx,
+            tokio::sync::watch::channel(None).0,
+            move || {
+                let cursor = Arc::clone(&cursor);
+                let ok_tx = ok_tx.clone();
+                let keep_open = Arc::clone(&keep_open);
+                async move {
+                    let idx = cursor.load(Ordering::Relaxed) % 2;
+                    if idx == 0 {
+                        cursor.fetch_add(1, Ordering::Relaxed); // rotate past the broken exit
+                        return Err(SdkError::NoMultihopExit);
+                    }
+                    let _ = ok_tx.send(idx);
+                    Ok(EstablishedTunnel {
+                        sink: ClosableSink { close: keep_open },
+                        local_ip: "10.66.0.2".parse().unwrap(),
+                        prefix: 24,
+                        gateway: "10.66.0.1".parse().unwrap(),
+                        ipv6: None,
+                    })
                 }
-                let _ = ok_tx.send(idx);
-                Ok(EstablishedTunnel {
-                    sink: ClosableSink { close: keep_open },
-                    local_ip: "10.66.0.2".parse().unwrap(),
-                    prefix: 24,
-                    gateway: "10.66.0.1".parse().unwrap(),
-                    ipv6: None,
-                })
-            }
-        })
+            },
+        )
         .await;
     });
 
@@ -209,30 +355,37 @@ async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
         tokio::sync::mpsc::unbounded_channel::<Arc<tokio::sync::Notify>>();
 
     let task = tokio::spawn(async move {
-        supervise_proxy(socks_listener, None, None, state_tx, move || {
-            let cursor = Arc::clone(&cursor);
-            let used_tx = used_tx.clone();
-            let close_tx = close_tx.clone();
-            async move {
-                let idx = cursor.load(Ordering::Relaxed) % 2;
-                if idx != 0 {
-                    cursor.fetch_add(1, Ordering::Relaxed);
-                    return Err(SdkError::NoMultihopExit);
+        supervise_proxy(
+            socks_listener,
+            None,
+            None,
+            state_tx,
+            tokio::sync::watch::channel(None).0,
+            move || {
+                let cursor = Arc::clone(&cursor);
+                let used_tx = used_tx.clone();
+                let close_tx = close_tx.clone();
+                async move {
+                    let idx = cursor.load(Ordering::Relaxed) % 2;
+                    if idx != 0 {
+                        cursor.fetch_add(1, Ordering::Relaxed);
+                        return Err(SdkError::NoMultihopExit);
+                    }
+                    // Exit 0 works: hand the test a fresh close handle for this
+                    // session so it can drop it, and report the idx used.
+                    let close = Arc::new(tokio::sync::Notify::new());
+                    let _ = close_tx.send(Arc::clone(&close));
+                    let _ = used_tx.send(idx);
+                    Ok(EstablishedTunnel {
+                        sink: ClosableSink { close },
+                        local_ip: "10.66.0.2".parse().unwrap(),
+                        prefix: 24,
+                        gateway: "10.66.0.1".parse().unwrap(),
+                        ipv6: None,
+                    })
                 }
-                // Exit 0 works: hand the test a fresh close handle for this
-                // session so it can drop it, and report the idx used.
-                let close = Arc::new(tokio::sync::Notify::new());
-                let _ = close_tx.send(Arc::clone(&close));
-                let _ = used_tx.send(idx);
-                Ok(EstablishedTunnel {
-                    sink: ClosableSink { close },
-                    local_ip: "10.66.0.2".parse().unwrap(),
-                    prefix: 24,
-                    gateway: "10.66.0.1".parse().unwrap(),
-                    ipv6: None,
-                })
-            }
-        })
+            },
+        )
         .await;
     });
 
@@ -272,24 +425,31 @@ async fn supervisor_retries_past_failed_attempts_then_connects() {
         // Keeps the eventual success session's read side open (never closes).
         let keep_open = Arc::new(tokio::sync::Notify::new());
         tokio::spawn(async move {
-            supervise_proxy(socks_listener, None, None, state_tx, move || {
-                let attempts = Arc::clone(&attempts);
-                let keep_open = Arc::clone(&keep_open);
-                async move {
-                    // Fail the first two attempts, then establish: exercises the
-                    // backoff/retry branch and the recovery to Connected.
-                    if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
-                        return Err(SdkError::NoMultihopExit);
+            supervise_proxy(
+                socks_listener,
+                None,
+                None,
+                state_tx,
+                tokio::sync::watch::channel(None).0,
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    let keep_open = Arc::clone(&keep_open);
+                    async move {
+                        // Fail the first two attempts, then establish: exercises the
+                        // backoff/retry branch and the recovery to Connected.
+                        if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                            return Err(SdkError::NoMultihopExit);
+                        }
+                        Ok(EstablishedTunnel {
+                            sink: ClosableSink { close: keep_open },
+                            local_ip: "10.66.0.2".parse().unwrap(),
+                            prefix: 24,
+                            gateway: "10.66.0.1".parse().unwrap(),
+                            ipv6: None,
+                        })
                     }
-                    Ok(EstablishedTunnel {
-                        sink: ClosableSink { close: keep_open },
-                        local_ip: "10.66.0.2".parse().unwrap(),
-                        prefix: 24,
-                        gateway: "10.66.0.1".parse().unwrap(),
-                        ipv6: None,
-                    })
-                }
-            })
+                },
+            )
             .await;
         })
     };

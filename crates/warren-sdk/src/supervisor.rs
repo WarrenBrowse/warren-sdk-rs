@@ -1,11 +1,12 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use warren_discovery::VerifiedExit;
-use warren_net::MultihopPacketSink;
+use warren_net::{ForwardedPort, MapProto, MultihopPacketSink};
 use warren_transport::{Backoff, ConnectionState, MultihopClientTunnel};
 
 use crate::error::SdkError;
-use crate::proxy::{addressing_from_session, build_netstack_config};
+use crate::proxy::{ProxyForwarder, addressing_from_session, build_netstack_config};
 
 /// An established tunnel plus the netstack addressing derived from its `IpAssign`.
 /// Generic over the sink so the supervisor loop is unit-testable with a fake sink.
@@ -26,6 +27,10 @@ pub struct SupervisedProxyHandle {
     pub(crate) local_addr: std::net::SocketAddr,
     pub(crate) http_addr: Option<std::net::SocketAddr>,
     pub(crate) state_rx: tokio::sync::watch::Receiver<ConnectionState>,
+    /// The forwarder for the current epoch, republished by the supervisor on
+    /// every (re)connect and cleared (`None`) while the tunnel is down. Drives
+    /// the self-healing port forwards.
+    pub(crate) forwarder_rx: tokio::sync::watch::Receiver<Option<ProxyForwarder>>,
     pub(crate) task: tokio::task::JoinHandle<()>,
 }
 
@@ -56,6 +61,42 @@ impl SupervisedProxyHandle {
         self.state_rx.clone()
     }
 
+    /// Forwards a tunnel-side port that survives reconnects: maps `internal_port`
+    /// at the exit via NAT-PMP and relays inbound connections to `local_target`,
+    /// re-establishing the mapping on every tunnel rebuild. The returned
+    /// [`SupervisedForwardedPort`] keeps it alive until dropped.
+    ///
+    /// Unlike the one-shot [`ProxyHandle::forward_port`](crate::ProxyHandle::forward_port),
+    /// the granted external port can CHANGE across reconnects (NAT-PMP may grant
+    /// a different one), so read it from
+    /// [`SupervisedForwardedPort::external_port`] rather than caching it. It is
+    /// `None` while the tunnel is down or before the first mapping is granted.
+    ///
+    /// Needs an exit that runs a NAT-PMP gateway; not every exit does.
+    #[must_use]
+    pub fn forward_port(
+        &self,
+        proto: MapProto,
+        internal_port: u16,
+        local_target: SocketAddr,
+    ) -> SupervisedForwardedPort {
+        let (external_tx, external_rx) = tokio::sync::watch::channel(None);
+        let forwarder_rx = self.forwarder_rx.clone();
+        let task = tokio::spawn(async move {
+            supervise_forward(forwarder_rx, external_tx, move |forwarder| async move {
+                forwarder
+                    .forward_port(proto, internal_port, local_target)
+                    .await
+            })
+            .await;
+        });
+        SupervisedForwardedPort {
+            internal_port,
+            external_rx,
+            task,
+        }
+    }
+
     /// Stops the supervisor and tears down the datapath.
     pub fn shutdown(self) {
         self.task.abort();
@@ -65,6 +106,105 @@ impl SupervisedProxyHandle {
 impl Drop for SupervisedProxyHandle {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+/// A tunnel-side forwarded port that re-establishes itself across reconnects
+/// (see [`SupervisedProxyHandle::forward_port`]). Dropping it tears the mapping
+/// down (the exit reclaims the port when the lease lapses).
+pub struct SupervisedForwardedPort {
+    internal_port: u16,
+    external_rx: tokio::sync::watch::Receiver<Option<u16>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SupervisedForwardedPort {
+    /// The local internal port being forwarded (stable for the life of this
+    /// handle).
+    #[must_use]
+    pub fn internal_port(&self) -> u16 {
+        self.internal_port
+    }
+
+    /// The currently-granted external port remote peers reach the app on, or
+    /// `None` while the tunnel is down or the first mapping is not yet granted.
+    /// This can change across reconnects, so do not cache it.
+    #[must_use]
+    pub fn external_port(&self) -> Option<u16> {
+        *self.external_rx.borrow()
+    }
+
+    /// A watch receiver for external-port changes, so an app can react to a
+    /// re-mapping (`rx.changed().await`) rather than poll [`Self::external_port`].
+    #[must_use]
+    pub fn watch_external_port(&self) -> tokio::sync::watch::Receiver<Option<u16>> {
+        self.external_rx.clone()
+    }
+
+    /// Tears the forward down.
+    pub fn shutdown(self) {
+        self.task.abort();
+    }
+}
+
+impl Drop for SupervisedForwardedPort {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// An established forwarded port whose granted external port can be read. Lets
+/// [`supervise_forward`] be unit-tested with a fake port (the production type is
+/// [`ForwardedPort`]).
+pub(crate) trait ExternalPort {
+    fn external_port(&self) -> u16;
+}
+
+impl ExternalPort for ForwardedPort {
+    fn external_port(&self) -> u16 {
+        ForwardedPort::external_port(self)
+    }
+}
+
+/// Drives one forwarded port across tunnel rebuilds: when a forwarder appears
+/// (re)connect, it establishes the mapping and publishes the granted external
+/// port; when the tunnel goes away (`None`), it drops the mapping and clears the
+/// port. Generic over the forwarder and established-port types so the state
+/// machine is testable without a real NAT-PMP gateway.
+pub(crate) async fn supervise_forward<F, P, E, Fut>(
+    mut forwarder_rx: tokio::sync::watch::Receiver<Option<F>>,
+    external_tx: tokio::sync::watch::Sender<Option<u16>>,
+    mut establish: E,
+) where
+    F: Clone,
+    P: ExternalPort,
+    E: FnMut(F) -> Fut,
+    Fut: std::future::Future<Output = Result<P, SdkError>>,
+{
+    // Holding `current` keeps the established port alive; replacing or clearing
+    // it drops the previous one, which tears its mapping/relay tasks down.
+    let mut current: Option<P> = None;
+    loop {
+        let snapshot = forwarder_rx.borrow_and_update().clone();
+        match snapshot {
+            Some(forwarder) if current.is_none() => {
+                // A refusal or transient failure leaves the port unset; the next
+                // epoch change retries. No identity material is logged.
+                if let Ok(port) = establish(forwarder).await {
+                    let _ = external_tx.send(Some(port.external_port()));
+                    current = Some(port);
+                }
+            }
+            Some(_) => {}
+            None => {
+                if current.take().is_some() {
+                    let _ = external_tx.send(None);
+                }
+            }
+        }
+        if forwarder_rx.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -135,6 +275,7 @@ pub(crate) async fn supervise_proxy<S, F, Fut>(
     http_listener: Option<tokio::net::TcpListener>,
     dns_server: Option<std::net::Ipv4Addr>,
     state_tx: tokio::sync::watch::Sender<ConnectionState>,
+    forwarder_tx: tokio::sync::watch::Sender<Option<ProxyForwarder>>,
     mut connect: F,
 ) where
     S: warren_net::PacketSink + 'static,
@@ -171,10 +312,19 @@ pub(crate) async fn supervise_proxy<S, F, Fut>(
                     est.ipv6,
                     dns_server,
                 );
+                let gateway = est.gateway;
                 let (connector, alive_rx) = warren_net::spawn_over_sink(Arc::new(est.sink), config);
+                // Publish this epoch's forwarder so self-healing port forwards
+                // can re-map on the fresh connector; cleared to `None` below when
+                // the tunnel dies.
+                let _ = forwarder_tx.send(Some(ProxyForwarder {
+                    connector: connector.clone(),
+                    gateway,
+                }));
                 let _ = state_tx.send(ConnectionState::Connected);
                 let up_since = std::time::Instant::now();
                 serve_epoch(&socks_listener, http_listener.as_ref(), connector, alive_rx).await;
+                let _ = forwarder_tx.send(None);
                 // The tunnel died. A healthy session resets backoff and reconnects
                 // at once; a flapping one (died almost immediately) backs off first.
                 if up_since.elapsed() >= MIN_HEALTHY_UPTIME {

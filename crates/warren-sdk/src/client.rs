@@ -842,15 +842,25 @@ impl<T: HttpTransport> WarrenClient<T> {
         };
 
         let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+        let (forwarder_tx, forwarder_rx) = tokio::sync::watch::channel(None);
         let dns_server = cfg.dns_server;
         let task = tokio::spawn(async move {
-            supervise_proxy(socks_listener, http_listener, dns_server, state_tx, connect).await;
+            supervise_proxy(
+                socks_listener,
+                http_listener,
+                dns_server,
+                state_tx,
+                forwarder_tx,
+                connect,
+            )
+            .await;
         });
 
         Ok(SupervisedProxyHandle {
             local_addr,
             http_addr,
             state_rx,
+            forwarder_rx,
             task,
         })
     }

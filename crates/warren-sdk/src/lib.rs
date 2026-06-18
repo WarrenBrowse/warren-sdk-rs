@@ -72,7 +72,7 @@ pub use client::{
 pub use error::{BuildError, SdkError};
 pub use proxy::{ProxyForwarder, ProxyHandle, TunnelState};
 pub use store::{FileGenerationStore, FileServerKeyStore};
-pub use supervisor::SupervisedProxyHandle;
+pub use supervisor::{SupervisedForwardedPort, SupervisedProxyHandle};
 
 #[cfg(test)]
 mod tests;
