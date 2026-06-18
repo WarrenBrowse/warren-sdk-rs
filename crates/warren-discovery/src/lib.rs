@@ -9,7 +9,7 @@
 //!   filtered by geography ([`LocationConstraint`]) and IP availability
 //!   ([`IpAvailability`]).
 //!
-//! Wire-compatible with warren-core (`SignedRelayList` v6).
+//! Wire-compatible with warren-core (`SignedRelayList` v7).
 
 pub mod exit_id;
 pub mod multihop_directory;
@@ -29,6 +29,6 @@ pub use selector::{ExitSelector, SelectorError};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use signed::sign_relay_list;
 pub use signed::{
-    JsonEndpoint, JsonGeoIp, JsonListener, JsonLocation, JsonNode, SIGNED_VERSION, SignedError,
+    JsonEgress, JsonEndpoint, JsonListener, JsonLocation, JsonNode, SIGNED_VERSION, SignedError,
     SignedRelayList, VerifiedRelayList, verify_signed_relay_list, verify_signed_relay_list_any,
 };

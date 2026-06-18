@@ -1,11 +1,12 @@
-//! Signed exit list (the `warren-relays` v6 node/endpoint format) verification.
+//! Signed exit list (the `warren-relays` v7 minimized node/endpoint format)
+//! verification.
 //!
 //! An attacker who can intercept the HTTP fetch could substitute their own
 //! exits. The warren-api server's Ed25519 signature binds the list to a
 //! legitimate operator; the client verifies against a pinned `server_pubkey`
 //! (or TOFU on first boot).
 //!
-//! Canonical format (frozen at v6, never modify without rotating the version):
+//! Canonical format (frozen at v7, never modify without rotating the version):
 //!
 //! ```text
 //! canonical_bytes = serde_json::to_vec(UnsignedRelayList {
@@ -22,9 +23,13 @@
 //! (anti-freeze/replay). The crate stays clock-free; the caller enforces both via
 //! [`VerifiedRelayList`].
 //!
-//! v6 replaced the v5 flat-relay model with a node/endpoint model: each node
-//! declares `roles` (entry/relay/exit), an optional multihop X25519 key, and a
-//! list of endpoints carrying per-endpoint family/ingress/egress/listeners/geoip.
+//! v7 minimizes the v6 node/endpoint model down to the strict minimum a client
+//! dials (censorship-minimization): it DROPS `roles` (structural now: an endpoint
+//! with a listener is a dial point), `multihop_pubkey` (multi-hop gets the exit
+//! key from the directory), per-endpoint `geoip`, and the per-endpoint
+//! `ingress`/`egress` flags. Egress capability is two node-level booleans
+//! (`egress.ipv4`/`egress.ipv6`) with NO egress source address: a client knows an
+//! exit's geolocation to pick a country, never its egress IP.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -39,7 +44,7 @@ use crate::exit_id::ExitId;
 use crate::relay::{Location, Relay, RelayList};
 
 /// Current signed format version. Bumping is an incompatible rotation.
-pub const SIGNED_VERSION: u32 = 6;
+pub const SIGNED_VERSION: u32 = 7;
 
 /// A dial listener on an endpoint (`port`/`transport`/`alpn`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -53,23 +58,9 @@ pub struct JsonListener {
     pub alpn: String,
 }
 
-/// API-derived geolocation of an endpoint's egress IP (ground truth, distinct
-/// from the node's manually-declared [`JsonLocation`]).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct JsonGeoIp {
-    /// ISO 3166-1 alpha-2 country code.
-    pub country: String,
-    /// City name.
-    pub city: String,
-    /// Autonomous system number, omitted when unknown.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub asn: Option<u32>,
-    /// GeoIP database source tag.
-    pub source: String,
-}
-
-/// One endpoint of a node: an address plus its capabilities and listeners.
+/// One dialable entry endpoint of a node (v7): an address and its listeners. An
+/// endpoint with at least one listener IS a client dial point; v7 carries no
+/// direction flags and no geoip on the public wire.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct JsonEndpoint {
@@ -77,15 +68,20 @@ pub struct JsonEndpoint {
     pub addr: String,
     /// `"ipv4"` or `"ipv6"`; must agree with `addr`.
     pub family: String,
-    /// `true` when clients dial this address.
-    pub ingress: bool,
-    /// `true` when the node egresses internet traffic from this source IP.
-    pub egress: bool,
-    /// Dial listeners (empty for egress-only endpoints).
+    /// Dial listeners served at this address.
     pub listeners: Vec<JsonListener>,
-    /// API-resolved geoip of the egress IP, omitted when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub geoip: Option<JsonGeoIp>,
+}
+
+/// Node-level egress capability (v7): whether the node can route in-tunnel
+/// client traffic to the v4 / v6 internet. Capability booleans only, the egress
+/// source address is never published to clients.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JsonEgress {
+    /// `true` if the node has a working IPv4 egress source.
+    pub ipv4: bool,
+    /// `true` if the node has a working IPv6 egress source.
+    pub ipv6: bool,
 }
 
 /// A node's declared (manual, authoritative-for-selection) geolocation.
@@ -98,7 +94,7 @@ pub struct JsonLocation {
     pub city: String,
 }
 
-/// Wire representation of one node in the signed v6 JSON.
+/// Wire representation of one node in the signed v7 JSON (public projection).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct JsonNode {
@@ -107,18 +103,15 @@ pub struct JsonNode {
     pub id: String,
     /// Stable operator-assigned identifier (32-char hex in JSON).
     pub exit_id: ExitId,
-    /// Hex X25519 HPKE pubkey when the node is a multihop exit, omitted otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub multihop_pubkey: Option<String>,
-    /// Roles this node serves: `"entry"`, `"relay"`, `"exit"`.
-    pub roles: Vec<String>,
     /// Declared geolocation (authoritative for selection).
     pub location: JsonLocation,
     /// Relative weight for weighted selection (`0` disables).
     pub weight: u64,
     /// `false` disables the node without removing it from the list.
     pub active: bool,
-    /// Reachable endpoints (one or more addresses).
+    /// Node-level egress capability (no source address).
+    pub egress: JsonEgress,
+    /// Dialable entry endpoints (one or more addresses).
     pub endpoints: Vec<JsonEndpoint>,
 }
 
@@ -217,9 +210,6 @@ pub enum SignedError {
     /// A node's id is not a valid 16-byte hex exit id.
     #[error("invalid node id")]
     InvalidNodeId,
-    /// A node carries a role outside the recognized set (entry/relay/exit).
-    #[error("unrecognized node role")]
-    UnrecognizedRole,
     /// A node endpoint address is not a valid IP socket address.
     #[error("invalid endpoint address")]
     InvalidEndpointAddress,
@@ -373,27 +363,16 @@ fn decode_node_id(s: &str) -> Result<[u8; 32], SignedError> {
         .ok_or(SignedError::InvalidNodeId)
 }
 
-/// Maps a verified v6 node to a resolved [`Relay`]: the dialable addresses are
-/// the QUIC listeners of its ingress endpoints; `ipv6_egress` is derived from
-/// any v6 endpoint that egresses. The node `roles` and `multihop_pubkey` carry
-/// only server-level trust here (the strong multihop trust chain lives in the
-/// operational-signed multihop directory), so the single-hop datapath uses the
+/// Maps a verified v7 node to a resolved [`Relay`]: every endpoint is a dial
+/// point (v7 has no per-endpoint direction flags), so the dialable addresses are
+/// the QUIC listeners of all endpoints; `ipv6_egress` is the node-level
+/// `egress.ipv6` capability boolean. The strong multihop trust chain lives in
+/// the operational-signed multihop directory; the single-hop datapath uses the
 /// dialable addresses only.
 fn json_node_to_relay(n: JsonNode) -> Result<Relay, SignedError> {
     let endpoint_id = decode_node_id(&n.id)?;
 
-    // Validate roles against the frozen v6 set (entry/relay/exit), matching
-    // warren-core's `parse_role`: an unknown token means the list was produced by
-    // a newer schema and must be rejected rather than silently used. The token
-    // itself is a protocol label, but the message stays static (no-log discipline).
-    for role in &n.roles {
-        if !matches!(role.as_str(), "entry" | "relay" | "exit") {
-            return Err(SignedError::UnrecognizedRole);
-        }
-    }
-
     let mut addrs: Vec<SocketAddr> = Vec::new();
-    let mut ipv6_egress = false;
     for ep in &n.endpoints {
         let ip: IpAddr = ep
             .addr
@@ -407,15 +386,10 @@ fn json_node_to_relay(n: JsonNode) -> Result<Relay, SignedError> {
         if !family_ok {
             return Err(SignedError::EndpointFamilyMismatch);
         }
-        if ep.egress && ip.is_ipv6() {
-            ipv6_egress = true;
-        }
-        if ep.ingress {
-            for l in &ep.listeners {
-                // The SDK dials QUIC; ignore any other transport a node lists.
-                if l.transport == "quic" {
-                    addrs.push(SocketAddr::new(ip, l.port));
-                }
+        for l in &ep.listeners {
+            // The SDK dials QUIC; ignore any other transport a node lists.
+            if l.transport == "quic" {
+                addrs.push(SocketAddr::new(ip, l.port));
             }
         }
     }
@@ -428,7 +402,7 @@ fn json_node_to_relay(n: JsonNode) -> Result<Relay, SignedError> {
         n.weight,
         n.active,
     )
-    .with_ipv6_egress(ipv6_egress))
+    .with_ipv6_egress(n.egress.ipv6))
 }
 
 #[cfg(test)]
@@ -443,25 +417,24 @@ mod tests {
         JsonNode {
             id: "00".repeat(32),
             exit_id: ExitId::from_bytes([0xaa; 16]),
-            multihop_pubkey: None,
-            roles: vec!["entry".to_owned(), "relay".to_owned(), "exit".to_owned()],
             location: JsonLocation {
                 country: "RO".to_owned(),
                 city: "Bucharest".to_owned(),
             },
             weight: 100,
             active: true,
+            egress: JsonEgress {
+                ipv4: true,
+                ipv6: false,
+            },
             endpoints: vec![JsonEndpoint {
                 addr: "127.0.0.1".to_owned(),
                 family: "ipv4".to_owned(),
-                ingress: true,
-                egress: true,
                 listeners: vec![JsonListener {
                     port: 1234,
                     transport: "quic".to_owned(),
                     alpn: "h3".to_owned(),
                 }],
-                geoip: None,
             }],
         }
     }
@@ -482,20 +455,48 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_egress_is_derived_from_an_egressing_v6_endpoint() {
+    fn ipv6_egress_comes_from_the_node_level_capability() {
+        // v7: egress is a node-level boolean, not derived from any endpoint. A
+        // node dialable on v6 but without a v6 egress source must NOT report v6
+        // egress (the FDC DAD-fail shape).
         let mut node = sample_node();
+        node.egress.ipv6 = true;
         node.endpoints.push(JsonEndpoint {
             addr: "2001:db8::1".to_owned(),
             family: "ipv6".to_owned(),
-            ingress: false,
-            egress: true,
-            listeners: vec![],
-            geoip: None,
+            listeners: vec![JsonListener {
+                port: 1234,
+                transport: "quic".to_owned(),
+                alpn: "h3".to_owned(),
+            }],
         });
         let signed = sign_relay_list(vec![node], &fixed_server_key(), 1, 1, 2);
         let json = serde_json::to_string(&signed).unwrap();
         let v = verify_signed_relay_list(&json, None).expect("verify");
-        assert!(v.relays.relays()[0].ipv6_egress());
+        let relay = &v.relays.relays()[0];
+        assert!(relay.ipv6_egress(), "node-level egress.ipv6 is honored");
+        assert!(relay.has_ipv6(), "v6 endpoint is still dialable");
+    }
+
+    #[test]
+    fn dialable_v6_without_egress_capability_does_not_report_egress() {
+        let mut node = sample_node();
+        node.egress.ipv6 = false;
+        node.endpoints.push(JsonEndpoint {
+            addr: "2001:db8::2".to_owned(),
+            family: "ipv6".to_owned(),
+            listeners: vec![JsonListener {
+                port: 1234,
+                transport: "quic".to_owned(),
+                alpn: "h3".to_owned(),
+            }],
+        });
+        let signed = sign_relay_list(vec![node], &fixed_server_key(), 1, 1, 2);
+        let json = serde_json::to_string(&signed).unwrap();
+        let v = verify_signed_relay_list(&json, None).expect("verify");
+        let relay = &v.relays.relays()[0];
+        assert!(relay.has_ipv6(), "v6 endpoint is dialable");
+        assert!(!relay.ipv6_egress(), "but the node has no v6 egress source");
     }
 
     #[test]
@@ -511,16 +512,16 @@ mod tests {
     }
 
     #[test]
-    fn unrecognized_role_is_rejected() {
-        // warren-core rejects a node whose role is outside {entry,relay,exit}; the
-        // SDK must reject the (validly signed) list too rather than use the node.
-        let mut node = sample_node();
-        node.roles.push("superexit".to_owned());
-        let signed = sign_relay_list(vec![node], &fixed_server_key(), 1, 1, 2);
-        let json = serde_json::to_string(&signed).unwrap();
+    fn verify_rejects_tampered_egress_capability() {
+        // Anti-tamper: flipping a node's egress capability (e.g. to make a
+        // v4-only exit appear v6-capable) must break the signature.
+        let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
+        let mut tampered = signed.clone();
+        tampered.nodes[0].egress.ipv6 = true;
+        let json = serde_json::to_string(&tampered).unwrap();
         assert!(matches!(
             verify_signed_relay_list(&json, None).unwrap_err(),
-            SignedError::UnrecognizedRole
+            SignedError::BadSignature
         ));
     }
 
@@ -605,7 +606,7 @@ mod tests {
         }
         assert!(found, "expected an off-curve 32-byte value to exist");
         let json = format!(
-            r#"{{"version":6,"nodes":[],"generation":0,"signed_at":0,"expires_at":0,"server_pubkey_hex":"{}","signature_hex":"{}"}}"#,
+            r#"{{"version":7,"nodes":[],"generation":0,"signed_at":0,"expires_at":0,"server_pubkey_hex":"{}","signature_hex":"{}"}}"#,
             hex::encode(off_curve),
             "00".repeat(64)
         );
@@ -700,20 +701,21 @@ mod tests {
     }
 
     #[test]
-    fn verify_rejects_pre_v6_version() {
-        let json = r#"{"version":5,"nodes":[],"generation":0,"signed_at":0,"expires_at":0,"server_pubkey_hex":"00","signature_hex":"00"}"#;
+    fn verify_rejects_pre_v7_version() {
+        // A v6 version number must be rejected since the bump to v7.
+        let json = r#"{"version":6,"nodes":[],"generation":0,"signed_at":0,"expires_at":0,"server_pubkey_hex":"00","signature_hex":"00"}"#;
         assert!(matches!(
             verify_signed_relay_list(json, None).unwrap_err(),
-            SignedError::UnsupportedVersion { got: 5 }
+            SignedError::UnsupportedVersion { got: 6 }
         ));
     }
 
     #[test]
-    fn top_level_field_order_is_frozen_at_v6() {
+    fn top_level_field_order_is_frozen_at_v7() {
         let signed = sign_relay_list(vec![], &fixed_server_key(), 7, 42, 86442);
         let json = serde_json::to_string(&signed).unwrap();
         let order = [
-            r#""version":6"#,
+            r#""version":7"#,
             r#""nodes":[]"#,
             r#""generation":7"#,
             r#""signed_at":42"#,
@@ -731,18 +733,17 @@ mod tests {
     }
 
     #[test]
-    fn node_field_order_is_frozen_at_v6() {
-        // multihop_pubkey and geoip are omitted (None); the rest are in order.
+    fn node_field_order_is_frozen_at_v7() {
         let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
         let json = serde_json::to_string(&signed).unwrap();
         let order = [
             r#""id":"#,
             r#""exit_id":"#,
-            r#""roles":["entry","relay","exit"]"#,
             r#""location":{"country":"RO","city":"Bucharest"}"#,
             r#""weight":100"#,
             r#""active":true"#,
-            r#""endpoints":[{"addr":"127.0.0.1","family":"ipv4","ingress":true,"egress":true,"listeners":[{"port":1234,"transport":"quic","alpn":"h3"}]}]"#,
+            r#""egress":{"ipv4":true,"ipv6":false}"#,
+            r#""endpoints":[{"addr":"127.0.0.1","family":"ipv4","listeners":[{"port":1234,"transport":"quic","alpn":"h3"}]}]"#,
         ];
         let mut last = 0usize;
         for needle in order {
@@ -751,9 +752,19 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {needle} in {json}"));
             last += pos + needle.len();
         }
-        // The optional fields are omitted entirely, never emitted as null.
-        assert!(!json.contains("multihop_pubkey"));
-        assert!(!json.contains("geoip"));
+    }
+
+    #[test]
+    fn public_wire_omits_geoip_roles_and_multihop_pubkey() {
+        // Minimization guard: the v7 wire must NOT carry the dropped v6 fields.
+        let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
+        let json = serde_json::to_string(&signed).unwrap();
+        for forbidden in ["geoip", "roles", "multihop_pubkey", "ingress"] {
+            assert!(
+                !json.contains(forbidden),
+                "v7 public node must not contain `{forbidden}`"
+            );
+        }
     }
 
     #[test]

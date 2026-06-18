@@ -95,7 +95,14 @@ struct ExitDescriptorSigned {
     exit_ed25519_pubkey: [u8; 32],
     #[serde(with = "hexn")]
     exit_x25519_multihop_pubkey: [u8; 32],
-    endpoint: SocketAddr,
+    /// Exit egress endpoint. `None` = redacted: the client-facing
+    /// `/v1/multihop/directory` omits the exit egress IP (Phase 2
+    /// censorship-minimization), since the client dials the entry relay, never
+    /// the exit. `endpoint` is outside the descriptor signature, so omitting it
+    /// keeps each node fully vouched. `skip_serializing_if` so a full descriptor
+    /// serializes byte-identically to the pre-Phase-2 form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<SocketAddr>,
     #[serde(with = "hexn")]
     signature: [u8; 64],
     #[serde(default, skip_serializing_if = "is_false")]
@@ -432,7 +439,11 @@ pub fn verify_multihop_directory(
                 exit_id: n.exit.exit_id,
                 exit_ed25519_pubkey: n.exit.exit_ed25519_pubkey,
                 exit_x25519_multihop_pubkey: n.exit.exit_x25519_multihop_pubkey,
-                endpoint: n.exit.endpoint,
+                // The client dials the ENTRY RELAY, never the exit egress IP
+                // (which v7 redacts from the client directory). For a dual-role
+                // node these coincide; for a true two-hop fleet this is the
+                // entry hop, which is the correct dial target either way.
+                endpoint: n.relay.endpoint,
                 country: n.country,
                 city: n.city,
                 weight: n.weight,
@@ -502,7 +513,7 @@ pub mod test_helpers {
                 exit_id,
                 exit_ed25519_pubkey: exit_ed,
                 exit_x25519_multihop_pubkey: exit_x,
-                endpoint,
+                endpoint: Some(endpoint),
                 signature: exit_sig,
                 dns_disabled: false,
             },
@@ -608,7 +619,7 @@ mod tests {
                 exit_id,
                 exit_ed25519_pubkey: exit_ed,
                 exit_x25519_multihop_pubkey: exit_x,
-                endpoint,
+                endpoint: Some(endpoint),
                 signature: exit_sig,
                 dns_disabled: false,
             },
@@ -677,6 +688,39 @@ mod tests {
         .expect("verifies");
         assert_eq!(dir.exits.len(), 2, "both fully-vouched nodes returned");
         assert_eq!(dir.exits[0].country, "RO");
+    }
+
+    #[test]
+    fn redacted_client_directory_omits_exit_endpoint_and_dials_the_relay() {
+        // Phase 2 (v7): the client-facing directory is signed over nodes whose
+        // exit egress IP is redacted (`exit.endpoint = None`). It must verify end
+        // to end (the endpoint is outside the operational signature and the
+        // envelope is recomputed over the redacted nodes), carry NO exit endpoint
+        // on the wire, and resolve the dial target to the ENTRY RELAY endpoint.
+        let (root, op, server) = (key(1), key(2), key(3));
+        let mut node = signed_node(&op, 10, "RO", 100);
+        node.exit.endpoint = None;
+        let json = signed_directory_json(&root, &op, &server, vec![node], 1000, 1000 + 3600);
+        // The dual-role node's address now appears exactly once (the relay's),
+        // never as a second, exit-side occurrence: redaction leaves only the
+        // entry-relay endpoint on the client wire.
+        assert_eq!(
+            json.matches("198.51.100.10:443").count(),
+            1,
+            "the exit-side endpoint must be omitted; only the relay endpoint remains"
+        );
+        let dir = verify_multihop_directory(
+            &json,
+            &[&server_pin(&server)],
+            &[&hex::encode(root.verifying_key().to_bytes())],
+        )
+        .expect("redacted client directory must verify end to end");
+        assert_eq!(dir.exits.len(), 1);
+        assert_eq!(
+            dir.exits[0].endpoint,
+            "198.51.100.10:443".parse().unwrap(),
+            "the dial target is the entry relay endpoint"
+        );
     }
 
     #[test]

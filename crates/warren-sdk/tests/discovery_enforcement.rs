@@ -9,7 +9,8 @@ use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use warren_sdk::api::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_sdk::discovery::{
-    ExitId, ExitQuery, JsonEndpoint, JsonListener, JsonLocation, JsonNode, sign_relay_list,
+    ExitId, ExitQuery, JsonEgress, JsonEndpoint, JsonListener, JsonLocation, JsonNode,
+    sign_relay_list,
 };
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::{GenerationStore, SdkError, ServerKeyStore, WarrenClient};
@@ -36,25 +37,24 @@ fn signed_list(server: &SigningKey, generation: u64, expires_at: u64) -> String 
     let node = JsonNode {
         id: "11".repeat(32),
         exit_id: ExitId::from_bytes([0xa1; 16]),
-        multihop_pubkey: None,
-        roles: vec!["entry".to_owned(), "relay".to_owned(), "exit".to_owned()],
         location: JsonLocation {
             country: "RO".to_owned(),
             city: "Bucharest".to_owned(),
         },
         weight: 100,
         active: true,
+        egress: JsonEgress {
+            ipv4: true,
+            ipv6: false,
+        },
         endpoints: vec![JsonEndpoint {
             addr: "198.51.100.7".to_owned(),
             family: "ipv4".to_owned(),
-            ingress: true,
-            egress: true,
             listeners: vec![JsonListener {
                 port: 443,
                 transport: "quic".to_owned(),
                 alpn: "h3".to_owned(),
             }],
-            geoip: None,
         }],
     };
     // Keep the signed validity window within the verifier's cap (7 days).
