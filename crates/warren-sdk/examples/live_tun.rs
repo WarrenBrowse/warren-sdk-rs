@@ -1,4 +1,4 @@
-//! PRIVILEGED TUN datapath validation harness (P6). EXPERIMENTAL.
+//! PRIVILEGED TUN datapath validation harness. EXPERIMENTAL.
 //!
 //! This is the runnable end-to-end check for the privileged TUN backend. It
 //! cannot run from a headless CI/dev sandbox: it needs root / `CAP_NET_ADMIN`, a

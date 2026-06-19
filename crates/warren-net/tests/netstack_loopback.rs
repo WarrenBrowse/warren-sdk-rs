@@ -1308,7 +1308,7 @@ async fn netstack_accepts_an_inbound_connection_and_echoes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn netstack_serves_a_forwarded_port_to_a_local_listener() {
-    // Full P7 inbound bridge: a local app server (host side) echoes; the engine
+    // Full inbound bridge: a local app server (host side) echoes; the engine
     // listens on a tunnel-side port and `serve_inbound` relays each inbound
     // connection to that local server. The exit dials in and round-trips.
     let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1645,7 +1645,7 @@ async fn natpmp_gateway_then_inbound(
         }
         let _ = iface.poll(now(), &mut device, &mut sockets);
 
-        // Phase 1: answer the NAT-PMP Map request, echoing the internal port the
+        // Step 1: answer the NAT-PMP Map request, echoing the internal port the
         // client asked for (request bytes [4..6]).
         if !mapped {
             let request = {
@@ -1664,7 +1664,7 @@ async fn natpmp_gateway_then_inbound(
             }
         }
 
-        // Phase 2: once mapped, dial the client's forwarded port like a remote peer.
+        // Step 2: once mapped, dial the client's forwarded port like a remote peer.
         if mapped && !connecting {
             let _ = sockets.get_mut::<tcp::Socket<'_>>(tcp_handle).connect(
                 iface.context(),

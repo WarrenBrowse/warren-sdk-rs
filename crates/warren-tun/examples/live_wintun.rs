@@ -1,4 +1,4 @@
-//! Windows Wintun device smoke-test harness (P6). EXPERIMENTAL.
+//! Windows Wintun device smoke-test harness. EXPERIMENTAL.
 //!
 //! Cannot run from the dev sandbox: needs a Windows host, Administrator, and the
 //! `wintun.dll` runtime on PATH (or next to the exe). It opens a Wintun adapter,

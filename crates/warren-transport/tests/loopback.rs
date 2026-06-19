@@ -1,6 +1,6 @@
 //! In-process end-to-end test: a client tunnel handshakes with a minimal exit
 //! built from the same TLS RPK layer, then exchanges a datagram. This validates
-//! the full P5 stack (RPK handshake, Setup/SetupAck, datagram plane) without any
+//! the full transport stack (RPK handshake, Setup/SetupAck, datagram plane) without any
 //! real network or privilege.
 
 use std::net::Ipv4Addr;

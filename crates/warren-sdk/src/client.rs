@@ -633,7 +633,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         }
         // Push the exit resolvers and route EVERY query through the tunnel link.
         // Without this, the split-default capture above still leaves DNS going to
-        // the host's previous resolver (the R4 leak). Fail-safe like the steps
+        // the host's previous resolver (a DNS leak). Fail-safe like the steps
         // before it: undo DNS, routing and the killswitch if the push fails.
         if let Err(e) = warren_tun::apply::apply_dns(&config) {
             warren_tun::apply::revert_dns(&config);

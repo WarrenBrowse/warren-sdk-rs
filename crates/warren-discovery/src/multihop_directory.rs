@@ -96,11 +96,11 @@ struct ExitDescriptorSigned {
     #[serde(with = "hexn")]
     exit_x25519_multihop_pubkey: [u8; 32],
     /// Exit egress endpoint. `None` = redacted: the client-facing
-    /// `/v1/multihop/directory` omits the exit egress IP (Phase 2
-    /// censorship-minimization), since the client dials the entry relay, never
-    /// the exit. `endpoint` is outside the descriptor signature, so omitting it
-    /// keeps each node fully vouched. `skip_serializing_if` so a full descriptor
-    /// serializes byte-identically to the pre-Phase-2 form.
+    /// `/v1/multihop/directory` omits the exit egress IP (censorship
+    /// minimization), since the client dials the entry relay, never the exit.
+    /// `endpoint` is outside the descriptor signature, so omitting it keeps each
+    /// node fully vouched. `skip_serializing_if` so a full descriptor serializes
+    /// byte-identically to the non-redacted form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     endpoint: Option<SocketAddr>,
     #[serde(with = "hexn")]
@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn redacted_client_directory_omits_exit_endpoint_and_dials_the_relay() {
-        // Phase 2 (v7): the client-facing directory is signed over nodes whose
+        // v7 redacted: the client-facing directory is signed over nodes whose
         // exit egress IP is redacted (`exit.endpoint = None`). It must verify end
         // to end (the endpoint is outside the operational signature and the
         // envelope is recomputed over the redacted nodes), carry NO exit endpoint
