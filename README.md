@@ -4,11 +4,18 @@ Standalone Rust client SDK for the [Warren VPN](https://warrenbrowse.com): a
 no-log VPN whose client to exit tunnel is pure QUIC, with a non-custodial Ed25519
 identity derived from a BIP39 mnemonic.
 
-This SDK is **standalone**: it does not depend on the warren-core monorepo. It is
-a clean-room reimplementation that stays **wire-compatible** with warren-core's
-frozen contracts, so it can talk to real exits and the production API. The same
-SDK is being reimplemented in TypeScript, Dart, Python, Kotlin, Swift and Java;
-this Rust crate is the reference and the source of the shared golden vectors.
+This SDK does not depend on the private **warren-core** backend. For the
+data-plane primitives (wire frames, identity, multihop HPKE, DAITA, TUN, TLS) it
+shares the open-source **WarrenGuard engine** (`warrenguard`, AGPL-3.0, sibling
+checkout `../warrenguard`): the `warren-{wire,identity,multihop,daita,tun,tun-core}`
+crates are thin re-exports of the matching `warrenguard-*` engine crates, so the
+protocol primitives have a single source of truth instead of a duplicate
+reimplementation. The control-plane (`warren-api`, `-discovery`, `-sdk`) and the
+userland transport stay SDK-local. It stays **wire-compatible** with warren-core's
+frozen contracts (same golden vectors), so it can talk to real exits and the
+production API. The same SDK is being reimplemented in TypeScript, Dart, Python,
+Kotlin, Swift and Java; this Rust crate is the reference and the source of the
+shared golden vectors.
 
 See `ARCHITECTURE.md` for the design, `ROADMAP.md` for the plan, and `CLAUDE.md`
 for the engineering rules.

@@ -437,10 +437,11 @@ echo harness covers the **datagram plane**. The exit's full termination mode
   the SAME account identity receive the SAME sticky IP from the exit's allocator
   (keyed on `client_pubkey`); a distinct identity gets a distinct IP. No new wire
   format. (The bonded sink stripes over N such same-IP connections.)
-- DAITA. DONE + REAL-EXIT VALIDATED (full schedule). The clean-room `warren-daita`
-  crate ports warren-core's DAITA layer: the wire `DaitaConfig`, the curated
-  five-machine pool, and the maybenot-backed `DaitaState` driver (event -> action
-  -> per-machine timer). `warren_transport::DaitaDriver` pumps the scheduled uplink
+- DAITA. DONE + REAL-EXIT VALIDATED (full schedule). The `warren-daita` crate is
+  now a thin re-export of the shared `warrenguard-daita` engine crate (the wire
+  `DaitaConfig`, the curated five-machine pool, and the maybenot-backed
+  `DaitaState` driver: event -> action -> per-machine timer).
+  `warren_transport::DaitaDriver` pumps the scheduled uplink
   cover traffic over a live `MultihopSession`, and the facade exposes it opt-in
   (`WarrenClientBuilder::daita()` / `daita_machine(name)`, auto-spawned in
   `connect_multihop`). Validated against the real DAITA-active exit: the driver
