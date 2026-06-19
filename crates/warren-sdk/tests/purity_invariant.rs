@@ -1,4 +1,4 @@
-//! Userland-purity invariant (Phase 0 ticket P0.4, RED until Phase 2).
+//! Userland-purity invariant.
 //!
 //! The default build of `warren-sdk` (no-root, userland proxy datapath) must
 //! pull **zero privileged code**: no TUN device open, no OS killswitch, no
@@ -8,16 +8,17 @@
 //! feature unification (the footgun: a sibling member enabling a feature must
 //! not be able to drag privileged code into a userland build).
 //!
-//! ## Why this is `#[ignore]` today (the RED reason)
+//! ## Why this is `#[ignore]` today
 //!
 //! `warren-net` currently depends on `warren-tun` **unconditionally**
-//! (`warren-net/Cargo.toml`), so `warren-tun` — which carries the privileged
-//! device-open code — is already in `warren-sdk`'s default dependency closure.
-//! The fix is Phase 2 (E2.5/E2.6): split `warren-tun` into `warrenguard-tun-core`
-//! (safe traits/types/parsers, zero unsafe, always-on) and
-//! `warrenguard-tun-device` (the only unsafe+root crate, `experimental-tun`-gated),
-//! and re-point `tun-bridge` at `-core`. Once that edge is gone, the default
-//! closure is privileged-free and this test flips GREEN (remove `#[ignore]`).
+//! (`warren-net/Cargo.toml`), so `warren-tun`, which carries the privileged
+//! device-open code, is already in `warren-sdk`'s default dependency closure.
+//! The fix is to split `warren-tun` into a safe core crate (traits, types and
+//! parsers: zero unsafe, always on) and a privileged device crate (the only
+//! unsafe+root crate, gated behind `experimental-tun`), then re-point the
+//! TUN-to-sink bridge at the safe core. Once that unconditional edge is gone the
+//! default closure is privileged-free and this test flips GREEN (drop the
+//! `#[ignore]`).
 //!
 //! `libc` and `smoltcp` in the default closure are **OK**: they are userland
 //! FFI / a userspace netstack, not privileged operations. The invariant keys
@@ -31,11 +32,11 @@ use serde_json::Value;
 /// Crate names that must never appear in the userland (default-feature) closure
 /// of `warren-sdk`. The post-split engine names are listed alongside the current
 /// monolithic `warren-tun` so the assertion is correct both before and after the
-/// Phase 2 carve.
+/// device-crate split.
 const PRIVILEGED_CRATES: &[&str] = &[
     // Current monolith carrying the privileged device-open (pre-split).
     "warren-tun",
-    // Post-split engine crates (Phase 2 target state).
+    // Post-split engine crates carrying the privileged device-open / OS killswitch.
     "warrenguard-tun-device",
     "warrenguard-killswitch-os",
     // Platform privileged shims that must only ever appear feature-gated.
@@ -117,7 +118,7 @@ fn default_closure_crate_names() -> HashSet<String> {
 }
 
 #[test]
-#[ignore = "RED until Phase 2 E2.6: warren-net→warren-tun edge keeps privileged code in the default closure"]
+#[ignore = "RED until warren-tun is split into a safe core and a privileged device crate (the unconditional warren-net to warren-tun edge keeps privileged code in the default closure)"]
 fn default_build_pulls_no_privileged_crate() {
     let reached = default_closure_crate_names();
     let violations: Vec<&str> = PRIVILEGED_CRATES
@@ -129,6 +130,6 @@ fn default_build_pulls_no_privileged_crate() {
         violations.is_empty(),
         "userland (default-feature) closure of warren-sdk must contain no privileged crate, \
          found: {violations:?}. Privileged datapaths belong behind `experimental-tun` in \
-         separate crates (Phase 2 E2.5-E2.8)."
+         separate crates."
     );
 }
