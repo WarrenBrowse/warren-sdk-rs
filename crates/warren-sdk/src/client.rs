@@ -631,6 +631,16 @@ impl<T: HttpTransport> WarrenClient<T> {
             let _ = warren_tun::apply::teardown_killswitch();
             return Err(SdkError::Tun(e));
         }
+        // Push the exit resolvers and route EVERY query through the tunnel link.
+        // Without this, the split-default capture above still leaves DNS going to
+        // the host's previous resolver (the R4 leak). Fail-safe like the steps
+        // before it: undo DNS, routing and the killswitch if the push fails.
+        if let Err(e) = warren_tun::apply::apply_dns(&config) {
+            warren_tun::apply::revert_dns(&config);
+            warren_tun::apply::revert_routing(&routing, &dev_name, gateway);
+            let _ = warren_tun::apply::teardown_killswitch();
+            return Err(SdkError::Tun(e));
+        }
 
         let (tun_sink, bridge) =
             warren_net::tun_channels(device, warren_tun::Framing::for_target_os(), config.mtu);
@@ -640,7 +650,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             driver,
             pump,
             routing,
-            tun_name: dev_name,
+            config,
             gateway,
         })
     }
@@ -928,7 +938,7 @@ pub struct TunDatapathHandle {
     driver: tokio::task::JoinHandle<std::io::Result<()>>,
     pump: tokio::task::JoinHandle<Result<(), warren_net::NetError>>,
     routing: warren_tun::RoutingPlan,
-    tun_name: String,
+    config: warren_tun::TunConfig,
     gateway: std::net::IpAddr,
 }
 
@@ -940,7 +950,8 @@ impl Drop for TunDatapathHandle {
         // Best-effort: a route/table already gone on teardown is not an error.
         self.driver.abort();
         self.pump.abort();
-        warren_tun::apply::revert_routing(&self.routing, &self.tun_name, self.gateway);
+        warren_tun::apply::revert_dns(&self.config);
+        warren_tun::apply::revert_routing(&self.routing, &self.config.name, self.gateway);
         let _ = warren_tun::apply::teardown_killswitch();
     }
 }

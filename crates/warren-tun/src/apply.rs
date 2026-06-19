@@ -181,6 +181,41 @@ pub fn revert_routing(plan: &RoutingPlan, dev: &str, physical_gateway: IpAddr) {
     }
 }
 
+/// Pushes the exit-assigned DNS resolvers onto the TUN link and routes EVERY
+/// query through it (Linux/systemd-resolved via `resolvectl`). This closes the
+/// DNS-leak vector: once the split-default routing captures traffic, lookups
+/// must not keep hitting the host's previous resolver. No-op when the exit
+/// assigned no DNS.
+///
+/// macOS DNS push (`scutil`/`networksetup`) is not yet wired, so a macOS TUN
+/// datapath still resolves via the host resolver until that lands; the routing
+/// capture above is unaffected. Tracked as the remaining half of the DNS-leak
+/// fix for the experimental TUN path.
+///
+/// # Errors
+///
+/// The first `resolvectl` invocation that fails.
+pub fn apply_dns(config: &TunConfig) -> io::Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    for argv in config.dns_push_commands_linux() {
+        run(&argv, None)?;
+    }
+    #[cfg(target_os = "macos")]
+    let _ = config;
+    Ok(())
+}
+
+/// Reverts [`apply_dns`] (best-effort: a link already reverted is not fatal), so
+/// the host resolver returns on datapath shutdown. No-op when no DNS was pushed.
+pub fn revert_dns(config: &TunConfig) {
+    #[cfg(not(target_os = "macos"))]
+    for argv in config.dns_teardown_commands_linux() {
+        let _ = run(&argv, None);
+    }
+    #[cfg(target_os = "macos")]
+    let _ = config;
+}
+
 /// Tears the killswitch down, restoring normal output. On macOS this flushes the
 /// rules and disables pf (back to the default unfiltered state); on Linux it
 /// deletes the nftables table.

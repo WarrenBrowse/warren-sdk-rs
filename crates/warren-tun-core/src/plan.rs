@@ -25,10 +25,10 @@ pub struct TunConfig {
     /// The exit's public UDP endpoint: traffic to it must keep using the physical
     /// link (otherwise the tunnel would route its own carrier packets into itself).
     pub exit_endpoint: SocketAddr,
-    /// DNS servers the exit assigned, to be pushed as the system resolvers
-    /// (queried over the tunnel). Carried from the IP assignment but NOT yet
-    /// consumed: the experimental TUN apply path has no DNS-push step yet, so this
-    /// is reserved for that roadmap item rather than read today.
+    /// DNS servers the exit assigned, pushed as the link resolvers and queried
+    /// over the tunnel. Consumed by [`Self::dns_push_commands_linux`], which also
+    /// installs the `~.` routing domain so no lookup leaks to the host resolver
+    /// while the tunnel is up.
     pub dns: Vec<IpAddr>,
 }
 
@@ -107,6 +107,50 @@ impl TunConfig {
             ]);
         }
         cmds
+    }
+}
+
+impl TunConfig {
+    /// Linux DNS push via systemd-resolved: set the exit-assigned resolvers on
+    /// the TUN link AND install the `~.` routing domain so EVERY query is sent
+    /// through this link's resolver. Without the routing domain, systemd-resolved
+    /// still routes queries matched by another link's search domain to the host
+    /// resolver, leaking them outside the tunnel (the R4 DNS-leak vector).
+    ///
+    /// Returns an empty vec when the exit assigned no DNS (nothing to push).
+    /// Pure (no exec); the privileged applier runs each argv. Reverted by
+    /// [`Self::dns_teardown_commands_linux`].
+    #[must_use]
+    pub fn dns_push_commands_linux(&self) -> Vec<Vec<String>> {
+        if self.dns.is_empty() {
+            return Vec::new();
+        }
+        let mut set_resolvers = vec!["resolvectl".to_owned(), "dns".to_owned(), self.name.clone()];
+        set_resolvers.extend(self.dns.iter().map(ToString::to_string));
+        vec![
+            set_resolvers,
+            vec![
+                "resolvectl".to_owned(),
+                "domain".to_owned(),
+                self.name.clone(),
+                "~.".to_owned(),
+            ],
+        ]
+    }
+
+    /// Reverts [`Self::dns_push_commands_linux`]: drops the per-link resolver and
+    /// routing-domain config so the host resolver is restored on shutdown. Empty
+    /// when no DNS was pushed. Pure (no exec); applied best-effort on teardown.
+    #[must_use]
+    pub fn dns_teardown_commands_linux(&self) -> Vec<Vec<String>> {
+        if self.dns.is_empty() {
+            return Vec::new();
+        }
+        vec![vec![
+            "resolvectl".to_owned(),
+            "revert".to_owned(),
+            self.name.clone(),
+        ]]
     }
 }
 
@@ -575,6 +619,56 @@ mod tests {
             ]));
         // up is still last.
         assert_eq!(cmds.last().unwrap().last().unwrap(), "up");
+    }
+
+    #[test]
+    fn dns_push_sets_link_resolvers_and_routes_all_queries_via_the_tunnel() {
+        // R4 DNS-leak guard: pushing the exit resolvers is not enough; without
+        // the `~.` routing domain, systemd-resolved still sends queries for
+        // names matched by another link's search domain to the host resolver,
+        // leaking them outside the tunnel. Both argv must be rendered.
+        let cmds = v4_config().dns_push_commands_linux();
+        assert_eq!(
+            cmds,
+            vec![
+                vec!["resolvectl", "dns", "warren0", "10.66.0.1"],
+                vec!["resolvectl", "domain", "warren0", "~."],
+            ],
+            "DNS push must set the link resolver AND the `~.` routing domain so \
+             no lookup escapes to the host resolver while the tunnel is up"
+        );
+    }
+
+    #[test]
+    fn dns_push_passes_every_assigned_resolver_in_order() {
+        let mut cfg = v4_config();
+        cfg.dns = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 66, 0, 1)),
+            IpAddr::V6(Ipv6Addr::new(0xfd66, 0, 0, 0, 0, 0, 0, 1)),
+        ];
+        let cmds = cfg.dns_push_commands_linux();
+        assert_eq!(
+            cmds[0],
+            vec!["resolvectl", "dns", "warren0", "10.66.0.1", "fd66::1"],
+            "all assigned resolvers (v4 and v6) go on the link, in order"
+        );
+    }
+
+    #[test]
+    fn dns_teardown_reverts_the_link_so_the_host_resolver_returns() {
+        let cmds = v4_config().dns_teardown_commands_linux();
+        assert_eq!(cmds, vec![vec!["resolvectl", "revert", "warren0"]]);
+    }
+
+    #[test]
+    fn no_dns_is_pushed_or_torn_down_when_the_exit_assigned_none() {
+        let mut cfg = v4_config();
+        cfg.dns.clear();
+        assert!(
+            cfg.dns_push_commands_linux().is_empty(),
+            "no assigned resolver means nothing to push (and nothing to revert)"
+        );
+        assert!(cfg.dns_teardown_commands_linux().is_empty());
     }
 
     #[test]
