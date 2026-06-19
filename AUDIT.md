@@ -1,5 +1,11 @@
 # Audit report (post-implementation)
 
+> Historical record. This audit predates the 2026-06-20 engine migration, when
+> the data-plane crates (`warren-{wire,identity,multihop,daita,tun,tun-core}`)
+> became thin re-exports of the shared `warrenguard` engine. References below to
+> a "clean-room port of warren-core" describe the pre-migration state; the
+> wire-compat guarantees they assert still hold via the shared golden vectors.
+
 Comprehensive audit of `warren-sdk-rs` after the P1 to P9 implementation, across
 security, Rust architecture/clean-code, and performance/userland. Conducted by
 three independent reviewers reading the full source and cross-checking the
