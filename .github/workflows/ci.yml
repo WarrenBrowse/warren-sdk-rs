@@ -25,6 +25,9 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-engine
+        with:
+          token: ${{ secrets.ENGINE_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: rustfmt
@@ -45,6 +48,9 @@ jobs:
             runner: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-engine
+        with:
+          token: ${{ secrets.ENGINE_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy
@@ -77,6 +83,9 @@ jobs:
         with:
           submodules: recursive
           token: ${{ secrets.VECTORS_TOKEN }}
+      - uses: ./.github/actions/checkout-engine
+        with:
+          token: ${{ secrets.ENGINE_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-nextest
@@ -94,6 +103,9 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-engine
+        with:
+          token: ${{ secrets.ENGINE_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       # Build the cdylib and generate foreign bindings from it. This fails if the
@@ -139,6 +151,9 @@ jobs:
       - uses: actions/checkout@v4
       # Install and run directly rather than the container action: the Linux
       # runners are not guaranteed to expose a usable Docker daemon to jobs.
+      - uses: ./.github/actions/checkout-engine
+        with:
+          token: ${{ secrets.ENGINE_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.89.0
       - name: install cargo-deny
         uses: taiki-e/install-action@v2
@@ -158,6 +173,9 @@ jobs:
         with:
           submodules: recursive
           token: ${{ secrets.VECTORS_TOKEN }}
+      - uses: ./.github/actions/checkout-engine
+        with:
+          token: ${{ secrets.ENGINE_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: llvm-tools-preview

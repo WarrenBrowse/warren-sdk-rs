@@ -336,7 +336,7 @@ fn exit_seal(
     aead_tag.copy_from_slice(tag.as_slice());
     WarrenMultihopFrame {
         version: WARREN_HPKE_VERSION_V1,
-        exit_id: *exit_id,
+        exit_id: warren_wire::multihop::ExitId::from_bytes(*exit_id),
         epoch,
         seq,
         encapsulated_key,
@@ -381,7 +381,11 @@ pub async fn spawn_fake_multihop_exit(exit_key: SigningKey) -> (SocketAddr, Mult
         let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
         let request_bytes = recv.read_to_end(65536).await.expect("read setup request");
         let request = WarrenMultihopFrame::decode(&request_bytes).expect("decode request frame");
-        assert_eq!(request.exit_id, exit_id, "setup frame exit_id must match");
+        assert_eq!(
+            request.exit_id.as_bytes(),
+            &exit_id,
+            "setup frame exit_id must match"
+        );
 
         let encapped =
             <ExitKem as KemTrait>::EncappedKey::from_bytes(&request.encapsulated_key).unwrap();
@@ -430,7 +434,7 @@ pub async fn spawn_fake_multihop_exit(exit_key: SigningKey) -> (SocketAddr, Mult
             let Ok(frame) = WarrenMultihopFrame::decode(&dg) else {
                 continue;
             };
-            if frame.exit_id != exit_id {
+            if frame.exit_id.as_bytes() != &exit_id {
                 continue;
             }
             let Some(ip_packet) = exit_open(&ctx, &exit_id, &frame) else {
@@ -596,7 +600,7 @@ pub async fn spawn_netstack_multihop_exit(exit_key: SigningKey) -> (SocketAddr, 
                 dg = conn.read_datagram() => match dg {
                     Ok(datagram) => {
                         if let Ok(frame) = WarrenMultihopFrame::decode(&datagram)
-                            && frame.exit_id == exit_id
+                            && frame.exit_id.as_bytes() == &exit_id
                             && let Some(ip) = exit_open(&ctx, &exit_id, &frame)
                         {
                             device.rx.push_back(ip);
@@ -689,7 +693,7 @@ pub async fn spawn_replaying_multihop_exit(exit_key: SigningKey) -> (SocketAddr,
             let Ok(frame) = WarrenMultihopFrame::decode(&datagram) else {
                 continue;
             };
-            if frame.exit_id != exit_id {
+            if frame.exit_id.as_bytes() != &exit_id {
                 continue;
             }
             let Some(ip) = exit_open(&ctx, &exit_id, &frame) else {

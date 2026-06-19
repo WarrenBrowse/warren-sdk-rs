@@ -49,7 +49,7 @@ fn multihop_frame_vectors_match() {
     for v in &f.vectors {
         let frame = WarrenMultihopFrame {
             version: f.version,
-            exit_id: bytes16(&v.exit_id_hex),
+            exit_id: warren_wire::multihop::ExitId::from_bytes(bytes16(&v.exit_id_hex)),
             epoch: v.epoch,
             seq: v.seq,
             encapsulated_key: bytes32(&v.encapsulated_key_hex),

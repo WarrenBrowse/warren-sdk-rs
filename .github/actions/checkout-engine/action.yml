@@ -1,0 +1,27 @@
+name: Checkout WarrenGuard engine
+description: >
+  Clone the open-source WarrenGuard engine (AGPL-3.0) into the sibling
+  `../warrenguard` at the SHA pinned in `.warrenguard-version`. The SDK
+  path-deps the engine crates from there. The engine is consumed against plain
+  upstream quinn (the SDK carries no `[patch.crates-io]`), so the engine's
+  gitignored `vendor/quinn-fork` is intentionally not assembled here.
+inputs:
+  token:
+    description: PAT with Contents:read on WarrenBrowse/warrenguard.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        ENGINE_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        REV="$(tr -d '[:space:]' < .warrenguard-version)"
+        echo "==> warrenguard engine pinned at ${REV}"
+        rm -rf ../warrenguard
+        git clone --quiet \
+          "https://x-access-token:${ENGINE_TOKEN}@github.com/WarrenBrowse/warrenguard.git" \
+          ../warrenguard
+        git -C ../warrenguard checkout --quiet "${REV}"
+        echo "==> warrenguard checked out at $(git -C ../warrenguard rev-parse --short HEAD)"

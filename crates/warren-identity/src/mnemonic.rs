@@ -5,23 +5,13 @@
 //! the mnemonic alone reproduces the identity. Any future second factor comes
 //! from an upper layer (local keyring), never from BIP39.
 
-use bip39::{Language, Mnemonic};
-use zeroize::{Zeroize, Zeroizing};
+use bip39::Mnemonic;
 
-/// Errors from parsing or generating a BIP39 mnemonic.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum MnemonicError {
-    /// Invalid BIP39 mnemonic (unexpected length, unknown word, bad checksum).
-    ///
-    /// The `bip39::Error` Display forwarded here is positions/indices only (for
-    /// example `UnknownWord` carries the word index, never the word string), so
-    /// it leaks no mnemonic material. If a future bip39 bump starts echoing the
-    /// offending word, this `{0}` forward would breach the no-log discipline and
-    /// must be redacted then.
-    #[error("invalid BIP39 mnemonic: {0}")]
-    Invalid(#[from] bip39::Error),
-}
+// `seed_from_mnemonic` and `MnemonicError` are the byte-locked derivation
+// primitive, now sourced from the engine's `warrenguard-identity` so a single
+// implementation is shared with warren-core. The tests below stay as the
+// byte-compat guard over the re-exported impl.
+pub use warrenguard_identity::{MnemonicError, seed_from_mnemonic};
 
 /// Generates a fresh 12-word English BIP39 mnemonic.
 ///
@@ -32,33 +22,6 @@ pub fn generate() -> String {
     Mnemonic::generate(12)
         .expect("BIP39 12-word generation never fails for a valid word count")
         .to_string()
-}
-
-/// Converts a BIP39 mnemonic phrase (12 or 24 English words) to the 32-byte
-/// seed fed to the HKDF key derivation.
-///
-/// A BIP39 seed is natively 64 bytes (PBKDF2-SHA512). Warren keeps only the
-/// first 32 and feeds them to HKDF-SHA256. This truncation is safe because
-/// HKDF re-mixes the input with its salt and info, so no usable entropy is
-/// lost beyond 32 bytes in a 256-bit symmetric-key scheme.
-///
-/// The result is wrapped in [`Zeroizing`] so the 32 secret bytes are wiped at
-/// drop, even on an intermediate panic.
-///
-/// # Errors
-///
-/// BIP39 parsing error (unknown word, invalid length, bad checksum).
-pub fn seed_from_mnemonic(mnemonic: &str) -> Result<Zeroizing<[u8; 32]>, MnemonicError> {
-    // Pin English explicitly: `Mnemonic::parse` auto-detects the language from
-    // the bip39 crate's enabled features, so enabling another wordlist feature
-    // would silently change which words decode and therefore the derived seed
-    // (the identity). The frozen contract is English-only.
-    let parsed = Mnemonic::parse_in_normalized(Language::English, mnemonic)?;
-    let mut full_seed = parsed.to_seed_normalized("");
-    let mut seed32 = Zeroizing::new([0u8; 32]);
-    seed32.copy_from_slice(&full_seed[..32]);
-    full_seed.zeroize();
-    Ok(seed32)
 }
 
 #[cfg(test)]

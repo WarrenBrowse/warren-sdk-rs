@@ -98,7 +98,7 @@ pub(crate) async fn dial_quic(
     let mut endpoint = quinn::Endpoint::client(bind).map_err(QuicDialError::Bind)?;
     endpoint.set_default_client_config(client_cfg);
 
-    let server_name = tls::name::encode(&exit_pubkey);
+    let server_name = tls::name::encode(tls::WarrenPubkey::from_bytes(exit_pubkey));
     let conn = endpoint
         .connect(exit_addr, &server_name)
         .map_err(QuicDialError::Connect)?
@@ -107,7 +107,7 @@ pub(crate) async fn dial_quic(
 
     // Confirm the authenticated peer key matches the expected exit identity.
     match tls::peer_pubkey(&conn) {
-        Some(pk) if pk == exit_pubkey => Ok((endpoint, conn)),
+        Some(pk) if pk.as_bytes() == &exit_pubkey => Ok((endpoint, conn)),
         _ => Err(QuicDialError::IdentityMismatch),
     }
 }

@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
-use warren_multihop::ClientSession;
+use warren_multihop::{ClientSession, ExitId, parse_exit_x25519_pubkey};
 use warren_wire::multihop::{EXIT_ID_LEN, WarrenMultihopFrame};
 
 /// Times `f` over `iters` iterations after a warm-up, printing ns/op.
@@ -36,8 +36,8 @@ fn main() {
     // Deterministic setup so runs are comparable; the KEM keypair and exit key
     // are fixed (setup cost is one-time, outside the timed loops).
     let mut rng = ChaCha20Rng::seed_from_u64(0x5741_5252_454e);
-    let exit_x = [7u8; 32];
-    let exit_id = [0x11u8; EXIT_ID_LEN];
+    let exit_x = parse_exit_x25519_pubkey(&[7u8; 32]).expect("parse exit x25519");
+    let exit_id = ExitId::from_bytes([0x11u8; EXIT_ID_LEN]);
     let session = ClientSession::new(&exit_x, exit_id, &mut rng).expect("session");
 
     // 64B: a bare ACK-sized packet. 576B: the classic minimum IPv4 MTU. 1280B:

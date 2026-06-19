@@ -5,11 +5,19 @@ implementation of the Warren client protocol; the same SDK is reimplemented in
 TypeScript, Dart, Python, Kotlin, Swift and Java. Read `ARCHITECTURE.md` for the
 layering and `ROADMAP.md` for the phase plan.
 
-## Prime directive: standalone and wire-compatible
+## Prime directive: engine-backed, no backend dependency, wire-compatible
 
-1. **No dependency on warren-core.** This SDK never imports a warren-core crate.
-   It is a clean-room reimplementation. warren-core is read-only reference
-   material at `../warren-core` (source of truth for the frozen contracts).
+1. **No dependency on the private backend (`warren-core`).** This SDK never
+   imports a `warren-core` crate; `../warren-core` is read-only reference
+   material only. The data-plane primitives (wire frames, identity, multihop
+   HPKE, DAITA, TUN, TLS) come from the **shared open-source engine**
+   `warrenguard` (AGPL-3.0, sibling checkout `../warrenguard`): the SDK's
+   `warren-{wire,identity,multihop,daita,tun,tun-core}` crates are thin
+   re-exports of the matching `warrenguard-*` engine crates, so there is a
+   single source of truth for the protocol primitives rather than a duplicate
+   reimplementation. The SDK keeps its own control-plane (`warren-api`,
+   `-discovery`, `-sdk`, `-sdk-ffi`) and userland transport (`warren-transport`,
+   `-net`), which are intentionally SDK-specific (non-root userland datapath).
 2. **Wire compatibility is non-negotiable.** Identity derivation, SS58, request
    signing, the handshake frames, the signed relay list, NAT-PMP and the
    multihop frame must match warren-core byte-for-byte, otherwise the SDK cannot

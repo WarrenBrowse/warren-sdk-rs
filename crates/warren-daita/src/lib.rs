@@ -1,33 +1,19 @@
-//! Warren DAITA v2 client driver (Defense Against AI-guided Traffic Analysis).
+//! Warren DAITA client surface (Defense Against AI-guided Traffic Analysis).
 //!
 //! DAITA obscures the packet-timing and packet-size fingerprint of encrypted
-//! traffic by scheduling cover ("dummy") packets and outgoing-blocking from a set
-//! of probabilistic state machines (the [`maybenot`] framework). This crate is a
-//! clean-room port of warren-core's DAITA layer: the wire [`DaitaConfig`], the
-//! curated [`DaitaPool`] of machines, and the synchronous [`DaitaState`] driver
-//! that turns traffic events into padding actions.
+//! traffic by scheduling cover ("dummy") packets and outgoing-blocking from a
+//! set of probabilistic state machines (the [`maybenot`] framework).
 //!
-//! It does no I/O and no async: an async pump owns the wall clock, emits the
-//! cover traffic, and feeds events back. On the multihop path the client picks a
-//! machine from [`DaitaPool`] and pads its uplink; the exit independently pads
-//! the downlink (the directions are asymmetric, client-unilateral defenses).
-//!
-//! ## Wire compatibility
-//!
-//! [`DaitaConfig::machine_specs`] carries the exact base64 strings produced by
-//! `maybenot::Machine::serialize`, and the pool parameters match warren-core, so
-//! a Warren exit and this client reconstruct byte-identical machines. The
-//! `maybenot` / `maybenot-machines` versions are pinned for the same reason.
+//! This is now a thin re-export of the engine's `warrenguard-daita`, so a single
+//! maybenot-driven implementation is shared with warren-core: the wire
+//! [`DaitaConfig`], the curated [`DaitaPool`] of machines, and the synchronous
+//! [`DaitaState`] driver. The behavioural-equivalence tests below stay as a
+//! guard over the re-exported implementation (both sides drive the same
+//! `maybenot::Framework`, so the curated cadence must match).
 
-mod config;
-mod pool;
-mod state;
-
-pub use config::{DaitaConfig, DaitaError};
-pub use pool::DaitaPool;
-pub use state::{
-    DAITA_PLACEHOLDER_SLEEP, DaitaAction, DaitaEvent, DaitaMetrics, DaitaState, DaitaTimer,
-    MachineId,
+pub use warrenguard_daita::{
+    DAITA_PLACEHOLDER_SLEEP, DaitaAction, DaitaConfig, DaitaConfigExt, DaitaError, DaitaEvent,
+    DaitaMetrics, DaitaPool, DaitaState, DaitaTimer, MachineId,
 };
 
 #[cfg(test)]

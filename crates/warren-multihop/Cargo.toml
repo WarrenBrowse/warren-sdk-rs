@@ -10,28 +10,24 @@ authors.workspace = true
 publish.workspace = true
 
 [features]
-# Exposes test-only constructors (e.g. `IpAssignment::placeholder_for_test`) for
-# downstream harnesses that bypass the real setup exchange. OFF by default; only
-# ever enabled as a dev-dependency feature, never in a production dependency.
-test-helpers = []
+# Forwards to the engine's test-only constructors (e.g.
+# `IpAssignment::placeholder_for_test`) for downstream harnesses that bypass the
+# real setup exchange. OFF by default; only ever enabled as a dev-dependency
+# feature, never in a production dependency.
+test-helpers = ["warrenguard-multihop/test-helpers"]
 
 [dependencies]
-warren-wire = { path = "../warren-wire" }
-thiserror = { workspace = true }
-# Ed25519 for the multihop proof of possession (account-key signature binding
-# the session's encapsulated key + exit_id). Same crate/features as identity.
-ed25519-dalek = { workspace = true }
-# HPKE RFC 9180 (NOT hpke-rs/Cryspen). Pinned to match warren-core's wire output.
-hpke = { version = "=0.13.0", default-features = false, features = ["alloc", "x25519"] }
-chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
-# hpke 0.13 expects the rand_core 0.9 CryptoRng/RngCore trait surface.
-rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
-# Zeroize the per-packet symmetric key after use (secret hygiene, matches core).
-zeroize = { workspace = true }
+# The multihop HPKE session + setup + replay + pop now live in the engine; this
+# crate is a thin re-export so a single implementation is shared with warren-core.
+warrenguard-multihop = { path = "../../../warrenguard/crates/warrenguard-multihop" }
 
 [dev-dependencies]
-# Deterministic RNG (rand_core 0.9 traits) for the HPKE round-trip test.
+# The PoP golden-vector replay builds a SigningKey directly.
+ed25519-dalek = { workspace = true }
+# The datapath bench reaches the frame codec + a deterministic RNG directly.
+warren-wire = { path = "../warren-wire" }
 rand_chacha = "0.9"
+rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
 # Replaying the shared cross-language PoP golden vector (vectors/pop.json).
 serde = { workspace = true }
 serde_json = { workspace = true }

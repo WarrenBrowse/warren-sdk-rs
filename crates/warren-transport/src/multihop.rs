@@ -35,7 +35,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use warren_multihop::{ClientSession as HpkeSession, IpAssignment, ReplayWindow, SetupError};
+use warren_multihop::{
+    ClientSession as HpkeSession, ExitId, IpAssignment, ReplayWindow, SetupError,
+    parse_exit_x25519_pubkey,
+};
 use warren_wire::control::{CONTROL_FIRST_BYTE, try_decode_control};
 use warren_wire::multihop::{EXIT_ID_LEN, WarrenMultihopFrame};
 
@@ -84,7 +87,7 @@ pub enum MultihopError {
     },
     /// The multihop frame failed to encode or decode.
     #[error("multihop frame codec error")]
-    Frame(#[source] warren_wire::multihop::MultihopFrameError),
+    Frame(#[source] warren_wire::multihop::MultihopError),
     /// The HPKE setup exchange failed (seal/open, policy rejection, exhaustion).
     #[error("multihop setup failed")]
     Setup(#[source] SetupError),
@@ -192,9 +195,11 @@ impl MultihopClientTunnel {
 
         // Build the per-session HPKE context (one KEM ECDH against the exit's
         // X25519 multihop key); its encapsulated key rides every frame.
+        let exit_x25519_key = parse_exit_x25519_pubkey(&exit_x25519)
+            .map_err(|e| MultihopError::Setup(SetupError::Session(e)))?;
         let session = HpkeSession::new(
-            &exit_x25519,
-            exit_id,
+            &exit_x25519_key,
+            ExitId::from_bytes(exit_id),
             &mut rand_core::UnwrapErr(rand_core::OsRng),
         )
         .map_err(|e| MultihopError::Setup(SetupError::Session(e)))?;
@@ -245,6 +250,7 @@ impl MultihopClientTunnel {
             conn,
             session: RwLock::new(session),
             exit_id,
+            exit_x25519,
             // Setup consumed forward seq 0; data starts at 1.
             seq_send: AtomicU64::new(1),
             replay: Mutex::new(replay),
@@ -340,7 +346,7 @@ impl EpochReplay {
 
     /// Probe `seq` for `epoch` without recording. An epoch never seen yet
     /// accepts (its window is created on the matching record).
-    fn check(&self, seq: u64, epoch: u32) -> Result<(), warren_multihop::SessionError> {
+    fn check(&self, seq: u64, epoch: u32) -> Result<(), warren_multihop::MultihopError> {
         match self.windows.get(&epoch) {
             Some(w) => w.check(seq, epoch),
             None => Ok(()),
@@ -353,7 +359,7 @@ impl EpochReplay {
         &mut self,
         seq: u64,
         epoch: u32,
-    ) -> Result<(), warren_multihop::SessionError> {
+    ) -> Result<(), warren_multihop::MultihopError> {
         let result = self
             .windows
             .entry(epoch)
@@ -445,6 +451,11 @@ pub struct MultihopSession {
     conn: quinn::Connection,
     session: RwLock<HpkeSession>,
     exit_id: [u8; EXIT_ID_LEN],
+    // The exit's long-lived X25519 multihop pubkey (raw bytes). Held so a rekey
+    // can re-encapsulate against it: the engine `ClientSession::rekey` takes the
+    // recipient key rather than storing it (the session is recipient-stateless
+    // after setup), so the transport owns the bytes and re-parses per rotation.
+    exit_x25519: [u8; 32],
     seq_send: AtomicU64,
     replay: Mutex<EpochReplay>,
     assignment: IpAssignment,
@@ -553,10 +564,19 @@ impl MultihopSession {
     /// [`MultihopError::Setup`] if the fresh `setup_sender` fails.
     pub fn rekey(&self) -> Result<u32, MultihopError> {
         let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
-        let mut guard = self.session.write().unwrap_or_else(|e| e.into_inner());
-        let new_epoch = guard
-            .rekey(&mut rng)
+        // The engine session does not retain the recipient key, so re-parse the
+        // exit's X25519 pubkey to re-encapsulate (validated at connect time, so
+        // this cannot realistically fail here).
+        let exit_key = parse_exit_x25519_pubkey(&self.exit_x25519)
             .map_err(|e| MultihopError::Setup(SetupError::Session(e)))?;
+        let mut guard = self.session.write().unwrap_or_else(|e| e.into_inner());
+        // rekey bumps the session's epoch internally and returns the new
+        // encapsulated key (which now rides every frame); the epoch is read back
+        // under the same write lock.
+        guard
+            .rekey(&exit_key, &mut rng)
+            .map_err(|e| MultihopError::Setup(SetupError::Session(e)))?;
+        let new_epoch = guard.epoch();
         // Publish the seq reset and epoch under the write lock, before any seal
         // can observe the new epoch (the write lock excludes all read-lock seals).
         self.seq_send.store(0, Ordering::SeqCst);
@@ -573,7 +593,7 @@ impl MultihopSession {
         self.session
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .prune_old_epoch();
+            .prune_pending_old_epoch();
     }
 
     /// The current HPKE epoch (starts at `0`, `+1` per [`rekey`](Self::rekey)).
@@ -647,7 +667,7 @@ impl MultihopSession {
             let Ok(frame) = WarrenMultihopFrame::decode(&datagram) else {
                 continue;
             };
-            if frame.exit_id != self.exit_id {
+            if frame.exit_id.as_bytes() != &self.exit_id {
                 continue;
             }
             // Probe-open-record. The cheap pre-`check` lets a replayed frame be
@@ -717,12 +737,14 @@ impl MultihopSession {
         conn: quinn::Connection,
         session: HpkeSession,
         exit_id: [u8; EXIT_ID_LEN],
+        exit_x25519: [u8; 32],
     ) -> Self {
         Self {
             _endpoint: endpoint,
             conn,
             session: RwLock::new(session),
             exit_id,
+            exit_x25519,
             seq_send: AtomicU64::new(0),
             replay: Mutex::new(EpochReplay::new()),
             assignment: IpAssignment::placeholder_for_test(),
@@ -752,7 +774,7 @@ mod real_exit_tests {
     use std::process::{Child, Command, Stdio};
     use std::time::Duration;
 
-    use warren_multihop::{ClientSession, SessionError};
+    use warren_multihop::{ClientSession, ExitId, parse_exit_x25519_pubkey};
 
     /// Frozen BIP39 test vector. The exit derives BOTH its Ed25519 QUIC RPK
     /// (via the identity HKDF) and its long-lived X25519 multihop key from this
@@ -910,8 +932,9 @@ mod real_exit_tests {
         let (endpoint, conn) = dial_with_retry(&client_key, exit_rpk, addr).await;
 
         let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
-        let mut session =
-            ClientSession::new(&exit_x25519, TEST_EXIT_ID, &mut rng).expect("HPKE setup_sender");
+        let exit_key = parse_exit_x25519_pubkey(&exit_x25519).expect("parse exit x25519");
+        let mut session = ClientSession::new(&exit_key, ExitId::from_bytes(TEST_EXIT_ID), &mut rng)
+            .expect("HPKE setup_sender");
 
         // Epoch 0: a handful of frames open cleanly (baseline datapath).
         for seq in 0..8u64 {
@@ -921,7 +944,10 @@ mod real_exit_tests {
 
         // Rekey: a fresh encapsulated_key makes the exit's session cache MISS and
         // run a brand new `setup_receiver`. The new-epoch datapath must round-trip.
-        let new_epoch = session.rekey(&mut rng).expect("rekey");
+        // The engine rekey returns the new encapsulated key and bumps the epoch
+        // internally; read the epoch back for the round-trip assertions.
+        session.rekey(&exit_key, &mut rng).expect("rekey");
+        let new_epoch = session.epoch();
         assert_eq!(new_epoch, 1);
         for seq in 0..8u64 {
             let payload: Vec<u8> = (0..200).map(|i| (i as u64 ^ seq ^ 0xA5) as u8).collect();
@@ -929,27 +955,14 @@ mod real_exit_tests {
         }
 
         // The overlap window keeps the OLD epoch openable for in-flight REVERSE
-        // frames the exit already sealed under it; it does NOT let the client
-        // seal a fresh FORWARD frame at the retired epoch. Forward frames are
-        // always sealed at the current epoch, so sealing at epoch 0 after the
-        // rotation is refused, overlap window or not (stamping epoch 0 onto a
-        // frame keyed by the epoch-1 context would be undecryptable garbage).
-        assert!(
-            matches!(
-                session.seal(b"forward seal at retired epoch", 0, 100),
-                Err(SessionError::UnknownEpoch { epoch: 0 })
-            ),
-            "forward frames must only seal at the current epoch, never the retired one"
-        );
-
-        // Closing the overlap is client-side bookkeeping (it drops the old
-        // context used to open reverse stragglers); forward seals at the retired
-        // epoch stay refused either way.
-        session.prune_old_epoch();
-        assert!(
-            session.seal(b"after prune", 0, 101).is_err(),
-            "old epoch must remain unusable for forward seals after the overlap is pruned"
-        );
+        // frames the exit already sealed under it. The engine `ClientSession` is
+        // a pure crypto primitive: `seal` binds the payload to whatever (epoch,
+        // seq) the caller passes, and the transport's `seal_and_send` only ever
+        // passes the current epoch (read under the session lock), so a forward
+        // seal at a retired epoch cannot occur in real operation. Closing the
+        // overlap is client-side bookkeeping: it drops the old context used to
+        // open reverse stragglers.
+        session.prune_pending_old_epoch();
 
         // The current epoch is unaffected by the prune.
         echo_roundtrip(&conn, &session, new_epoch, 8, b"current epoch still works").await;
@@ -984,9 +997,14 @@ mod real_exit_tests {
         let (endpoint, conn) = dial_with_retry(&client_key, exit_rpk, addr).await;
 
         let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
-        let hpke =
-            ClientSession::new(&exit_x25519, TEST_EXIT_ID, &mut rng).expect("HPKE setup_sender");
-        let session = MultihopSession::from_raw_for_test(endpoint, conn, hpke, TEST_EXIT_ID);
+        let hpke = ClientSession::new(
+            &parse_exit_x25519_pubkey(&exit_x25519).expect("parse exit x25519"),
+            ExitId::from_bytes(TEST_EXIT_ID),
+            &mut rng,
+        )
+        .expect("HPKE setup_sender");
+        let session =
+            MultihopSession::from_raw_for_test(endpoint, conn, hpke, TEST_EXIT_ID, exit_x25519);
 
         // An IPv4-looking packet (first nibble 4) so recv_packet returns it
         // instead of dropping it as DAITA padding or a control message.

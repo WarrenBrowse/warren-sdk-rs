@@ -7,7 +7,7 @@
 
 use ed25519_dalek::SigningKey;
 use serde::Deserialize;
-use warren_multihop::{POP_CONTEXT_V2, pop_signing_message, sign_pop, verify_pop};
+use warren_multihop::{ExitId, POP_CONTEXT_V2, pop_signing_message, sign_pop, verify_pop};
 
 #[derive(Deserialize)]
 struct PopFile {
@@ -47,7 +47,7 @@ fn pop_preimage_and_signature_match_the_vector() {
     assert!(!f.vectors.is_empty(), "vector file must carry a case");
 
     for v in &f.vectors {
-        let exit_id = b16(&v.exit_id_hex);
+        let exit_id = ExitId::from_bytes(b16(&v.exit_id_hex));
         let encap = b32(&v.encapsulated_key_hex);
 
         // The preimage is the frozen cross-language contract.
@@ -73,8 +73,9 @@ fn pop_preimage_and_signature_match_the_vector() {
             verify_pop(&pubkey, &exit_id, &encap, &sig),
             "freshly signed PoP must verify"
         );
-        let mut other_exit = exit_id;
-        other_exit[0] ^= 0x01;
+        let mut other_raw = *exit_id.as_bytes();
+        other_raw[0] ^= 0x01;
+        let other_exit = ExitId::from_bytes(other_raw);
         assert!(
             !verify_pop(&pubkey, &other_exit, &encap, &sig),
             "a PoP bound to one exit_id must not verify for another"

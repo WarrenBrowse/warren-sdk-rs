@@ -23,14 +23,16 @@ pub mod signing;
 pub mod ss58;
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
-use zeroize::Zeroize;
 
 /// Re-export of the exact `ed25519-dalek` the SDK builds against, so dependent
 /// crates can name `SigningKey`/`VerifyingKey` without pinning the version
 /// themselves.
 pub use ed25519_dalek;
+
+/// The byte-locked seed -> Ed25519 derivation primitive is the engine's, shared
+/// with warren-core (one implementation of the frozen identity pipeline).
+pub use warrenguard_identity::derive_node_key;
 
 pub use mnemonic::{MnemonicError, generate as generate_mnemonic, seed_from_mnemonic};
 pub use signing::{
@@ -52,29 +54,6 @@ pub enum IdentityError {
     /// The supplied mnemonic is not a valid BIP39 phrase.
     #[error(transparent)]
     Mnemonic(#[from] MnemonicError),
-}
-
-/// Derives the Warren `SigningKey` from a 32-byte seed (the first 32 bytes of
-/// the 64-byte BIP39 seed).
-///
-/// The HKDF salt and info are frozen constants. Never modify without bumping
-/// the version (`identity/v2`).
-///
-/// # Secret handling
-///
-/// The `seed` is borrowed, not consumed: the caller owns its lifetime and must
-/// zeroize it (pass a `Zeroizing<[u8; 32]>` or wipe it after use). Internally
-/// the derived secret bytes are zeroized before returning; only the caller's
-/// seed buffer is outside this function's guarantee.
-#[must_use]
-pub fn derive_node_key(seed: &[u8; 32]) -> SigningKey {
-    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT_IDENTITY_V1), seed);
-    let mut secret = [0u8; 32];
-    hk.expand(HKDF_INFO_NODEKEY, &mut secret)
-        .expect("32 bytes is short enough for HKDF-SHA256");
-    let key = SigningKey::from_bytes(&secret);
-    secret.zeroize();
-    key
 }
 
 /// A Warren wallet identity: an Ed25519 keypair derived from a BIP39 mnemonic,

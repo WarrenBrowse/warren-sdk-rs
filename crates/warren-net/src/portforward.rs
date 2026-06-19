@@ -647,7 +647,6 @@ mod tests {
             ResultCode::UnsupportedOpcode => 5,
             ResultCode::SuggestedPortUnavailable => 6,
             ResultCode::RateLimited => 7,
-            _ => 3,
         }
     }
 
