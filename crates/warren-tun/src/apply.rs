@@ -181,39 +181,107 @@ pub fn revert_routing(plan: &RoutingPlan, dev: &str, physical_gateway: IpAddr) {
     }
 }
 
-/// Pushes the exit-assigned DNS resolvers onto the TUN link and routes EVERY
-/// query through it (Linux/systemd-resolved via `resolvectl`). This closes the
-/// DNS-leak vector: once the split-default routing captures traffic, lookups
-/// must not keep hitting the host's previous resolver. No-op when the exit
-/// assigned no DNS.
+/// Pushes the exit-assigned DNS resolvers and routes EVERY query through the
+/// tunnel, closing the DNS-leak vector: once the split-default routing captures
+/// traffic, lookups must not keep hitting the host's prior resolver. No-op when
+/// the exit assigned no DNS.
 ///
-/// macOS DNS push (`scutil`/`networksetup`) is not yet wired, so a macOS TUN
-/// datapath still resolves via the host resolver until that lands; the routing
-/// capture above is unaffected. Tracked as the remaining half of the DNS-leak
-/// fix for the experimental TUN path.
+/// - **Linux** (systemd-resolved): sets the per-link resolvers + the `~.` routing
+///   domain (`resolvectl`), reverted cleanly per link.
+/// - **macOS** (`networksetup`): snapshots the primary service's current resolvers
+///   to a root-owned backup, then points that service at the in-tunnel resolver;
+///   [`revert_dns`] restores the snapshot. Like the routing/killswitch appliers
+///   here, the macOS path is implemented but its live behaviour is pending a
+///   rooted real-exit validation.
 ///
 /// # Errors
 ///
-/// The first `resolvectl` invocation that fails.
+/// The first `resolvectl` (Linux) or `networksetup` (macOS) invocation that fails.
 pub fn apply_dns(config: &TunConfig) -> io::Result<()> {
     #[cfg(not(target_os = "macos"))]
     for argv in config.dns_push_commands_linux() {
         run(&argv, None)?;
     }
     #[cfg(target_os = "macos")]
-    let _ = config;
+    if !config.dns.is_empty() {
+        let listing = run_capture(&[
+            "networksetup".to_owned(),
+            "-listnetworkserviceorder".to_owned(),
+        ])?;
+        let service = crate::plan::parse_primary_network_service(&listing)
+            .ok_or_else(|| io::Error::other("no primary network service to set DNS on"))?;
+        // Snapshot the current resolvers BEFORE overriding them, so teardown
+        // restores the exact prior config instead of clobbering it.
+        let current = run_capture(&[
+            "networksetup".to_owned(),
+            "-getdnsservers".to_owned(),
+            service.clone(),
+        ])
+        .unwrap_or_default();
+        let previous = crate::plan::parse_macos_dns_servers(&current);
+        write_dns_backup(&service, &previous);
+        for argv in config.dns_push_commands_macos(&service) {
+            run(&argv, None)?;
+        }
+    }
     Ok(())
 }
 
-/// Reverts [`apply_dns`] (best-effort: a link already reverted is not fatal), so
-/// the host resolver returns on datapath shutdown. No-op when no DNS was pushed.
+/// Reverts [`apply_dns`] (best-effort: a missing resolver/backup on teardown is
+/// not fatal), so the host resolver returns on datapath shutdown. On Linux it
+/// reverts the link; on macOS it restores the snapshot taken at apply (clearing
+/// to DHCP if none was captured). No-op when no DNS was pushed.
 pub fn revert_dns(config: &TunConfig) {
     #[cfg(not(target_os = "macos"))]
     for argv in config.dns_teardown_commands_linux() {
         let _ = run(&argv, None);
     }
     #[cfg(target_os = "macos")]
-    let _ = config;
+    {
+        let _ = config;
+        if let Some((service, previous)) = read_dns_backup() {
+            for argv in crate::plan::dns_restore_commands_macos(&service, &previous) {
+                let _ = run(&argv, None);
+            }
+            let _ = std::fs::remove_file(dns_backup_path());
+        }
+    }
+}
+
+/// Backup path for the macOS pre-push resolver snapshot. Root-owned `/var/run`
+/// (not world-writable `/tmp`), mirroring the killswitch backup, so a non-root
+/// user cannot pre-seed a malicious "previous" resolver list for teardown.
+#[cfg(target_os = "macos")]
+fn dns_backup_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/run/warren-dns-backup.conf")
+}
+
+/// Records the primary service name (line 1) and the resolvers to restore (one
+/// IP per remaining line) so [`revert_dns`] can put them back. Best-effort: a
+/// failed write just means teardown finds no backup and clears to DHCP.
+#[cfg(target_os = "macos")]
+fn write_dns_backup(service: &str, previous: &[std::net::IpAddr]) {
+    let mut body = String::from(service);
+    body.push('\n');
+    for ip in previous {
+        body.push_str(&ip.to_string());
+        body.push('\n');
+    }
+    let _ = std::fs::write(dns_backup_path(), body);
+}
+
+/// Reads back [`write_dns_backup`]: `(service, previous_resolvers)`. `None` when
+/// no backup exists (nothing was pushed, or the snapshot write failed).
+#[cfg(target_os = "macos")]
+fn read_dns_backup() -> Option<(String, Vec<std::net::IpAddr>)> {
+    let body = std::fs::read_to_string(dns_backup_path()).ok()?;
+    let mut lines = body.lines();
+    let service = lines.next()?.trim().to_owned();
+    if service.is_empty() {
+        return None;
+    }
+    let previous = crate::plan::parse_macos_dns_servers(&lines.collect::<Vec<_>>().join("\n"));
+    Some((service, previous))
 }
 
 /// Tears the killswitch down, restoring normal output. On macOS this flushes the

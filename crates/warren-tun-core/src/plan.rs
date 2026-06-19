@@ -152,6 +152,80 @@ impl TunConfig {
             self.name.clone(),
         ]]
     }
+
+    /// macOS DNS push: point the primary network service's resolvers at the
+    /// exit-assigned servers (`networksetup -setdnsservers <service> <ips>`). The
+    /// split-default capture already routes those resolver IPs through the tunnel,
+    /// so lookups resolve over the exit instead of leaking to the prior resolver.
+    /// `service` is the primary network service name (e.g. `Wi-Fi`), discovered at
+    /// apply time. Empty when the exit assigned no DNS. Pair with a backup of the
+    /// current servers so [`dns_restore_commands_macos`] restores them faithfully.
+    #[must_use]
+    pub fn dns_push_commands_macos(&self, service: &str) -> Vec<Vec<String>> {
+        if self.dns.is_empty() {
+            return Vec::new();
+        }
+        let mut argv = vec![
+            "networksetup".to_owned(),
+            "-setdnsservers".to_owned(),
+            service.to_owned(),
+        ];
+        argv.extend(self.dns.iter().map(ToString::to_string));
+        vec![argv]
+    }
+}
+
+/// macOS: renders the `networksetup -setdnsservers` argv that RESTORES the
+/// `previous` resolvers captured before [`TunConfig::dns_push_commands_macos`].
+/// An empty `previous` restores the DHCP-provided resolvers via the literal
+/// `Empty` (networksetup's "clear" sentinel), so teardown never strands the
+/// service with the in-tunnel resolver after the tunnel is gone. Pure (no exec).
+#[must_use]
+pub fn dns_restore_commands_macos(service: &str, previous: &[IpAddr]) -> Vec<Vec<String>> {
+    let mut argv = vec![
+        "networksetup".to_owned(),
+        "-setdnsservers".to_owned(),
+        service.to_owned(),
+    ];
+    if previous.is_empty() {
+        argv.push("Empty".to_owned());
+    } else {
+        argv.extend(previous.iter().map(ToString::to_string));
+    }
+    vec![argv]
+}
+
+/// Parses the resolver list `networksetup -getdnsservers <service>` prints (one
+/// IP per line), used to snapshot the current DNS before a push so teardown can
+/// restore it. When DNS is unset, networksetup prints a human sentence ("There
+/// aren't any DNS Servers set on ...") with no parseable address, yielding an
+/// empty vec (restore then clears to DHCP). Non-address lines are ignored.
+#[must_use]
+pub fn parse_macos_dns_servers(output: &str) -> Vec<IpAddr> {
+    output
+        .lines()
+        .filter_map(|l| l.trim().parse::<IpAddr>().ok())
+        .collect()
+}
+
+/// Parses the primary (first enabled) network service name from
+/// `networksetup -listnetworkserviceorder`. Lines read `(N) Service Name`; a
+/// disabled service is prefixed `(*)`. The first enabled entry is the primary
+/// egress service whose resolvers a full-tunnel VPN overrides. `None` if none.
+#[must_use]
+pub fn parse_primary_network_service(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        // Skip the disabled marker `(*) Name` and the hardware-port detail lines.
+        if let Some(rest) = trimmed.strip_prefix('(')
+            && let Some((tag, name)) = rest.split_once(')')
+            && tag.chars().all(|c| c.is_ascii_digit())
+            && !name.trim().is_empty()
+        {
+            return Some(name.trim().to_owned());
+        }
+    }
+    None
 }
 
 /// A single routing operation in a [`RoutingPlan`].
@@ -669,6 +743,65 @@ mod tests {
             "no assigned resolver means nothing to push (and nothing to revert)"
         );
         assert!(cfg.dns_teardown_commands_linux().is_empty());
+    }
+
+    #[test]
+    fn macos_dns_push_sets_the_service_resolvers() {
+        let cmds = v4_config().dns_push_commands_macos("Wi-Fi");
+        assert_eq!(
+            cmds,
+            vec![vec!["networksetup", "-setdnsservers", "Wi-Fi", "10.66.0.1"]],
+            "the in-tunnel resolver is set on the primary service so lookups go \
+             over the tunnel instead of the prior resolver"
+        );
+        let mut none = v4_config();
+        none.dns.clear();
+        assert!(none.dns_push_commands_macos("Wi-Fi").is_empty());
+    }
+
+    #[test]
+    fn macos_dns_restore_brings_back_previous_servers_or_clears_to_dhcp() {
+        let prev = [IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))];
+        assert_eq!(
+            dns_restore_commands_macos("Wi-Fi", &prev),
+            vec![vec!["networksetup", "-setdnsservers", "Wi-Fi", "1.1.1.1"]],
+            "teardown restores the exact resolvers captured before the push"
+        );
+        assert_eq!(
+            dns_restore_commands_macos("Wi-Fi", &[]),
+            vec![vec!["networksetup", "-setdnsservers", "Wi-Fi", "Empty"]],
+            "no prior resolver => clear to DHCP rather than strand the tunnel IP"
+        );
+    }
+
+    #[test]
+    fn macos_parses_current_dns_servers_and_the_unset_sentinel() {
+        assert_eq!(
+            parse_macos_dns_servers("1.1.1.1\n8.8.8.8\n"),
+            vec![
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            ]
+        );
+        assert!(
+            parse_macos_dns_servers("There aren't any DNS Servers set on Wi-Fi.").is_empty(),
+            "the human 'unset' sentence parses to no servers (restore clears to DHCP)"
+        );
+    }
+
+    #[test]
+    fn macos_picks_the_first_enabled_network_service_as_primary() {
+        let listing = "An asterisk (*) denotes that a network service is disabled.\n\
+                       (1) Wi-Fi\n\
+                       (Hardware Port: Wi-Fi, Device: en0)\n\
+                       (2) Thunderbolt Bridge\n\
+                       (Hardware Port: Thunderbolt Bridge, Device: bridge0)\n";
+        assert_eq!(
+            parse_primary_network_service(listing).as_deref(),
+            Some("Wi-Fi"),
+            "the first numbered (enabled) service is the primary egress"
+        );
+        assert!(parse_primary_network_service("no services here").is_none());
     }
 
     #[test]
