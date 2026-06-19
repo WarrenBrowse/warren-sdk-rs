@@ -10,7 +10,8 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
-thiserror = { workspace = true }
+# The safe, always-on seam (framing, plan, gateway, device traits + adapter).
+warren-tun-core = { path = "../warren-tun-core" }
 # Only the privileged device open (TUNSETIFF ioctl on Linux, utun control socket
 # on macOS) needs raw OS calls; it is gated behind `experimental-tun` so the
 # default build pulls no third-party dependency and stays `unsafe`-free.
@@ -20,7 +21,7 @@ libc = { version = "0.2", optional = true }
 # Compiles the privileged per-OS TUN device open (requires root / CAP_NET_ADMIN
 # at runtime). OFF by default: the framing and plan logic compile and test
 # without it. NOT YET validated against a real exit (see the crate docs).
-experimental-tun = ["dep:libc"]
+experimental-tun = ["dep:libc", "warren-tun-core/experimental-tun"]
 
 [lints.rust]
 # TUN exception: opening the kernel TUN device needs `unsafe` (the ioctl /

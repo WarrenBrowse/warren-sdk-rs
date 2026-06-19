@@ -1,0 +1,28 @@
+[package]
+name = "warren-tun-core"
+description = "Safe, always-on TUN seam for the Warren datapath: OS-agnostic packet framing, the RawTunDevice/TunIo traits and framing adapter, default-gateway parsing, and routing/killswitch plan computation. Zero unsafe, zero third-party dependencies. The privileged per-OS device open lives in the separate `warren-tun` crate behind `experimental-tun`, so this crate can sit in any userland (no-root) build."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[features]
+# Gates the live-host routing-table probes (`gateway::discover_default_gateway`
+# runs `ip` / `netstat`). No privileged code and no extra dependencies: the gate
+# just keeps the process-calling helpers out of a pure userland build's surface,
+# mirroring the `warren-tun` feature of the same name.
+experimental-tun = []
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

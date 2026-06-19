@@ -21,6 +21,7 @@ members = [
     "crates/warren-multihop",
     "crates/warren-daita",
     "crates/warren-tun",
+    "crates/warren-tun-core",
     "crates/warren-test-support",
 ]
 

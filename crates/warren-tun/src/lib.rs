@@ -45,11 +45,13 @@
 #[cfg(all(unix, feature = "experimental-tun"))]
 pub mod apply;
 pub mod device;
-pub mod frame;
-pub mod gateway;
-pub mod plan;
 
-pub use device::{FramedTun, RawTunDevice, TunIo};
-pub use frame::{Framing, PacketFamily};
-pub use gateway::parse_default_gateway;
-pub use plan::{KillswitchPlan, RouteOp, RoutingPlan, TunConfig};
+// The safe seam (framing, plan, gateway, the device traits and the framing
+// adapter) lives in `warren-tun-core` and is re-exported here so existing
+// `warren_tun::{...}` paths keep working. Keeping the privileged device open in
+// this separately-named crate is what lets a userland build depend only on
+// `warren-tun-core` and keep this crate out of its dependency closure.
+pub use warren_tun_core::{
+    FramedTun, Framing, KillswitchPlan, PacketFamily, RawTunDevice, RouteOp, RoutingPlan,
+    TunConfig, TunIo, frame, gateway, parse_default_gateway, plan,
+};

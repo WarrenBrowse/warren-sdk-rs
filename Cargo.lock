@@ -2601,6 +2601,7 @@ dependencies = [
  "warren-test-support",
  "warren-transport",
  "warren-tun",
+ "warren-tun-core",
  "warren-wire",
 ]
 
@@ -2680,8 +2681,12 @@ name = "warren-tun"
 version = "0.0.1"
 dependencies = [
  "libc",
- "thiserror 2.0.18",
+ "warren-tun-core",
 ]
+
+[[package]]
+name = "warren-tun-core"
+version = "0.0.1"
 
 [[package]]
 name = "warren-wire"

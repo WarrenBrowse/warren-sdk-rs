@@ -8,17 +8,17 @@
 //! feature unification (the footgun: a sibling member enabling a feature must
 //! not be able to drag privileged code into a userland build).
 //!
-//! ## Why this is `#[ignore]` today
+//! ## How the userland closure is kept privileged-free
 //!
-//! `warren-net` currently depends on `warren-tun` **unconditionally**
-//! (`warren-net/Cargo.toml`), so `warren-tun`, which carries the privileged
-//! device-open code, is already in `warren-sdk`'s default dependency closure.
-//! The fix is to split `warren-tun` into a safe core crate (traits, types and
-//! parsers: zero unsafe, always on) and a privileged device crate (the only
-//! unsafe+root crate, gated behind `experimental-tun`), then re-point the
-//! TUN-to-sink bridge at the safe core. Once that unconditional edge is gone the
-//! default closure is privileged-free and this test flips GREEN (drop the
-//! `#[ignore]`).
+//! `warren-tun` was split into `warren-tun-core` (the safe, always-on seam:
+//! framing, the routing/killswitch plan, gateway parsing, and the
+//! `RawTunDevice`/`TunIo` traits + `FramedTun` adapter, zero unsafe, no deps) and
+//! `warren-tun` (the only crate with the privileged per-OS device open + the
+//! routing/killswitch applier, behind `experimental-tun`). `warren-net`'s
+//! TUN-to-sink bridge depends on `warren-tun-core` and pulls `warren-tun` only
+//! under `experimental-tun`. So the default closure carries the safe core but
+//! never the privileged crate, and this invariant holds by *crate boundary*, not
+//! merely by feature flag (it survives Cargo's workspace feature unification).
 //!
 //! `libc` and `smoltcp` in the default closure are **OK**: they are userland
 //! FFI / a userspace netstack, not privileged operations. The invariant keys
@@ -118,7 +118,6 @@ fn default_closure_crate_names() -> HashSet<String> {
 }
 
 #[test]
-#[ignore = "RED until warren-tun is split into a safe core and a privileged device crate (the unconditional warren-net to warren-tun edge keeps privileged code in the default closure)"]
 fn default_build_pulls_no_privileged_crate() {
     let reached = default_closure_crate_names();
     let violations: Vec<&str> = PRIVILEGED_CRATES

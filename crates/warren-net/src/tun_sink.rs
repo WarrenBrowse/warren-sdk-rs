@@ -1,6 +1,6 @@
 //! Privileged TUN datapath packet sink.
 //!
-//! Bridges a [`warren_tun::RawTunDevice`] to the async [`PacketSink`] seam. The
+//! Bridges a [`warren_tun_core::RawTunDevice`] to the async [`PacketSink`] seam. The
 //! sink side is channels (so `&self` async send/recv work); a worker owns the
 //! device and shuttles framed packets between it and the channels.
 //!
@@ -12,7 +12,7 @@
 
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
-use warren_tun::{Framing, RawTunDevice};
+use warren_tun_core::{Framing, RawTunDevice};
 
 use crate::error::NetError;
 use crate::sink::PacketSink;

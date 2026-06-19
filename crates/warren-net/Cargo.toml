@@ -13,11 +13,12 @@ publish.workspace = true
 warren-transport = { path = "../warren-transport" }
 # NAT-PMP wire codec for the port-forwarding client (RFC 6886 + Warren trailer).
 warren-wire = { path = "../warren-wire" }
-# TUN framing + device seam for the privileged-datapath packet sink. Default
-# features only (no `experimental-tun`): warren-net stays unsafe-free; the safe
-# channel bridge here works over any `RawTunDevice`, the real device is opened by
-# warren-tun behind its feature.
-warren-tun = { path = "../warren-tun" }
+# The TUN bridge needs only the safe seam (the `RawTunDevice` trait + framing) to
+# adapt an injected device to a `PacketSink`; this is the always-on, unsafe-free,
+# privileged-code-free core. The real kernel device open lives in `warren-tun`,
+# pulled in only under `experimental-tun` so a userland build never reaches it.
+warren-tun-core = { path = "../warren-tun-core" }
+warren-tun = { path = "../warren-tun", optional = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 tokio-util = "0.7"
@@ -44,7 +45,7 @@ tun = []
 killswitch = []
 # Enables the real-fd TUN datapath driver (the async duplex loop over a kernel
 # device); pulls warren-tun's privileged device open. EXPERIMENTAL, unvalidated.
-experimental-tun = ["warren-tun/experimental-tun"]
+experimental-tun = ["dep:warren-tun", "warren-tun/experimental-tun"]
 
 [dev-dependencies]
 # `test-util` enables `start_paused` for the NAT-PMP retransmit/refresh tests.
