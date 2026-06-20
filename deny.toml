@@ -17,6 +17,9 @@ ignore = [
     # advisory for the same reason. Removing this requires maybenot to migrate off
     # bincode; track upstream.
     "RUSTSEC-2025-0141",
+    # atomic-polyfill: unmaintained, pulled transitively via the engine smoltcp/heapless
+    # netstack deps. Security-clean (no CVE). warren-core ignores the same.
+    "RUSTSEC-2023-0089",
 ]
 
 [licenses]
