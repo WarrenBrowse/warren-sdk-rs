@@ -141,6 +141,37 @@ This is the universal industry pattern: a single native datapath core (Mullvad
 and Cloudflare WARP in Rust, Tailscale in Go) wrapped by thin per-platform
 layers. This repository is that core for Warren.
 
+## QUIC handshake obfuscation: known divergence from warren-core/app
+
+This SDK builds its QUIC datapath on **upstream quinn**, not the WarrenGuard
+engine's patched quinn fork (`warren_transport_config()` in `warren-transport`
+sets only buffers, keep-alive, MTU and idle timeout). The fork carries two
+Initial-padding knobs that upstream quinn does not expose:
+`min_first_datagram_size` and `warren_first_initial_crypto_chunk(Some(64))`. The
+second splits the ClientHello across several Initial packets so a DPI box cannot
+read the obfuscation SNI (which encodes the exit pubkey) out of a single packet.
+
+Consequence, stated plainly so it is not a silent gap:
+
+- A client built on this SDK presents a **different QUIC Initial fingerprint**
+  than `warren-app` (the Mullvad fork, which goes through `warren-core` and the
+  fork). Its handshake is more recognizable to a censor doing QUIC DPI, and the
+  encoded-pubkey SNI is not split across packets.
+- This divergence is at the **handshake/Initial layer only**. The
+  steady-state traffic-analysis defense (DAITA cover traffic) IS present in this
+  SDK (`daita_driver`), and the golden vectors still freeze the **frame** wire
+  format (Setup/SetupAck, multihop HPKE, NAT-PMP), so "wire-compatible" holds at
+  the protocol layer but not at the QUIC-Initial obfuscation layer.
+- Every consumer of this SDK inherits the gap: the desktop system-VPN daemon
+  (`warrend`), the Dart/Flutter proxy mode (`warren_sdk_frb`), and the Node
+  native binding (`warren_napi`) all pin this crate and therefore upstream quinn.
+
+Reaching parity is a deliberate, binary choice: adopting `warrenguard-transport`
+pulls in the fork (the fork-only setters do not compile against upstream quinn,
+which is the engine's E0599 anti-depatch guard), so every embedder and language
+port would then have to vendor the patched quinn. That trade (anti-DPI parity vs
+embeddability) is a product threat-model decision, tracked here until made.
+
 **Recommended target for the Dart/Flutter SDK: hybrid.** It lives in the sibling
 repository `warren-sdk-dart` and reuses this engine; it is not implemented here.
 
