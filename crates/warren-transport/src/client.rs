@@ -82,11 +82,12 @@ pub(crate) async fn dial_quic(
     exit_pubkey: [u8; 32],
     exit_addr: SocketAddr,
     bind_local_ip: Option<SocketAddr>,
+    transport_config: Option<Arc<quinn::TransportConfig>>,
 ) -> Result<(quinn::Endpoint, quinn::Connection), QuicDialError> {
     let mut client_cfg =
         tls::make_client_config(signing_key, tls::default_crypto_provider(), &[ALPN_H3])
             .map_err(QuicDialError::Tls)?;
-    client_cfg.transport_config(Arc::new(warren_transport_config()));
+    client_cfg.transport_config(effective_transport_config(transport_config));
 
     let bind = bind_local_ip.unwrap_or_else(|| {
         if exit_addr.is_ipv6() {
@@ -122,6 +123,18 @@ pub(crate) fn warren_transport_config() -> quinn::TransportConfig {
         tc.max_idle_timeout(Some(idle));
     }
     tc
+}
+
+/// Picks the transport config for a dial: an explicit caller override wins, else
+/// the SDK's upstream-quinn default ([`warren_transport_config`]). The override
+/// is how a fork-patched workspace (the privileged system-VPN daemon) injects
+/// the engine's QUIC-Initial obfuscation config without this crate ever naming a
+/// fork-only quinn API, so the SDK keeps building on upstream quinn. See
+/// ARCHITECTURE.md "QUIC handshake obfuscation".
+pub(crate) fn effective_transport_config(
+    override_cfg: Option<Arc<quinn::TransportConfig>>,
+) -> Arc<quinn::TransportConfig> {
+    override_cfg.unwrap_or_else(|| Arc::new(warren_transport_config()))
 }
 
 /// Errors from establishing or driving a tunnel.
@@ -199,6 +212,7 @@ pub struct ClientTunnel {
     device_id: [u8; DEVICE_ID_LEN],
     bind_local_ip: Option<SocketAddr>,
     auto_local_ip: bool,
+    transport_config: Option<Arc<quinn::TransportConfig>>,
 }
 
 // Manual Debug (no-log discipline): render only a short public-key prefix and the
@@ -230,6 +244,7 @@ impl ClientTunnel {
             device_id: [0u8; DEVICE_ID_LEN],
             bind_local_ip: None,
             auto_local_ip: false,
+            transport_config: None,
         }
     }
 
@@ -270,6 +285,17 @@ impl ClientTunnel {
         self
     }
 
+    /// Overrides the QUIC transport config (advanced). The default applies the
+    /// SDK's upstream-quinn settings; a fork-patched system-VPN workspace passes
+    /// the engine's obfuscated config here to match warren-app's anti-DPI
+    /// handshake. The `quinn::TransportConfig` type is fork-agnostic. See
+    /// ARCHITECTURE.md "QUIC handshake obfuscation".
+    #[must_use]
+    pub fn with_transport_config(mut self, cfg: Arc<quinn::TransportConfig>) -> Self {
+        self.transport_config = Some(cfg);
+        self
+    }
+
     /// The client's 32-byte Ed25519 public key.
     #[must_use]
     pub fn node_id(&self) -> [u8; 32] {
@@ -304,6 +330,7 @@ impl ClientTunnel {
             exit_pubkey,
             exit_addr,
             effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
+            self.transport_config.clone(),
         )
         .await?;
 
@@ -558,6 +585,29 @@ mod tests {
         let ip = local_ip_for_endpoint("127.0.0.1:9".parse().unwrap())
             .expect("a loopback route always exists");
         assert_eq!(ip, std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn effective_transport_config_prefers_the_caller_override() {
+        // The override is the seam a fork-patched system-VPN workspace uses to
+        // inject the engine's obfuscated config; when present it is used verbatim.
+        let custom = Arc::new(warren_transport_config());
+        let chosen = effective_transport_config(Some(Arc::clone(&custom)));
+        assert!(
+            Arc::ptr_eq(&custom, &chosen),
+            "an explicit transport config override must be used as-is"
+        );
+    }
+
+    #[test]
+    fn effective_transport_config_falls_back_to_the_default() {
+        // No override: a fresh default (SDK upstream-quinn settings) is built.
+        let a = effective_transport_config(None);
+        let b = effective_transport_config(None);
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "the default path builds a fresh config each call (no shared override)"
+        );
     }
 
     #[test]

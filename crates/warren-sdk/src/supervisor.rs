@@ -349,6 +349,7 @@ pub(crate) async fn establish_multihop(
     exit: &VerifiedExit,
     auto_local_ip: bool,
     wants_ipv6: bool,
+    transport_config: Option<std::sync::Arc<warren_transport::TransportConfig>>,
 ) -> Result<EstablishedTunnel<MultihopPacketSink>, SdkError> {
     let mut tunnel = MultihopClientTunnel::new(signing);
     if auto_local_ip {
@@ -356,6 +357,9 @@ pub(crate) async fn establish_multihop(
     }
     if wants_ipv6 {
         tunnel = tunnel.with_ipv6(true);
+    }
+    if let Some(cfg) = transport_config {
+        tunnel = tunnel.with_transport_config(cfg);
     }
     let session = tunnel
         .connect(

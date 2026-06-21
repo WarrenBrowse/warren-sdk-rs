@@ -122,6 +122,7 @@ pub struct MultihopClientTunnel {
     bind_local_ip: Option<SocketAddr>,
     auto_local_ip: bool,
     wants_ipv6: bool,
+    transport_config: Option<std::sync::Arc<quinn::TransportConfig>>,
 }
 
 impl MultihopClientTunnel {
@@ -133,6 +134,7 @@ impl MultihopClientTunnel {
             bind_local_ip: None,
             auto_local_ip: false,
             wants_ipv6: false,
+            transport_config: None,
         }
     }
 
@@ -158,6 +160,17 @@ impl MultihopClientTunnel {
     #[must_use]
     pub fn with_ipv6(mut self, enable: bool) -> Self {
         self.wants_ipv6 = enable;
+        self
+    }
+
+    /// Overrides the QUIC transport config (advanced). The default applies the
+    /// SDK's upstream-quinn settings; a fork-patched system-VPN workspace passes
+    /// the engine's obfuscated config here to match warren-app's anti-DPI
+    /// handshake. The `quinn::TransportConfig` type is fork-agnostic. See
+    /// ARCHITECTURE.md "QUIC handshake obfuscation".
+    #[must_use]
+    pub fn with_transport_config(mut self, cfg: std::sync::Arc<quinn::TransportConfig>) -> Self {
+        self.transport_config = Some(cfg);
         self
     }
 
@@ -190,6 +203,7 @@ impl MultihopClientTunnel {
             exit_pubkey,
             exit_addr,
             effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
+            self.transport_config.clone(),
         )
         .await?;
 
@@ -886,6 +900,7 @@ mod real_exit_tests {
                 exit_rpk,
                 addr,
                 effective_bind(None, false, addr),
+                None,
             )
             .await
             {

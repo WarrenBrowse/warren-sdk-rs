@@ -166,11 +166,17 @@ Consequence, stated plainly so it is not a silent gap:
   (`warrend`), the Dart/Flutter proxy mode (`warren_sdk_frb`), and the Node
   native binding (`warren_napi`) all pin this crate and therefore upstream quinn.
 
-Reaching parity is a deliberate, binary choice: adopting `warrenguard-transport`
-pulls in the fork (the fork-only setters do not compile against upstream quinn,
-which is the engine's E0599 anti-depatch guard), so every embedder and language
-port would then have to vendor the patched quinn. That trade (anti-DPI parity vs
-embeddability) is a product threat-model decision, tracked here until made.
+Reaching parity does NOT require changing this SDK's quinn. The connect path
+takes a caller-supplied transport config: `WarrenClient::transport_config` (and
+the `with_transport_config` builders on `ClientTunnel` / `MultihopClientTunnel`)
+accept an `Arc<TransportConfig>` that overrides the upstream default. A
+privileged system-VPN workspace patched to the WarrenGuard fork builds the
+engine's obfuscated config
+(`warrenguard_transport_core::warren_transport_config_client`) and injects it, so
+its handshake matches warren-app. This SDK never names a fork-only quinn API
+(the type is fork-agnostic), so it keeps building on upstream quinn for embedders
+and stays `--all-features` clean. Whether to enable obfuscation on a given client
+is then a per-deployment threat-model decision, not a fork-wide compile choice.
 
 **Recommended target for the Dart/Flutter SDK: hybrid.** It lives in the sibling
 repository `warren-sdk-dart` and reuses this engine; it is not implemented here.

@@ -14,11 +14,16 @@ pub mod reconnect;
 pub mod tls;
 
 pub use client::{ClientSession, ClientTunnel, TunnelError, local_ip_for_endpoint};
+// Re-export so callers can build a custom transport config (e.g. a fork-patched
+// system-VPN workspace injecting the engine's obfuscated config) and pass it to
+// `with_transport_config` without depending on quinn directly. The type is
+// fork-agnostic: identical whether the workspace patches quinn or not.
 pub use daita_driver::{DaitaDriver, DaitaDriverHandle};
 pub use multihop::{
     MultihopClientTunnel, MultihopError, MultihopMetrics, MultihopMetricsSnapshot, MultihopSession,
     RekeyPolicy,
 };
+pub use quinn::TransportConfig;
 pub use reconnect::{
     Backoff, BackoffIter, ConnectionState, JitterBackoff, RetryError, connect_with_retry,
     connect_with_state,

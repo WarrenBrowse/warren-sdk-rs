@@ -98,6 +98,7 @@ pub struct WarrenClientBuilder {
     pub(crate) wants_ipv6: bool,
     pub(crate) daita: bool,
     pub(crate) daita_machine: Option<String>,
+    pub(crate) transport_config: Option<Arc<warren_transport::TransportConfig>>,
     pub(crate) generation_store: Arc<dyn GenerationStore>,
     pub(crate) multihop_generation_store: Arc<dyn GenerationStore>,
     pub(crate) server_key_store: Option<Arc<dyn ServerKeyStore>>,
@@ -172,6 +173,20 @@ impl WarrenClientBuilder {
     #[must_use]
     pub fn request_ipv6(mut self) -> Self {
         self.wants_ipv6 = true;
+        self
+    }
+
+    /// Overrides the QUIC transport config for every tunnel (advanced). The
+    /// default builds the SDK's upstream-quinn settings. A privileged system-VPN
+    /// workspace patched to the WarrenGuard quinn fork passes the engine's
+    /// obfuscated config here (built via
+    /// `warrenguard_transport_core::warren_transport_config_client`) so its
+    /// QUIC-Initial handshake matches warren-app's anti-DPI behaviour. The
+    /// `warren_transport::TransportConfig` type is fork-agnostic. See
+    /// ARCHITECTURE.md "QUIC handshake obfuscation".
+    #[must_use]
+    pub fn transport_config(mut self, cfg: Arc<warren_transport::TransportConfig>) -> Self {
+        self.transport_config = Some(cfg);
         self
     }
 
@@ -292,6 +307,7 @@ impl WarrenClientBuilder {
             wants_ipv6: self.wants_ipv6,
             daita: self.daita,
             daita_machine: self.daita_machine,
+            transport_config: self.transport_config,
             generation_store: self.generation_store,
             multihop_generation_store: self.multihop_generation_store,
             server_key_store: self.server_key_store,
@@ -319,6 +335,9 @@ pub struct WarrenClient<T> {
     pub(crate) daita: bool,
     /// Pin DAITA to a named curated machine (else a random pool pick).
     pub(crate) daita_machine: Option<String>,
+    /// Optional QUIC transport config override applied to every tunnel (the
+    /// system-VPN obfuscation injection seam). `None` = SDK upstream default.
+    pub(crate) transport_config: Option<Arc<warren_transport::TransportConfig>>,
     /// Anti-rollback floor: highest signed-list `generation` trusted so far.
     pub(crate) generation_store: Arc<dyn GenerationStore>,
     /// Anti-rollback floor for the multihop directory (separate sequence).
@@ -342,6 +361,7 @@ impl WarrenClient<()> {
             wants_ipv6: false,
             daita: false,
             daita_machine: None,
+            transport_config: None,
             generation_store: Arc::new(InMemoryGenerationStore::default()),
             multihop_generation_store: Arc::new(InMemoryGenerationStore::default()),
             server_key_store: None,
@@ -423,6 +443,9 @@ impl<T: HttpTransport> WarrenClient<T> {
         let mut tunnel = ClientTunnel::new(self.signing.clone());
         if self.auto_local_ip {
             tunnel = tunnel.with_auto_local_ip();
+        }
+        if let Some(cfg) = &self.transport_config {
+            tunnel = tunnel.with_transport_config(cfg.clone());
         }
         let session = tunnel.connect(exit.endpoint_id(), addr).await?;
         Ok(QuicPacketSink::new(session))
@@ -529,6 +552,9 @@ impl<T: HttpTransport> WarrenClient<T> {
         }
         if self.wants_ipv6 {
             tunnel = tunnel.with_ipv6(true);
+        }
+        if let Some(cfg) = &self.transport_config {
+            tunnel = tunnel.with_transport_config(cfg.clone());
         }
         let session = tunnel
             .connect(
@@ -762,10 +788,15 @@ impl<T: HttpTransport> WarrenClient<T> {
         let exit = exit.clone();
         let auto_local_ip = self.auto_local_ip;
         let wants_ipv6 = self.wants_ipv6;
+        let transport_config = self.transport_config.clone();
         self.spawn_supervised(cfg, move || {
             let signing = signing.clone();
             let exit = exit.clone();
-            async move { establish_multihop(signing, &exit, auto_local_ip, wants_ipv6).await }
+            let transport_config = transport_config.clone();
+            async move {
+                establish_multihop(signing, &exit, auto_local_ip, wants_ipv6, transport_config)
+                    .await
+            }
         })
         .await
     }
@@ -802,6 +833,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         let signing = self.signing.clone();
         let auto_local_ip = self.auto_local_ip;
         let wants_ipv6 = self.wants_ipv6;
+        let transport_config = self.transport_config.clone();
         // Shared cursor: advanced only on a failed attempt, so a working exit is
         // kept (stable egress) and a broken one is rotated past on the next try.
         let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -809,9 +841,18 @@ impl<T: HttpTransport> WarrenClient<T> {
             let signing = signing.clone();
             let exits = exits.clone();
             let cursor = Arc::clone(&cursor);
+            let transport_config = transport_config.clone();
             async move {
                 let idx = cursor.load(Ordering::Relaxed) % exits.len();
-                match establish_multihop(signing, &exits[idx], auto_local_ip, wants_ipv6).await {
+                match establish_multihop(
+                    signing,
+                    &exits[idx],
+                    auto_local_ip,
+                    wants_ipv6,
+                    transport_config,
+                )
+                .await
+                {
                     Ok(tunnel) => Ok(tunnel),
                     Err(e) => {
                         cursor.fetch_add(1, Ordering::Relaxed);
