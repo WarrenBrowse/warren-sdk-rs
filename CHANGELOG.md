@@ -7,6 +7,18 @@ the pre-release `0.0.x` line.
 
 ## [Unreleased]
 
+### Added
+
+- `WarrenClient::transport_config` (and `with_transport_config` on `ClientTunnel`
+  and `MultihopClientTunnel`) inject a caller-supplied transport config,
+  re-exported as `warren_transport::TransportConfig`. The default still builds the
+  SDK's upstream-quinn settings; a privileged system-VPN build patched to the
+  WarrenGuard quinn fork passes the engine's obfuscated QUIC-Initial config
+  (`warrenguard_transport_core::warren_transport_config_client`) here to match
+  warren-app's anti-DPI handshake. The SDK names no fork-only quinn API, so it
+  keeps building on upstream quinn for embedders. See ARCHITECTURE.md "QUIC
+  handshake obfuscation".
+
 ### Removed
 
 - The hand-written Dart binding under `bindings/dart/` is removed. The Dart and
