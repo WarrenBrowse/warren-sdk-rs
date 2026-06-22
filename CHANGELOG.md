@@ -7,7 +7,7 @@ the pre-release `0.0.x` line.
 
 ## [Unreleased]
 
-## [0.0.9] - 2026-06-22
+## [0.0.10] - 2026-06-22
 
 ### Added
 
@@ -20,6 +20,17 @@ the pre-release `0.0.x` line.
   warren-app's anti-DPI handshake. The SDK names no fork-only quinn API, so it
   keeps building on upstream quinn for embedders. See ARCHITECTURE.md "QUIC
   handshake obfuscation".
+
+### Changed
+
+- The WarrenGuard engine crates are now sourced as pinned git dependencies
+  (rev in `.warrenguard-version`) instead of bare `../warrenguard` path deps, so
+  the SDK is self-resolving as a git dependency for downstream consumers (the
+  desktop daemon `warrend`, the Dart `flutter_rust_bridge` binding, the TS napi
+  binding) that have no sibling engine checkout. Local dev and CI keep building
+  against the sibling `../warrenguard` via a `[patch]` in the workspace manifest.
+  This fixes consumption of the SDK by git tag, which the engine extraction had
+  broken after v0.0.8.
 
 ### Removed
 
