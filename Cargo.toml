@@ -35,6 +35,22 @@ authors = ["WarrenBrowse <hello@warrenbrowse.com>"]
 publish = false
 
 [workspace.dependencies]
+# WarrenGuard engine crates: the generic data-plane primitives the SDK re-exports.
+# Declared as GIT deps pinned to the rev in `.warrenguard-version` so the SDK is
+# self-resolving as a git dependency for downstream consumers (warrend, the Dart
+# FRB, the TS napi binding) that have no sibling engine checkout. Local dev and CI
+# override these with the sibling `../warrenguard` via the `[patch]` at the foot of
+# this file (CI's checkout-engine action clones it there at the same rev). Keep the
+# rev below in lockstep with `.warrenguard-version`.
+warrenguard-wire = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "16141d04c8c923771d6aedb756f258958e1cb600" }
+warrenguard-identity = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "16141d04c8c923771d6aedb756f258958e1cb600" }
+warrenguard-multihop = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "16141d04c8c923771d6aedb756f258958e1cb600" }
+warrenguard-daita = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "16141d04c8c923771d6aedb756f258958e1cb600" }
+warrenguard-tls = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "16141d04c8c923771d6aedb756f258958e1cb600" }
+warrenguard-natpmp-protocol = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "16141d04c8c923771d6aedb756f258958e1cb600" }
+warrenguard-tun-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "16141d04c8c923771d6aedb756f258958e1cb600" }
+warrenguard-tun-device = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "16141d04c8c923771d6aedb756f258958e1cb600" }
+
 # Identity / crypto. Leaf RustCrypto and ecosystem crates, kept minimal
 # so each can be mapped 1:1 to the other language SDKs.
 ed25519-dalek = { version = "2", features = ["zeroize", "rand_core"] }
@@ -124,3 +140,21 @@ codegen-units = 1
 [profile.bench]
 inherits = "release"
 debug = true
+
+# Local-dev / CI override: resolve the WarrenGuard engine crates from the sibling
+# checkout (`../warrenguard`) instead of fetching the pinned git rev declared in
+# `[workspace.dependencies]`. CI's `checkout-engine` action clones warrenguard
+# there at `.warrenguard-version`; local dev has it as a sibling. This keeps the
+# engine working tree the single source of truth for sibling builds, while the git
+# deps make the SDK self-resolving for a downstream consumer that has no sibling
+# (it simply does not inherit this patch). Mirror any add/remove in
+# `[workspace.dependencies]` above.
+[patch."https://github.com/WarrenBrowse/warrenguard.git"]
+warrenguard-wire = { path = "../warrenguard/crates/warrenguard-wire" }
+warrenguard-identity = { path = "../warrenguard/crates/warrenguard-identity" }
+warrenguard-multihop = { path = "../warrenguard/crates/warrenguard-multihop" }
+warrenguard-daita = { path = "../warrenguard/crates/warrenguard-daita" }
+warrenguard-tls = { path = "../warrenguard/crates/warrenguard-tls" }
+warrenguard-natpmp-protocol = { path = "../warrenguard/crates/warrenguard-natpmp-protocol" }
+warrenguard-tun-core = { path = "../warrenguard/crates/warrenguard-tun-core" }
+warrenguard-tun-device = { path = "../warrenguard/crates/warrenguard-tun-device" }

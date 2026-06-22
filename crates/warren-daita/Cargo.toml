@@ -10,7 +10,7 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
-warrenguard-daita = { path = "../../../warrenguard/crates/warrenguard-daita" }
+warrenguard-daita = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

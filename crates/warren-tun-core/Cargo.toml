@@ -10,7 +10,7 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
-warrenguard-tun-core = { path = "../../../warrenguard/crates/warrenguard-tun-core" }
+warrenguard-tun-core = { workspace = true }
 
 [features]
 # Forwarded to the engine crate: gates the live-host routing-table probes.

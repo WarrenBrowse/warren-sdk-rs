@@ -10,9 +10,9 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
-warrenguard-wire = { path = "../../../warrenguard/crates/warrenguard-wire" }
-warrenguard-natpmp-protocol = { path = "../../../warrenguard/crates/warrenguard-natpmp-protocol" }
-warrenguard-multihop = { path = "../../../warrenguard/crates/warrenguard-multihop" }
+warrenguard-wire = { workspace = true }
+warrenguard-natpmp-protocol = { workspace = true }
+warrenguard-multihop = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

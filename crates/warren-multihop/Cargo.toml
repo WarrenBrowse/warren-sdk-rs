@@ -19,7 +19,7 @@ test-helpers = ["warrenguard-multihop/test-helpers"]
 [dependencies]
 # The multihop HPKE session + setup + replay + pop now live in the engine; this
 # crate is a thin re-export so a single implementation is shared with warren-core.
-warrenguard-multihop = { path = "../../../warrenguard/crates/warrenguard-multihop" }
+warrenguard-multihop = { workspace = true }
 
 [dev-dependencies]
 # The PoP golden-vector replay builds a SigningKey directly.

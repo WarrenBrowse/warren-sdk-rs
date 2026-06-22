@@ -10,7 +10,7 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
-warrenguard-tun-device = { path = "../../../warrenguard/crates/warrenguard-tun-device" }
+warrenguard-tun-device = { workspace = true }
 
 [features]
 experimental-tun = ["warrenguard-tun-device/experimental-tun"]
