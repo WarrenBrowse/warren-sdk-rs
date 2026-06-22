@@ -7,6 +7,8 @@ the pre-release `0.0.x` line.
 
 ## [Unreleased]
 
+## [0.0.9] - 2026-06-22
+
 ### Added
 
 - `WarrenClient::transport_config` (and `with_transport_config` on `ClientTunnel`
