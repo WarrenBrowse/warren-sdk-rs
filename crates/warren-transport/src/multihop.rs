@@ -115,8 +115,10 @@ impl From<QuicDialError> for MultihopError {
 
 /// Builder/dialer for a multihop client tunnel.
 pub struct MultihopClientTunnel {
-    /// Account signing key: the TLS raw-public-key identity AND the key that
-    /// signs the setup proof of possession.
+    /// Account signing key: signs the multi-hop setup proof of possession.
+    /// Since protocol v5 it is NOT a TLS identity (the relay->exit dial is
+    /// anonymous at the TLS layer); the client is authenticated to the exit
+    /// solely by the PoP carried in the sealed `IpRequest`.
     signing_key: SigningKey,
     bind_local_ip: Option<SocketAddr>,
     auto_local_ip: bool,
