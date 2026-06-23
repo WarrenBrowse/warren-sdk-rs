@@ -7,6 +7,7 @@
 //! round-trip tests; this module no longer carries a second implementation.
 
 pub use warrenguard_wire::{
-    DEVICE_ID_LEN, DaitaConfig, MAX_SETUP_FRAME_BYTES, PROTOCOL_VERSION, ProtocolError, Setup,
-    SetupAck, decode_setup, decode_setup_ack, encode_setup, encode_setup_ack, features,
+    AUTH_SIG_LEN, AuthSig, CLIENT_PUBKEY_LEN, DEVICE_ID_LEN, DaitaConfig, MAX_SETUP_FRAME_BYTES,
+    PROTOCOL_VERSION, ProtocolError, Setup, SetupAck, decode_setup, decode_setup_ack, encode_setup,
+    encode_setup_ack, features,
 };

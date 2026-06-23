@@ -67,7 +67,6 @@ pub(crate) enum QuicDialError {
     Bind(std::io::Error),
     Connect(quinn::ConnectError),
     Quic(quinn::ConnectionError),
-    IdentityMismatch,
 }
 
 /// Dials and authenticates a QUIC connection to `exit_addr`: builds the TLS
@@ -78,15 +77,18 @@ pub(crate) enum QuicDialError {
 /// Returns the dialed `(Endpoint, Connection)`. The endpoint drives the
 /// connection's I/O, so the caller must keep it alive for the session's lifetime.
 pub(crate) async fn dial_quic(
-    signing_key: &SigningKey,
     exit_pubkey: [u8; 32],
     exit_addr: SocketAddr,
     bind_local_ip: Option<SocketAddr>,
     transport_config: Option<Arc<quinn::TransportConfig>>,
 ) -> Result<(quinn::Endpoint, quinn::Connection), QuicDialError> {
-    let mut client_cfg =
-        tls::make_client_config(signing_key, tls::default_crypto_provider(), &[ALPN_H3])
-            .map_err(QuicDialError::Tls)?;
+    // v5: the client is anonymous at the TLS layer (no client cert). The exit
+    // identity is pinned via the SNI: the server-cert verifier fails the
+    // handshake unless the exit proves possession of `exit_pubkey`, so a
+    // separate post-handshake peer-pubkey check is redundant. The CLIENT proves
+    // its own identity in-band when it sends `Setup` (see `connect`).
+    let mut client_cfg = tls::make_client_config(tls::default_crypto_provider(), &[ALPN_H3])
+        .map_err(QuicDialError::Tls)?;
     client_cfg.transport_config(effective_transport_config(transport_config));
 
     let bind = bind_local_ip.unwrap_or_else(|| {
@@ -106,11 +108,7 @@ pub(crate) async fn dial_quic(
         .await
         .map_err(QuicDialError::Quic)?;
 
-    // Confirm the authenticated peer key matches the expected exit identity.
-    match tls::peer_pubkey(&conn) {
-        Some(pk) if pk.as_bytes() == &exit_pubkey => Ok((endpoint, conn)),
-        _ => Err(QuicDialError::IdentityMismatch),
-    }
+    Ok((endpoint, conn))
 }
 
 pub(crate) fn warren_transport_config() -> quinn::TransportConfig {
@@ -198,7 +196,6 @@ impl From<QuicDialError> for TunnelError {
                 context: "connect",
                 source,
             },
-            QuicDialError::IdentityMismatch => TunnelError::ExitIdentityMismatch,
         }
     }
 }
@@ -326,7 +323,6 @@ impl ClientTunnel {
         exit_addr: SocketAddr,
     ) -> Result<ClientSession, TunnelError> {
         let (endpoint, conn) = dial_quic(
-            &self.signing_key,
             exit_pubkey,
             exit_addr,
             effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
@@ -339,6 +335,10 @@ impl ClientTunnel {
             source: e,
         })?;
 
+        // v5 in-band client auth: sign this connection's channel binding (bound
+        // to the device_id) with the client identity key; the exit verifies it
+        // before admitting the session (the exit requests no TLS client cert).
+        let cb = tls::channel_binding(&conn).map_err(TunnelError::Tls)?;
         let setup = Setup {
             protocol_version: warren_wire::PROTOCOL_VERSION,
             features: self.features,
@@ -346,6 +346,12 @@ impl ClientTunnel {
             total_connections: 1,
             daita_support: self.daita_support,
             device_id: self.device_id,
+            client_pubkey: self.signing_key.verifying_key().to_bytes(),
+            auth_sig: warren_wire::AuthSig(tls::sign_client_auth(
+                &self.signing_key,
+                &cb,
+                &self.device_id,
+            )),
         };
         send.write_all(&encode_setup(&setup)?)
             .await

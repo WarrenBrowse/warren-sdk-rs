@@ -109,7 +109,6 @@ impl From<QuicDialError> for MultihopError {
                 context: "connect",
                 source,
             },
-            QuicDialError::IdentityMismatch => MultihopError::ExitIdentityMismatch,
         }
     }
 }
@@ -199,7 +198,6 @@ impl MultihopClientTunnel {
         exit_addr: SocketAddr,
     ) -> Result<MultihopSession, MultihopError> {
         let (endpoint, conn) = dial_quic(
-            &self.signing_key,
             exit_pubkey,
             exit_addr,
             effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
@@ -890,19 +888,12 @@ mod real_exit_tests {
 
     /// Dials the exit's raw multihop QUIC plane, retrying until it is listening.
     async fn dial_with_retry(
-        client_key: &SigningKey,
         exit_rpk: [u8; 32],
         addr: SocketAddr,
     ) -> (quinn::Endpoint, quinn::Connection) {
         for attempt in 0..50u32 {
-            match crate::client::dial_quic(
-                client_key,
-                exit_rpk,
-                addr,
-                effective_bind(None, false, addr),
-                None,
-            )
-            .await
+            match crate::client::dial_quic(exit_rpk, addr, effective_bind(None, false, addr), None)
+                .await
             {
                 Ok(pair) => return pair,
                 Err(_) if attempt < 49 => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -943,8 +934,8 @@ mod real_exit_tests {
             return;
         };
 
-        let client_key = SigningKey::from_bytes(&CLIENT_SEED);
-        let (endpoint, conn) = dial_with_retry(&client_key, exit_rpk, addr).await;
+        let _client_key = SigningKey::from_bytes(&CLIENT_SEED);
+        let (endpoint, conn) = dial_with_retry(exit_rpk, addr).await;
 
         let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
         let exit_key = parse_exit_x25519_pubkey(&exit_x25519).expect("parse exit x25519");
@@ -1008,8 +999,8 @@ mod real_exit_tests {
             return;
         };
 
-        let client_key = SigningKey::from_bytes(&CLIENT_SEED);
-        let (endpoint, conn) = dial_with_retry(&client_key, exit_rpk, addr).await;
+        let _client_key = SigningKey::from_bytes(&CLIENT_SEED);
+        let (endpoint, conn) = dial_with_retry(exit_rpk, addr).await;
 
         let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
         let hpke = ClientSession::new(

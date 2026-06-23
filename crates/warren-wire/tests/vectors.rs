@@ -26,6 +26,8 @@ struct SetupVec {
     total_connections: u8,
     daita_support: bool,
     device_id_hex: String,
+    client_pubkey_hex: String,
+    auth_sig_hex: String,
     bytes_hex: String,
 }
 
@@ -80,6 +82,16 @@ fn setup_vectors_match() {
             total_connections: vec.total_connections,
             daita_support: vec.daita_support,
             device_id: device_id(&vec.device_id_hex),
+            client_pubkey: hex::decode(&vec.client_pubkey_hex)
+                .expect("client_pubkey hex")
+                .try_into()
+                .expect("client_pubkey is 32 bytes"),
+            auth_sig: warren_wire::AuthSig(
+                hex::decode(&vec.auth_sig_hex)
+                    .expect("auth_sig hex")
+                    .try_into()
+                    .expect("auth_sig is 64 bytes"),
+            ),
         };
         assert_eq!(
             hex::encode(encode_setup(&s).expect("encode")),
