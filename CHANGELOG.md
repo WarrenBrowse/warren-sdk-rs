@@ -7,6 +7,19 @@ the pre-release `0.0.x` line.
 
 ## [Unreleased]
 
+## [0.0.11] - 2026-06-24
+
+### Changed
+
+- Adopted WarrenGuard protocol v5 in-band client authentication. The client now
+  declares its Ed25519 identity in `Setup` and proves possession by signing the
+  connection's TLS channel binding (`sign_client_auth`), so the exit no longer
+  issues a mutual-TLS `CertificateRequest`. Dropping the client certificate
+  removes an active-probing tell while keeping the per-connection binding that
+  makes a captured `Setup` useless on any other connection. The pinned engine
+  (rev in `.warrenguard-version`) is bumped to `6e4f40c`, and the v5 golden
+  vectors are pinned under `vectors/`.
+
 ## [0.0.10] - 2026-06-22
 
 ### Added

@@ -88,7 +88,7 @@ break and requires a schema version bump.
 | Identity | BIP39 (12 words) -> seed (64 bytes, empty passphrase) -> first 32 bytes -> HKDF-SHA256 (salt `warren/identity/v1`, info `vpn-node-key`) -> Ed25519 |
 | Address | SS58 prefix 13295 (`wb…`), Blake2b-512 checksum, base58 |
 | API auth | canonical `METHOD\npath\ntimestamp\nnonce_hex\nsha256_hex(body)`, Ed25519 signature, headers `X-Warren-PubKey` (SS58), `X-Warren-Sig`, `X-Warren-Timestamp`, `X-Warren-Nonce` |
-| Handshake | Setup/SetupAck (postcard), protocol version 4, 16-byte device id, feature bitmask |
+| Handshake | Setup/SetupAck (postcard), protocol version 5, 16-byte device id, feature bitmask, in-band client auth (client signs the TLS channel binding in `Setup`; no mutual-TLS client certificate) |
 | Discovery | Signed relay list (v7), canonical JSON, Ed25519 over a pinned server pubkey, generation anti-rollback, expiry anti-freeze |
 | TLS | Raw public keys (RFC 7250), ALPN `h3`, TLS 1.3 only, 0-RTT off |
 | NAT-PMP | RFC 6886 plus Warren rate-limit extensions |
