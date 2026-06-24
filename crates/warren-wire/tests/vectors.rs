@@ -2,8 +2,8 @@
 
 use serde::Deserialize;
 use warren_wire::{
-    DEVICE_ID_LEN, DaitaConfig, Setup, SetupAck, decode_setup, decode_setup_ack, encode_setup,
-    encode_setup_ack,
+    AUTH_SIG_LEN, AuthSig, DEVICE_ID_LEN, DaitaConfig, Setup, SetupAck, decode_setup,
+    decode_setup_ack, encode_setup, encode_setup_ack,
 };
 
 #[derive(Deserialize)]
@@ -46,6 +46,7 @@ struct SetupAckVec {
     multiconn_attached: bool,
     #[serde(default)]
     daita_spec: Option<DaitaSpecVec>,
+    exit_auth_sig_hex: String,
     bytes_hex: String,
 }
 
@@ -120,6 +121,10 @@ fn setup_ack_vectors_match() {
             max_padding_frac: d.max_padding_frac,
             max_blocking_frac: d.max_blocking_frac,
         });
+        let exit_auth_sig: [u8; AUTH_SIG_LEN] = hex::decode(&vec.exit_auth_sig_hex)
+            .expect("hex")
+            .try_into()
+            .expect("auth sig is AUTH_SIG_LEN bytes");
         let a = SetupAck {
             protocol_version: vec.protocol_version,
             tunnel_ipv4: vec.tunnel_ipv4,
@@ -128,6 +133,7 @@ fn setup_ack_vectors_match() {
             max_mtu: vec.max_mtu,
             multiconn_attached: vec.multiconn_attached,
             daita_spec,
+            exit_auth_sig: AuthSig(exit_auth_sig),
         };
         assert_eq!(
             hex::encode(encode_setup_ack(&a).expect("encode")),

@@ -24,7 +24,8 @@ use warren_transport::tls::{WarrenPubkey, channel_binding, verify_client_auth};
 use warren_transport::{default_crypto_provider, make_server_config};
 use warren_wire::multihop::{EXIT_ID_LEN, WarrenMultihopFrame};
 use warren_wire::{
-    MAX_SETUP_FRAME_BYTES, PROTOCOL_VERSION, SetupAck, decode_setup, encode_setup_ack,
+    AUTH_SIG_LEN, AuthSig, MAX_SETUP_FRAME_BYTES, PROTOCOL_VERSION, SetupAck, decode_setup,
+    encode_setup_ack,
 };
 use warren_wire::{
     WARREN_HPKE_AAD_V1, WARREN_HPKE_VERSION_V1, WarrenControlMessage, encode_control,
@@ -96,6 +97,9 @@ pub async fn spawn_fake_exit(exit_key: SigningKey) -> (SocketAddr, [u8; 32]) {
             max_mtu: 1280,
             multiconn_attached: true,
             daita_spec: None,
+            // Engine wg-0005 (v6) added SetupAck.exit_auth_sig; test-only filler
+            // (this stub exit does not run the v6 auth-sig verification path).
+            exit_auth_sig: AuthSig([0xAA; AUTH_SIG_LEN]),
         };
         send.write_all(&encode_setup_ack(&ack).expect("encode ack"))
             .await
@@ -194,6 +198,9 @@ pub async fn spawn_netstack_exit(exit_key: SigningKey) -> (SocketAddr, [u8; 32])
             max_mtu: 1280,
             multiconn_attached: true,
             daita_spec: None,
+            // Engine wg-0005 (v6) added SetupAck.exit_auth_sig; test-only filler
+            // (this stub exit does not run the v6 auth-sig verification path).
+            exit_auth_sig: AuthSig([0xAA; AUTH_SIG_LEN]),
         };
         send.write_all(&encode_setup_ack(&ack).expect("enc"))
             .await
