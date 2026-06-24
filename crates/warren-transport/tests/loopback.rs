@@ -3,11 +3,12 @@
 //! the full transport stack (RPK handshake, Setup/SetupAck, datagram plane) without any
 //! real network or privilege.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 use ed25519_dalek::SigningKey;
 use warren_test_support::spawn_fake_exit;
-use warren_transport::{ClientTunnel, TunnelError};
+use warren_transport::tls;
+use warren_transport::{ClientTunnel, TunnelError, default_crypto_provider, make_client_config};
 
 #[tokio::test]
 async fn handshake_assigns_ip_and_datagram_echoes() {
@@ -60,4 +61,57 @@ async fn wrong_exit_pubkey_is_rejected() {
             ..
         } | TunnelError::ExitIdentityMismatch
     ));
+}
+
+#[tokio::test]
+async fn bogus_inband_auth_signature_is_rejected_by_the_exit() {
+    // A client that stamps an invalid v5 in-band auth signature must not be
+    // admitted: the exit verifies the channel-binding proof and drops the
+    // connection without ever sending a SetupAck. This is the regression guard
+    // that the fake exit really verifies (not just decodes) the client auth.
+    let exit_key = SigningKey::from_bytes(&[9u8; 32]);
+    let (exit_addr, exit_pubkey) = spawn_fake_exit(exit_key).await;
+
+    let crypto = default_crypto_provider();
+    let client_cfg = make_client_config(crypto, &[b"h3"]).expect("client config");
+    let bind = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
+    let mut endpoint = quinn::Endpoint::client(bind).expect("client endpoint");
+    endpoint.set_default_client_config(client_cfg);
+
+    let server_name = tls::name::encode(tls::WarrenPubkey::from_bytes(exit_pubkey));
+    let conn = endpoint
+        .connect(exit_addr, &server_name)
+        .expect("connect")
+        .await
+        .expect("tls handshake");
+
+    let signing_key = SigningKey::from_bytes(&[1u8; 32]);
+    let device_id = [0xABu8; warren_wire::DEVICE_ID_LEN];
+    let cb = tls::channel_binding(&conn).expect("client channel binding");
+    let mut sig = tls::sign_client_auth(&signing_key, &cb, &device_id);
+    // Corrupt the otherwise-valid proof so verification on the exit fails.
+    sig[0] ^= 0xFF;
+
+    let setup = warren_wire::Setup {
+        protocol_version: warren_wire::PROTOCOL_VERSION,
+        features: 0,
+        connection_index: 0,
+        total_connections: 1,
+        daita_support: false,
+        device_id,
+        client_pubkey: signing_key.verifying_key().to_bytes(),
+        auth_sig: warren_wire::AuthSig(sig),
+    };
+    let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
+    send.write_all(&warren_wire::encode_setup(&setup).expect("encode setup"))
+        .await
+        .expect("write setup");
+    send.finish().expect("finish");
+
+    // The exit rejects by dropping the connection, so no SetupAck arrives.
+    let result = recv.read_to_end(warren_wire::MAX_SETUP_FRAME_BYTES).await;
+    assert!(
+        result.map(|b| b.is_empty()).unwrap_or(true),
+        "a bogus in-band auth signature must not yield a SetupAck"
+    );
 }

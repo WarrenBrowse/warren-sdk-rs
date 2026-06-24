@@ -20,6 +20,7 @@ use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use tokio::sync::mpsc;
+use warren_transport::tls::{WarrenPubkey, channel_binding, verify_client_auth};
 use warren_transport::{default_crypto_provider, make_server_config};
 use warren_wire::multihop::{EXIT_ID_LEN, WarrenMultihopFrame};
 use warren_wire::{
@@ -65,13 +66,27 @@ pub async fn spawn_fake_exit(exit_key: SigningKey) -> (SocketAddr, [u8; 32]) {
             .await
             .expect("connection established");
         let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
-        let _setup = decode_setup(
+        let setup = decode_setup(
             &recv
                 .read_to_end(MAX_SETUP_FRAME_BYTES)
                 .await
                 .expect("read setup"),
         )
         .expect("decode setup");
+
+        // v5 in-band client auth: verify the client's channel-binding signature
+        // exactly as a real exit does, then drop the connection without acking if
+        // it fails. This makes a regression in the client's CB / auth-sig
+        // construction fail in-process instead of silently passing.
+        let server_cb = channel_binding(&conn).expect("export server channel binding");
+        if !verify_client_auth(
+            &WarrenPubkey::from_bytes(setup.client_pubkey),
+            &server_cb,
+            &setup.device_id,
+            &setup.auth_sig.0,
+        ) {
+            return;
+        }
 
         let ack = SetupAck {
             protocol_version: PROTOCOL_VERSION,
