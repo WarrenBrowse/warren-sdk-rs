@@ -39,7 +39,7 @@ use warren_multihop::{
     ClientSession as HpkeSession, ExitId, IpAssignment, ReplayWindow, SetupError,
     parse_exit_x25519_pubkey,
 };
-use warren_wire::control::{CONTROL_FIRST_BYTE, try_decode_control};
+use warren_wire::control::{CONTROL_FIRST_BYTE, WarrenControlMessage, try_decode_control};
 use warren_wire::multihop::{EXIT_ID_LEN, WarrenMultihopFrame};
 
 use crate::client::{QuicDialError, dial_quic, effective_bind};
@@ -124,6 +124,7 @@ pub struct MultihopClientTunnel {
     auto_local_ip: bool,
     wants_ipv6: bool,
     transport_config: Option<std::sync::Arc<quinn::TransportConfig>>,
+    idle_cover: bool,
 }
 
 impl MultihopClientTunnel {
@@ -136,6 +137,7 @@ impl MultihopClientTunnel {
             auto_local_ip: false,
             wants_ipv6: false,
             transport_config: None,
+            idle_cover: false,
         }
     }
 
@@ -175,6 +177,19 @@ impl MultihopClientTunnel {
         self
     }
 
+    /// Enables ADR-0006 idle cover traffic: the keep-alive PING is disabled and
+    /// the caller drives [`crate::idle_cover::IdleCoverDriver`] over the returned
+    /// session so jittered, size-varied dummies replace the fixed keep-alive
+    /// beacon. No effect when an explicit
+    /// [`with_transport_config`](Self::with_transport_config) override is set. Off
+    /// by default. The caller MUST spawn the cover driver, or the session has no
+    /// keep-alive.
+    #[must_use]
+    pub fn with_idle_cover(mut self, enable: bool) -> Self {
+        self.idle_cover = enable;
+        self
+    }
+
     /// The account public key (TLS identity and PoP key).
     #[must_use]
     pub fn node_id(&self) -> [u8; 32] {
@@ -199,11 +214,18 @@ impl MultihopClientTunnel {
         exit_id: [u8; EXIT_ID_LEN],
         exit_addr: SocketAddr,
     ) -> Result<MultihopSession, MultihopError> {
+        // An explicit override wins; else, when idle cover is on, use the
+        // keep-alive-disabled config so the cover driver replaces the beacon.
+        let transport_config = self.transport_config.clone().or_else(|| {
+            self.idle_cover.then(|| {
+                std::sync::Arc::new(crate::client::warren_transport_config_with_idle_cover(true))
+            })
+        });
         let (endpoint, conn) = dial_quic(
             exit_pubkey,
             exit_addr,
             effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
-            self.transport_config.clone(),
+            transport_config,
         )
         .await?;
 
@@ -271,6 +293,7 @@ impl MultihopClientTunnel {
             assignment,
             metrics: Arc::new(MultihopMetrics::new(0)),
             last_rekey_at: Mutex::new(Instant::now()),
+            drain_tx: tokio::sync::watch::channel(None).0,
         })
     }
 }
@@ -451,6 +474,41 @@ impl Default for RekeyPolicy {
     }
 }
 
+/// Maintenance-drain advisory the exit emitted mid-session (ADR 36).
+///
+/// The exit publishes a sealed `ExitDraining` control frame on the live
+/// downlink when an operator drains it for maintenance.
+/// [`MultihopSession::recv_packet`] decodes it and republishes it on the
+/// session's drain watch so an upper layer (the SDK supervisor / FFI host)
+/// can migrate off the draining exit before its hard-close deadline.
+/// `Copy + Eq` so a `watch` can dedupe identical re-emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainAdvisory {
+    /// Absolute Unix-epoch seconds after which the exit hard-closes any
+    /// straggler. `u64::MAX` = soft drain (no hard deadline).
+    pub deadline_unix_secs: u64,
+    /// Opaque operator reason code (0 = maintenance).
+    pub reason_code: u8,
+}
+
+impl DrainAdvisory {
+    /// Extract a drain advisory from a decoded control plaintext, or `None`
+    /// if it is not an `ExitDraining` frame (DAITA dummy, other control
+    /// variant, or a malformed frame).
+    fn from_control(plaintext: &[u8]) -> Option<Self> {
+        match try_decode_control(plaintext) {
+            Ok(Some(WarrenControlMessage::ExitDraining {
+                deadline_unix_secs,
+                reason_code,
+            })) => Some(Self {
+                deadline_unix_secs,
+                reason_code,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// An established multihop session: IP packets travel as per-packet sealed
 /// `WarrenMultihopFrame`s over QUIC datagrams.
 ///
@@ -477,6 +535,9 @@ pub struct MultihopSession {
     /// When the current epoch was installed (construction or last rekey); drives
     /// [`RekeyPolicy::is_due`].
     last_rekey_at: Mutex<Instant>,
+    /// ADR 36: republishes a mid-session `ExitDraining` advisory to the upper
+    /// layer. Holds `None` until the exit signals a drain.
+    drain_tx: tokio::sync::watch::Sender<Option<DrainAdvisory>>,
 }
 
 impl MultihopSession {
@@ -718,9 +779,25 @@ impl MultihopSession {
             match plaintext.first() {
                 // DAITA padding or a control message: not an IP packet.
                 Some(&DAITA_DUMMY_FIRST_BYTE) | Some(&CONTROL_FIRST_BYTE) => {
-                    // A stray control message on the data plane is ignored
-                    // (the client setup is already complete).
-                    let _ = try_decode_control(&plaintext);
+                    // A DAITA dummy is discarded. A control frame on the data
+                    // plane is the ADR 36 maintenance-drain advisory (the
+                    // setup control exchange is already complete): surface it
+                    // on the drain watch so the upper layer can migrate off
+                    // the draining exit before its hard-close deadline.
+                    if let Some(adv) = DrainAdvisory::from_control(&plaintext) {
+                        // Dedupe: the exit re-emits the same advisory every few
+                        // seconds until the deadline. Publish only on a real
+                        // change so a `changed()`-based consumer is not woken by
+                        // every identical re-emit (`DrainAdvisory: Eq`).
+                        self.drain_tx.send_if_modified(|cur| {
+                            if *cur == Some(adv) {
+                                false
+                            } else {
+                                *cur = Some(adv);
+                                true
+                            }
+                        });
+                    }
                     continue;
                 }
                 Some(_) => {
@@ -735,9 +812,31 @@ impl MultihopSession {
         }
     }
 
+    /// Subscribe to mid-session maintenance-drain advisories (ADR 36).
+    ///
+    /// The receiver holds `None` until the exit signals it is draining, then
+    /// yields `Some(DrainAdvisory)`. An upper layer (the SDK supervisor / FFI
+    /// host) reacts by migrating off the draining exit before its hard-close
+    /// deadline (make-before-break).
+    pub fn watch_drain(&self) -> tokio::sync::watch::Receiver<Option<DrainAdvisory>> {
+        self.drain_tx.subscribe()
+    }
+
     /// Close the connection cleanly.
     pub fn disconnect(&self) {
         self.conn.close(0u32.into(), b"client disconnect");
+    }
+}
+
+impl crate::idle_cover::CoverSink for MultihopSession {
+    fn send_cover(&self, padding_len: usize) -> bool {
+        self.send_cover_traffic(padding_len).is_ok()
+    }
+    fn max_inner_payload(&self) -> usize {
+        self.max_inner_payload()
+    }
+    fn cover_seed(&self) -> u64 {
+        self.conn.stable_id() as u64
     }
 }
 
@@ -764,6 +863,7 @@ impl MultihopSession {
             assignment: IpAssignment::placeholder_for_test(),
             metrics: Arc::new(MultihopMetrics::new(0)),
             last_rekey_at: Mutex::new(Instant::now()),
+            drain_tx: tokio::sync::watch::channel(None).0,
         }
     }
 }
@@ -1266,6 +1366,32 @@ mod policy_tests {
         );
         // The static context label is fine (it is a step name, not identity).
         assert!(setup_io.to_string().contains("open setup stream"));
+    }
+
+    #[test]
+    fn drain_advisory_decodes_an_exit_draining_control_frame() {
+        // ADR 36: the exit's sealed ExitDraining frame, once HPKE-opened to
+        // its plaintext, must decode to a DrainAdvisory carrying the exact
+        // deadline + reason so the upper layer can migrate before the close.
+        let plaintext = warren_wire::control::encode_control(&WarrenControlMessage::ExitDraining {
+            deadline_unix_secs: 1_700_000_000,
+            reason_code: 7,
+        })
+        .expect("encode ExitDraining");
+        let adv =
+            DrainAdvisory::from_control(&plaintext).expect("ExitDraining must yield an advisory");
+        assert_eq!(adv.deadline_unix_secs, 1_700_000_000);
+        assert_eq!(adv.reason_code, 7);
+    }
+
+    #[test]
+    fn drain_advisory_ignores_other_control_and_data_frames() {
+        // A non-draining control frame (Rejected) is not an advisory...
+        let rejected = warren_wire::control::encode_control(&WarrenControlMessage::Rejected)
+            .expect("encode Rejected");
+        assert!(DrainAdvisory::from_control(&rejected).is_none());
+        // ...and a raw IPv4 packet (first nibble 4) is not even a control frame.
+        assert!(DrainAdvisory::from_control(&[0x45, 0x00, 0x00, 0x14]).is_none());
     }
 
     #[test]
