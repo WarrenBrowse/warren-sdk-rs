@@ -347,6 +347,10 @@ pub(crate) async fn supervise_proxy<S, F, Fut>(
                 };
                 let _ = forwarder_tx.send(None);
                 if drained {
+                    // Surface the migration to the host right away (the app
+                    // shows "reconnecting" during the drain window instead of a
+                    // frozen "connected"); the loop also re-sends it next round.
+                    let _ = state_tx.send(ConnectionState::Reconnecting);
                     // Proactive drain reconnect: ALWAYS jitter-delay (never
                     // reset) so a pinned single-exit does not tight-loop on the
                     // still-draining exit, and the herd spreads (anti-stampede).
