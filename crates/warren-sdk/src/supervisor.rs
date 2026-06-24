@@ -328,8 +328,12 @@ pub(crate) async fn supervise_proxy<S, F, Fut>(
                 let up_since = std::time::Instant::now();
                 // Serve until the tunnel dies OR (ADR 36) the exit signals a
                 // maintenance drain. A drain wins the race so we reconnect
-                // proactively before the exit's hard close; the failover
-                // datapath then rotates to the next exit.
+                // proactively before the exit's hard close. NOTE: the failover
+                // cursor only advances on a connect `Err`, so a drain re-dials
+                // the SAME exit once; it is still draining and hard-closes
+                // shortly, which yields the `Err` that rotates to the next exit.
+                // So failover self-heals in one extra cycle (rotating directly
+                // on the drain advisory is a possible future optimization).
                 let drained = match drain_rx {
                     Some(mut rx) => {
                         tokio::select! {
