@@ -313,6 +313,9 @@ pub(crate) async fn supervise_proxy<S, F, Fut>(
                     dns_server,
                 );
                 let gateway = est.gateway;
+                // ADR 36: grab the drain watch before the sink is moved into the
+                // netstack engine. `None` for paths that emit no drain signal.
+                let drain_rx = est.sink.drain_watch();
                 let (connector, alive_rx) = warren_net::spawn_over_sink(Arc::new(est.sink), config);
                 // Publish this epoch's forwarder so self-healing port forwards
                 // can re-map on the fresh connector; cleared to `None` below when
@@ -323,13 +326,36 @@ pub(crate) async fn supervise_proxy<S, F, Fut>(
                 }));
                 let _ = state_tx.send(ConnectionState::Connected);
                 let up_since = std::time::Instant::now();
-                serve_epoch(&socks_listener, http_listener.as_ref(), connector, alive_rx).await;
+                // Serve until the tunnel dies OR (ADR 36) the exit signals a
+                // maintenance drain. A drain wins the race so we reconnect
+                // proactively before the exit's hard close; the failover
+                // datapath then rotates to the next exit.
+                let drained = match drain_rx {
+                    Some(mut rx) => {
+                        tokio::select! {
+                            () = serve_epoch(
+                                &socks_listener, http_listener.as_ref(), connector, alive_rx,
+                            ) => false,
+                            () = wait_for_drain(&mut rx) => true,
+                        }
+                    }
+                    None => {
+                        serve_epoch(&socks_listener, http_listener.as_ref(), connector, alive_rx)
+                            .await;
+                        false
+                    }
+                };
                 let _ = forwarder_tx.send(None);
-                // The tunnel died. A healthy session resets backoff and reconnects
-                // at once; a flapping one (died almost immediately) backs off first.
-                if up_since.elapsed() >= MIN_HEALTHY_UPTIME {
+                if drained {
+                    // Proactive drain reconnect: ALWAYS jitter-delay (never
+                    // reset) so a pinned single-exit does not tight-loop on the
+                    // still-draining exit, and the herd spreads (anti-stampede).
+                    tokio::time::sleep(backoff.next_delay()).await;
+                } else if up_since.elapsed() >= MIN_HEALTHY_UPTIME {
+                    // The tunnel died after a healthy run: reconnect at once.
                     backoff.reset();
                 } else {
+                    // Flapped (died almost immediately): back off first.
                     tokio::time::sleep(backoff.next_delay()).await;
                 }
             }
@@ -337,6 +363,22 @@ pub(crate) async fn supervise_proxy<S, F, Fut>(
                 // No identity material is logged. Back off before the next attempt.
                 tokio::time::sleep(backoff.next_delay()).await;
             }
+        }
+    }
+}
+
+/// Resolves when the exit publishes a maintenance-drain advisory on `rx`
+/// (ADR 36). Parks forever if the watch sender is dropped (the session ended),
+/// so on a natural tunnel death `serve_epoch` wins the race instead of this.
+async fn wait_for_drain(
+    rx: &mut tokio::sync::watch::Receiver<Option<warren_transport::DrainAdvisory>>,
+) {
+    loop {
+        if rx.borrow_and_update().is_some() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
         }
     }
 }
@@ -378,4 +420,52 @@ pub(crate) async fn establish_multihop(
         gateway,
         ipv6,
     })
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use std::time::Duration;
+    use warren_transport::DrainAdvisory;
+
+    #[tokio::test]
+    async fn wait_for_drain_resolves_on_advisory() {
+        // A published advisory must win the race so the supervisor reconnects.
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        tx.send(Some(DrainAdvisory {
+            deadline_unix_secs: 1_700_000_000,
+            reason_code: 0,
+        }))
+        .expect("receiver live");
+        tokio::time::timeout(Duration::from_millis(200), wait_for_drain(&mut rx))
+            .await
+            .expect("wait_for_drain must resolve once a drain advisory is published");
+    }
+
+    #[tokio::test]
+    async fn wait_for_drain_parks_when_no_advisory() {
+        // No advisory, sender still alive: must NOT resolve (else serve_epoch
+        // could never win the race on a healthy tunnel).
+        let (_tx, mut rx) = tokio::sync::watch::channel::<Option<DrainAdvisory>>(None);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), wait_for_drain(&mut rx))
+                .await
+                .is_err(),
+            "wait_for_drain must park while the tunnel is healthy (no drain)"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_drain_parks_when_sender_dropped() {
+        // Sender dropped (session ended): park forever so `serve_epoch` drives
+        // the reconnect on a natural tunnel death, not a phantom drain.
+        let (tx, mut rx) = tokio::sync::watch::channel::<Option<DrainAdvisory>>(None);
+        drop(tx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), wait_for_drain(&mut rx))
+                .await
+                .is_err(),
+            "a dropped drain sender must park, never resolve"
+        );
+    }
 }

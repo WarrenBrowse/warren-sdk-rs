@@ -22,8 +22,8 @@ pub use idle_cover::{CoverSink, IdleCover, IdleCoverDriver, IdleCoverDriverHandl
 // fork-agnostic: identical whether the workspace patches quinn or not.
 pub use daita_driver::{DaitaDriver, DaitaDriverHandle};
 pub use multihop::{
-    MultihopClientTunnel, MultihopError, MultihopMetrics, MultihopMetricsSnapshot, MultihopSession,
-    RekeyPolicy,
+    DrainAdvisory, MultihopClientTunnel, MultihopError, MultihopMetrics, MultihopMetricsSnapshot,
+    MultihopSession, RekeyPolicy,
 };
 pub use quinn::TransportConfig;
 pub use reconnect::{

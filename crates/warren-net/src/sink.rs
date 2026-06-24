@@ -40,6 +40,16 @@ pub trait PacketSink: Send + Sync {
     /// The largest packet payload the current path can carry.
     fn max_payload(&self) -> usize;
 
+    /// Subscribe to mid-session maintenance-drain advisories (ADR 36), if the
+    /// underlying tunnel surfaces them. The default returns `None` (the path
+    /// emits no drain signal); the multi-hop sink overrides it. The proxy
+    /// supervisor uses this to proactively reconnect off a draining exit.
+    fn drain_watch(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<Option<warren_transport::DrainAdvisory>>> {
+        None
+    }
+
     /// Sends a batch of packets. The default forwards them one by one; a
     /// GSO-aware implementation can override this to coalesce the syscall.
     ///
@@ -191,6 +201,12 @@ impl PacketSink for MultihopPacketSink {
         // is the inner IP MTU the netstack engine should clamp to.
         self.session.max_inner_payload()
     }
+
+    fn drain_watch(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<Option<warren_transport::DrainAdvisory>>> {
+        Some(self.session.watch_drain())
+    }
 }
 
 /// Channel depth for the merged inbound stream of a [`BondedPacketSink`].
@@ -296,6 +312,14 @@ impl<S: PacketSink + 'static> PacketSink for BondedPacketSink<S> {
 
     fn max_payload(&self) -> usize {
         self.max_payload
+    }
+
+    fn drain_watch(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<Option<warren_transport::DrainAdvisory>>> {
+        // Every member bonds to the SAME exit, so any member's drain advisory
+        // speaks for the whole bundle; the first member's watch suffices.
+        self.members.first().and_then(|m| m.drain_watch())
     }
 }
 
