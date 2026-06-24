@@ -7,6 +7,19 @@ the pre-release `0.0.x` line.
 
 ## [Unreleased]
 
+### Added
+
+- ADR-0006 idle cover traffic ("B2-lite"), opt-in via `with_idle_cover(true)` on
+  `ClientTunnel` and `MultihopClientTunnel` (off by default). When enabled the
+  keep-alive PING is disabled and a caller-spawned `IdleCoverDriver` emits a
+  jittered (10-20s), size-varied cover datagram while the tunnel is idle, reusing
+  the existing `0xFF` DAITA discriminator (no wire change). This replaces the
+  fixed keep-alive beacon, which is a passive traffic-analysis tell that no
+  browser produces, while still refreshing the NAT mapping and resetting the idle
+  timeout. Real-exit validation against a live exit is still required before
+  enabling it by default. New public surface: `IdleCover`, `IdleCoverDriver`,
+  `IdleCoverDriverHandle`, `CoverSink`.
+
 ## [0.0.11] - 2026-06-24
 
 ### Changed

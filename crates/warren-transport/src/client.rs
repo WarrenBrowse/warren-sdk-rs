@@ -123,6 +123,23 @@ pub(crate) fn warren_transport_config() -> quinn::TransportConfig {
     tc
 }
 
+/// Transport config for ADR-0006 idle cover. When `idle_cover` is true the
+/// keep-alive PING is DISABLED: the idle cover driver
+/// ([`crate::idle_cover::IdleCoverDriver`]) refreshes the NAT mapping and resets
+/// the idle timeout with jittered, size-varied dummies instead, removing the
+/// fixed keep-alive beacon. The idle timeout still detects a dead exit. The
+/// caller MUST run the cover driver when this is set, or the connection has no
+/// liveness mechanism beyond the idle timeout. With `idle_cover` false this is
+/// identical to [`warren_transport_config`].
+#[must_use]
+pub(crate) fn warren_transport_config_with_idle_cover(idle_cover: bool) -> quinn::TransportConfig {
+    let mut tc = warren_transport_config();
+    if idle_cover {
+        tc.keep_alive_interval(None);
+    }
+    tc
+}
+
 /// Picks the transport config for a dial: an explicit caller override wins, else
 /// the SDK's upstream-quinn default ([`warren_transport_config`]). The override
 /// is how a fork-patched workspace (the privileged system-VPN daemon) injects
@@ -210,6 +227,7 @@ pub struct ClientTunnel {
     bind_local_ip: Option<SocketAddr>,
     auto_local_ip: bool,
     transport_config: Option<Arc<quinn::TransportConfig>>,
+    idle_cover: bool,
 }
 
 // Manual Debug (no-log discipline): render only a short public-key prefix and the
@@ -242,6 +260,7 @@ impl ClientTunnel {
             bind_local_ip: None,
             auto_local_ip: false,
             transport_config: None,
+            idle_cover: false,
         }
     }
 
@@ -293,6 +312,18 @@ impl ClientTunnel {
         self
     }
 
+    /// Enables ADR-0006 idle cover traffic: the keep-alive PING is disabled and
+    /// the caller drives [`crate::idle_cover::IdleCoverDriver`] over the returned
+    /// session so jittered, size-varied dummies replace the fixed keep-alive
+    /// beacon. No effect when an explicit [`with_transport_config`](Self::with_transport_config)
+    /// override is set (the override's keep-alive wins). Off by default. The
+    /// caller MUST spawn the cover driver, or the session has no keep-alive.
+    #[must_use]
+    pub fn with_idle_cover(mut self, enable: bool) -> Self {
+        self.idle_cover = enable;
+        self
+    }
+
     /// The client's 32-byte Ed25519 public key.
     #[must_use]
     pub fn node_id(&self) -> [u8; 32] {
@@ -322,11 +353,17 @@ impl ClientTunnel {
         exit_pubkey: [u8; 32],
         exit_addr: SocketAddr,
     ) -> Result<ClientSession, TunnelError> {
+        // An explicit override wins; else, when idle cover is on, use the
+        // keep-alive-disabled config so the cover driver replaces the beacon.
+        let transport_config = self.transport_config.clone().or_else(|| {
+            self.idle_cover
+                .then(|| Arc::new(warren_transport_config_with_idle_cover(true)))
+        });
         let (endpoint, conn) = dial_quic(
             exit_pubkey,
             exit_addr,
             effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
-            self.transport_config.clone(),
+            transport_config,
         )
         .await?;
 
@@ -549,6 +586,18 @@ impl ClientSession {
     /// Closes the connection cleanly.
     pub fn disconnect(&self) {
         self.conn.close(0u32.into(), b"client disconnect");
+    }
+}
+
+impl crate::idle_cover::CoverSink for ClientSession {
+    fn send_cover(&self, padding_len: usize) -> bool {
+        self.send_cover_traffic(padding_len).is_ok()
+    }
+    fn max_inner_payload(&self) -> usize {
+        self.max_inner_payload()
+    }
+    fn cover_seed(&self) -> u64 {
+        self.conn.stable_id() as u64
     }
 }
 
