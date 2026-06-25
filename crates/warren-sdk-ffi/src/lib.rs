@@ -82,6 +82,11 @@ pub enum FfiConnectionState {
     Connected,
     /// A previous attempt failed; a retry is in flight.
     Reconnecting,
+    /// ADR 36: the exit is draining for maintenance; the SDK is proactively
+    /// migrating to another server. Distinguished from `Reconnecting` so the
+    /// host can show a "switching server for maintenance" UI. Followed by
+    /// `Connected`.
+    Draining,
     /// Every attempt failed; the supervisor gave up.
     Failed,
 }
@@ -1010,6 +1015,7 @@ fn map_connection_state(state: ConnectionState) -> Option<FfiConnectionState> {
         ConnectionState::Connecting => Some(FfiConnectionState::Connecting),
         ConnectionState::Connected => Some(FfiConnectionState::Connected),
         ConnectionState::Reconnecting => Some(FfiConnectionState::Reconnecting),
+        ConnectionState::Draining => Some(FfiConnectionState::Draining),
         ConnectionState::Failed => Some(FfiConnectionState::Failed),
         _ => None,
     }

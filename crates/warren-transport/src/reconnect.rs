@@ -195,6 +195,11 @@ pub enum ConnectionState {
     Connected,
     /// A previous attempt failed; the next retry is in flight (after backoff).
     Reconnecting,
+    /// ADR 36: the exit signalled a planned maintenance drain, and the
+    /// supervisor is proactively migrating off it (a reconnect, but one the
+    /// host can distinguish from a failure-driven `Reconnecting` to show a
+    /// "switching server for maintenance" UI). Followed by `Connected`.
+    Draining,
     /// Every attempt failed; the supervisor gave up.
     Failed,
 }
