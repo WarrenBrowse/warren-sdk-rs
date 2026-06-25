@@ -876,6 +876,28 @@ async fn connect_tunnel_without_a_dialable_address_is_no_exit_address() {
     }
 }
 
+#[tokio::test]
+async fn connect_tunnel_refuses_an_x509_cover_domain_exit() {
+    // wg-0005 lockstep: the SDK transport implements only the RPK handshake.
+    // An exit advertising a cover domain runs in v6 X.509 mode and cannot
+    // interoperate with an RPK dial, so the SDK must refuse up front rather
+    // than silently fail the handshake. The guard runs before the address
+    // check, so even a fully dialable relay is refused on capability.
+    let relay = Relay::new(
+        [0u8; 32],
+        ExitId::from_bytes([0u8; 16]),
+        vec!["198.51.100.1:443".parse().unwrap()],
+        Location::new("ZZ", "Test"),
+        1,
+        true,
+    )
+    .with_cover_domain(Some("cover.example.com".to_owned()));
+    match test_client().connect_tunnel(&relay).await {
+        Err(SdkError::CoverDomainUnsupported) => {}
+        other => panic!("expected CoverDomainUnsupported, got {other:?}"),
+    }
+}
+
 /// A transport that is never actually called by these builder tests.
 struct NullTransport;
 

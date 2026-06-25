@@ -44,6 +44,13 @@ pub enum SdkError {
     /// The chosen exit has no dialable address.
     #[error("exit has no dialable address")]
     NoExitAddress,
+    /// The chosen exit advertises a v6 X.509 cover domain (wg-0005), but this
+    /// SDK transport implements only the raw-public-key handshake. The two
+    /// modes are lockstep and do not interoperate, so dialing it in RPK mode
+    /// would fail the handshake; the SDK refuses up front instead. Use the
+    /// engine transport (warrenguard) for X.509 exits until SDK parity lands.
+    #[error("exit requires v6 X.509 (cover domain) which this SDK transport does not implement")]
+    CoverDomainUnsupported,
     /// The chosen exit runs no in-tunnel DNS forwarder and no override resolver
     /// was configured, so name resolution over the tunnel would fail closed.
     /// Set [`ProxyConfig::dns_server`](warren_net::ProxyConfig) to a reachable

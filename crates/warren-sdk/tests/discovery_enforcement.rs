@@ -56,6 +56,7 @@ fn signed_list(server: &SigningKey, generation: u64, expires_at: u64) -> String 
                 alpn: "h3".to_owned(),
             }],
         }],
+        cover_domain: None,
     };
     // Keep the signed validity window within the verifier's cap (7 days).
     let signed_at = expires_at.saturating_sub(86_400);

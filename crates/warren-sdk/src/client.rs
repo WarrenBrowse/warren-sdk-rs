@@ -439,6 +439,13 @@ impl<T: HttpTransport> WarrenClient<T> {
         &self,
         exit: &warren_discovery::Relay,
     ) -> Result<QuicPacketSink, SdkError> {
+        // wg-0005 lockstep: an exit advertising a cover domain runs in v6
+        // X.509 mode, which this SDK transport does not implement (RPK only).
+        // Refuse rather than silently mis-dial in RPK mode, which cannot
+        // interoperate and would fail the handshake with an opaque error.
+        if exit.cover_domain().is_some() {
+            return Err(SdkError::CoverDomainUnsupported);
+        }
         let addr: SocketAddr = *exit.addrs().first().ok_or(SdkError::NoExitAddress)?;
         let mut tunnel = ClientTunnel::new(self.signing.clone());
         if self.auto_local_ip {
