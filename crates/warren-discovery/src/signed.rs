@@ -6,7 +6,7 @@
 //! legitimate operator; the client verifies against a pinned `server_pubkey`
 //! (or TOFU on first boot).
 //!
-//! Canonical format (frozen at v7, never modify without rotating the version):
+//! Canonical format (frozen at v8, never modify without rotating the version):
 //!
 //! ```text
 //! canonical_bytes = serde_json::to_vec(UnsignedRelayList {
@@ -44,7 +44,7 @@ use crate::exit_id::ExitId;
 use crate::relay::{Location, Relay, RelayList};
 
 /// Current signed format version. Bumping is an incompatible rotation.
-pub const SIGNED_VERSION: u32 = 7;
+pub const SIGNED_VERSION: u32 = 8;
 
 /// A dial listener on an endpoint (`port`/`transport`/`alpn`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -113,6 +113,12 @@ pub struct JsonNode {
     pub egress: JsonEgress,
     /// Dialable entry endpoints (one or more addresses).
     pub endpoints: Vec<JsonEndpoint>,
+    /// v6 X.509 cover-domain SNI (wg-0005): the hostname on the exit's real
+    /// certificate the client dials and validates via WebPKI instead of pinning
+    /// the exit's raw public key. `None` (skipped from the wire) keeps the RPK
+    /// handshake. Added in v8; must stay last to preserve the signed field order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_domain: Option<String>,
 }
 
 /// Signed exit list (full v6 wire format).
@@ -402,7 +408,8 @@ fn json_node_to_relay(n: JsonNode) -> Result<Relay, SignedError> {
         n.weight,
         n.active,
     )
-    .with_ipv6_egress(n.egress.ipv6))
+    .with_ipv6_egress(n.egress.ipv6)
+    .with_cover_domain(n.cover_domain))
 }
 
 #[cfg(test)]
@@ -436,6 +443,7 @@ mod tests {
                     alpn: "h3".to_owned(),
                 }],
             }],
+            cover_domain: None,
         }
     }
 
@@ -606,7 +614,7 @@ mod tests {
         }
         assert!(found, "expected an off-curve 32-byte value to exist");
         let json = format!(
-            r#"{{"version":7,"nodes":[],"generation":0,"signed_at":0,"expires_at":0,"server_pubkey_hex":"{}","signature_hex":"{}"}}"#,
+            r#"{{"version":8,"nodes":[],"generation":0,"signed_at":0,"expires_at":0,"server_pubkey_hex":"{}","signature_hex":"{}"}}"#,
             hex::encode(off_curve),
             "00".repeat(64)
         );
@@ -701,21 +709,22 @@ mod tests {
     }
 
     #[test]
-    fn verify_rejects_pre_v7_version() {
-        // A v6 version number must be rejected since the bump to v7.
-        let json = r#"{"version":6,"nodes":[],"generation":0,"signed_at":0,"expires_at":0,"server_pubkey_hex":"00","signature_hex":"00"}"#;
+    fn verify_rejects_pre_v8_version() {
+        // The previous v7 list (and anything older) must be rejected since the
+        // bump to v8: a v7 client/list and a v8 one do not interoperate.
+        let json = r#"{"version":7,"nodes":[],"generation":0,"signed_at":0,"expires_at":0,"server_pubkey_hex":"00","signature_hex":"00"}"#;
         assert!(matches!(
             verify_signed_relay_list(json, None).unwrap_err(),
-            SignedError::UnsupportedVersion { got: 6 }
+            SignedError::UnsupportedVersion { got: 7 }
         ));
     }
 
     #[test]
-    fn top_level_field_order_is_frozen_at_v7() {
+    fn top_level_field_order_is_frozen_at_v8() {
         let signed = sign_relay_list(vec![], &fixed_server_key(), 7, 42, 86442);
         let json = serde_json::to_string(&signed).unwrap();
         let order = [
-            r#""version":7"#,
+            r#""version":8"#,
             r#""nodes":[]"#,
             r#""generation":7"#,
             r#""signed_at":42"#,
@@ -733,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn node_field_order_is_frozen_at_v7() {
+    fn node_field_order_is_frozen_at_v8() {
         let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
         let json = serde_json::to_string(&signed).unwrap();
         let order = [
@@ -752,6 +761,36 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {needle} in {json}"));
             last += pos + needle.len();
         }
+        // A node without a cover domain MUST NOT emit the field, so a v8 list
+        // with no cover domains is byte-identical to the old node shape.
+        assert!(
+            !json.contains("cover_domain"),
+            "cover_domain=None must be skipped on the wire; got {json}"
+        );
+    }
+
+    #[test]
+    fn cover_domain_is_frozen_last_in_the_node_and_roundtrips() {
+        // Freeze the v8 addition: when present, cover_domain is the LAST node
+        // field (after endpoints), and it survives sign -> verify into the Relay.
+        let mut node = sample_node();
+        node.cover_domain = Some("e7f3a.cover.example.com".to_owned());
+        let signed = sign_relay_list(vec![node], &fixed_server_key(), 1, 1, 2);
+        let json = serde_json::to_string(&signed).unwrap();
+        let endpoints_at = json.find(r#""endpoints":"#).expect("endpoints present");
+        let cover_at = json
+            .find(r#""cover_domain":"e7f3a.cover.example.com""#)
+            .expect("cover_domain present");
+        assert!(
+            cover_at > endpoints_at,
+            "cover_domain must serialize last (after endpoints); got {json}"
+        );
+        let v = verify_signed_relay_list(&json, None).expect("verify");
+        assert_eq!(
+            v.relays.relays()[0].cover_domain(),
+            Some("e7f3a.cover.example.com"),
+            "cover_domain must reach the resolved Relay"
+        );
     }
 
     #[test]

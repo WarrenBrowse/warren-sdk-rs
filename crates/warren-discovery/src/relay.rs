@@ -46,6 +46,7 @@ pub struct Relay {
     weight: u64,
     active: bool,
     ipv6_egress: bool,
+    cover_domain: Option<String>,
 }
 
 impl Relay {
@@ -68,6 +69,7 @@ impl Relay {
             weight,
             active,
             ipv6_egress: false,
+            cover_domain: None,
         }
     }
 
@@ -75,6 +77,13 @@ impl Relay {
     #[must_use]
     pub fn with_ipv6_egress(mut self, ipv6_egress: bool) -> Self {
         self.ipv6_egress = ipv6_egress;
+        self
+    }
+
+    /// Sets the v6 X.509 cover-domain SNI advertised for this exit (wg-0005).
+    #[must_use]
+    pub fn with_cover_domain(mut self, cover_domain: Option<String>) -> Self {
+        self.cover_domain = cover_domain;
         self
     }
 
@@ -131,6 +140,13 @@ impl Relay {
     #[must_use]
     pub fn ipv6_egress(&self) -> bool {
         self.ipv6_egress
+    }
+
+    /// The v6 X.509 cover-domain SNI for this exit, if the roster advertises
+    /// one (wg-0005). `None` means dial in RPK mode.
+    #[must_use]
+    pub fn cover_domain(&self) -> Option<&str> {
+        self.cover_domain.as_deref()
     }
 }
 
