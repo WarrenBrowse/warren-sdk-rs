@@ -789,15 +789,21 @@ impl<T: HttpTransport> WarrenClient<T> {
         let auto_local_ip = self.auto_local_ip;
         let wants_ipv6 = self.wants_ipv6;
         let transport_config = self.transport_config.clone();
-        self.spawn_supervised(cfg, move || {
-            let signing = signing.clone();
-            let exit = exit.clone();
-            let transport_config = transport_config.clone();
-            async move {
-                establish_multihop(signing, &exit, auto_local_ip, wants_ipv6, transport_config)
-                    .await
-            }
-        })
+        self.spawn_supervised(
+            cfg,
+            move || {
+                let signing = signing.clone();
+                let exit = exit.clone();
+                let transport_config = transport_config.clone();
+                async move {
+                    establish_multihop(signing, &exit, auto_local_ip, wants_ipv6, transport_config)
+                        .await
+                }
+            },
+            // Single pinned exit: a drain has nowhere to rotate, the proactive
+            // reconnect re-dials it (the ambient relay-list refresh excludes it).
+            || {},
+        )
         .await
     }
 
@@ -834,48 +840,59 @@ impl<T: HttpTransport> WarrenClient<T> {
         let auto_local_ip = self.auto_local_ip;
         let wants_ipv6 = self.wants_ipv6;
         let transport_config = self.transport_config.clone();
-        // Shared cursor: advanced only on a failed attempt, so a working exit is
-        // kept (stable egress) and a broken one is rotated past on the next try.
+        // Shared cursor: advanced on a failed attempt (so a working exit is kept
+        // and a broken one is rotated past) AND on a drain advisory (ADR 36: the
+        // current exit is healthy but leaving, so rotate past it directly instead
+        // of waiting for its hard-close to produce the `Err` that rotates).
         let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        self.spawn_supervised(cfg, move || {
-            let signing = signing.clone();
-            let exits = exits.clone();
-            let cursor = Arc::clone(&cursor);
-            let transport_config = transport_config.clone();
-            async move {
-                let idx = cursor.load(Ordering::Relaxed) % exits.len();
-                match establish_multihop(
-                    signing,
-                    &exits[idx],
-                    auto_local_ip,
-                    wants_ipv6,
-                    transport_config,
-                )
-                .await
-                {
-                    Ok(tunnel) => Ok(tunnel),
-                    Err(e) => {
-                        cursor.fetch_add(1, Ordering::Relaxed);
-                        Err(e)
+        let drain_cursor = Arc::clone(&cursor);
+        self.spawn_supervised(
+            cfg,
+            move || {
+                let signing = signing.clone();
+                let exits = exits.clone();
+                let cursor = Arc::clone(&cursor);
+                let transport_config = transport_config.clone();
+                async move {
+                    let idx = cursor.load(Ordering::Relaxed) % exits.len();
+                    match establish_multihop(
+                        signing,
+                        &exits[idx],
+                        auto_local_ip,
+                        wants_ipv6,
+                        transport_config,
+                    )
+                    .await
+                    {
+                        Ok(tunnel) => Ok(tunnel),
+                        Err(e) => {
+                            cursor.fetch_add(1, Ordering::Relaxed);
+                            Err(e)
+                        }
                     }
                 }
-            }
-        })
+            },
+            move || {
+                drain_cursor.fetch_add(1, Ordering::Relaxed);
+            },
+        )
         .await
     }
 
     /// Binds the stable proxy listeners, spawns the supervisor over `connect`, and
     /// returns the [`SupervisedProxyHandle`]. Shared by the single-exit and
     /// failover supervised datapaths; only the (re)connect closure differs.
-    async fn spawn_supervised<F, Fut>(
+    async fn spawn_supervised<F, Fut, D>(
         &self,
         cfg: &warren_net::ProxyConfig,
         connect: F,
+        on_drain: D,
     ) -> Result<SupervisedProxyHandle, SdkError>
     where
         F: FnMut() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<EstablishedTunnel<MultihopPacketSink>, SdkError>>
             + Send,
+        D: Fn() + Send + 'static,
     {
         let socks_listener = tokio::net::TcpListener::bind(cfg.socks5)
             .await
@@ -903,6 +920,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                 state_tx,
                 forwarder_tx,
                 connect,
+                on_drain,
             )
             .await;
         });

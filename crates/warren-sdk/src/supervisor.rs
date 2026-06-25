@@ -270,17 +270,23 @@ pub(crate) async fn serve_epoch(
 /// drop, with capped exponential backoff between failed attempts), reporting each
 /// [`ConnectionState`] transition. `connect` is the (re)establish closure; it is
 /// generic so the loop is testable with a fake sink and a fake connector.
-pub(crate) async fn supervise_proxy<S, F, Fut>(
+pub(crate) async fn supervise_proxy<S, F, Fut, D>(
     socks_listener: tokio::net::TcpListener,
     http_listener: Option<tokio::net::TcpListener>,
     dns_server: Option<std::net::Ipv4Addr>,
     state_tx: tokio::sync::watch::Sender<ConnectionState>,
     forwarder_tx: tokio::sync::watch::Sender<Option<ProxyForwarder>>,
     mut connect: F,
+    on_drain: D,
 ) where
     S: warren_net::PacketSink + 'static,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<EstablishedTunnel<S>, SdkError>>,
+    // Invoked once per drain advisory, BEFORE the proactive reconnect (ADR 36).
+    // The failover datapath wires this to advance its rotation cursor so the
+    // reconnect rotates PAST the draining exit instead of re-dialing it; the
+    // single-exit datapath passes a no-op (one pinned exit, nothing to rotate).
+    D: Fn(),
 {
     // A session that stayed up at least this long is treated as healthy, so its
     // next reconnect starts fresh. A shorter one is "flapping" (the exit accepts
@@ -328,12 +334,10 @@ pub(crate) async fn supervise_proxy<S, F, Fut>(
                 let up_since = std::time::Instant::now();
                 // Serve until the tunnel dies OR (ADR 36) the exit signals a
                 // maintenance drain. A drain wins the race so we reconnect
-                // proactively before the exit's hard close. NOTE: the failover
-                // cursor only advances on a connect `Err`, so a drain re-dials
-                // the SAME exit once; it is still draining and hard-closes
-                // shortly, which yields the `Err` that rotates to the next exit.
-                // So failover self-heals in one extra cycle (rotating directly
-                // on the drain advisory is a possible future optimization).
+                // proactively before the exit's hard close, and `on_drain`
+                // (below) advances the failover cursor so the reconnect rotates
+                // PAST the draining exit directly (no waiting for its hard-close
+                // `Err`). Single-exit `on_drain` is a no-op (one pinned exit).
                 let drained = match drain_rx {
                     Some(mut rx) => {
                         tokio::select! {
@@ -351,6 +355,9 @@ pub(crate) async fn supervise_proxy<S, F, Fut>(
                 };
                 let _ = forwarder_tx.send(None);
                 if drained {
+                    // Rotate the failover cursor PAST the draining exit so the
+                    // reconnect lands on a different one (no-op for single-exit).
+                    on_drain();
                     // Surface the migration to the host right away (the app
                     // shows "reconnecting" during the drain window instead of a
                     // frozen "connected"); the loop also re-sends it next round.

@@ -33,6 +33,50 @@ impl warren_net::PacketSink for ClosableSink {
     }
 }
 
+/// A sink that models a tunnel whose exit signals a maintenance DRAIN (ADR 36):
+/// `drain_watch` surfaces a (possibly pre-seeded) advisory so the supervisor's
+/// make-before-break race can fire its drain arm; `close` still drives the
+/// ordinary dead-path. Used to prove the failover datapath rotates its cursor
+/// on a drain (not only on a connect failure).
+struct DrainingSink {
+    close: Arc<tokio::sync::Notify>,
+    drain_rx: tokio::sync::watch::Receiver<Option<warren_transport::DrainAdvisory>>,
+}
+
+impl warren_net::PacketSink for DrainingSink {
+    async fn send_packet(&self, _packet: &[u8]) -> Result<(), warren_net::NetError> {
+        Ok(())
+    }
+
+    async fn recv_packet(&self) -> Result<bytes::Bytes, warren_net::NetError> {
+        self.close.notified().await;
+        Err(warren_net::NetError::EngineStopped)
+    }
+
+    fn max_payload(&self) -> usize {
+        1280
+    }
+
+    fn drain_watch(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<Option<warren_transport::DrainAdvisory>>> {
+        Some(self.drain_rx.clone())
+    }
+}
+
+/// A drain watch receiver: `draining` => pre-seeded with an advisory that fires
+/// immediately; otherwise a receiver whose sender is dropped, so the watch holds
+/// `None` forever and the drain arm never fires (the session just serves).
+fn make_drain_rx(
+    draining: bool,
+) -> tokio::sync::watch::Receiver<Option<warren_transport::DrainAdvisory>> {
+    let seed = draining.then_some(warren_transport::DrainAdvisory {
+        deadline_unix_secs: u64::MAX,
+        reason_code: 0,
+    });
+    tokio::sync::watch::channel(seed).1
+}
+
 /// A bare TCP connect to `addr` succeeds within ~2s (the supervisor's accept
 /// loop is live there). Retried because the serve loop starts asynchronously.
 async fn proxy_accepts(addr: SocketAddr) -> bool {
@@ -83,6 +127,7 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
                         })
                     }
                 },
+                || {},
             )
             .await;
         })
@@ -143,6 +188,7 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
                     })
                 }
             },
+            || {},
         )
         .await;
     });
@@ -274,6 +320,7 @@ async fn supervisor_serves_both_socks_and_http_listeners() {
                     })
                 }
             },
+            || {},
         )
         .await;
     });
@@ -324,6 +371,7 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
                     })
                 }
             },
+            || {},
         )
         .await;
     });
@@ -336,6 +384,75 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
         success_idx, 1,
         "failover rotated past the broken exit 0 to the working exit 1"
     );
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn supervisor_failover_rotates_on_drain() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Two candidate exits, BOTH connect fine. Exit 0 signals a maintenance
+    // DRAIN; exit 1 does not. The failover `on_drain` must advance the cursor so
+    // the proactive reconnect rotates 0 -> 1 directly, instead of waiting for the
+    // draining exit's hard-close to produce the `Err` that the broken-exit path
+    // relies on. This is the ADR 36 audit fix (P1-2).
+    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let drain_cursor = Arc::clone(&cursor);
+    let (used_tx, mut used_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let keep_open = Arc::new(tokio::sync::Notify::new());
+
+    let task = tokio::spawn(async move {
+        supervise_proxy(
+            socks_listener,
+            None,
+            None,
+            state_tx,
+            tokio::sync::watch::channel(None).0,
+            move || {
+                let cursor = Arc::clone(&cursor);
+                let used_tx = used_tx.clone();
+                let keep_open = Arc::clone(&keep_open);
+                async move {
+                    let idx = cursor.load(Ordering::Relaxed) % 2;
+                    let _ = used_tx.send(idx);
+                    Ok::<_, SdkError>(EstablishedTunnel {
+                        // Exit 0 drains immediately; exit 1 never drains.
+                        sink: DrainingSink {
+                            close: Arc::clone(&keep_open),
+                            drain_rx: make_drain_rx(idx == 0),
+                        },
+                        local_ip: "10.66.0.2".parse().unwrap(),
+                        prefix: 24,
+                        gateway: "10.66.0.1".parse().unwrap(),
+                        ipv6: None,
+                    })
+                }
+            },
+            // The failover datapath's on_drain: rotate past the draining exit.
+            move || {
+                drain_cursor.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .await;
+    });
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), used_rx.recv())
+        .await
+        .expect("first connect in time")
+        .expect("first idx");
+    assert_eq!(first, 0, "first dial is exit 0");
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), used_rx.recv())
+        .await
+        .expect("the drain must trigger a reconnect in time")
+        .expect("second idx");
+    assert_eq!(
+        second, 1,
+        "the drain advisory must rotate the failover cursor 0 -> 1 (both exits connect; \
+         only the drain, via on_drain, moves the cursor)"
+    );
+
     task.abort();
 }
 
@@ -385,6 +502,7 @@ async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
                     })
                 }
             },
+            || {},
         )
         .await;
     });
@@ -449,6 +567,7 @@ async fn supervisor_retries_past_failed_attempts_then_connects() {
                         })
                     }
                 },
+                || {},
             )
             .await;
         })
