@@ -181,6 +181,11 @@ pub struct VerifiedExit {
     /// The exit runs no in-tunnel DNS forwarder: name resolution over the tunnel
     /// will fail unless the client points the netstack at another resolver.
     pub dns_disabled: bool,
+    /// X.509 cover-domain SNI from the relay descriptor (ADR-0004). When
+    /// `Some`, the client dials this domain as the TLS SNI, validates the relay's
+    /// real X.509 certificate via WebPKI, and then verifies the relay's in-band
+    /// identity proof. `None` keeps the historical RPK path.
+    pub cover_domain: Option<String>,
 }
 
 /// Verified directory: trusted exits plus freshness metadata the caller enforces.
@@ -457,6 +462,11 @@ pub fn verify_multihop_directory(
                 city: n.city,
                 weight: n.weight,
                 dns_disabled,
+                // The cover domain lives on the RELAY descriptor (not the exit):
+                // it controls the client->relay TLS handshake, which is the
+                // first hop. Thread it through so the connect caller can branch
+                // into WebPKI mode when present.
+                cover_domain: n.relay.cover_domain,
             })
         })
         .collect();

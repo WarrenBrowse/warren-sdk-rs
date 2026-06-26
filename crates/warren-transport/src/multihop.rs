@@ -5,14 +5,22 @@
 //! [`Setup`](warren_wire::Setup): a raw Setup is rejected with `malformed setup
 //! frame`. This module implements that path:
 //!
-//! 1. QUIC + TLS raw-public-key handshake against the dialed peer (the exit for
-//!    single-hop; a relay for true multihop), pinned by `exit_pubkey`.
+//! 1. QUIC + TLS handshake against the dialed peer. In X.509 cover-domain mode
+//!    (see [`MultihopClientTunnel::with_cover_domain`]), the client validates the
+//!    relay's real X.509 chain via WebPKI (Mozilla roots), dialing the cover
+//!    domain as the SNI, exactly like a browser. In RPK mode (the default), the
+//!    relay's Ed25519 identity is pinned via the SNI (base32-encoded pubkey) and
+//!    the raw-public-key TLS verifier.
 //! 2. Open a reliable bidi stream and send the sealed setup frame, whose inner
 //!    plaintext is an [`IpRequest`](warren_wire::WarrenControlMessage) carrying
 //!    the account pubkey and a proof of possession over the session's
 //!    `encapsulated_key`. The exit replies with a sealed
 //!    [`IpAssign`](warren_wire::WarrenControlMessage) (or `Rejected` /
-//!    `IpExhausted`).
+//!    `IpExhausted`). In X.509 cover-domain mode, step 2 includes an in-band
+//!    relay-identity proof exchange (see ADR-0004): after the setup frame is
+//!    sent, the client reads the relay's server-initiated bi stream carrying its
+//!    Ed25519 signature over the channel binding, and verifies it before reading
+//!    the reply. A relay that cannot produce this proof is rejected.
 //! 3. IP packets then ride per-packet sealed `WarrenMultihopFrame`s on the QUIC
 //!    datagram plane, forward seq continuing from `1` (the setup frame was the
 //!    first forward frame, `seq = 0`).
@@ -41,9 +49,16 @@ use warren_multihop::{
 };
 use warren_wire::control::{CONTROL_FIRST_BYTE, WarrenControlMessage, try_decode_control};
 use warren_wire::multihop::{EXIT_ID_LEN, WarrenMultihopFrame};
+use warrenguard_multihop::{RELAY_AUTH_PROOF_LEN, decode_relay_auth_proof};
 
-use crate::client::{QuicDialError, dial_quic, effective_bind};
+use crate::client::{QuicDialError, dial_quic, dial_quic_webpki, effective_bind};
 use crate::tls;
+
+/// Wall-clock ceiling for receiving the entry relay's in-band identity proof
+/// (ADR-0004) in X.509 cover-domain mode. The proof rides a server-initiated bi
+/// stream sent right after the setup frame arrives. A relay that does not produce
+/// it promptly fails the identity check.
+const RELAY_PROOF_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Largest sealed setup frame accepted on the reliable stream (matches the data
 /// frame ceiling; the setup payload is a few hundred bytes in practice).
@@ -97,6 +112,14 @@ pub enum MultihopError {
     /// Reading a datagram failed (the connection closed).
     #[error("read datagram failed")]
     ReadDatagram(#[source] quinn::ConnectionError),
+    /// X.509 cover-domain mode only (ADR-0004): the entry relay did not prove
+    /// possession of the Ed25519 identity pinned in the signed relay roster. The
+    /// WebPKI handshake succeeded (the relay holds a valid cover-domain cert) but
+    /// the in-band relay-auth proof was absent, malformed, or signed by the wrong
+    /// key. Fail-closed: a man-in-the-middle holding only the cover-domain cert
+    /// must not be dialed through.
+    #[error("entry relay identity proof failed: {0}")]
+    RelayIdentity(&'static str),
 }
 
 impl From<QuicDialError> for MultihopError {
@@ -125,6 +148,13 @@ pub struct MultihopClientTunnel {
     wants_ipv6: bool,
     transport_config: Option<std::sync::Arc<quinn::TransportConfig>>,
     idle_cover: bool,
+    /// X.509 cover-domain SNI (ADR-0004). When set, the client dials
+    /// `cover_domain` as the SNI and validates the relay's real X.509
+    /// certificate via WebPKI (Mozilla roots) instead of pinning the relay's
+    /// raw public key. The relay then proves its Warren identity in-band via a
+    /// server-initiated bi stream after the setup frame is sent. `None` keeps
+    /// the historical RPK path.
+    cover_domain: Option<String>,
 }
 
 impl MultihopClientTunnel {
@@ -138,6 +168,7 @@ impl MultihopClientTunnel {
             wants_ipv6: false,
             transport_config: None,
             idle_cover: false,
+            cover_domain: None,
         }
     }
 
@@ -190,6 +221,20 @@ impl MultihopClientTunnel {
         self
     }
 
+    /// Opts into X.509 cover-domain mode (ADR-0004): dial `cover_domain` as the
+    /// TLS SNI and validate the relay's real certificate via WebPKI (Mozilla roots)
+    /// instead of pinning its raw public key. The relay then proves its Warren
+    /// identity in-band (see the module docs). Pass `None` to revert to RPK mode.
+    ///
+    /// The `exit_pubkey` passed to [`Self::connect`] doubles as the expected
+    /// relay Ed25519 key for the in-band proof, so both the WebPKI cert and the
+    /// proof must pass before the session is accepted.
+    #[must_use]
+    pub fn with_cover_domain(mut self, cover_domain: Option<String>) -> Self {
+        self.cover_domain = cover_domain;
+        self
+    }
+
     /// The account public key (TLS identity and PoP key).
     #[must_use]
     pub fn node_id(&self) -> [u8; 32] {
@@ -198,15 +243,20 @@ impl MultihopClientTunnel {
 
     /// Connect to a dialed peer and complete the multihop setup exchange.
     ///
-    /// `exit_pubkey` is the Ed25519 identity to pin on the TLS peer (the exit
-    /// for single-hop). `exit_x25519` and `exit_id` come from the verified
-    /// multihop directory: the HPKE recipient key and the cleartext routing tag.
+    /// `exit_pubkey` is the Ed25519 identity of the dialed peer: in RPK mode it
+    /// is pinned as the TLS raw public key; in X.509 cover-domain mode (see
+    /// [`Self::with_cover_domain`]) it is the expected relay identity for the
+    /// in-band relay-auth proof (ADR-0004). `exit_x25519` and `exit_id` come from
+    /// the verified multihop directory: the HPKE recipient key and the cleartext
+    /// routing tag.
     ///
     /// # Errors
     ///
     /// See [`MultihopError`]. In particular [`MultihopError::Setup`] wraps a
     /// policy rejection ([`SetupError::Rejected`]) or pool exhaustion
-    /// ([`SetupError::IpExhausted`]).
+    /// ([`SetupError::IpExhausted`]), and [`MultihopError::RelayIdentity`] means
+    /// the relay's in-band identity proof was absent, malformed, or signed by the
+    /// wrong key (X.509 cover-domain mode only).
     pub async fn connect(
         &self,
         exit_pubkey: [u8; 32],
@@ -221,13 +271,30 @@ impl MultihopClientTunnel {
                 std::sync::Arc::new(crate::client::warren_transport_config_with_idle_cover(true))
             })
         });
-        let (endpoint, conn) = dial_quic(
-            exit_pubkey,
-            exit_addr,
-            effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
-            transport_config,
-        )
-        .await?;
+
+        // In X.509 cover-domain mode, dial the cover domain as the SNI and
+        // validate the relay's real X.509 chain via WebPKI (Mozilla roots),
+        // exactly like a browser. In RPK mode (no cover domain), pin the relay's
+        // Ed25519 pubkey in the SNI and use the raw-public-key verifier. The
+        // relay's Warren identity is verified in-band after the setup frame is
+        // sent (cover-domain mode) or at the TLS layer (RPK mode).
+        let (endpoint, conn) = if let Some(ref domain) = self.cover_domain {
+            dial_quic_webpki(
+                domain,
+                exit_addr,
+                effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
+                transport_config,
+            )
+            .await?
+        } else {
+            dial_quic(
+                exit_pubkey,
+                exit_addr,
+                effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
+                transport_config,
+            )
+            .await?
+        };
 
         // Build the per-session HPKE context (one KEM ECDH against the exit's
         // X25519 multihop key); its encapsulated key rides every frame.
@@ -261,6 +328,18 @@ impl MultihopClientTunnel {
             context: "finish request",
             source: Box::new(e),
         })?;
+
+        // ADR-0004: in X.509 cover-domain mode, now that the setup frame is on
+        // the wire (proving to the relay that this is a Warren client), verify the
+        // relay's in-band identity proof BEFORE reading the reply or forwarding
+        // any data. A man-in-the-middle holding only a valid cover-domain cert
+        // cannot forge this proof. RPK mode pins the identity at the TLS layer and
+        // needs no in-band proof.
+        if self.cover_domain.is_some() {
+            let relay_pubkey = tls::WarrenPubkey::from_bytes(exit_pubkey);
+            verify_relay_proof(&conn, &relay_pubkey).await?;
+        }
+
         let reply_bytes =
             recv.read_to_end(MAX_SETUP_FRAME_BYTES)
                 .await
@@ -296,6 +375,46 @@ impl MultihopClientTunnel {
             drain_tx: tokio::sync::watch::channel(None).0,
         })
     }
+}
+
+/// Reads and verifies the entry relay's in-band identity proof (ADR-0004), which
+/// the relay sends on a SERVER-initiated bi stream once the client has proven it is
+/// a Warren client by sending its setup frame. The proof is
+/// `RELAY_AUTH_PROOF_VERSION || sig`, where `sig` is the relay's Ed25519 signature
+/// over this connection's channel binding. We verify it against
+/// `expected_relay_pubkey` (the pubkey from the signed relay roster), so a
+/// man-in-the-middle that completed the WebPKI handshake with only a valid
+/// cover-domain certificate is rejected. Fails closed on a missing, malformed, or
+/// mis-signed proof.
+async fn verify_relay_proof(
+    conn: &quinn::Connection,
+    expected_relay_pubkey: &tls::WarrenPubkey,
+) -> Result<(), MultihopError> {
+    let cb = tls::channel_binding(conn).map_err(MultihopError::Tls)?;
+    // The relay opens a SERVER-initiated bi stream carrying the proof; we accept
+    // it here. A bi stream (not a server-initiated uni stream) is used because the
+    // multihop client profile advertises zero peer-initiated uni streams but a
+    // non-zero bidi limit, so no transport-config change is required and delivery
+    // is reliable. The relay always opens (never the client) so the same emit path
+    // is safe on unified relay->exit C2 connections whose dialer simply never
+    // calls accept_bi. We read the proof from the recv half.
+    let (_send, mut recv) = tokio::time::timeout(RELAY_PROOF_TIMEOUT, conn.accept_bi())
+        .await
+        .map_err(|_| MultihopError::RelayIdentity("timed out awaiting relay-auth stream"))?
+        .map_err(|_| MultihopError::RelayIdentity("relay opened no auth stream"))?;
+    let bytes = tokio::time::timeout(RELAY_PROOF_TIMEOUT, recv.read_to_end(RELAY_AUTH_PROOF_LEN))
+        .await
+        .map_err(|_| MultihopError::RelayIdentity("timed out reading relay-auth proof"))?
+        .map_err(|_| MultihopError::RelayIdentity("short or oversized relay-auth proof"))?;
+    let sig = decode_relay_auth_proof(&bytes)
+        .map_err(|_| MultihopError::RelayIdentity("malformed relay-auth proof"))?;
+    if !tls::verify_relay_auth(expected_relay_pubkey, &cb, &sig) {
+        conn.close(quinn::VarInt::from_u32(0), b"relay identity proof failed");
+        return Err(MultihopError::RelayIdentity(
+            "relay-auth signature does not match the expected relay pubkey",
+        ));
+    }
+    Ok(())
 }
 
 /// Live data-plane counters for a multihop session, cheaply shareable (`Arc`):
@@ -1433,6 +1552,162 @@ mod policy_tests {
         assert!(
             r.check_and_record(5, 0).is_ok(),
             "evicted epoch 0 window forgets its seqs"
+        );
+    }
+}
+
+/// Unit tests for the in-band entry-relay identity proof (ADR-0004).
+///
+/// The proof exchange is independent of the TLS cert type, so these tests use
+/// the RPK path (no X.509 cert fixtures needed). A loopback QUIC server opens a
+/// server-initiated bi stream and writes the proof; the client calls
+/// `verify_relay_proof` and the result must match the expectation.
+#[cfg(test)]
+mod relay_proof_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use warrenguard_multihop::encode_relay_auth_proof;
+    use warrenguard_tls::{make_server_config, sign_relay_auth};
+
+    /// What the mock relay writes on its server-initiated auth stream.
+    enum MockProof {
+        /// A valid proof signed by this key over the connection's channel binding.
+        SignedBy(SigningKey),
+        /// A well-framed proof signed by the WRONG key (MITM with a valid
+        /// cover-domain cert but not the directory-vouched relay identity key).
+        SignedByWrongKey(SigningKey),
+        /// Garbage bytes (wrong length or version byte): a framing failure.
+        Garbage,
+        /// No proof: the relay never opens the auth stream.
+        Silent,
+    }
+
+    /// Spins up an RPK loopback where the "relay" opens a server-initiated bi
+    /// stream and writes `proof` after the handshake. Returns the established
+    /// client connection plus the endpoint handles to keep alive.
+    async fn loopback_with_mock_proof(
+        proof: MockProof,
+    ) -> (quinn::Connection, quinn::Endpoint, quinn::Endpoint) {
+        let tls_key = SigningKey::from_bytes(&[9u8; 32]);
+        let server_cfg = make_server_config(&tls_key, tls::default_crypto_provider(), &[b"h3"])
+            .expect("server config");
+        let server_ep = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
+            .expect("server bind");
+        let addr = server_ep.local_addr().expect("server addr");
+
+        let server_for_task = server_ep.clone();
+        tokio::spawn(async move {
+            let Some(incoming) = server_for_task.accept().await else {
+                return;
+            };
+            let conn = incoming.await.expect("server handshake");
+            let cb = tls::channel_binding(&conn).expect("server channel binding");
+            let bytes: Vec<u8> = match proof {
+                MockProof::SignedBy(k) | MockProof::SignedByWrongKey(k) => {
+                    encode_relay_auth_proof(&sign_relay_auth(&k, &cb)).to_vec()
+                }
+                MockProof::Garbage => vec![0xFFu8; 10],
+                MockProof::Silent => {
+                    // Hold the connection open without writing anything, so the
+                    // client's bounded read must time out.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    return;
+                }
+            };
+            let (mut send, _recv) = conn.open_bi().await.expect("open auth stream");
+            send.write_all(&bytes).await.expect("write proof");
+            let _ = send.finish();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let client_cfg = tls::make_client_config(tls::default_crypto_provider(), &[b"h3"])
+            .expect("client config");
+        let mut client_ep =
+            quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client bind");
+        client_ep.set_default_client_config(client_cfg);
+        let sni = tls::name::encode(tls::WarrenPubkey::from_bytes(
+            tls_key.verifying_key().to_bytes(),
+        ));
+        let conn = client_ep
+            .connect(addr, &sni)
+            .expect("connect")
+            .await
+            .expect("client handshake");
+        (conn, server_ep, client_ep)
+    }
+
+    #[tokio::test]
+    async fn relay_proof_accepts_the_directory_vouched_identity() {
+        // A proof signed by the relay's real identity key over the channel binding
+        // must verify successfully.
+        let relay_key = SigningKey::from_bytes(&[0x51; 32]);
+        let expected = tls::WarrenPubkey::from_bytes(relay_key.verifying_key().to_bytes());
+        let (conn, _s, _c) = loopback_with_mock_proof(MockProof::SignedBy(relay_key)).await;
+        verify_relay_proof(&conn, &expected)
+            .await
+            .expect("a proof signed by the expected relay key must verify");
+    }
+
+    #[tokio::test]
+    async fn relay_proof_rejects_a_mitm_with_a_valid_cert_but_wrong_key() {
+        // The MITM completed the TLS handshake and holds SOME key, but not the
+        // directory-vouched relay identity. The proof verifies as a well-formed
+        // Ed25519 signature, but against the wrong pubkey; fail closed.
+        let attacker = SigningKey::from_bytes(&[0x66; 32]);
+        let expected_relay = tls::WarrenPubkey::from_bytes(
+            SigningKey::from_bytes(&[0x51; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let (conn, _s, _c) = loopback_with_mock_proof(MockProof::SignedByWrongKey(attacker)).await;
+        let err = verify_relay_proof(&conn, &expected_relay)
+            .await
+            .expect_err("a proof not signed by the expected relay identity must be rejected");
+        assert!(
+            matches!(err, MultihopError::RelayIdentity(_)),
+            "expected RelayIdentity, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_proof_rejects_a_malformed_message() {
+        // Garbage bytes (wrong length, wrong version byte) must fail the framing
+        // check before any signature verification.
+        let expected = tls::WarrenPubkey::from_bytes(
+            SigningKey::from_bytes(&[0x51; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let (conn, _s, _c) = loopback_with_mock_proof(MockProof::Garbage).await;
+        let err = verify_relay_proof(&conn, &expected)
+            .await
+            .expect_err("a malformed proof must be rejected");
+        assert!(
+            matches!(err, MultihopError::RelayIdentity(_)),
+            "expected RelayIdentity, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_proof_times_out_when_relay_is_silent() {
+        // A relay that never opens the auth stream must cause a RelayIdentity
+        // error rather than hanging indefinitely.
+        let expected = tls::WarrenPubkey::from_bytes(
+            SigningKey::from_bytes(&[0x51; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let (conn, _s, _c) = loopback_with_mock_proof(MockProof::Silent).await;
+        let err = tokio::time::timeout(
+            RELAY_PROOF_TIMEOUT + Duration::from_secs(2),
+            verify_relay_proof(&conn, &expected),
+        )
+        .await
+        .expect("verify_relay_proof must respect its own timeout, not hang forever")
+        .expect_err("a silent relay must fail the identity check");
+        assert!(
+            matches!(err, MultihopError::RelayIdentity(_)),
+            "expected RelayIdentity, got {err:?}"
         );
     }
 }

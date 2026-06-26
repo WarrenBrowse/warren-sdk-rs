@@ -605,6 +605,7 @@ fn fake_verified_exit(
         city: "Test".to_owned(),
         weight: 100,
         dns_disabled: false,
+        cover_domain: None,
     }
 }
 
@@ -839,6 +840,7 @@ async fn start_proxy_multihop_refuses_a_dns_disabled_exit_without_a_resolver() {
         city: "Test".to_owned(),
         weight: 1,
         dns_disabled: true,
+        cover_domain: None,
     };
     let cfg = warren_net::ProxyConfig {
         socks5: "127.0.0.1:0".parse().unwrap(),
@@ -979,6 +981,7 @@ fn exit_with_dns(dns_disabled: bool) -> VerifiedExit {
         city: "Test".to_owned(),
         weight: 100,
         dns_disabled,
+        cover_domain: None,
     }
 }
 

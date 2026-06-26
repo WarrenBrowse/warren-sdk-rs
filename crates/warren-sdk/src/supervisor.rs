@@ -420,6 +420,12 @@ pub(crate) async fn establish_multihop(
     if let Some(cfg) = transport_config {
         tunnel = tunnel.with_transport_config(cfg);
     }
+    // Thread the cover domain from the verified relay descriptor so the
+    // tunnel dials in X.509 WebPKI mode when the relay roster advertises one,
+    // and keeps the historical RPK path otherwise.
+    if exit.cover_domain.is_some() {
+        tunnel = tunnel.with_cover_domain(exit.cover_domain.clone());
+    }
     let session = tunnel
         .connect(
             exit.exit_ed25519_pubkey,

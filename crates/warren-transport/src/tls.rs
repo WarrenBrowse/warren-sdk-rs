@@ -12,5 +12,6 @@
 
 pub use warrenguard_tls::{
     WarrenPubkey, WarrenTlsError, channel_binding, default_crypto_provider, make_client_config,
-    make_server_config, name, sign_client_auth, verify_client_auth,
+    make_client_config_webpki, make_server_config, mozilla_root_store, name, sign_client_auth,
+    verify_client_auth, verify_relay_auth,
 };

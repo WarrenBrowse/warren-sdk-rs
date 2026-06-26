@@ -111,6 +111,46 @@ pub(crate) async fn dial_quic(
     Ok((endpoint, conn))
 }
 
+/// Dials a QUIC connection to `exit_addr` using WebPKI (X.509) certificate
+/// validation: the relay must present a real certificate chain trusted by
+/// `roots` (Mozilla roots in production), and `server_name` is the SNI sent in
+/// the ClientHello (the cover domain from the relay roster). This is the
+/// X.509 cover-domain path (ADR-0004); the relay's Warren identity is then
+/// confirmed in-band by the caller via the relay-auth proof exchange. Returns
+/// `(Endpoint, Connection)`.
+pub(crate) async fn dial_quic_webpki(
+    server_name: &str,
+    exit_addr: SocketAddr,
+    bind_local_ip: Option<SocketAddr>,
+    transport_config: Option<Arc<quinn::TransportConfig>>,
+) -> Result<(quinn::Endpoint, quinn::Connection), QuicDialError> {
+    let mut client_cfg = tls::make_client_config_webpki(
+        tls::mozilla_root_store(),
+        tls::default_crypto_provider(),
+        &[ALPN_H3],
+    )
+    .map_err(QuicDialError::Tls)?;
+    client_cfg.transport_config(effective_transport_config(transport_config));
+
+    let bind = bind_local_ip.unwrap_or_else(|| {
+        if exit_addr.is_ipv6() {
+            SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
+        } else {
+            SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
+        }
+    });
+    let mut endpoint = quinn::Endpoint::client(bind).map_err(QuicDialError::Bind)?;
+    endpoint.set_default_client_config(client_cfg);
+
+    let conn = endpoint
+        .connect(exit_addr, server_name)
+        .map_err(QuicDialError::Connect)?
+        .await
+        .map_err(QuicDialError::Quic)?;
+
+    Ok((endpoint, conn))
+}
+
 pub(crate) fn warren_transport_config() -> quinn::TransportConfig {
     let mut tc = quinn::TransportConfig::default();
     tc.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));

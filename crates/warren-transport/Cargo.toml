@@ -13,6 +13,9 @@ publish.workspace = true
 # RPK TLS 1.3 config + SNI pubkey codec, shared with warren-core (the tls module
 # is a re-export of this engine crate).
 warrenguard-tls = { workspace = true }
+# Direct engine dep for the relay-auth proof codec (decode_relay_auth_proof,
+# RELAY_AUTH_PROOF_LEN) used in the X.509 cover-domain handshake (ADR-0004).
+warrenguard-multihop = { workspace = true }
 warren-wire = { path = "../warren-wire" }
 warren-multihop = { path = "../warren-multihop" }
 warren-daita = { path = "../warren-daita" }
