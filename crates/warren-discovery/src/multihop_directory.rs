@@ -81,6 +81,11 @@ struct RelayDescriptorSigned {
     #[serde(with = "hexn")]
     relay_ed25519_pubkey: [u8; 32],
     endpoint: SocketAddr,
+    /// X.509 cover-domain SNI (ADR-0004). Outside the descriptor signature
+    /// (like `endpoint`); `skip_serializing_if` so an RPK descriptor serializes
+    /// byte-identically. Present when the node serves X.509 on its dispatcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cover_domain: Option<String>,
     #[serde(with = "hexn")]
     signature: [u8; 64],
 }
@@ -103,6 +108,10 @@ struct ExitDescriptorSigned {
     /// byte-identically to the non-redacted form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     endpoint: Option<SocketAddr>,
+    /// X.509 cover-domain SNI (ADR-0004). Outside the descriptor signature;
+    /// drives the relay->exit C2 dialer to WebPKI. Omitted for RPK exits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cover_domain: Option<String>,
     #[serde(with = "hexn")]
     signature: [u8; 64],
     #[serde(default, skip_serializing_if = "is_false")]
@@ -507,6 +516,7 @@ pub mod test_helpers {
                 relay_id,
                 relay_ed25519_pubkey: relay_ed,
                 endpoint,
+                cover_domain: None,
                 signature: relay_sig,
             },
             exit: ExitDescriptorSigned {
@@ -514,6 +524,7 @@ pub mod test_helpers {
                 exit_ed25519_pubkey: exit_ed,
                 exit_x25519_multihop_pubkey: exit_x,
                 endpoint: Some(endpoint),
+                cover_domain: None,
                 signature: exit_sig,
                 dns_disabled: false,
             },
@@ -580,6 +591,51 @@ mod tests {
         SigningKey::from_bytes(&[seed; 32])
     }
 
+    #[test]
+    fn descriptors_accept_and_round_trip_cover_domain() {
+        // ADR-0004 forward-compat: `deny_unknown_fields` must NOT reject an
+        // X.509 directory carrying `cover_domain`; the field round-trips, and an
+        // RPK descriptor still omits it (byte-identical to the pre-ADR form).
+        let relay = RelayDescriptorSigned {
+            relay_id: [1; 16],
+            relay_ed25519_pubkey: [2; 32],
+            endpoint: "198.51.100.1:443".parse().unwrap(),
+            cover_domain: Some("nl1.edge.example.com".to_owned()),
+            signature: [3; 64],
+        };
+        let json = serde_json::to_string(&relay).expect("serialize");
+        assert!(json.contains("nl1.edge.example.com"));
+        let back: RelayDescriptorSigned = serde_json::from_str(&json).expect("parse X.509 relay");
+        assert_eq!(back, relay);
+
+        let exit = ExitDescriptorSigned {
+            exit_id: [4; 16],
+            exit_ed25519_pubkey: [5; 32],
+            exit_x25519_multihop_pubkey: [6; 32],
+            endpoint: Some("198.51.100.1:443".parse().unwrap()),
+            cover_domain: Some("nl1.edge.example.com".to_owned()),
+            signature: [7; 64],
+            dns_disabled: false,
+        };
+        let exit_back: ExitDescriptorSigned =
+            serde_json::from_str(&serde_json::to_string(&exit).unwrap()).expect("parse X.509 exit");
+        assert_eq!(
+            exit_back.cover_domain.as_deref(),
+            Some("nl1.edge.example.com")
+        );
+
+        let rpk = RelayDescriptorSigned {
+            cover_domain: None,
+            ..relay
+        };
+        assert!(
+            !serde_json::to_string(&rpk)
+                .unwrap()
+                .contains("cover_domain"),
+            "an RPK descriptor must omit cover_domain entirely"
+        );
+    }
+
     fn op_sign(op: &SigningKey, ctx: &[u8], parts: &[&[u8]]) -> [u8; 64] {
         let mut payload = ctx.to_vec();
         for p in parts {
@@ -613,6 +669,7 @@ mod tests {
                 relay_id,
                 relay_ed25519_pubkey: relay_ed,
                 endpoint,
+                cover_domain: None,
                 signature: relay_sig,
             },
             exit: ExitDescriptorSigned {
@@ -620,6 +677,7 @@ mod tests {
                 exit_ed25519_pubkey: exit_ed,
                 exit_x25519_multihop_pubkey: exit_x,
                 endpoint: Some(endpoint),
+                cover_domain: None,
                 signature: exit_sig,
                 dns_disabled: false,
             },
