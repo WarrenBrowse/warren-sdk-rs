@@ -1537,7 +1537,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
  "bytes",
- "fastbloom",
  "getrandom 0.3.4",
  "lru-slab",
  "rand 0.9.4",
@@ -1545,7 +1544,6 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "rustls-pki-types",
- "rustls-platform-verifier",
  "slab",
  "thiserror 2.0.18",
  "tinyvec",
@@ -2686,6 +2684,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "warren-quinn"
+version = "0.11.10"
+source = "git+ssh://git@github.com/WarrenBrowse/warren-quinn.git?tag=v0.11.14-fork.4#2d33493ff3fb90407a140708a79b55034c682aec"
+dependencies = [
+ "bytes",
+ "cfg_aliases",
+ "pin-project-lite",
+ "rustc-hash",
+ "rustls",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "warren-quinn-proto",
+ "warren-quinn-udp",
+ "web-time",
+]
+
+[[package]]
+name = "warren-quinn-proto"
+version = "0.11.14-fork.4"
+source = "git+ssh://git@github.com/WarrenBrowse/warren-quinn.git?tag=v0.11.14-fork.4#2d33493ff3fb90407a140708a79b55034c682aec"
+dependencies = [
+ "bytes",
+ "fastbloom",
+ "getrandom 0.3.4",
+ "lru-slab",
+ "rand 0.9.4",
+ "ring",
+ "rustc-hash",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-platform-verifier",
+ "slab",
+ "thiserror 2.0.18",
+ "tinyvec",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "warren-quinn-udp"
+version = "0.6.1"
+source = "git+ssh://git@github.com/WarrenBrowse/warren-quinn.git?tag=v0.11.14-fork.4#2d33493ff3fb90407a140708a79b55034c682aec"
+dependencies = [
+ "cfg_aliases",
+ "libc",
+ "log",
+ "socket2",
+ "tracing",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "warren-sdk"
 version = "0.0.1"
 dependencies = [
@@ -2725,10 +2777,10 @@ dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
  "hpke",
- "quinn",
  "rand_core 0.9.5",
  "smoltcp",
  "tokio",
+ "warren-quinn",
  "warren-transport",
  "warren-wire",
 ]
@@ -2740,7 +2792,6 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "hex",
- "quinn",
  "rand 0.8.6",
  "rand_core 0.9.5",
  "tempfile",
@@ -2749,6 +2800,7 @@ dependencies = [
  "warren-daita",
  "warren-identity",
  "warren-multihop",
+ "warren-quinn",
  "warren-test-support",
  "warren-wire",
  "warrenguard-multihop",
@@ -2844,10 +2896,10 @@ version = "0.1.0"
 dependencies = [
  "data-encoding",
  "ed25519-dalek",
- "quinn",
  "rustls",
  "rustls-pemfile",
  "thiserror 2.0.18",
+ "warren-quinn",
  "warrenguard-wire",
  "webpki-root-certs",
 ]

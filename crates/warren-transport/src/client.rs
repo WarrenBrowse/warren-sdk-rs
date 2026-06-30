@@ -157,6 +157,12 @@ pub(crate) fn warren_transport_config() -> quinn::TransportConfig {
     tc.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
     tc.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_INTERVAL_SECS)));
     tc.initial_mtu(INITIAL_MTU);
+    // Anti-ossification Initial fragmentation, on by default so every consumer
+    // of this SDK (proxy mode included) presents the same handshake shape: cap
+    // the first CRYPTO fragment and pad the first Initial datagram(s) so the
+    // handshake spans two or more UDP datagrams.
+    tc.initial_crypto_first_fragment_size(Some(64));
+    tc.initial_datagram_min_size(INITIAL_MTU);
     if let Ok(idle) = quinn::IdleTimeout::try_from(Duration::from_secs(MAX_IDLE_TIMEOUT_SECS)) {
         tc.max_idle_timeout(Some(idle));
     }
