@@ -47,12 +47,34 @@ impl ProxyForwarder {
         internal_port: u16,
         local_target: SocketAddr,
     ) -> Result<warren_net::ForwardedPort, SdkError> {
-        warren_net::forward_port(
+        self.forward_port_with_suggested(proto, internal_port, local_target, 0)
+            .await
+    }
+
+    /// Like [`Self::forward_port`], but asks the exit to grant
+    /// `suggested_external_port` (`0` lets the gateway choose). The supervised
+    /// forward re-suggests the last-granted port across reconnects so the public
+    /// port follows the client; a taken port surfaces as
+    /// [`SdkError::PortForward`] rather than a silent random fallback.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::PortForward`] if the engine has stopped, a socket cannot be
+    /// opened, or the exit refuses (or cannot honour) the mapping.
+    pub async fn forward_port_with_suggested(
+        &self,
+        proto: warren_net::MapProto,
+        internal_port: u16,
+        local_target: SocketAddr,
+        suggested_external_port: u16,
+    ) -> Result<warren_net::ForwardedPort, SdkError> {
+        warren_net::forward_port_with_suggested(
             &self.connector,
             self.gateway,
             proto,
             internal_port,
             local_target,
+            suggested_external_port,
         )
         .await
         .map_err(SdkError::from)

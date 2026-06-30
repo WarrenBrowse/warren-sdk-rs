@@ -411,6 +411,30 @@ pub async fn forward_port(
     internal_port: u16,
     local_target: SocketAddr,
 ) -> Result<ForwardedPort, PortForwardError> {
+    forward_port_with_suggested(connector, gateway, proto, internal_port, local_target, 0).await
+}
+
+/// Like [`forward_port`], but asks the exit to grant `suggested_external_port`
+/// (`0` lets the gateway choose, identical to [`forward_port`]).
+///
+/// A supervised forward re-suggests the previously-granted port across
+/// reconnects so the public port "follows" the client. The exit honours the
+/// suggestion strictly: if that external port is already taken on the new exit
+/// it answers [`ResultCode::SuggestedPortUnavailable`], surfaced here as
+/// [`PortForwardError::Gateway`] rather than a silent fallback to a random port.
+///
+/// # Errors
+///
+/// Same as [`forward_port`], plus [`PortForwardError::Gateway`] with
+/// [`ResultCode::SuggestedPortUnavailable`] when the re-suggested port is taken.
+pub async fn forward_port_with_suggested(
+    connector: &TunnelConnector,
+    gateway: Ipv4Addr,
+    proto: MapProto,
+    internal_port: u16,
+    local_target: SocketAddr,
+    suggested_external_port: u16,
+) -> Result<ForwardedPort, PortForwardError> {
     let listener = connector
         .listen(internal_port)
         .await
@@ -423,7 +447,7 @@ pub async fn forward_port(
     let spec = MapSpec {
         proto,
         internal_port,
-        suggested_external_port: 0,
+        suggested_external_port,
         lifetime_secs: DEFAULT_MAP_LIFETIME_SECS,
     };
     // Map once synchronously: this surfaces a real gateway refusal to the caller

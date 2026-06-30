@@ -248,7 +248,7 @@ async fn supervise_forward_remaps_across_epochs_and_clears_on_drop() {
         let establishes = Arc::clone(&establishes);
         let first_dropped = Arc::clone(&first_dropped);
         tokio::spawn(async move {
-            supervise_forward(fwd_rx, ext_tx, move |f: FakeForwarder| {
+            supervise_forward(fwd_rx, ext_tx, move |f: FakeForwarder, _suggested: u16| {
                 let establishes = Arc::clone(&establishes);
                 let dropped = Arc::clone(&first_dropped);
                 async move {
@@ -288,6 +288,66 @@ async fn supervise_forward_remaps_across_epochs_and_clears_on_drop() {
     );
 
     task.abort();
+}
+
+#[tokio::test]
+async fn supervise_forward_resuggests_the_last_granted_external_port() {
+    // The public port must "follow" the client: the first establish suggests 0
+    // (auto), and every subsequent establish re-suggests the port the exit last
+    // granted, so a reconnect/exit-change keeps the same external port instead of
+    // a fresh random one.
+    use std::sync::Mutex;
+
+    use crate::supervisor::{ExternalPort, supervise_forward};
+
+    #[derive(Clone)]
+    struct FakeForwarder(u16);
+
+    struct FakePort(u16);
+    impl ExternalPort for FakePort {
+        fn external_port(&self) -> u16 {
+            self.0
+        }
+    }
+
+    let (fwd_tx, fwd_rx) = tokio::sync::watch::channel::<Option<FakeForwarder>>(None);
+    let (ext_tx, mut ext_rx) = tokio::sync::watch::channel::<Option<u16>>(None);
+    let suggested_seen = Arc::new(Mutex::new(Vec::<u16>::new()));
+
+    let task = {
+        let suggested_seen = Arc::clone(&suggested_seen);
+        tokio::spawn(async move {
+            supervise_forward(fwd_rx, ext_tx, move |f: FakeForwarder, suggested: u16| {
+                let suggested_seen = Arc::clone(&suggested_seen);
+                async move {
+                    suggested_seen.lock().unwrap().push(suggested);
+                    Ok::<_, SdkError>(FakePort(f.0))
+                }
+            })
+            .await;
+        })
+    };
+
+    // Epoch 1: the exit grants external port 5000.
+    fwd_tx.send(Some(FakeForwarder(5000))).unwrap();
+    ext_rx.changed().await.unwrap();
+    assert_eq!(*ext_rx.borrow(), Some(5000));
+
+    // Tunnel dies, then a fresh forwarder reconnects (a different exit that would
+    // auto-pick 9999). The re-suggested port must be the last grant (5000), not
+    // whatever the new exit would otherwise choose.
+    fwd_tx.send(None).unwrap();
+    ext_rx.changed().await.unwrap();
+    fwd_tx.send(Some(FakeForwarder(9999))).unwrap();
+    ext_rx.changed().await.unwrap();
+
+    task.abort();
+
+    assert_eq!(
+        *suggested_seen.lock().unwrap(),
+        vec![0, 5000],
+        "first establish suggests 0 (auto); the next re-suggests the last-granted port"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

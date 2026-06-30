@@ -66,9 +66,11 @@ impl SupervisedProxyHandle {
     /// re-establishing the mapping on every tunnel rebuild. The returned
     /// [`SupervisedForwardedPort`] keeps it alive until dropped.
     ///
-    /// Unlike the one-shot [`ProxyHandle::forward_port`](crate::ProxyHandle::forward_port),
-    /// the granted external port can CHANGE across reconnects (NAT-PMP may grant
-    /// a different one), so read it from
+    /// The forward asks the exit to re-grant the previously-allocated external
+    /// port on every rebuild, so the public port "follows" the client and stays
+    /// stable across reconnects/exit-changes. If the new exit already has that
+    /// port taken it answers strictly (no silent random fallback) and the
+    /// mapping stays unset for that epoch, so still read the live value from
     /// [`SupervisedForwardedPort::external_port`] rather than caching it. It is
     /// `None` while the tunnel is down or before the first mapping is granted.
     ///
@@ -83,11 +85,20 @@ impl SupervisedProxyHandle {
         let (external_tx, external_rx) = tokio::sync::watch::channel(None);
         let forwarder_rx = self.forwarder_rx.clone();
         let task = tokio::spawn(async move {
-            supervise_forward(forwarder_rx, external_tx, move |forwarder| async move {
-                forwarder
-                    .forward_port(proto, internal_port, local_target)
-                    .await
-            })
+            supervise_forward(
+                forwarder_rx,
+                external_tx,
+                move |forwarder, suggested| async move {
+                    forwarder
+                        .forward_port_with_suggested(
+                            proto,
+                            internal_port,
+                            local_target,
+                            suggested,
+                        )
+                        .await
+                },
+            )
             .await;
         });
         SupervisedForwardedPort {
@@ -178,19 +189,26 @@ pub(crate) async fn supervise_forward<F, P, E, Fut>(
 ) where
     F: Clone,
     P: ExternalPort,
-    E: FnMut(F) -> Fut,
+    E: FnMut(F, u16) -> Fut,
     Fut: std::future::Future<Output = Result<P, SdkError>>,
 {
     // Holding `current` keeps the established port alive; replacing or clearing
     // it drops the previous one, which tears its mapping/relay tasks down.
     let mut current: Option<P> = None;
+    // The external port to re-suggest on the next establish so the public port
+    // follows the client across reconnects/exit-changes. `0` (auto) for the very
+    // first establish; the last-granted port thereafter.
+    let mut suggested: u16 = 0;
     loop {
         let snapshot = forwarder_rx.borrow_and_update().clone();
         match snapshot {
             Some(forwarder) if current.is_none() => {
                 // A refusal or transient failure leaves the port unset; the next
                 // epoch change retries. No identity material is logged.
-                if let Ok(port) = establish(forwarder).await {
+                if let Ok(port) = establish(forwarder, suggested).await {
+                    // Remember this grant so the next establish re-suggests it and
+                    // the public port follows the client across reconnects.
+                    suggested = port.external_port();
                     let _ = external_tx.send(Some(port.external_port()));
                     current = Some(port);
                 }
