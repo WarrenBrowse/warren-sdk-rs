@@ -5,6 +5,15 @@ implementation of the Warren client protocol; the same SDK is reimplemented in
 TypeScript, Dart, Python, Kotlin, Swift and Java. Read `ARCHITECTURE.md` for the
 layering and `ROADMAP.md` for the phase plan.
 
+> Shared Warren rules (single source of truth: WarrenBrowse/warren-workspace).
+> They resolve when this repo is checked out inside the workspace (mani sync);
+> cloned standalone, the imports just warn harmlessly.
+@../shared/rules/00-conventions.md
+@../shared/rules/10-tdd.md
+@../shared/rules/20-errors-secrets.md
+@../shared/rules/30-git-commits.md
+@../shared/rules/40-wire-vectors.md
+
 ## Prime directive: engine-backed, no backend dependency, wire-compatible
 
 1. **No dependency on the private backend (`warren-core`).** This SDK never
@@ -18,48 +27,21 @@ layering and `ROADMAP.md` for the phase plan.
    reimplementation. The SDK keeps its own control-plane (`warren-api`,
    `-discovery`, `-sdk`, `-sdk-ffi`) and userland transport (`warren-transport`,
    `-net`), which are intentionally SDK-specific (non-root userland datapath).
-2. **Wire compatibility is non-negotiable.** Identity derivation, SS58, request
-   signing, the handshake frames, the signed relay list, NAT-PMP and the
-   multihop frame must match warren-core byte-for-byte, otherwise the SDK cannot
-   talk to real exits or the production API.
-3. **Golden vectors are the contract.** Every frozen format is pinned by a file
-   under `vectors/`. These vectors are shared across all sibling-language SDKs.
-   Changing a vector means changing the wire format, which requires bumping the
-   schema version (for example `identity/v2`). Never edit a vector to make a test
-   pass; fix the code.
-4. **Portability in concept.** Keep each layer mappable to the other languages:
+2. **Wire compatibility is non-negotiable** (see the shared wire-vectors rule).
+   Identity derivation, SS58, request signing, the handshake frames, the signed
+   relay list, NAT-PMP and the multihop frame must match warren-core
+   byte-for-byte, otherwise the SDK cannot talk to real exits or the production
+   API.
+3. **Portability in concept.** Keep each layer mappable to the other languages:
    no clever Rust-only constructs in the public surface, narrow async seams, and
    plain serializable types at boundaries (the FFI layer depends on this).
 
-## TDD is mandatory
+## Testing specifics (in addition to the shared TDD rule)
 
-Red, green, refactor. For every functional change:
-
-1. Write the test first. It must fail for the right reason before any production
-   code exists.
-2. Make it pass with the minimal change.
-3. Refactor with the test green.
-
-Rules:
-
-- Every public function has a direct test. Every documented error variant
-  (`# Errors`) is triggered by at least one test.
-- No hollow tests (`assert!(true)`, `assert_eq!(x, x)`). A test must be able to
-  fail by breaking the production code.
-- Frozen wire formats get a vector test that pins the exact bytes/string.
 - Async tests use `#[tokio::test]`; networking regression tests use
   `flavor = "multi_thread"`.
 - Local fake-device tests are necessary but not sufficient for tunnel features:
   the real behavior is validated against a real exit before claiming it works.
-
-## Error handling
-
-- Libraries use `thiserror`; binaries use `anyhow`. Never a stringly-typed error.
-- Public error enums are `#[non_exhaustive]`.
-- Attach the underlying error via `#[source]`; never string-wrap it.
-- No-log discipline: never put a pubkey, address, IP, nonce or other identity
-  material in an error message or log in clear. Redact to a short prefix if a
-  value is genuinely needed for debugging.
 
 ## Code style and lints
 
@@ -77,35 +59,8 @@ Rules:
 - Coverage target: 80% line coverage on library code
   (`cargo llvm-cov --workspace --summary-only`).
 
-## Language policy: English only in code
-
-All code comments, doc comments, identifiers, commit messages and PR
-descriptions are in **English**. Rationale: keep the codebase aligned with the
-sibling-language SDKs and accessible to all contributors. Exceptions:
-`.planning/` artifacts and assistant chat output to the user may be in French.
-
-## Typography: never use the em-dash
-
-The em-dash `—` (U+2014) and en-dash `–` (U+2013) are banned everywhere you
-author text (code, comments, docs, commit messages). Use a comma, a colon, a
-period, a hyphen for ranges, or restructure the sentence. When you edit a file
-that still contains a stray dash, fix it as part of your change.
-
-## Comment content: why, not what
-
-A comment explains the non-obvious why: an invariant, a subtle reason for an
-unusual choice, or a warning that stops a future agent from reintroducing a
-known bug. No step narration, no tombstones of old behavior, no restating the
-next line. Be parsimonious; when in doubt, leave it out.
-
 ## Crate layout
 
 One crate per layer under `crates/` (see `ARCHITECTURE.md`). The public surface
 lives in `src/lib.rs` (re-exports plus crate docs); modules are split by concern.
 Applications depend only on `warren-sdk`, which re-exports the layers.
-
-## Secrets and zeroization
-
-Buffers holding secret material (seeds, signing keys) are zeroized on drop
-(`zeroize`). Never derive `Debug` on a type holding a secret; implement it
-manually to render only the public handle (for example the SS58 address).
