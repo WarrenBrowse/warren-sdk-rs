@@ -82,14 +82,12 @@ rand = "0.8"
 # TLS-1.3-only (no tls12) with raw public keys. data-encoding provides the
 # base32-DNSSEC SNI codec.
 #
-# DELIBERATE: the SDK builds on UPSTREAM quinn, NOT the warrenguard/warren-core
-# quinn fork. Its userland transport is its own (the engine's forked
-# `warrenguard-transport-core` is not in the SDK's dep tree), so it compiles
-# clean against upstream and intentionally does NOT inherit the fork's GSO
-# transmit caps or the obfuscated-Initial padding knobs. Consequence: the SDK's
-# throughput ceiling is lower (~25% per the M3.K research) and its QUIC Initial
-# fingerprint differs from the app's obfuscated shape. Accept this, or wire the
-# fork in (setup-quinn-fork.sh + [patch.crates-io]) if parity is ever required.
+# The SDK builds on the warren-quinn fork (renamed crate, lib name stays `quinn`
+# so `use quinn` is unchanged), the same QUIC backend as warrenguard/warren-core.
+# This gives every SDK consumer the fork's GSO transmit caps and the
+# obfuscated-Initial padding/fragmentation knobs, which `warren_transport_config`
+# enables by default, so a Dart proxy via warren_sdk_frb presents the same QUIC
+# Initial fingerprint and network quality as warren-app with zero configuration.
 quinn = { git = "ssh://git@github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.14-fork.4", package = "warren-quinn" }
 # No `logging` feature: rustls can emit handshake diagnostics (including the
 # SNI, which encodes the exit pubkey) through the `log` facade, which would leak
