@@ -141,42 +141,45 @@ This is the universal industry pattern: a single native datapath core (Mullvad
 and Cloudflare WARP in Rust, Tailscale in Go) wrapped by thin per-platform
 layers. This repository is that core for Warren.
 
-## QUIC handshake obfuscation: known divergence from warren-core/app
+## QUIC handshake obfuscation: on by default, parity with warren-core/app
 
-This SDK builds its QUIC datapath on **upstream quinn**, not the WarrenGuard
-engine's patched quinn fork (`warren_transport_config()` in `warren-transport`
-sets only buffers, keep-alive, MTU and idle timeout). The fork carries two
-Initial-padding knobs that upstream quinn does not expose:
-`min_first_datagram_size` and `warren_first_initial_crypto_chunk(Some(64))`. The
-second splits the ClientHello across several Initial packets so a DPI box cannot
-read the obfuscation SNI (which encodes the exit pubkey) out of a single packet.
+This SDK builds its QUIC datapath on the **`warren-quinn` fork** (the published
+`WarrenBrowse/warren-quinn` git-dep, pinned by tag, consumed as
+`quinn = { package = "warren-quinn" }`; the package is renamed but the lib name
+stays `quinn`, so `use quinn` is unchanged). It is the same QUIC backend that
+`warren-core` and `warrenguard` use, so the SDK is fork-aligned, not on upstream
+quinn.
 
-Consequence, stated plainly so it is not a silent gap:
+Obfuscation is **on by default**. `warren_transport_config()` in
+`warren-transport` sets the fork's two Initial-fragmentation knobs alongside the
+buffers, keep-alive, MTU and idle timeout:
 
-- A client built on this SDK presents a **different QUIC Initial fingerprint**
-  than `warren-app` (the Mullvad fork, which goes through `warren-core` and the
-  fork). Its handshake is more recognizable to a censor doing QUIC DPI, and the
-  encoded-pubkey SNI is not split across packets.
-- This divergence is at the **handshake/Initial layer only**. The
-  steady-state traffic-analysis defense (DAITA cover traffic) IS present in this
-  SDK (`daita_driver`), and the golden vectors still freeze the **frame** wire
+- `initial_datagram_min_size(INITIAL_MTU)` pads the obfuscated client Initial so
+  the first datagram is full-MTU sized.
+- `initial_crypto_first_fragment_size(Some(64))` splits the ClientHello across
+  several Initial packets so a DPI box cannot read the obfuscation SNI (which
+  encodes the exit pubkey) out of a single packet.
+
+Consequence, stated plainly:
+
+- A client built on this SDK presents the **same QUIC Initial fingerprint** as
+  `warren-app` (the Mullvad fork, which goes through `warren-core` and the same
+  fork). The encoded-pubkey SNI is split across packets exactly as in the app,
+  so a censor doing QUIC DPI sees the obfuscated handshake, not a distinct one.
+- The steady-state traffic-analysis defense (DAITA cover traffic) is also present
+  in this SDK (`daita_driver`), and the golden vectors freeze the **frame** wire
   format (Setup/SetupAck, multihop HPKE, NAT-PMP), so "wire-compatible" holds at
-  the protocol layer but not at the QUIC-Initial obfuscation layer.
-- Every consumer of this SDK inherits the gap: the desktop system-VPN daemon
+  both the protocol layer and the QUIC-Initial obfuscation layer.
+- Every consumer inherits the obfuscated default: the desktop system-VPN daemon
   (`warrend`), the Dart/Flutter proxy mode (`warren_sdk_frb`), and the Node
-  native binding (`warren_napi`) all pin this crate and therefore upstream quinn.
+  native binding (`warren_napi`) all pin this crate and therefore the fork.
 
-Reaching parity does NOT require changing this SDK's quinn. The connect path
-takes a caller-supplied transport config: `WarrenClient::transport_config` (and
-the `with_transport_config` builders on `ClientTunnel` / `MultihopClientTunnel`)
-accept an `Arc<TransportConfig>` that overrides the upstream default. A
-privileged system-VPN workspace patched to the WarrenGuard fork builds the
-engine's obfuscated config
-(`warrenguard_transport_core::warren_transport_config_client`) and injects it, so
-its handshake matches warren-app. This SDK never names a fork-only quinn API
-(the type is fork-agnostic), so it keeps building on upstream quinn for embedders
-and stays `--all-features` clean. Whether to enable obfuscation on a given client
-is then a per-deployment threat-model decision, not a fork-wide compile choice.
+The connect path still takes a caller-supplied transport config:
+`WarrenClient::transport_config` (and the `with_transport_config` builders on
+`ClientTunnel` / `MultihopClientTunnel`) accept an `Arc<TransportConfig>` that
+overrides the default, so a deployment can tune or disable obfuscation as a
+per-deployment threat-model decision. The fork is a git-dep, so the SDK builds
+`--all-features` clean for embedders with no vendored tree or local setup.
 
 **Recommended target for the Dart/Flutter SDK: hybrid.** It lives in the sibling
 repository `warren-sdk-dart` and reuses this engine; it is not implemented here.

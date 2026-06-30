@@ -177,13 +177,11 @@ impl WarrenClientBuilder {
     }
 
     /// Overrides the QUIC transport config for every tunnel (advanced). The
-    /// default builds the SDK's upstream-quinn settings. A privileged system-VPN
-    /// workspace patched to the WarrenGuard quinn fork passes the engine's
-    /// obfuscated config here (built via
-    /// `warrenguard_transport_core::warren_transport_config_client`) so its
-    /// QUIC-Initial handshake matches warren-app's anti-DPI behaviour. The
-    /// `warren_transport::TransportConfig` type is fork-agnostic. See
-    /// ARCHITECTURE.md "QUIC handshake obfuscation".
+    /// default already applies the SDK's obfuscated config (Initial padding plus
+    /// CRYPTO fragmentation on the warren-quinn fork), so out of the box the
+    /// SDK's QUIC-Initial handshake matches warren-app's anti-DPI behaviour.
+    /// Pass a custom `warren_transport::TransportConfig` only to deviate from
+    /// that default. See ARCHITECTURE.md "QUIC handshake obfuscation".
     #[must_use]
     pub fn transport_config(mut self, cfg: Arc<warren_transport::TransportConfig>) -> Self {
         self.transport_config = Some(cfg);
