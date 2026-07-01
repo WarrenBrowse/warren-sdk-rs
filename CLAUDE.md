@@ -28,7 +28,7 @@ layering and `ROADMAP.md` for the phase plan.
    `-discovery`, `-sdk`, `-sdk-ffi`) and userland transport (`warren-transport`,
    `-net`), which are intentionally SDK-specific (non-root userland datapath).
    The wire-facing client-to-server contract has a second neutral home,
-   `warren-contract` (sibling path-dep, pinned by `.warren-contract-version`,
+   `warren-contract` (sibling git-dep patched to the local checkout, pinned by `.warren-contract-version`,
    depends only on `warrenguard-wire`): it owns the SS58 address codec, the
    X-Warren canonical signing message plus header names, and the HTTP `/v1`
    DTOs. `warren-identity` re-exports its `ss58` and `auth` modules (as

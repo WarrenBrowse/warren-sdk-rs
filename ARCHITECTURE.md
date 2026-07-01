@@ -7,8 +7,8 @@ data-plane primitives: the `warren-{wire,identity,multihop,daita,tun,tun-core}`
 crates are thin re-exports of the matching `warrenguard-*` engine crates, so the
 protocol primitives have a single source of truth rather than a duplicate
 reimplementation. The wire-facing client-to-server contract has a second neutral
-home, the **`warren-contract`** crate (sibling path-dep, depends only on
-`warrenguard-wire`): it owns the SS58 address codec, the X-Warren canonical
+home, the **`warren-contract`** crate (sibling git-dep patched to the local
+checkout, depends only on `warrenguard-wire`): it owns the SS58 address codec, the X-Warren canonical
 signing message and header names, and the HTTP `/v1` DTOs, with golden tests for
 all three. `warren-identity` re-exports its `ss58` and `auth` modules and
 `warren-api` re-exports its `dto`; warren-core depends on the same crate, so the
