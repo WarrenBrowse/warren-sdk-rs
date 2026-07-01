@@ -13,10 +13,13 @@ publish.workspace = true
 # Exposes server-side signing helpers (signed-list and multihop-directory
 # minting) for tests in OTHER crates. Off by default so these fixtures never
 # enter the production-compiled surface; enabled via the dev-dependency.
-test-helpers = []
+test-helpers = ["warren-discovery-core/test-helpers"]
 
 [dependencies]
 warren-identity = { path = "../warren-identity" }
+# The neutral single-source discovery crate (shared with the backend); this
+# crate delegates the verifiers to it so there is one implementation.
+warren-discovery-core = { path = "../../../warren-contract/warren-discovery" }
 ed25519-dalek = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
