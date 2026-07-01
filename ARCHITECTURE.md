@@ -47,7 +47,7 @@ portable in concept.
 | Crate | Layer | Role | Status |
 |---|---|---|---|
 | `warren-identity` | core | BIP39 mnemonic to Ed25519, SS58 `wb…` address, canonical API request signing | done |
-| `warren-wire` | core | Pure codecs: Setup/SetupAck handshake, NAT-PMP, multihop HPKE frame, control `/v2`, PoP | done |
+| `warren-wire` | core | Re-exports the engine's (`warrenguard-wire`) canonical codecs: Setup/SetupAck handshake, NAT-PMP, multihop HPKE frame, control `/v2`, PoP | done |
 | `warren-api` | core | Signed HTTP client for the `/v1/*` account API (incl. payments, support, incidents) with anti-censorship host fallback; transport-agnostic core + optional reqwest | done |
 | `warren-discovery` | core | Verify the signed relay list (v7) + weighted selection; verify the multihop directory PKI chain | done |
 | `warren-multihop` | core | Client HPKE session (X25519 / HKDF-SHA256 / ChaCha20Poly1305), sealed `IpRequest`/`IpAssign`, epoch/seq replay window | done |

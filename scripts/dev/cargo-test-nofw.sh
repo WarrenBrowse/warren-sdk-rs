@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 #
-# cargo-test-nofw - wrapper qui désactive temporairement l'Application
-# Firewall macOS pendant un cargo test/run/bench, pour éviter les popups
-# récurrents à chaque nouveau hash de binaire compilé par cargo.
+# cargo-test-nofw - wrapper that temporarily disables the macOS Application
+# Firewall around a cargo test/run/bench, to avoid the recurring popups on
+# every new binary hash compiled by cargo.
 #
-# Désactive les 3 modes du Application Firewall macOS :
-#   - --setglobalstate     : firewall actif/inactif global
-#   - --setblockall        : "block all incoming" mode strict
-#   - --setstealthmode     : ne répond pas aux pings
-# Tous les 3 sont restaurés dans leur état initial via `trap` à la fin,
-# y compris en cas de Ctrl-C, panic, ou de kill du wrapper.
+# It disables the 3 modes of the macOS Application Firewall:
+#   - --setglobalstate     : global firewall on/off
+#   - --setblockall        : strict "block all incoming" mode
+#   - --setstealthmode     : do not reply to pings
+# All 3 are restored to their initial state via `trap` on exit, including on
+# Ctrl-C, panic, or a kill of the wrapper.
 #
-# Usage :
+# Usage:
 #   ./scripts/dev/cargo-test-nofw.sh test --workspace
-#   ./scripts/dev/cargo-test-nofw.sh test -p warren-tunnel --test bench --release -- --ignored
-#   ./scripts/dev/cargo-test-nofw.sh run -p warren-exit -- --use-tun ...
+#   ./scripts/dev/cargo-test-nofw.sh test -p warren-transport --test loopback --release -- --ignored
+#   ./scripts/dev/cargo-test-nofw.sh run -p warren-sdk --example ...
 #
-# Hint : `alias nofw='./scripts/dev/cargo-test-nofw.sh'` dans ton ~/.zshrc.
+# Hint: `alias nofw='./scripts/dev/cargo-test-nofw.sh'` in your ~/.zshrc.
 #
-# Sur Linux, transparent passthrough vers cargo.
+# On Linux, transparent passthrough to cargo.
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Linux / non-macOS : passthrough.
+# Linux / non-macOS: passthrough.
 # ---------------------------------------------------------------------------
 if [[ "$(uname)" != "Darwin" ]]; then
     exec cargo "$@"
@@ -32,25 +32,28 @@ fi
 FW_BIN=/usr/libexec/ApplicationFirewall/socketfilterfw
 
 # ---------------------------------------------------------------------------
-# Vérifier que sudo peut appeler `socketfilterfw` sans password.
+# Check that sudo can call `socketfilterfw` without a password.
 #
-# Idéalement, le user a configuré `/etc/sudoers.d/warren-firewall` avec
-# NOPASSWD pour socketfilterfw uniquement (cf. scripts/README.md). Dans
-# ce cas, `sudo -n socketfilterfw --getglobalstate` passe immédiatement.
+# Configure `/etc/sudoers.d/warren-firewall` with a NOPASSWD entry scoped to
+# socketfilterfw only, so `sudo -n socketfilterfw --getglobalstate` passes
+# immediately without a prompt.
 #
-# `sudo -v` (validation générique des creds) demande un password même
-# avec un NOPASSWD scopé - donc on l'évite et on teste directement la
-# commande visée.
+# `sudo -v` (generic credential validation) prompts for a password even with a
+# scoped NOPASSWD entry, so we avoid it and test the target command directly.
 # ---------------------------------------------------------------------------
 if ! sudo -n "$FW_BIN" --getglobalstate >/dev/null 2>&1; then
     echo "==> sudo password required for socketfilterfw" >&2
-    echo "==> Configure NOPASSWD pour éviter ce prompt (cf. scripts/README.md)" >&2
+    echo "==> Configure a NOPASSWD sudoers entry for socketfilterfw to avoid this prompt" >&2
     sudo -v
 fi
 
+# Repo root, captured before the trap so orphan cleanup resolves it even if the
+# cwd changes during the run or the wrapper is launched from a sub-directory.
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
 # ---------------------------------------------------------------------------
-# Capturer l'état initial des 3 modes du firewall.
-# Sortie typique :
+# Capture the initial state of the 3 firewall modes.
+# Typical output:
 #   "Firewall is enabled. (State = 1)"
 #   "Firewall has block all state set to disabled."
 #   "Stealth mode disabled"
@@ -71,9 +74,8 @@ STEALTH_WAS_ON=0
 state_was --getstealthmode '^stealth mode enabled' && STEALTH_WAS_ON=1
 
 # ---------------------------------------------------------------------------
-# Restauration via trap. Toujours best-effort : on log mais on ne fail pas
-# si une commande de restauration échoue (l'utilisateur peut toujours la
-# relancer manuellement).
+# Restore via trap. Always best-effort: log but do not fail if a restore
+# command fails (the user can always re-run it manually).
 # ---------------------------------------------------------------------------
 restore_firewall() {
     local exit_code=$?
@@ -90,17 +92,13 @@ restore_firewall() {
         sudo "$FW_BIN" --setstealthmode on >/dev/null 2>&1 || true
     fi
 
-    # **M3.J round 9 - kill orphan test binaries.** Les helpers
-    # `accept_one_handshake_for_test` peuvent stuck (avant le fix timeout
-    # 30 s) si le client ne se connecte jamais. Sous `cargo test --workspace`,
-    # plusieurs ExitListener acceptent en parallèle sur des ports random
-    # → contention localhost UDP/TCP → certains binaires test boucle à
-    # ~90 % CPU des heures durant. Découvert en M3.J : 3 process
-    # regressions_m3e à ~90 % CPU pendant 9 h. On nettoie best-effort si
-    # ce wrapper est tué (Ctrl-C, timeout, kill du shell parent) sans que
-    # cargo ait reap ses enfants.
+    # Kill orphan test binaries. Networking tests spin up userland listeners
+    # (loopback, multihop, proxy, netstack sinks) that can keep spinning at high
+    # CPU if the wrapper is killed (Ctrl-C, timeout, parent-shell kill) before
+    # cargo reaps its children. Scope strictly to this repo's compiled test
+    # binaries so we never touch unrelated processes.
     local orphans
-    orphans=$(pgrep -f "$REPO_ROOT/target/(debug|release|profiling)/deps/(regressions_|multi_conn|pump-|e2e_|exit_|coverage_)" 2>/dev/null || true)
+    orphans=$(pgrep -f "$REPO_ROOT/target/(debug|release|profiling)/deps/" 2>/dev/null || true)
     if [[ -n "$orphans" ]]; then
         echo "==> Killing orphan test binaries: $(echo "$orphans" | tr '\n' ' ')" >&2
         kill -9 $orphans 2>/dev/null || true
@@ -110,12 +108,8 @@ restore_firewall() {
 }
 trap restore_firewall EXIT INT TERM
 
-# Capture le repo root pour le nettoyage des orphans (au cas où le cwd
-# change pendant l'exécution ou le wrapper est lancé depuis un sous-dir).
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-
 # ---------------------------------------------------------------------------
-# Désactiver les 3 modes pendant l'exécution.
+# Disable the 3 modes for the duration of the run.
 # ---------------------------------------------------------------------------
 if [[ "$GLOBAL_WAS_ON" == "1" ]]; then
     echo "==> Disabling firewall global state" >&2
@@ -131,7 +125,7 @@ if [[ "$STEALTH_WAS_ON" == "1" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Lance cargo avec les args passés. `exec` n'est *pas* utilisé ici parce
-# qu'on a besoin du `trap` pour restaurer le firewall après.
+# Run cargo with the passed args. `exec` is not used here because we need the
+# `trap` to restore the firewall afterwards.
 # ---------------------------------------------------------------------------
 cargo "$@"
