@@ -2877,7 +2877,6 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "hex",
- "rand 0.8.6",
  "rand_core 0.9.5",
  "tempfile",
  "thiserror 2.0.18",
@@ -2888,6 +2887,7 @@ dependencies = [
  "warren-quinn",
  "warren-test-support",
  "warren-wire",
+ "warrenguard-backoff",
  "warrenguard-multihop",
  "warrenguard-tls",
 ]
@@ -2916,6 +2916,14 @@ dependencies = [
  "warrenguard-multihop",
  "warrenguard-natpmp-protocol",
  "warrenguard-wire",
+]
+
+[[package]]
+name = "warrenguard-backoff"
+version = "0.1.0"
+source = "git+https://github.com/WarrenBrowse/warrenguard.git?rev=95fe53bb31ca5b3c7854f88da254f5ab7cee1852#95fe53bb31ca5b3c7854f88da254f5ab7cee1852"
+dependencies = [
+ "rand 0.10.1",
 ]
 
 [[package]]

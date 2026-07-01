@@ -14,156 +14,11 @@
 //! network.
 
 use std::future::Future;
-use std::iter::FusedIterator;
-use std::time::Duration;
 
-use rand::Rng;
-
-/// Exponential backoff schedule (base delay + hard ceiling).
-///
-/// Purely descriptive: nothing happens until [`Backoff::take`] turns it into a
-/// [`BackoffIter`]. If `base > max`, the iterator clamps the effective base to
-/// `max` so the `delay <= max` invariant always holds.
-///
-/// # Examples
-///
-/// ```
-/// use std::time::Duration;
-/// use warren_transport::Backoff;
-///
-/// let delays: Vec<Duration> = Backoff::HANDSHAKE.take(3).collect();
-/// assert_eq!(delays.len(), 3);
-/// assert_eq!(delays[0], Duration::ZERO); // first attempt is immediate
-/// assert!(delays.iter().all(|d| *d <= Backoff::HANDSHAKE.max));
-/// ```
-#[derive(Clone, Copy, Debug)]
-#[must_use = "a Backoff schedule does nothing until you call `.take(n)`"]
-pub struct Backoff {
-    /// Initial non-zero delay (the first jitter upper bound).
-    pub base: Duration,
-    /// Hard ceiling: no individual delay ever exceeds this value.
-    pub max: Duration,
-}
-
-impl Backoff {
-    /// QUIC handshake / connect retry profile: base 500 ms, ceiling 15 s.
-    pub const HANDSHAKE: Self = Self {
-        base: Duration::from_millis(500),
-        max: Duration::from_secs(15),
-    };
-
-    /// Long-running background loop profile: base 1 s, ceiling 60 s.
-    pub const BACKGROUND: Self = Self {
-        base: Duration::from_secs(1),
-        max: Duration::from_secs(60),
-    };
-
-    /// Fast-call retry profile: base 200 ms, ceiling 5 s.
-    pub const SHORT: Self = Self {
-        base: Duration::from_millis(200),
-        max: Duration::from_secs(5),
-    };
-
-    /// Builds a finite iterator yielding `attempts` successive delays. The
-    /// first delay is always [`Duration::ZERO`] (retry immediately); each
-    /// subsequent delay is drawn from `[current / 2, current]` with `current`
-    /// doubling up to [`Backoff::max`].
-    #[must_use = "iterators are lazy and do nothing unless consumed"]
-    pub fn take(self, attempts: usize) -> BackoffIter {
-        BackoffIter {
-            backoff: self,
-            remaining: attempts,
-            next: Duration::ZERO,
-        }
-    }
-
-    /// Builds an unbounded [`JitterBackoff`] for a supervisor that retries
-    /// indefinitely (the first delay is still [`Duration::ZERO`]).
-    #[must_use]
-    pub fn forever(self) -> JitterBackoff {
-        JitterBackoff {
-            backoff: self,
-            next: Duration::ZERO,
-        }
-    }
-}
-
-/// Iterator of successive backoff delays from a [`Backoff`].
-///
-/// Created by [`Backoff::take`]. [`ExactSizeIterator`] exposes the remaining
-/// attempt count; [`FusedIterator`] because it stays `None` once exhausted.
-#[must_use = "iterators are lazy and do nothing unless consumed"]
-pub struct BackoffIter {
-    backoff: Backoff,
-    remaining: usize,
-    next: Duration,
-}
-
-/// Advances `next` per the full-jitter law and returns this attempt's delay: the
-/// first call (when `next` is zero) fires immediately and seeds `next` at `base`;
-/// each later call draws from `[current / 2, current]` and doubles up to `max`.
-/// Shared by the finite [`BackoffIter`] and the unbounded [`JitterBackoff`].
-fn jitter_step(backoff: &Backoff, next: &mut Duration) -> Duration {
-    if next.is_zero() {
-        *next = backoff.base.min(backoff.max);
-        return Duration::ZERO;
-    }
-    let current = (*next).min(backoff.max);
-    *next = current.saturating_mul(2).min(backoff.max);
-    let half = current / 2;
-    let half_nanos = u64::try_from(half.as_nanos()).unwrap_or(u64::MAX);
-    // Inclusive range so the delay can be exactly `current` (= half + half).
-    let jitter_nanos = rand::thread_rng().gen_range(0..=half_nanos);
-    half + Duration::from_nanos(jitter_nanos)
-}
-
-impl Iterator for BackoffIter {
-    type Item = Duration;
-
-    fn next(&mut self) -> Option<Duration> {
-        if self.remaining == 0 {
-            return None;
-        }
-        self.remaining -= 1;
-        Some(jitter_step(&self.backoff, &mut self.next))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-/// Unbounded full-jitter backoff for supervisors that retry indefinitely (where
-/// the finite [`BackoffIter`] does not fit). Same jitter law: the first
-/// [`next_delay`](Self::next_delay) is zero, then each is drawn from
-/// `[current / 2, current]` doubling up to the ceiling. [`reset`](Self::reset)
-/// returns to the immediate-retry state, e.g. after a session that stayed healthy.
-#[derive(Clone, Copy, Debug)]
-pub struct JitterBackoff {
-    backoff: Backoff,
-    next: Duration,
-}
-
-impl JitterBackoff {
-    /// Returns the next delay and advances the schedule.
-    #[must_use]
-    pub fn next_delay(&mut self) -> Duration {
-        jitter_step(&self.backoff, &mut self.next)
-    }
-
-    /// Resets to the immediate-retry state (the next delay is zero again).
-    pub fn reset(&mut self) {
-        self.next = Duration::ZERO;
-    }
-}
-
-impl ExactSizeIterator for BackoffIter {
-    fn len(&self) -> usize {
-        self.remaining
-    }
-}
-
-impl FusedIterator for BackoffIter {}
+/// The full-jitter backoff schedule now lives in the engine so the SDK and
+/// warren-core share one implementation. Re-exported here to keep the
+/// `warren_transport::{Backoff, BackoffIter, JitterBackoff}` public paths.
+pub use warrenguard_backoff::{Backoff, BackoffIter, JitterBackoff};
 
 /// Outcome of [`connect_with_retry`] when no attempt succeeds.
 #[derive(Debug, thiserror::Error)]
@@ -305,6 +160,7 @@ where
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::time::Duration;
 
     #[test]
     fn first_delay_is_zero_then_jittered() {

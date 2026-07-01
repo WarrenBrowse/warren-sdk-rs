@@ -42,14 +42,15 @@ publish = false
 # override these with the sibling `../warrenguard` via the `[patch]` at the foot of
 # this file (CI's checkout-engine action clones it there at the same rev). Keep the
 # rev below in lockstep with `.warrenguard-version`.
-warrenguard-wire = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "51652926345912bec5ab728ee1759e491b2ba4c2" }
-warrenguard-identity = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "51652926345912bec5ab728ee1759e491b2ba4c2" }
-warrenguard-multihop = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "51652926345912bec5ab728ee1759e491b2ba4c2" }
-warrenguard-daita = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "51652926345912bec5ab728ee1759e491b2ba4c2" }
-warrenguard-tls = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "51652926345912bec5ab728ee1759e491b2ba4c2" }
-warrenguard-natpmp-protocol = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "51652926345912bec5ab728ee1759e491b2ba4c2" }
-warrenguard-tun-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "51652926345912bec5ab728ee1759e491b2ba4c2" }
-warrenguard-tun-device = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "51652926345912bec5ab728ee1759e491b2ba4c2" }
+warrenguard-wire = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "95fe53bb31ca5b3c7854f88da254f5ab7cee1852" }
+warrenguard-identity = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "95fe53bb31ca5b3c7854f88da254f5ab7cee1852" }
+warrenguard-multihop = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "95fe53bb31ca5b3c7854f88da254f5ab7cee1852" }
+warrenguard-daita = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "95fe53bb31ca5b3c7854f88da254f5ab7cee1852" }
+warrenguard-tls = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "95fe53bb31ca5b3c7854f88da254f5ab7cee1852" }
+warrenguard-natpmp-protocol = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "95fe53bb31ca5b3c7854f88da254f5ab7cee1852" }
+warrenguard-tun-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "95fe53bb31ca5b3c7854f88da254f5ab7cee1852" }
+warrenguard-tun-device = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "95fe53bb31ca5b3c7854f88da254f5ab7cee1852" }
+warrenguard-backoff = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "95fe53bb31ca5b3c7854f88da254f5ab7cee1852" }
 
 # Identity / crypto. Leaf RustCrypto and ecosystem crates, kept minimal
 # so each can be mapped 1:1 to the other language SDKs.

@@ -16,6 +16,9 @@ warrenguard-tls = { workspace = true }
 # Direct engine dep for the relay-auth proof codec (decode_relay_auth_proof,
 # RELAY_AUTH_PROOF_LEN) used in the X.509 cover-domain handshake (ADR-0004).
 warrenguard-multihop = { workspace = true }
+# Full-jitter reconnection backoff, single-homed in the engine (re-exported by
+# the `reconnect` module so the SDK and warren-core share one schedule).
+warrenguard-backoff = { workspace = true }
 warren-wire = { path = "../warren-wire" }
 warren-multihop = { path = "../warren-multihop" }
 warren-daita = { path = "../warren-daita" }
@@ -27,8 +30,6 @@ thiserror = { workspace = true }
 # rand_core 0.9 OsRng for the per-session HPKE ephemeral keypair (hpke 0.13
 # expects the 0.9 trait surface, matching warren-multihop).
 rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
-# rand 0.8 for the full-jitter reconnection backoff sampling.
-rand = { workspace = true }
 
 [dev-dependencies]
 # test-util enables `tokio::time` pause/auto-advance so the reconnect backoff
