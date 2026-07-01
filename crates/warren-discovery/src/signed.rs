@@ -1,288 +1,82 @@
-//! Signed exit list (the `warren-relays` v7 minimized node/endpoint format)
-//! verification.
-//!
-//! An attacker who can intercept the HTTP fetch could substitute their own
-//! exits. The warren-api server's Ed25519 signature binds the list to a
-//! legitimate operator; the client verifies against a pinned `server_pubkey`
-//! (or TOFU on first boot).
-//!
-//! Canonical format (frozen at v8, never modify without rotating the version):
-//!
-//! ```text
-//! canonical_bytes = serde_json::to_vec(UnsignedRelayList {
-//!     version, nodes, generation, signed_at, expires_at, server_pubkey_hex,
-//! })
-//! signature = Ed25519::sign(server_secret_key, canonical_bytes)
-//! ```
-//!
-//! Field order in the structs determines JSON order, which is part of the signed
-//! preimage; the signature is over plain `serde_json` bytes (not sorted-key
-//! canonical JSON), so every field, its order, and the `skip_serializing_if`
-//! omissions must match warren-core byte-for-byte. `generation` is a monotonic
-//! content version (anti-rollback); `expires_at` is a signed expiry
-//! (anti-freeze/replay). The crate stays clock-free; the caller enforces both via
-//! [`VerifiedRelayList`].
-//!
-//! v7 minimizes the v6 node/endpoint model down to the strict minimum a client
-//! dials (censorship-minimization): it DROPS `roles` (structural now: an endpoint
-//! with a listener is a dial point), `multihop_pubkey` (multi-hop gets the exit
-//! key from the directory), per-endpoint `geoip`, and the per-endpoint
-//! `ingress`/`egress` flags. Egress capability is two node-level booleans
-//! (`egress.ipv4`/`egress.ipv6`) with NO egress source address: a client knows an
-//! exit's geolocation to pick a country, never its egress IP.
+//! Signed relay-list verification, delegated to the neutral
+//! `warren-discovery-core` crate (the single verifier, shared with the backend).
+//! Keeps the SDK-facing flat `RelayList` / `VerifiedRelayList` (projected from
+//! the neutral's rich `WarrenRelay` model) so the SDK's public API is unchanged.
 
-use std::net::{IpAddr, SocketAddr};
+use warren_discovery_core::WarrenRelay;
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-// Signing types are only used by the test-only `sign_relay_list` (and the unit
-// tests); gated so they are not unused imports in a production build.
-#[cfg(any(test, feature = "test-helpers"))]
-use ed25519_dalek::{Signer, SigningKey};
-use serde::{Deserialize, Serialize};
+pub use warren_discovery_core::{
+    JsonEgress, JsonEndpoint, JsonListener, JsonLocation, JsonNode, SIGNED_VERSION, SignedError,
+    SignedRelayList, sign_relay_list,
+};
 
-use crate::exit_id::ExitId;
 use crate::relay::{Location, Relay, RelayList};
 
-/// Current signed format version. Bumping is an incompatible rotation.
-pub const SIGNED_VERSION: u32 = 8;
-
-/// A dial listener on an endpoint (`port`/`transport`/`alpn`).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct JsonListener {
-    /// Listening port.
-    pub port: u16,
-    /// Transport, e.g. `"quic"`.
-    pub transport: String,
-    /// ALPN, e.g. `"h3"`.
-    pub alpn: String,
-}
-
-/// One dialable entry endpoint of a node (v7): an address and its listeners. An
-/// endpoint with at least one listener IS a client dial point; v7 carries no
-/// direction flags and no geoip on the public wire.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct JsonEndpoint {
-    /// IP literal (no port; ports live in `listeners`).
-    pub addr: String,
-    /// `"ipv4"` or `"ipv6"`; must agree with `addr`.
-    pub family: String,
-    /// Dial listeners served at this address.
-    pub listeners: Vec<JsonListener>,
-}
-
-/// Node-level egress capability (v7): whether the node can route in-tunnel
-/// client traffic to the v4 / v6 internet. Capability booleans only, the egress
-/// source address is never published to clients.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct JsonEgress {
-    /// `true` if the node has a working IPv4 egress source.
-    pub ipv4: bool,
-    /// `true` if the node has a working IPv6 egress source.
-    pub ipv6: bool,
-}
-
-/// A node's declared (manual, authoritative-for-selection) geolocation.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct JsonLocation {
-    /// ISO 3166-1 alpha-2 country code.
-    pub country: String,
-    /// City name (free form).
-    pub city: String,
-}
-
-/// Wire representation of one node in the signed v7 JSON (public projection).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct JsonNode {
-    /// Node identity: a Warren SS58 (`wb…`) address (production) or 64-char hex
-    /// of the Ed25519 node pubkey (legacy/local).
-    pub id: String,
-    /// Stable operator-assigned identifier (32-char hex in JSON).
-    pub exit_id: ExitId,
-    /// Declared geolocation (authoritative for selection).
-    pub location: JsonLocation,
-    /// Relative weight for weighted selection (`0` disables).
-    pub weight: u64,
-    /// `false` disables the node without removing it from the list.
-    pub active: bool,
-    /// Node-level egress capability (no source address).
-    pub egress: JsonEgress,
-    /// Dialable entry endpoints (one or more addresses).
-    pub endpoints: Vec<JsonEndpoint>,
-    /// v6 X.509 cover-domain SNI (wg-0005): the hostname on the exit's real
-    /// certificate the client dials and validates via WebPKI instead of pinning
-    /// the exit's raw public key. `None` (skipped from the wire) keeps the RPK
-    /// handshake. Added in v8; must stay last to preserve the signed field order.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cover_domain: Option<String>,
-}
-
-/// Signed exit list (full v6 wire format).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SignedRelayList {
-    /// Must equal [`SIGNED_VERSION`].
-    pub version: u32,
-    /// Nodes announced by the server.
-    pub nodes: Vec<JsonNode>,
-    /// Monotonic content version (anti-rollback high-water mark).
-    pub generation: u64,
-    /// Unix epoch seconds the list was signed.
-    pub signed_at: u64,
-    /// Unix epoch seconds after which the list must not be trusted (anti-freeze).
-    pub expires_at: u64,
-    /// 64-char hex of the server's verifying key.
-    pub server_pubkey_hex: String,
-    /// 128-char hex Ed25519 signature over the canonical bytes.
-    pub signature_hex: String,
-}
-
-/// Signature preimage. Field order must match [`SignedRelayList`] minus
-/// `signature_hex` (the only excluded field).
-#[derive(Debug, Serialize)]
-struct UnsignedRelayList<'a> {
-    version: u32,
-    nodes: &'a [JsonNode],
-    generation: u64,
-    signed_at: u64,
-    expires_at: u64,
-    server_pubkey_hex: &'a str,
-}
-
-/// Result of a successful verification: resolved relays plus the
-/// freshness/anti-rollback metadata the caller must enforce.
+/// Verified relay list: the SDK's flat `Relay` model plus the freshness metadata
+/// the caller enforces (`generation` anti-rollback, `expires_at`).
 #[derive(Debug, Clone)]
 pub struct VerifiedRelayList {
-    /// Resolved relays.
+    /// Resolved relays (flat client model).
     pub relays: RelayList,
     /// Monotonic content version (anti-rollback high-water mark).
     pub generation: u64,
     /// Unix epoch seconds the list was signed.
     pub signed_at: u64,
-    /// Unix epoch seconds after which the list is stale.
+    /// Unix epoch seconds the list expires.
     pub expires_at: u64,
-    /// Hex Ed25519 pubkey that signed (and verified) this list. The facade
-    /// persists this for trust-on-first-use pinning.
+    /// Hex of the server key that signed this list (for TOFU pinning).
     pub server_pubkey_hex: String,
 }
 
 impl VerifiedRelayList {
-    /// True if `now_unix_secs` is at or past the signed expiry.
+    /// True once `now_unix_secs` reaches `expires_at`.
     #[must_use]
     pub fn is_expired(&self, now_unix_secs: u64) -> bool {
         now_unix_secs >= self.expires_at
     }
 }
 
-/// Errors from verifying a signed relay list.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum SignedError {
-    /// Invalid JSON or unexpected structure.
-    #[error("invalid signed relay list: {0}")]
-    Json(#[from] serde_json::Error),
-    /// `version != SIGNED_VERSION`.
-    #[error("unsupported signed relay list version: {got} (expected {SIGNED_VERSION})")]
-    UnsupportedVersion {
-        /// Version actually received.
-        got: u32,
-    },
-    /// The declared server pubkey is not in the pinned set. The keys are kept
-    /// as fields for programmatic inspection but deliberately NOT rendered in
-    /// the message (no-log discipline: a pubkey is identity material).
-    #[error("server pubkey not in the pinned set")]
-    ServerPubkeyMismatch {
-        /// Pubkey hex announced in the JSON.
-        got: String,
-        /// Comma-joined pinned set.
-        expected: String,
-    },
-    /// The signed validity window (`expires_at - signed_at`) is implausibly long.
-    #[error("signed relay list validity window too long")]
-    ValidityTooLong,
-    /// Invalid hex for the pubkey or the signature.
-    #[error("invalid hex encoding")]
-    InvalidHex,
-    /// Received pubkey is not a valid Ed25519 point.
-    #[error("server pubkey is not a valid Ed25519 point")]
-    PubkeyNotOnCurve,
-    /// Signature does not verify against the pubkey and canonical bytes.
-    #[error("signature verification failed")]
-    BadSignature,
-    /// A node's id is not a valid 16-byte hex exit id.
-    #[error("invalid node id")]
-    InvalidNodeId,
-    /// A node endpoint address is not a valid IP socket address.
-    #[error("invalid endpoint address")]
-    InvalidEndpointAddress,
-    /// A node endpoint's declared family disagrees with its address.
-    #[error("endpoint family mismatch")]
-    EndpointFamilyMismatch,
+/// Projects the neutral verifier's rich `WarrenRelay` to the SDK's flat `Relay`.
+/// The client dials the single derived endpoint; the rich entry/relay/exit
+/// listener structure is not needed by the userland datapath.
+fn relay_from_warren(wr: &WarrenRelay) -> Relay {
+    let addrs = wr.endpoint_addr().ip_addrs().collect();
+    let location = Location::new(wr.location().country_code(), wr.location().city());
+    Relay::new(
+        *wr.endpoint_id().as_bytes(),
+        crate::exit_id::ExitId::from_bytes(*wr.exit_id().as_bytes()),
+        addrs,
+        location,
+        wr.weight(),
+        wr.is_active(),
+    )
+    .with_ipv6_egress(wr.egress_v6())
+    .with_cover_domain(wr.endpoint_addr().cover_domain.clone())
 }
 
-/// Signs a relay list (server side). Test-only: gated so this fixture helper
-/// never enters the production-compiled surface (in-crate tests via `cfg(test)`,
-/// other crates via the `test-helpers` feature).
-///
-/// # Panics
-///
-/// Panics only if JSON serialization of the preimage fails, which is infallible
-/// in practice.
-#[cfg(any(test, feature = "test-helpers"))]
-#[must_use]
-pub fn sign_relay_list(
-    nodes: Vec<JsonNode>,
-    server_key: &SigningKey,
-    generation: u64,
-    signed_at: u64,
-    expires_at: u64,
-) -> SignedRelayList {
-    let server_pubkey_hex = hex::encode(server_key.verifying_key().as_bytes());
-    let unsigned = UnsignedRelayList {
-        version: SIGNED_VERSION,
-        nodes: &nodes,
-        generation,
-        signed_at,
-        expires_at,
-        server_pubkey_hex: &server_pubkey_hex,
-    };
-    let canonical =
-        serde_json::to_vec(&unsigned).expect("UnsignedRelayList JSON serialization is infallible");
-    let signature = server_key.sign(&canonical);
-    SignedRelayList {
-        version: SIGNED_VERSION,
-        nodes,
-        generation,
-        signed_at,
-        expires_at,
-        server_pubkey_hex,
-        signature_hex: hex::encode(signature.to_bytes()),
+fn project(v: warren_discovery_core::VerifiedRelayList) -> VerifiedRelayList {
+    VerifiedRelayList {
+        relays: RelayList::new(v.relays.relays().iter().map(relay_from_warren).collect()),
+        generation: v.generation,
+        signed_at: v.signed_at,
+        expires_at: v.expires_at,
+        server_pubkey_hex: v.server_pubkey_hex,
     }
 }
 
-/// Verifies a signed relay list, optionally pinning the server pubkey.
-///
-/// `expected_server_pubkey = None` is TOFU (any self-consistent signature).
+/// Verifies a signed relay list against a single pinned server key (None = TOFU).
 ///
 /// # Errors
 ///
-/// See [`SignedError`].
+/// [`SignedError`] on any verification failure.
 pub fn verify_signed_relay_list(
     s: &str,
     expected_server_pubkey: Option<&str>,
 ) -> Result<VerifiedRelayList, SignedError> {
-    match expected_server_pubkey {
-        Some(p) => verify_signed_relay_list_any(s, &[p]),
-        None => verify_signed_relay_list_any(s, &[]),
-    }
+    warren_discovery_core::verify_signed_relay_list(s, expected_server_pubkey).map(project)
 }
 
-/// Multi-key variant for pinned-key rotation: accepts the list if signed by any
-/// of `expected_server_pubkeys` (empty slice means TOFU).
+/// Multi-key variant for pinned-key rotation (empty slice = TOFU).
 ///
 /// # Errors
 ///
@@ -291,533 +85,5 @@ pub fn verify_signed_relay_list_any(
     s: &str,
     expected_server_pubkeys: &[&str],
 ) -> Result<VerifiedRelayList, SignedError> {
-    let signed: SignedRelayList = serde_json::from_str(s)?;
-    if signed.version != SIGNED_VERSION {
-        return Err(SignedError::UnsupportedVersion {
-            got: signed.version,
-        });
-    }
-    if !expected_server_pubkeys.is_empty()
-        && !expected_server_pubkeys
-            .iter()
-            .any(|p| *p == signed.server_pubkey_hex)
-    {
-        return Err(SignedError::ServerPubkeyMismatch {
-            got: signed.server_pubkey_hex.clone(),
-            expected: expected_server_pubkeys.join(","),
-        });
-    }
-
-    let pubkey_bytes: [u8; 32] = hex::decode(&signed.server_pubkey_hex)
-        .map_err(|_| SignedError::InvalidHex)?
-        .try_into()
-        .map_err(|_| SignedError::InvalidHex)?;
-    let server_pubkey =
-        VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| SignedError::PubkeyNotOnCurve)?;
-
-    let sig_bytes: [u8; 64] = hex::decode(&signed.signature_hex)
-        .map_err(|_| SignedError::InvalidHex)?
-        .try_into()
-        .map_err(|_| SignedError::InvalidHex)?;
-    let signature = Signature::from_bytes(&sig_bytes);
-
-    let unsigned = UnsignedRelayList {
-        version: signed.version,
-        nodes: &signed.nodes,
-        generation: signed.generation,
-        signed_at: signed.signed_at,
-        expires_at: signed.expires_at,
-        server_pubkey_hex: &signed.server_pubkey_hex,
-    };
-    let canonical = serde_json::to_vec(&unsigned).map_err(SignedError::Json)?;
-    server_pubkey
-        .verify(&canonical, &signature)
-        .map_err(|_| SignedError::BadSignature)?;
-
-    // Bound the authenticated validity window: a compromised signer cannot mint
-    // a list that anti-rollback can never supersede by setting a decade-long
-    // expiry. Clock-free (relationship between two signed fields).
-    const MAX_VALIDITY_SECS: u64 = 7 * 24 * 60 * 60;
-    if signed.expires_at.saturating_sub(signed.signed_at) > MAX_VALIDITY_SECS {
-        return Err(SignedError::ValidityTooLong);
-    }
-
-    let relays: Result<Vec<_>, SignedError> =
-        signed.nodes.into_iter().map(json_node_to_relay).collect();
-    Ok(VerifiedRelayList {
-        relays: RelayList::new(relays?),
-        generation: signed.generation,
-        signed_at: signed.signed_at,
-        expires_at: signed.expires_at,
-        server_pubkey_hex: signed.server_pubkey_hex,
-    })
-}
-
-/// Decodes a node `id` into the 32-byte exit pubkey.
-///
-/// warren-api publishes it as a Warren SS58 (`wb…`) address since the SS58
-/// migration; the 64-char hex form is accepted as a fallback for legacy or
-/// locally-authored lists. A hex string is never a valid SS58 address and
-/// vice-versa, so the dispatch is unambiguous (matches warren-core).
-fn decode_node_id(s: &str) -> Result<[u8; 32], SignedError> {
-    if let Ok(bytes) = warren_identity::ss58::decode(s) {
-        return Ok(bytes);
-    }
-    hex::decode(s)
-        .ok()
-        .and_then(|v| <[u8; 32]>::try_from(v).ok())
-        .ok_or(SignedError::InvalidNodeId)
-}
-
-/// Maps a verified v7 node to a resolved [`Relay`]: every endpoint is a dial
-/// point (v7 has no per-endpoint direction flags), so the dialable addresses are
-/// the QUIC listeners of all endpoints; `ipv6_egress` is the node-level
-/// `egress.ipv6` capability boolean. The strong multihop trust chain lives in
-/// the operational-signed multihop directory; the single-hop datapath uses the
-/// dialable addresses only.
-fn json_node_to_relay(n: JsonNode) -> Result<Relay, SignedError> {
-    let endpoint_id = decode_node_id(&n.id)?;
-
-    let mut addrs: Vec<SocketAddr> = Vec::new();
-    for ep in &n.endpoints {
-        let ip: IpAddr = ep
-            .addr
-            .parse()
-            .map_err(|_| SignedError::InvalidEndpointAddress)?;
-        // The declared family must agree with the address (matches warren-core).
-        let family_ok = matches!(
-            (ip, ep.family.as_str()),
-            (IpAddr::V4(_), "ipv4") | (IpAddr::V6(_), "ipv6")
-        );
-        if !family_ok {
-            return Err(SignedError::EndpointFamilyMismatch);
-        }
-        for l in &ep.listeners {
-            // The SDK dials QUIC; ignore any other transport a node lists.
-            if l.transport == "quic" {
-                addrs.push(SocketAddr::new(ip, l.port));
-            }
-        }
-    }
-
-    Ok(Relay::new(
-        endpoint_id,
-        n.exit_id,
-        addrs,
-        Location::new(n.location.country, n.location.city),
-        n.weight,
-        n.active,
-    )
-    .with_ipv6_egress(n.egress.ipv6)
-    .with_cover_domain(n.cover_domain))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fixed_server_key() -> SigningKey {
-        SigningKey::from_bytes(&[0x42; 32])
-    }
-
-    fn sample_node() -> JsonNode {
-        JsonNode {
-            id: "00".repeat(32),
-            exit_id: ExitId::from_bytes([0xaa; 16]),
-            location: JsonLocation {
-                country: "RO".to_owned(),
-                city: "Bucharest".to_owned(),
-            },
-            weight: 100,
-            active: true,
-            egress: JsonEgress {
-                ipv4: true,
-                ipv6: false,
-            },
-            endpoints: vec![JsonEndpoint {
-                addr: "127.0.0.1".to_owned(),
-                family: "ipv4".to_owned(),
-                listeners: vec![JsonListener {
-                    port: 1234,
-                    transport: "quic".to_owned(),
-                    alpn: "h3".to_owned(),
-                }],
-            }],
-            cover_domain: None,
-        }
-    }
-
-    #[test]
-    fn round_trip_sign_then_verify_resolves_the_dialable_address() {
-        let key = fixed_server_key();
-        let signed = sign_relay_list(vec![sample_node()], &key, 1, 1_700_000_000, 1_700_086_400);
-        let json = serde_json::to_string(&signed).unwrap();
-        let pin = hex::encode(key.verifying_key().as_bytes());
-        let v = verify_signed_relay_list(&json, Some(&pin)).expect("verify");
-        assert_eq!(v.relays.relays().len(), 1);
-        let relay = &v.relays.relays()[0];
-        assert_eq!(relay.addrs(), ["127.0.0.1:1234".parse().unwrap()]);
-        assert_eq!(relay.location().country_code(), "RO");
-        assert_eq!(v.generation, 1);
-        assert_eq!(v.expires_at, 1_700_086_400);
-    }
-
-    #[test]
-    fn ipv6_egress_comes_from_the_node_level_capability() {
-        // v7: egress is a node-level boolean, not derived from any endpoint. A
-        // node dialable on v6 but without a v6 egress source must NOT report v6
-        // egress (the FDC DAD-fail shape).
-        let mut node = sample_node();
-        node.egress.ipv6 = true;
-        node.endpoints.push(JsonEndpoint {
-            addr: "2001:db8::1".to_owned(),
-            family: "ipv6".to_owned(),
-            listeners: vec![JsonListener {
-                port: 1234,
-                transport: "quic".to_owned(),
-                alpn: "h3".to_owned(),
-            }],
-        });
-        let signed = sign_relay_list(vec![node], &fixed_server_key(), 1, 1, 2);
-        let json = serde_json::to_string(&signed).unwrap();
-        let v = verify_signed_relay_list(&json, None).expect("verify");
-        let relay = &v.relays.relays()[0];
-        assert!(relay.ipv6_egress(), "node-level egress.ipv6 is honored");
-        assert!(relay.has_ipv6(), "v6 endpoint is still dialable");
-    }
-
-    #[test]
-    fn dialable_v6_without_egress_capability_does_not_report_egress() {
-        let mut node = sample_node();
-        node.egress.ipv6 = false;
-        node.endpoints.push(JsonEndpoint {
-            addr: "2001:db8::2".to_owned(),
-            family: "ipv6".to_owned(),
-            listeners: vec![JsonListener {
-                port: 1234,
-                transport: "quic".to_owned(),
-                alpn: "h3".to_owned(),
-            }],
-        });
-        let signed = sign_relay_list(vec![node], &fixed_server_key(), 1, 1, 2);
-        let json = serde_json::to_string(&signed).unwrap();
-        let v = verify_signed_relay_list(&json, None).expect("verify");
-        let relay = &v.relays.relays()[0];
-        assert!(relay.has_ipv6(), "v6 endpoint is dialable");
-        assert!(!relay.ipv6_egress(), "but the node has no v6 egress source");
-    }
-
-    #[test]
-    fn endpoint_family_mismatch_is_rejected() {
-        let mut node = sample_node();
-        node.endpoints[0].family = "ipv6".to_owned(); // addr is ipv4
-        let signed = sign_relay_list(vec![node], &fixed_server_key(), 1, 1, 2);
-        let json = serde_json::to_string(&signed).unwrap();
-        assert!(matches!(
-            verify_signed_relay_list(&json, None).unwrap_err(),
-            SignedError::EndpointFamilyMismatch
-        ));
-    }
-
-    #[test]
-    fn verify_rejects_tampered_egress_capability() {
-        // Anti-tamper: flipping a node's egress capability (e.g. to make a
-        // v4-only exit appear v6-capable) must break the signature.
-        let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
-        let mut tampered = signed.clone();
-        tampered.nodes[0].egress.ipv6 = true;
-        let json = serde_json::to_string(&tampered).unwrap();
-        assert!(matches!(
-            verify_signed_relay_list(&json, None).unwrap_err(),
-            SignedError::BadSignature
-        ));
-    }
-
-    #[test]
-    fn verify_rejects_unexpected_server_pubkey() {
-        let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
-        let json = serde_json::to_string(&signed).unwrap();
-        let err = verify_signed_relay_list(&json, Some(&hex::encode([0xff; 32]))).unwrap_err();
-        assert!(matches!(err, SignedError::ServerPubkeyMismatch { .. }));
-    }
-
-    #[test]
-    fn server_pubkey_mismatch_display_omits_the_key() {
-        // No-log discipline: the pubkey must not appear in the Display.
-        let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
-        let json = serde_json::to_string(&signed).unwrap();
-        let pin = hex::encode([0xff; 32]);
-        let err = verify_signed_relay_list(&json, Some(&pin)).unwrap_err();
-        let rendered = err.to_string();
-        let actual_key = hex::encode(fixed_server_key().verifying_key().as_bytes());
-        assert!(
-            !rendered.contains(&actual_key),
-            "leaked server key: {rendered}"
-        );
-        assert!(!rendered.contains(&pin), "leaked pin: {rendered}");
-    }
-
-    #[test]
-    fn verify_rejects_implausibly_long_validity_window() {
-        let signed = sign_relay_list(
-            vec![sample_node()],
-            &fixed_server_key(),
-            1,
-            1_700_000_000,
-            1_700_000_000 + 365 * 24 * 60 * 60,
-        );
-        let json = serde_json::to_string(&signed).unwrap();
-        assert!(matches!(
-            verify_signed_relay_list(&json, None).unwrap_err(),
-            SignedError::ValidityTooLong
-        ));
-    }
-
-    #[test]
-    fn invalid_pubkey_hex_is_rejected() {
-        // The server pubkey hex is decoded before any signature work; non-hex
-        // there must surface as InvalidHex, not a signature failure.
-        let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
-        let mut value: serde_json::Value = serde_json::to_value(&signed).unwrap();
-        value["server_pubkey_hex"] = serde_json::json!("zz".repeat(32));
-        let json = serde_json::to_string(&value).unwrap();
-        assert!(matches!(
-            verify_signed_relay_list(&json, None).unwrap_err(),
-            SignedError::InvalidHex
-        ));
-    }
-
-    #[test]
-    fn invalid_signature_hex_is_rejected() {
-        let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
-        let mut value: serde_json::Value = serde_json::to_value(&signed).unwrap();
-        value["signature_hex"] = serde_json::json!("0".repeat(127)); // odd length
-        let json = serde_json::to_string(&value).unwrap();
-        assert!(matches!(
-            verify_signed_relay_list(&json, None).unwrap_err(),
-            SignedError::InvalidHex
-        ));
-    }
-
-    #[test]
-    fn pubkey_not_on_curve_is_rejected() {
-        // A syntactically valid 32-byte hex string that is not a valid Ed25519
-        // point must surface as PubkeyNotOnCurve, distinct from InvalidHex.
-        let mut off_curve = [0u8; 32];
-        let mut found = false;
-        for i in 0..=u8::MAX {
-            off_curve[31] = i;
-            if VerifyingKey::from_bytes(&off_curve).is_err() {
-                found = true;
-                break;
-            }
-        }
-        assert!(found, "expected an off-curve 32-byte value to exist");
-        let json = format!(
-            r#"{{"version":8,"nodes":[],"generation":0,"signed_at":0,"expires_at":0,"server_pubkey_hex":"{}","signature_hex":"{}"}}"#,
-            hex::encode(off_curve),
-            "00".repeat(64)
-        );
-        assert!(matches!(
-            verify_signed_relay_list(&json, None).unwrap_err(),
-            SignedError::PubkeyNotOnCurve
-        ));
-    }
-
-    #[test]
-    fn invalid_node_id_is_rejected_after_a_valid_signature() {
-        let mut node = sample_node();
-        node.id = "not-an-id".to_owned(); // neither SS58 nor 32-byte hex
-        let signed = sign_relay_list(vec![node], &fixed_server_key(), 1, 1, 2);
-        let json = serde_json::to_string(&signed).unwrap();
-        assert!(matches!(
-            verify_signed_relay_list(&json, None).unwrap_err(),
-            SignedError::InvalidNodeId
-        ));
-    }
-
-    #[test]
-    fn invalid_endpoint_address_is_rejected() {
-        let mut node = sample_node();
-        node.endpoints[0].addr = "not-an-ip".to_owned();
-        let signed = sign_relay_list(vec![node], &fixed_server_key(), 1, 1, 2);
-        let json = serde_json::to_string(&signed).unwrap();
-        assert!(matches!(
-            verify_signed_relay_list(&json, None).unwrap_err(),
-            SignedError::InvalidEndpointAddress
-        ));
-    }
-
-    #[test]
-    fn multi_key_rotation_accepts_a_non_first_pinned_key() {
-        // Pinned-key rotation: the matching key is second in the set.
-        let key = fixed_server_key();
-        let signed = sign_relay_list(vec![sample_node()], &key, 1, 1, 2);
-        let json = serde_json::to_string(&signed).unwrap();
-        let wrong = hex::encode([0xff; 32]);
-        let right = hex::encode(key.verifying_key().as_bytes());
-        let v = verify_signed_relay_list_any(&json, &[&wrong, &right]).expect("verify");
-        assert_eq!(v.relays.relays().len(), 1);
-    }
-
-    #[test]
-    fn node_id_accepts_ss58_and_hex() {
-        assert_eq!(
-            decode_node_id(&hex::encode([0xab; 32])).unwrap(),
-            [0xab; 32]
-        );
-        let ss58 = warren_identity::ss58::encode(&[0xcd; 32]);
-        assert!(ss58.starts_with("wb"));
-        assert_eq!(decode_node_id(&ss58).unwrap(), [0xcd; 32]);
-        assert!(decode_node_id("not-an-id").is_err());
-    }
-
-    #[test]
-    fn verify_rejects_unknown_fields() {
-        let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
-        let mut value: serde_json::Value = serde_json::to_value(&signed).unwrap();
-        value["surprise"] = serde_json::json!("x");
-        let json = serde_json::to_string(&value).unwrap();
-        assert!(matches!(
-            verify_signed_relay_list(&json, None).unwrap_err(),
-            SignedError::Json(_)
-        ));
-    }
-
-    #[test]
-    fn verify_rejects_tampered_nodes() {
-        let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
-        let mut tampered = signed.clone();
-        tampered.nodes[0].endpoints[0].listeners[0].port = 1235;
-        let json = serde_json::to_string(&tampered).unwrap();
-        assert!(matches!(
-            verify_signed_relay_list(&json, None).unwrap_err(),
-            SignedError::BadSignature
-        ));
-    }
-
-    #[test]
-    fn verify_rejects_tampered_generation() {
-        let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 9, 1, 2);
-        let mut tampered = signed.clone();
-        tampered.generation = 1;
-        let json = serde_json::to_string(&tampered).unwrap();
-        assert!(matches!(
-            verify_signed_relay_list(&json, None).unwrap_err(),
-            SignedError::BadSignature
-        ));
-    }
-
-    #[test]
-    fn verify_rejects_pre_v8_version() {
-        // The previous v7 list (and anything older) must be rejected since the
-        // bump to v8: a v7 client/list and a v8 one do not interoperate.
-        let json = r#"{"version":7,"nodes":[],"generation":0,"signed_at":0,"expires_at":0,"server_pubkey_hex":"00","signature_hex":"00"}"#;
-        assert!(matches!(
-            verify_signed_relay_list(json, None).unwrap_err(),
-            SignedError::UnsupportedVersion { got: 7 }
-        ));
-    }
-
-    #[test]
-    fn top_level_field_order_is_frozen_at_v8() {
-        let signed = sign_relay_list(vec![], &fixed_server_key(), 7, 42, 86442);
-        let json = serde_json::to_string(&signed).unwrap();
-        let order = [
-            r#""version":8"#,
-            r#""nodes":[]"#,
-            r#""generation":7"#,
-            r#""signed_at":42"#,
-            r#""expires_at":86442"#,
-            r#""server_pubkey_hex":"#,
-            r#""signature_hex":"#,
-        ];
-        let mut last = 0usize;
-        for needle in order {
-            let pos = json[last..]
-                .find(needle)
-                .unwrap_or_else(|| panic!("missing {needle}"));
-            last += pos + needle.len();
-        }
-    }
-
-    #[test]
-    fn node_field_order_is_frozen_at_v8() {
-        let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
-        let json = serde_json::to_string(&signed).unwrap();
-        let order = [
-            r#""id":"#,
-            r#""exit_id":"#,
-            r#""location":{"country":"RO","city":"Bucharest"}"#,
-            r#""weight":100"#,
-            r#""active":true"#,
-            r#""egress":{"ipv4":true,"ipv6":false}"#,
-            r#""endpoints":[{"addr":"127.0.0.1","family":"ipv4","listeners":[{"port":1234,"transport":"quic","alpn":"h3"}]}]"#,
-        ];
-        let mut last = 0usize;
-        for needle in order {
-            let pos = json[last..]
-                .find(needle)
-                .unwrap_or_else(|| panic!("missing {needle} in {json}"));
-            last += pos + needle.len();
-        }
-        // A node without a cover domain MUST NOT emit the field, so a v8 list
-        // with no cover domains is byte-identical to the old node shape.
-        assert!(
-            !json.contains("cover_domain"),
-            "cover_domain=None must be skipped on the wire; got {json}"
-        );
-    }
-
-    #[test]
-    fn cover_domain_is_frozen_last_in_the_node_and_roundtrips() {
-        // Freeze the v8 addition: when present, cover_domain is the LAST node
-        // field (after endpoints), and it survives sign -> verify into the Relay.
-        let mut node = sample_node();
-        node.cover_domain = Some("e7f3a.cover.example.com".to_owned());
-        let signed = sign_relay_list(vec![node], &fixed_server_key(), 1, 1, 2);
-        let json = serde_json::to_string(&signed).unwrap();
-        let endpoints_at = json.find(r#""endpoints":"#).expect("endpoints present");
-        let cover_at = json
-            .find(r#""cover_domain":"e7f3a.cover.example.com""#)
-            .expect("cover_domain present");
-        assert!(
-            cover_at > endpoints_at,
-            "cover_domain must serialize last (after endpoints); got {json}"
-        );
-        let v = verify_signed_relay_list(&json, None).expect("verify");
-        assert_eq!(
-            v.relays.relays()[0].cover_domain(),
-            Some("e7f3a.cover.example.com"),
-            "cover_domain must reach the resolved Relay"
-        );
-    }
-
-    #[test]
-    fn public_wire_omits_geoip_roles_and_multihop_pubkey() {
-        // Minimization guard: the v7 wire must NOT carry the dropped v6 fields.
-        let signed = sign_relay_list(vec![sample_node()], &fixed_server_key(), 1, 1, 2);
-        let json = serde_json::to_string(&signed).unwrap();
-        for forbidden in ["geoip", "roles", "multihop_pubkey", "ingress"] {
-            assert!(
-                !json.contains(forbidden),
-                "v7 public node must not contain `{forbidden}`"
-            );
-        }
-    }
-
-    #[test]
-    fn is_expired_boundary() {
-        let signed = sign_relay_list(
-            vec![sample_node()],
-            &fixed_server_key(),
-            1,
-            1_700_000_000,
-            1_700_086_400,
-        );
-        let json = serde_json::to_string(&signed).unwrap();
-        let v = verify_signed_relay_list(&json, None).unwrap();
-        assert!(!v.is_expired(1_700_086_399));
-        assert!(v.is_expired(1_700_086_400));
-    }
+    warren_discovery_core::verify_signed_relay_list_any(s, expected_server_pubkeys).map(project)
 }

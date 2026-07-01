@@ -32,3 +32,5 @@ pub use signed::{
     JsonEgress, JsonEndpoint, JsonListener, JsonLocation, JsonNode, SIGNED_VERSION, SignedError,
     SignedRelayList, VerifiedRelayList, verify_signed_relay_list, verify_signed_relay_list_any,
 };
+/// Wire identity types (ExitId, WarrenPubkey) for building test fixtures.
+pub use warren_discovery_core::warren_types;

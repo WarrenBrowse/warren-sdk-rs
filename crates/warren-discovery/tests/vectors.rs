@@ -54,7 +54,16 @@ fn signed_relay_list_vector_verifies_and_resolves() {
     for (got, exp) in verified.relays.relays().iter().zip(&v.expected.relays) {
         assert_eq!(hex::encode(got.endpoint_id()), exp.endpoint_id_hex);
         assert_eq!(got.exit_id(), ExitId::from_hex(&exp.exit_id_hex).unwrap());
-        assert_eq!(got.location().country_code(), exp.country);
+        // The verifier normalizes the country to lower-case ASCII (stable geo
+        // filtering); the golden vector keeps the wire case, so compare loosely.
+        assert!(
+            got.location()
+                .country_code()
+                .eq_ignore_ascii_case(&exp.country),
+            "country {} != vector {}",
+            got.location().country_code(),
+            exp.country
+        );
         assert_eq!(got.location().city(), exp.city);
         assert_eq!(got.weight(), exp.weight);
         assert_eq!(got.ipv6_egress(), exp.ipv6_egress);

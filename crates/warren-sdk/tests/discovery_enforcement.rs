@@ -9,8 +9,7 @@ use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use warren_sdk::api::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_sdk::discovery::{
-    ExitId, ExitQuery, JsonEgress, JsonEndpoint, JsonListener, JsonLocation, JsonNode,
-    sign_relay_list,
+    ExitQuery, JsonEgress, JsonEndpoint, JsonListener, JsonLocation, JsonNode, sign_relay_list,
 };
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::{GenerationStore, SdkError, ServerKeyStore, WarrenClient};
@@ -36,7 +35,7 @@ impl HttpTransport for QueueTransport {
 fn signed_list(server: &SigningKey, generation: u64, expires_at: u64) -> String {
     let node = JsonNode {
         id: "11".repeat(32),
-        exit_id: ExitId::from_bytes([0xa1; 16]),
+        exit_id: warren_sdk::discovery::warren_types::ExitId::from_bytes([0xa1; 16]),
         location: JsonLocation {
             country: "RO".to_owned(),
             city: "Bucharest".to_owned(),
@@ -108,7 +107,7 @@ async fn fresh_list_is_accepted() {
     let exit = selector
         .select(&ExitQuery::country("RO"))
         .expect("one exit");
-    assert_eq!(exit.location().country_code(), "RO");
+    assert_eq!(exit.location().country_code(), "ro");
 }
 
 #[tokio::test]

@@ -90,12 +90,7 @@ impl SupervisedProxyHandle {
                 external_tx,
                 move |forwarder, suggested| async move {
                     forwarder
-                        .forward_port_with_suggested(
-                            proto,
-                            internal_port,
-                            local_target,
-                            suggested,
-                        )
+                        .forward_port_with_suggested(proto, internal_port, local_target, suggested)
                         .await
                 },
             )
