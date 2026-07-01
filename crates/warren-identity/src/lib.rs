@@ -23,7 +23,6 @@ pub mod signing;
 pub mod ss58;
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use sha2::{Digest, Sha256};
 
 /// Re-export of the exact `ed25519-dalek` the SDK builds against, so dependent
 /// crates can name `SigningKey`/`VerifyingKey` without pinning the version
@@ -163,16 +162,7 @@ impl WarrenIdentity {
         timestamp: u64,
         nonce: [u8; 16],
     ) -> RequestSignature {
-        let nonce_hex = hex::encode(nonce);
-        let body_hash_hex = hex::encode(Sha256::digest(body));
-        let canonical = canonical_message(method, path, timestamp, &nonce_hex, &body_hash_hex);
-        let signature_hex = hex::encode(self.signing.sign(canonical.as_bytes()).to_bytes());
-        RequestSignature {
-            pubkey_ss58: self.address(),
-            signature_hex,
-            timestamp,
-            nonce_hex,
-        }
+        signing::sign_request(&self.signing, method, path, body, timestamp, nonce)
     }
 }
 
@@ -189,6 +179,7 @@ impl std::fmt::Debug for WarrenIdentity {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signature, Verifier};
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn derivation_is_deterministic() {

@@ -1,40 +1,14 @@
 //! Client-side signing of Warren API requests (`X-Warren-*` headers).
 //!
-//! The header names and the canonical message live in `warren-contract`, shared
-//! with the server verifier so they cannot drift. This module adds the
-//! client-side [`RequestSignature`] header bundle.
+//! The header names, the canonical message, the [`RequestSignature`] bundle and
+//! the [`sign_request`] procedure all live in `warren-contract`, the single
+//! definition shared with the server verifier and the backend's own client so
+//! nothing can drift. This module just re-exports them.
 
 pub use warren_contract::auth::{
-    HEADER_NONCE, HEADER_PUBKEY, HEADER_SIGNATURE, HEADER_TIMESTAMP, canonical_message,
+    HEADER_NONCE, HEADER_PUBKEY, HEADER_SIGNATURE, HEADER_TIMESTAMP, RequestSignature,
+    canonical_message, sign_request,
 };
-
-/// A signed request's authentication material, ready to be attached as the four
-/// `X-Warren-*` headers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestSignature {
-    /// Signer pubkey as a Warren SS58 address (`wb…`).
-    pub pubkey_ss58: String,
-    /// Ed25519 signature of the canonical message, 128 hex chars (64 bytes).
-    pub signature_hex: String,
-    /// Unix epoch-seconds timestamp the canonical message was built with.
-    pub timestamp: u64,
-    /// Random 32-hex-char nonce (16 bytes).
-    pub nonce_hex: String,
-}
-
-impl RequestSignature {
-    /// Returns the four `X-Warren-*` headers as `(name, value)` pairs, in a
-    /// stable order, ready to be added to an HTTP request.
-    #[must_use]
-    pub fn headers(&self) -> [(&'static str, String); 4] {
-        [
-            (HEADER_PUBKEY, self.pubkey_ss58.clone()),
-            (HEADER_SIGNATURE, self.signature_hex.clone()),
-            (HEADER_TIMESTAMP, self.timestamp.to_string()),
-            (HEADER_NONCE, self.nonce_hex.clone()),
-        ]
-    }
-}
 
 #[cfg(test)]
 mod tests {
