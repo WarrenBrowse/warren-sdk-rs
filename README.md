@@ -10,8 +10,13 @@ shares the open-source **WarrenGuard engine** (`warrenguard`, AGPL-3.0, sibling
 checkout `../warrenguard`): the `warren-{wire,identity,multihop,daita,tun,tun-core}`
 crates are thin re-exports of the matching `warrenguard-*` engine crates, so the
 protocol primitives have a single source of truth instead of a duplicate
-reimplementation. The control-plane (`warren-api`, `-discovery`, `-sdk`) and the
-userland transport stay SDK-local. It stays **wire-compatible** with warren-core's
+reimplementation. The wire-facing client-to-server contract (the SS58 address
+codec, the X-Warren canonical signing message and header names, and the HTTP
+`/v1` DTOs) comes from a second neutral crate, **`warren-contract`**, shared with
+warren-core: `warren-identity` re-exports its `ss58` and `auth` modules and
+`warren-api` re-exports its `dto`, so this contract cannot drift between the SDK
+and the backend. The control-plane (`warren-api`, `-discovery`, `-sdk`) and the
+userland transport otherwise stay SDK-local. It stays **wire-compatible** with warren-core's
 frozen contracts (same golden vectors), so it can talk to real exits and the
 production API. The same SDK is being reimplemented in TypeScript, Dart, Python,
 Kotlin, Swift and Java; this Rust crate is the reference and the source of the

@@ -6,10 +6,16 @@ engine** (`warrenguard`, AGPL-3.0, sibling checkout `../warrenguard`) for the
 data-plane primitives: the `warren-{wire,identity,multihop,daita,tun,tun-core}`
 crates are thin re-exports of the matching `warrenguard-*` engine crates, so the
 protocol primitives have a single source of truth rather than a duplicate
-reimplementation. The SDK keeps its own control-plane and userland transport on
-top. It stays wire-compatible with warren-core's frozen contracts (same golden
-vectors under `vectors/`, shared with the engine), so it can talk to real exits
-and the production API. The same architecture is meant to be reproduced in
+reimplementation. The wire-facing client-to-server contract has a second neutral
+home, the **`warren-contract`** crate (sibling path-dep, depends only on
+`warrenguard-wire`): it owns the SS58 address codec, the X-Warren canonical
+signing message and header names, and the HTTP `/v1` DTOs, with golden tests for
+all three. `warren-identity` re-exports its `ss58` and `auth` modules and
+`warren-api` re-exports its `dto`; warren-core depends on the same crate, so the
+contract cannot drift between the SDK and the backend. The SDK keeps its own
+control-plane and userland transport on top. It stays wire-compatible with
+warren-core's frozen contracts (same golden vectors under `vectors/`, shared with
+the engine), so it can talk to real exits and the production API. The same architecture is meant to be reproduced in
 TypeScript, Dart, Python, Kotlin, Swift and Java, so every layer is kept
 portable in concept.
 

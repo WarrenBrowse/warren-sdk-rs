@@ -27,6 +27,14 @@ layering and `ROADMAP.md` for the phase plan.
    reimplementation. The SDK keeps its own control-plane (`warren-api`,
    `-discovery`, `-sdk`, `-sdk-ffi`) and userland transport (`warren-transport`,
    `-net`), which are intentionally SDK-specific (non-root userland datapath).
+   The wire-facing client-to-server contract has a second neutral home,
+   `warren-contract` (sibling path-dep, pinned by `.warren-contract-version`,
+   depends only on `warrenguard-wire`): it owns the SS58 address codec, the
+   X-Warren canonical signing message plus header names, and the HTTP `/v1`
+   DTOs. `warren-identity` re-exports its `ss58` and `auth` modules (as
+   `ss58` and `signing`) and `warren-api` re-exports its `dto`; `warren-core`
+   depends on the same crate, so this contract cannot drift between the SDK and
+   the backend either.
 2. **Wire compatibility is non-negotiable** (see the shared wire-vectors rule).
    Identity derivation, SS58, request signing, the handshake frames, the signed
    relay list, NAT-PMP and the multihop frame must match warren-core
