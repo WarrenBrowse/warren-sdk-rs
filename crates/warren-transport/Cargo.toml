@@ -20,7 +20,12 @@ warrenguard-multihop = { workspace = true }
 # datagram send/recv): MultihopSession/MultihopClientTunnel below own a
 # `warrenguard_transport::multihop::MultiHopClient` and delegate to it, so the
 # protocol logic lives once, shared with warren-core via the same engine crate.
+# `client` (single-hop) mirrors this: ClientSession/ClientTunnel own a
+# `warrenguard_transport::client::{ClientSession, ClientTunnel}`.
 warrenguard-transport = { workspace = true }
+# Sealed error type of `warrenguard_transport::client`'s Result, needed to name
+# and map its variants in `client::map_engine_err`.
+warrenguard-transport-core = { workspace = true }
 # Full-jitter reconnection backoff, single-homed in the engine (re-exported by
 # the `reconnect` module so the SDK and warren-core share one schedule).
 warrenguard-backoff = { workspace = true }

@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use warren_wire::{DEVICE_ID_LEN, MAX_SETUP_FRAME_BYTES, Setup, decode_setup_ack, encode_setup};
+use warren_wire::DEVICE_ID_LEN;
+use warrenguard_transport_core::error::TunnelError as EngineTunnelError;
 
 use crate::tls;
 
@@ -225,20 +226,22 @@ pub enum TunnelError {
         #[source]
         source: quinn::ConnectionError,
     },
-    /// Writing or reading the Setup/SetupAck frame failed. The source is one of
-    /// quinn's stream error types, kept behind a boxed `dyn Error`.
+    /// Writing or reading the Setup/SetupAck frame failed: a quinn stream I/O
+    /// error, or the engine's own Setup/SetupAck wire encode/decode failure
+    /// (delegated via [`map_engine_err`]), kept behind a boxed `dyn Error`.
     #[error("handshake i/o error: {context}")]
     HandshakeIo {
         /// Which handshake step failed.
         context: &'static str,
-        /// Underlying quinn stream error.
+        /// Underlying quinn stream or wire-codec error.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
     /// The Setup/SetupAck frame did not decode.
     #[error("handshake frame error")]
     Frame(#[from] warren_wire::ProtocolError),
-    /// The exit's authenticated pubkey did not match the expected one.
+    /// The exit's in-band identity proof (`SetupAck.exit_auth_sig`, wg-0005
+    /// Stage 1) did not verify against the pubkey the client dialed.
     #[error("exit identity mismatch (possible MITM)")]
     ExitIdentityMismatch,
     /// Sending a datagram failed (too large, or connection closing).
@@ -247,6 +250,52 @@ pub enum TunnelError {
     /// Reading a datagram failed (connection closed).
     #[error("read datagram failed")]
     ReadDatagram(#[source] quinn::ConnectionError),
+    /// The exit explicitly rejected the handshake: this client's identity is
+    /// not authorized (no active subscription / not enrolled). The caller
+    /// MUST NOT silently retry (retrying reproduces the same outcome); the
+    /// user needs to provision or renew access.
+    #[error("exit rejected the handshake: identity not authorized")]
+    AuthRejected,
+    /// The account already has the maximum number of simultaneous devices.
+    #[error("device limit reached for this account")]
+    DeviceLimitReached,
+    /// Catch-all for a delegated engine transport error that cannot occur on
+    /// the codepath [`ClientTunnel::connect`] delegates to (dial-time-only,
+    /// exit-side-only, or TUN/DAITA variants); kept so [`map_engine_err`]
+    /// stays exhaustive against the engine's `#[non_exhaustive]` error type
+    /// as it grows.
+    #[error("internal tunnel error: {0}")]
+    Internal(String),
+}
+
+/// Maps a delegated engine
+/// [`warrenguard_transport_core::error::TunnelError`] to this crate's
+/// [`TunnelError`]. Precise for the variants reachable from
+/// [`warrenguard_transport::ClientTunnel::from_established_connection`]
+/// (the only engine call [`ClientTunnel::connect`] makes): this SDK dials via
+/// its own [`dial_quic`], never the engine's own `bind_client_endpoint`, so
+/// the dial-time-only variants (`Bind`/`NoExitAddr`/`QuicConnect`/
+/// `QuicEndpoint`), the exit-side-only variants
+/// (`InbandAuthFailed`/`DivertedToDecoy`/`AllowlistDenied`), and the
+/// TUN/DAITA/persistence variants never surface here; they map to
+/// [`TunnelError::Internal`] so the match stays exhaustive against future
+/// engine additions.
+fn map_engine_err(e: EngineTunnelError) -> TunnelError {
+    use EngineTunnelError as E;
+    match e {
+        E::QuicConnection { context, source } => TunnelError::Quic { context, source },
+        E::ChannelBindingExport => TunnelError::Tls(tls::WarrenTlsError::ChannelBindingUnavailable),
+        E::ExitAuthFailed => TunnelError::ExitIdentityMismatch,
+        E::AuthRejected => TunnelError::AuthRejected,
+        E::DeviceLimitReached => TunnelError::DeviceLimitReached,
+        E::QuicStream { source, .. } | E::SetupWire { source, .. } => TunnelError::HandshakeIo {
+            context: "setup handshake",
+            source,
+        },
+        E::QuicSendDatagram { source, .. } => TunnelError::SendDatagram(source),
+        E::QuicReadDatagram { source, .. } => TunnelError::ReadDatagram(source),
+        other => TunnelError::Internal(other.to_string()),
+    }
 }
 
 impl From<QuicDialError> for TunnelError {
@@ -385,9 +434,10 @@ impl ClientTunnel {
     /// # Production reality
     ///
     /// Production warren-core exits read an HPKE-sealed multihop frame as the
-    /// first frame on every connection and reject a bare [`Setup`] with `malformed
-    /// setup frame`. This single-hop path therefore only completes against the
-    /// in-repo fake exits and test harnesses; the live datapath is
+    /// first frame on every connection and reject a bare
+    /// [`Setup`](warren_wire::Setup) with `malformed setup frame`. This
+    /// single-hop path therefore only completes against the in-repo fake
+    /// exits and test harnesses; the live datapath is
     /// [`MultihopClientTunnel`](crate::MultihopClientTunnel). Use this only for
     /// local/test exits, not to reach a real exit.
     ///
@@ -413,91 +463,46 @@ impl ClientTunnel {
         )
         .await?;
 
-        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| TunnelError::Quic {
-            context: "open_bi",
-            source: e,
-        })?;
-
-        // v5 in-band client auth: sign this connection's channel binding (bound
-        // to the device_id) with the client identity key; the exit verifies it
-        // before admitting the session (the exit requests no TLS client cert).
-        let cb = tls::channel_binding(&conn).map_err(TunnelError::Tls)?;
-        let setup = Setup {
-            protocol_version: warren_wire::PROTOCOL_VERSION,
-            features: self.features,
-            connection_index: 0,
-            total_connections: 1,
-            daita_support: self.daita_support,
-            device_id: self.device_id,
-            client_pubkey: self.signing_key.verifying_key().to_bytes(),
-            auth_sig: warren_wire::AuthSig(tls::sign_client_auth(
-                &self.signing_key,
-                &cb,
-                &self.device_id,
-            )),
-        };
-        send.write_all(&encode_setup(&setup)?)
+        // The Setup/SetupAck handshake (the v5 in-band client auth proof and
+        // the wg-0005 Stage 1 in-band exit-identity proof) is delegated to the
+        // shared engine `ClientTunnel`, so that protocol logic lives once,
+        // shared with warren-core. This SDK keeps only its own dial glue
+        // (`dial_quic`, above): `auto_local_ip` detection and the fork-patched
+        // `transport_config` override, neither of which the engine's own
+        // `bind_client_endpoint` supports.
+        let inner = warrenguard_transport::ClientTunnel::with_signing_key(&self.signing_key)
+            .with_features(self.features)
+            .with_daita(self.daita_support)
+            .with_device_id(self.device_id);
+        let session = inner
+            .from_established_connection(endpoint, conn, tls::WarrenPubkey::from_bytes(exit_pubkey))
             .await
-            .map_err(|e| TunnelError::HandshakeIo {
-                context: "write setup",
-                source: Box::new(e),
-            })?;
-        send.finish().map_err(|e| TunnelError::HandshakeIo {
-            context: "finish setup",
-            source: Box::new(e),
-        })?;
-
-        let ack_bytes = recv.read_to_end(MAX_SETUP_FRAME_BYTES).await.map_err(|e| {
-            TunnelError::HandshakeIo {
-                context: "read setup_ack",
-                source: Box::new(e),
-            }
-        })?;
-        let ack = decode_setup_ack(&ack_bytes)?;
+            .map_err(map_engine_err)?;
+        let conn = session.clone_conn();
 
         Ok(ClientSession {
-            _endpoint: endpoint,
+            inner: session,
             conn,
-            assigned_ipv4: Ipv4Addr::from(ack.tunnel_ipv4),
-            assigned_ipv6: ack.tunnel_ipv6.map(Ipv6Addr::from),
-            assigned_max_mtu: ack.max_mtu,
             exit_pubkey,
-            negotiated_daita: ack.daita_spec,
         })
     }
 }
 
-/// First byte of a DAITA cover (dummy) datagram. Not a valid IP version nibble
-/// (4 or 6), so the exit drops it; same convention as the multihop data plane.
-const DAITA_DUMMY_FIRST_BYTE: u8 = 0xFF;
-
-/// Converts a negotiated wire DAITA spec into a runnable maybenot state. Shared
-/// by [`ClientSession::build_daita_state`] and its tests.
-fn daita_state_from_spec(
-    spec: &warren_wire::DaitaConfig,
-    start_time: std::time::Instant,
-) -> Result<warren_daita::DaitaState, warren_daita::DaitaError> {
-    let cfg = warren_daita::DaitaConfig::from_specs(
-        spec.machine_specs.clone(),
-        spec.max_padding_frac,
-        spec.max_blocking_frac,
-    );
-    warren_daita::DaitaState::from_config(&cfg, start_time)
-}
-
-/// An established tunnel session over which IP packets travel as QUIC datagrams.
+/// An established tunnel session over which IP packets travel as QUIC
+/// datagrams. Thin wrapper over the shared engine
+/// [`warrenguard_transport::ClientSession`]: the Setup/SetupAck
+/// handshake and the datagram plane live once, in `warrenguard-transport`,
+/// shared with warren-core.
 pub struct ClientSession {
-    // Held so the endpoint outlives the connection.
-    _endpoint: quinn::Endpoint,
+    inner: warrenguard_transport::ClientSession,
+    // A cheap clone of the engine's connection (`quinn::Connection` is an
+    // Arc-backed handle), for `Self::connection`'s `&self -> &Connection`
+    // borrow contract: the engine only exposes to-be-cloned accessors.
     conn: quinn::Connection,
-    assigned_ipv4: Ipv4Addr,
-    assigned_ipv6: Option<Ipv6Addr>,
-    assigned_max_mtu: u16,
+    // Kept SDK-side: the engine session does not retain the dialed pubkey
+    // (it only checks it during the handshake), and `Self::exit_pubkey` is a
+    // caller convenience predating the delegation.
     exit_pubkey: [u8; 32],
-    /// The DAITA machine spec the exit negotiated in the `SetupAck`, if any.
-    /// Single-hop DAITA is negotiated (unlike the client-unilateral multihop
-    /// path): the exit dictates the schedule both sides run.
-    negotiated_daita: Option<warren_wire::DaitaConfig>,
 }
 
 // Manual Debug (no-log discipline): the quinn `conn` renders the peer/local
@@ -512,8 +517,8 @@ impl std::fmt::Debug for ClientSession {
                 "exit_pubkey",
                 &format_args!("{:02x}{:02x}{:02x}{:02x}..", b[0], b[1], b[2], b[3]),
             )
-            .field("assigned_max_mtu", &self.assigned_max_mtu)
-            .field("daita", &self.negotiated_daita.is_some())
+            .field("assigned_max_mtu", &self.inner.assigned_max_mtu())
+            .field("daita", &self.inner.daita_spec().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -522,19 +527,19 @@ impl ClientSession {
     /// The tunnel IPv4 the exit assigned to this session.
     #[must_use]
     pub fn assigned_ipv4(&self) -> Ipv4Addr {
-        self.assigned_ipv4
+        self.inner.assigned_ipv4()
     }
 
     /// The tunnel IPv6 the exit assigned, if any.
     #[must_use]
     pub fn assigned_ipv6(&self) -> Option<Ipv6Addr> {
-        self.assigned_ipv6
+        self.inner.assigned_ipv6()
     }
 
     /// The negotiated maximum MTU.
     #[must_use]
     pub fn assigned_max_mtu(&self) -> u16 {
-        self.assigned_max_mtu
+        self.inner.assigned_max_mtu()
     }
 
     /// The exit's authenticated pubkey.
@@ -547,7 +552,7 @@ impl ClientSession {
     /// enabled for this single-hop session (`None` if the exit disabled it).
     #[must_use]
     pub fn negotiated_daita(&self) -> Option<&warren_wire::DaitaConfig> {
-        self.negotiated_daita.as_ref()
+        self.inner.daita_spec()
     }
 
     /// Builds a [`warren_daita::DaitaState`] from the exit-negotiated spec, ready
@@ -563,15 +568,13 @@ impl ClientSession {
         &self,
         start_time: std::time::Instant,
     ) -> Option<Result<warren_daita::DaitaState, warren_daita::DaitaError>> {
-        let spec = self.negotiated_daita.as_ref()?;
-        Some(daita_state_from_spec(spec, start_time))
+        self.inner.build_daita_state(start_time)
     }
 
     /// The largest inner payload a cover datagram can carry on the current path.
     #[must_use]
     pub fn max_inner_payload(&self) -> usize {
-        const BASE_MTU: usize = 1280;
-        self.conn.max_datagram_size().unwrap_or(BASE_MTU)
+        self.inner.max_inner_payload()
     }
 
     /// Sends one DAITA cover (dummy) datagram: a `0xFF` tag followed by
@@ -583,16 +586,15 @@ impl ClientSession {
     /// [`TunnelError::SendDatagram`] if the datagram is too large or the
     /// connection is closing.
     pub fn send_cover_traffic(&self, padding_len: usize) -> Result<(), TunnelError> {
-        let mut dummy = Vec::with_capacity(padding_len + 1);
-        dummy.push(DAITA_DUMMY_FIRST_BYTE);
-        dummy.resize(padding_len + 1, 0u8);
-        self.send_datagram(dummy)
+        self.inner
+            .send_cover_traffic(padding_len)
+            .map_err(map_engine_err)
     }
 
     /// The largest datagram payload the current path can carry, if known.
     #[must_use]
     pub fn max_datagram_size(&self) -> Option<usize> {
-        self.conn.max_datagram_size()
+        self.inner.max_datagram_size()
     }
 
     /// The underlying quinn connection (for the pump and advanced callers).
@@ -611,9 +613,9 @@ impl ClientSession {
     /// [`TunnelError::SendDatagram`] if the datagram is too large or the
     /// connection is closing.
     pub fn send_datagram(&self, payload: impl Into<bytes::Bytes>) -> Result<(), TunnelError> {
-        self.conn
-            .send_datagram(payload.into())
-            .map_err(TunnelError::SendDatagram)
+        self.inner
+            .send_datagram_bytes(payload)
+            .map_err(map_engine_err)
     }
 
     /// Awaits the next inbound datagram, returning the zero-copy [`bytes::Bytes`]
@@ -623,15 +625,12 @@ impl ClientSession {
     ///
     /// [`TunnelError::ReadDatagram`] if the connection closed.
     pub async fn read_datagram(&self) -> Result<bytes::Bytes, TunnelError> {
-        self.conn
-            .read_datagram()
-            .await
-            .map_err(TunnelError::ReadDatagram)
+        self.inner.read_datagram().await.map_err(map_engine_err)
     }
 
     /// Closes the connection cleanly.
     pub fn disconnect(&self) {
-        self.conn.close(0u32.into(), b"client disconnect");
+        self.inner.disconnect();
     }
 }
 
@@ -652,32 +651,75 @@ mod tests {
     use super::*;
     use std::error::Error;
 
-    #[test]
-    fn negotiated_daita_spec_builds_a_runnable_state() {
-        // The negotiated single-hop spec must flow from the wire DaitaConfig into
-        // a runnable maybenot DaitaState (consuming the SetupAck.daita_spec that
-        // was previously discarded). Use a real curated machine spec.
+    #[tokio::test]
+    async fn negotiated_daita_flows_through_the_delegated_session() {
+        // Regression: the exit-negotiated DAITA spec must flow from the
+        // delegated engine SetupAck all the way to a runnable maybenot state,
+        // through `ClientSession::negotiated_daita` / `build_daita_state`.
+        // The maybenot construction itself (including the unparseable-spec
+        // error path) is covered by the engine's own
+        // `warrenguard_transport::client` tests; this test proves the
+        // wrapper's delegation wiring, not the framework internals.
+        let exit_key = SigningKey::from_bytes(&[0x51; 32]);
+        let exit_pubkey = exit_key.verifying_key().to_bytes();
         let machine = warren_daita::DaitaPool::default_pool()
             .pick_named_os("tamaraw")
             .expect("tamaraw is in the pool");
-        let spec = warren_wire::DaitaConfig {
+        let daita_spec = warren_wire::DaitaConfig {
             machine_specs: machine.machine_specs.clone(),
             max_padding_frac: machine.max_padding_frac,
             max_blocking_frac: machine.max_blocking_frac,
         };
-        let state = daita_state_from_spec(&spec, std::time::Instant::now())
-            .expect("a valid negotiated spec builds a state");
-        assert!(state.is_enabled());
-    }
 
-    #[test]
-    fn an_unparseable_negotiated_machine_spec_is_an_error() {
-        let spec = warren_wire::DaitaConfig {
-            machine_specs: vec!["not-a-valid-machine".to_owned()],
-            max_padding_frac: 0.1,
-            max_blocking_frac: 0.1,
-        };
-        assert!(daita_state_from_spec(&spec, std::time::Instant::now()).is_err());
+        let cfg = tls::make_server_config(&exit_key, tls::default_crypto_provider(), &[b"h3"])
+            .expect("server config");
+        let endpoint =
+            quinn::Endpoint::server(cfg, "127.0.0.1:0".parse().unwrap()).expect("server bind");
+        let addr = endpoint.local_addr().expect("local addr");
+        let server_spec = daita_spec.clone();
+        tokio::spawn(async move {
+            let conn = endpoint
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("handshake");
+            let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
+            recv.read_to_end(65536).await.expect("read setup");
+            let cb = tls::channel_binding(&conn).expect("server channel binding");
+            let ack = warren_wire::SetupAck {
+                protocol_version: warren_wire::PROTOCOL_VERSION,
+                tunnel_ipv4: [10, 88, 0, 2],
+                tunnel_ipv6: None,
+                exit_pubkey,
+                max_mtu: 1350,
+                multiconn_attached: true,
+                daita_spec: Some(server_spec),
+                exit_auth_sig: warren_wire::AuthSig(tls::sign_server_auth(&exit_key, &cb)),
+            };
+            send.write_all(&warren_wire::encode_setup_ack(&ack).expect("encode ack"))
+                .await
+                .expect("write ack");
+            send.finish().expect("finish");
+            // Keep the connection (and its endpoint) alive until the client
+            // closes it, or dropping `endpoint` here could race the FIN flush
+            // and abort the reply before the client finishes reading it.
+            while conn.read_datagram().await.is_ok() {}
+            drop(endpoint);
+        });
+
+        let client_key = SigningKey::from_bytes(&[0x22; 32]);
+        let session = ClientTunnel::new(client_key)
+            .connect(exit_pubkey, addr)
+            .await
+            .expect("connect must succeed against a correctly-signed exit_auth_sig");
+
+        assert!(session.negotiated_daita().is_some());
+        let state = session
+            .build_daita_state(std::time::Instant::now())
+            .expect("daita_spec was negotiated, so build_daita_state must return Some")
+            .expect("the curated tamaraw spec must build a valid DaitaState");
+        assert!(state.is_enabled());
     }
 
     #[test]

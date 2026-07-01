@@ -3251,6 +3251,7 @@ dependencies = [
  "warrenguard-multihop",
  "warrenguard-tls",
  "warrenguard-transport",
+ "warrenguard-transport-core",
 ]
 
 [[package]]
