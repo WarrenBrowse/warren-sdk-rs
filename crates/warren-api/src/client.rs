@@ -477,6 +477,14 @@ fn unix_secs_from(t: std::time::SystemTime) -> Result<u64, ClientError> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use warren_contract::dto::{PubkeyHex, PubkeySs58};
+
+    fn a_ss58() -> PubkeySs58 {
+        PubkeySs58::try_from(warren_contract::ss58::encode(&[0xAA; 32])).unwrap()
+    }
+    fn a_pubkey_hex() -> PubkeyHex {
+        PubkeyHex::try_from("ab".repeat(32)).unwrap()
+    }
     use warren_identity::{HEADER_NONCE, HEADER_PUBKEY, HEADER_SIGNATURE, HEADER_TIMESTAMP};
 
     /// A transport that records the last request and returns a canned response.
@@ -751,7 +759,7 @@ mod tests {
     async fn register_is_unsigned_post_and_parses() {
         let c = client(MockTransport::new(200, r#"{"expires_at":123}"#));
         let req = RegisterAccountRequest {
-            pubkey_ss58: "wbAAA".to_owned(),
+            pubkey_ss58: a_ss58(),
             voucher_secret: "voucher".to_owned(),
             referral_code: None,
         };
@@ -788,7 +796,7 @@ mod tests {
             r#"{"admitted":true,"max":5,"current":1}"#,
         ));
         let req = SessionOpenRequest {
-            pubkey_ss58: "wbAAA".to_owned(),
+            pubkey_ss58: a_ss58(),
             device_id_hex: "00".repeat(16),
             exit_id: "exit".to_owned(),
             max_devices: None,
@@ -808,7 +816,7 @@ mod tests {
     async fn close_session_is_signed_post_returning_unit() {
         let c = client(MockTransport::new(200, ""));
         let req = SessionCloseRequest {
-            pubkey_ss58: "wbAAA".to_owned(),
+            pubkey_ss58: a_ss58(),
             device_id_hex: "00".repeat(16),
         };
         c.close_session(&req).await.expect("ok");
@@ -947,7 +955,7 @@ mod tests {
     async fn report_exit_down_is_signed_post_with_screaming_reason() {
         let c = client(MockTransport::new(204, ""));
         let req = IncidentExitDownRequest {
-            exit_pubkey_hex: "ab".repeat(32),
+            exit_pubkey_hex: a_pubkey_hex(),
             reason_code: crate::dto::IncidentReason::HandshakeFail,
             ts_unix: 1_700_000_123,
         };
@@ -1020,7 +1028,7 @@ mod tests {
     async fn report_exit_down_422_is_server_status() {
         let c = client(MockTransport::new(422, "unknown reason_code"));
         let req = IncidentExitDownRequest {
-            exit_pubkey_hex: "ab".repeat(32),
+            exit_pubkey_hex: a_pubkey_hex(),
             reason_code: crate::dto::IncidentReason::Timeout,
             ts_unix: 1,
         };

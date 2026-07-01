@@ -20,8 +20,9 @@ pub use client::{ClientError, WarrenApiClient};
 pub use dto::{
     CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
     IncidentPubkeyMismatchRequest, IncidentReason, InitApplePaymentResponse, MobilePaymentResponse,
-    RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest, SessionOpenRequest,
-    SessionOpenResponse, SubscriptionResponse, SupportReportRequest, SupportReportResponse,
+    PubkeyHex, PubkeySs58, RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest,
+    SessionOpenRequest, SessionOpenResponse, SubscriptionResponse, SupportReportRequest,
+    SupportReportResponse,
 };
 pub use transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 

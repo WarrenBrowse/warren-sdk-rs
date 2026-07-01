@@ -32,7 +32,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use warren_sdk::api::{ClientError, RegisterAccountRequest, SupportReportRequest};
+use warren_sdk::api::{ClientError, PubkeySs58, RegisterAccountRequest, SupportReportRequest};
 use warren_sdk::identity::{WarrenIdentity, ss58};
 use warren_sdk::net::{ForwardedPort, MapProto, ProxyConfig};
 use warren_sdk::transport::{Backoff, ConnectionState, RetryError, connect_with_state};
@@ -537,7 +537,8 @@ impl WarrenFfiClient {
     /// failure.
     pub async fn redeem_voucher(&self, voucher_secret: String) -> Result<u64, FfiError> {
         let req = RegisterAccountRequest {
-            pubkey_ss58: self.inner.api().address(),
+            pubkey_ss58: PubkeySs58::try_from(self.inner.api().address())
+                .expect("client identity address is a valid Warren SS58 by construction"),
             voucher_secret,
             referral_code: None,
         };

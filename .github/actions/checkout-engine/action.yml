@@ -25,3 +25,11 @@ runs:
           ../warrenguard
         git -C ../warrenguard checkout --quiet "${REV}"
         echo "==> warrenguard checked out at $(git -C ../warrenguard rev-parse --short HEAD)"
+        CONTRACT_REV="$(tr -d '[:space:]' < .warren-contract-version)"
+        echo "==> warren-contract pinned at ${CONTRACT_REV}"
+        rm -rf ../warren-contract
+        git clone --quiet \
+          "https://x-access-token:${ENGINE_TOKEN}@github.com/WarrenBrowse/warren-contract.git" \
+          ../warren-contract
+        git -C ../warren-contract checkout --quiet "${CONTRACT_REV}"
+        echo "==> warren-contract checked out at $(git -C ../warren-contract rev-parse --short HEAD)"
