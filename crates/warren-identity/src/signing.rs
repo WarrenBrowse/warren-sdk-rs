@@ -1,24 +1,12 @@
-//! Canonical signing of Warren API requests (`X-Warren-*` headers).
+//! Client-side signing of Warren API requests (`X-Warren-*` headers).
 //!
-//! Canonical format (frozen, never change without rotating to `/v2`):
-//!
-//! ```text
-//! message = METHOD || "\n" || path || "\n" || timestamp || "\n" || nonce_hex || "\n" || sha256_hex(body)
-//! sig     = Ed25519::sign(secret_key, message)
-//! ```
-//!
-//! The server verifier (warren-core `warren-identity::auth`) rebuilds the exact
-//! same string, so any drift here breaks every signature. The format is pinned
-//! by `vectors/identity.json`.
+//! The header names and the canonical message live in `warren-contract`, shared
+//! with the server verifier so they cannot drift. This module adds the
+//! client-side [`RequestSignature`] header bundle.
 
-/// Canonical name of the pubkey header (value: Warren SS58 `wb…` address).
-pub const HEADER_PUBKEY: &str = "X-Warren-PubKey";
-/// Canonical name of the signature header (value: 128 hex chars).
-pub const HEADER_SIGNATURE: &str = "X-Warren-Sig";
-/// Canonical name of the epoch-seconds timestamp header.
-pub const HEADER_TIMESTAMP: &str = "X-Warren-Timestamp";
-/// Canonical name of the 32-char hex nonce header.
-pub const HEADER_NONCE: &str = "X-Warren-Nonce";
+pub use warren_contract::auth::{
+    HEADER_NONCE, HEADER_PUBKEY, HEADER_SIGNATURE, HEADER_TIMESTAMP, canonical_message,
+};
 
 /// A signed request's authentication material, ready to be attached as the four
 /// `X-Warren-*` headers.
@@ -48,53 +36,9 @@ impl RequestSignature {
     }
 }
 
-/// Builds the canonical message that is signed and verified.
-///
-/// Format frozen: never change without rotating to `/v2`. Must stay strictly
-/// identical to the server-side verifier, otherwise no signature verifies.
-#[must_use]
-pub fn canonical_message(
-    method: &str,
-    path: &str,
-    timestamp: u64,
-    nonce_hex: &str,
-    body_hash_hex: &str,
-) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(
-        method.len() + path.len() + 20 + nonce_hex.len() + body_hash_hex.len() + 4,
-    );
-    s.push_str(method);
-    s.push('\n');
-    s.push_str(path);
-    s.push('\n');
-    write!(&mut s, "{timestamp}").expect("write to String is infallible");
-    s.push('\n');
-    s.push_str(nonce_hex);
-    s.push('\n');
-    s.push_str(body_hash_hex);
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn canonical_message_format_is_byte_stable() {
-        let actual = canonical_message("GET", "/v1/exits", 42, "abcd1234", "ff00");
-        assert_eq!(
-            actual, "GET\n/v1/exits\n42\nabcd1234\nff00",
-            "wire format change - bump auth schema version"
-        );
-    }
-
-    #[test]
-    fn canonical_message_uses_unix_newline_separator() {
-        let actual = canonical_message("GET", "/x", 1, "a", "b");
-        assert!(!actual.contains('\r'), "canonical must never contain CR");
-        assert_eq!(actual.matches('\n').count(), 4, "exactly 4 LF separators");
-    }
 
     #[test]
     fn headers_carry_all_four_fields() {
