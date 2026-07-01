@@ -27,6 +27,10 @@ ignore = [
     # warren-core ignores the same. Upgrade path: migrate warrenguard-tls's
     # certs.rs to rustls_pki_types::pem::PemObject.
     "RUSTSEC-2025-0134",
+    # paste: unmaintained but feature-complete proc-macro, pulled transitively.
+    # Compile-time code generation only, no runtime surface. warren-core and
+    # warren-app ignore the same.
+    "RUSTSEC-2024-0436",
 ]
 
 [licenses]
