@@ -19,6 +19,12 @@ env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-D warnings"
 
+concurrency:
+  # A single self-hosted Linux runner serves these jobs; cancel superseded runs
+  # on the same ref so a burst of pushes cannot pile up a long serial backlog.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   fmt:
     name: cargo fmt
