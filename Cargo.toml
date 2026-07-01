@@ -62,6 +62,14 @@ warrenguard-transport = { git = "https://github.com/WarrenBrowse/warrenguard.git
 # needed directly so `warren-transport` can name and map its variants.
 warrenguard-transport-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6f5f263adf600b08b48f4aa8dbd28e5c026a0403" }
 
+# Neutral client<->server contract (SS58, X-Warren signing, /v1 DTOs) and the
+# signed-relay-list discovery core. Git-dep + rev so the SDK self-resolves for a
+# downstream consumer with no sibling checkout; local dev and CI override with
+# the `../warren-contract` sibling via the `[patch]` at the foot of this file.
+# Keep the rev in lockstep with `.warren-contract-version`.
+warren-contract = { git = "https://github.com/WarrenBrowse/warren-contract.git", rev = "19b6a1c1aa3805211101daaa009ea9d3877cca20" }
+warren-discovery-core = { git = "https://github.com/WarrenBrowse/warren-contract.git", rev = "19b6a1c1aa3805211101daaa009ea9d3877cca20" }
+
 # Identity / crypto. Leaf RustCrypto and ecosystem crates, kept minimal
 # so each can be mapped 1:1 to the other language SDKs.
 ed25519-dalek = { version = "2", features = ["zeroize", "rand_core"] }
@@ -170,3 +178,7 @@ warrenguard-tun-device = { path = "../warrenguard/crates/warrenguard-tun-device"
 warrenguard-backoff = { path = "../warrenguard/crates/warrenguard-backoff" }
 warrenguard-transport = { path = "../warrenguard/crates/warrenguard-transport" }
 warrenguard-transport-core = { path = "../warrenguard/crates/warrenguard-transport-core" }
+
+[patch."https://github.com/WarrenBrowse/warren-contract.git"]
+warren-contract = { path = "../warren-contract" }
+warren-discovery-core = { path = "../warren-contract/warren-discovery" }

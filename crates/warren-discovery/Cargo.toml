@@ -19,7 +19,7 @@ test-helpers = ["warren-discovery-core/test-helpers"]
 warren-identity = { path = "../warren-identity" }
 # The neutral single-source discovery crate (shared with the backend); this
 # crate delegates the verifiers to it so there is one implementation.
-warren-discovery-core = { path = "../../../warren-contract/warren-discovery" }
+warren-discovery-core = { workspace = true }
 ed25519-dalek = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

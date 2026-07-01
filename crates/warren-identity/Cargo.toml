@@ -11,7 +11,7 @@ publish.workspace = true
 
 [dependencies]
 warrenguard-identity = { workspace = true }
-warren-contract = { path = "../../../warren-contract" }
+warren-contract = { workspace = true }
 ed25519-dalek = { workspace = true }
 bip39 = { workspace = true }
 thiserror = { workspace = true }

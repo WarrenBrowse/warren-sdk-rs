@@ -10,7 +10,7 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
-warren-contract = { path = "../../../warren-contract" }
+warren-contract = { workspace = true }
 warren-identity = { path = "../warren-identity" }
 serde = { workspace = true }
 serde_json = { workspace = true }
