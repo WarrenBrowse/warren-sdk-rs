@@ -59,3 +59,9 @@ allow-wildcard-paths = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[sources.allow-org]
+# All Warren git deps live under the WarrenBrowse org: the warren-quinn fork
+# (consumed by tag, no local patch), plus warrenguard and warren-contract when a
+# downstream consumer resolves them from git instead of a sibling `[patch]`.
+github = ["WarrenBrowse"]
