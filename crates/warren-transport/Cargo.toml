@@ -16,6 +16,11 @@ warrenguard-tls = { workspace = true }
 # Direct engine dep for the relay-auth proof codec (decode_relay_auth_proof,
 # RELAY_AUTH_PROOF_LEN) used in the X.509 cover-domain handshake (ADR-0004).
 warrenguard-multihop = { workspace = true }
+# The multihop protocol engine (HPKE seal/open, rekey/epoch, setup-over-stream,
+# datagram send/recv): MultihopSession/MultihopClientTunnel below own a
+# `warrenguard_transport::multihop::MultiHopClient` and delegate to it, so the
+# protocol logic lives once, shared with warren-core via the same engine crate.
+warrenguard-transport = { workspace = true }
 # Full-jitter reconnection backoff, single-homed in the engine (re-exported by
 # the `reconnect` module so the SDK and warren-core share one schedule).
 warrenguard-backoff = { workspace = true }

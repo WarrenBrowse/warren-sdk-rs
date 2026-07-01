@@ -1,6 +1,6 @@
 //! Multihop QUIC client tunnel (the handshake real exits actually require).
 //!
-//! Production exits read an HPKE-sealed [`WarrenMultihopFrame`] as the first
+//! Production exits read an HPKE-sealed [`WarrenMultihopFrame`](warren_wire::multihop::WarrenMultihopFrame) as the first
 //! frame on every connection (single-hop included), not a bare
 //! [`Setup`](warren_wire::Setup): a raw Setup is rejected with `malformed setup
 //! frame`. This module implements that path:
@@ -35,34 +35,35 @@
 //! live against the real `warren-core` exit (see the `real_exit_tests` module).
 //! The reverse direction is anti-replay-protected by a per-epoch sliding window,
 //! so the new epoch's low sequence numbers are not mistaken for replays.
+//!
+//! The multihop wire protocol itself (HPKE seal/open, rekey/epoch, the
+//! setup-over-stream exchange, and the anti-replay window) is implemented once,
+//! in the shared engine crate [`warrenguard_transport::multihop::MultiHopClient`]
+//! (also consumed by `warren-core`): [`MultihopSession`] and
+//! [`MultihopClientTunnel`] own one and delegate to it, keeping only the pieces
+//! genuinely specific to this SDK - the TLS dial (this SDK dials the exit
+//! directly, verified via the signed multihop directory, rather than through the
+//! engine's relay-descriptor-verified two-hop [`MultiHopClient::connect`]), the
+//! per-session byte/packet metrics shape, and the drop-and-retry resilience
+//! contract of [`MultihopSession::recv_packet`] (a single malformed, replayed, or
+//! misdirected datagram is dropped and retried, never surfaced as a fatal error).
 
-use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use warren_multihop::{
-    ClientSession as HpkeSession, ExitId, IpAssignment, ReplayWindow, SetupError,
-    parse_exit_x25519_pubkey,
-};
+use warren_multihop::{ExitId, IpAssignment, SetupError};
 use warren_wire::control::{CONTROL_FIRST_BYTE, WarrenControlMessage, try_decode_control};
-use warren_wire::multihop::{EXIT_ID_LEN, WarrenMultihopFrame};
-use warrenguard_multihop::{RELAY_AUTH_PROOF_LEN, decode_relay_auth_proof};
+use warren_wire::multihop::EXIT_ID_LEN;
+use warrenguard_transport::multihop::{
+    MultiHopClient, MultiHopError as EngineMultihopError, RekeyPolicy as EngineRekeyPolicy,
+};
 
 use crate::client::{QuicDialError, dial_quic, dial_quic_webpki, effective_bind};
 use crate::tls;
 
-/// Wall-clock ceiling for receiving the entry relay's in-band identity proof
-/// (ADR-0004) in X.509 cover-domain mode. The proof rides a server-initiated bi
-/// stream sent right after the setup frame arrives. A relay that does not produce
-/// it promptly fails the identity check.
-const RELAY_PROOF_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Largest sealed setup frame accepted on the reliable stream (matches the data
-/// frame ceiling; the setup payload is a few hundred bytes in practice).
-const MAX_SETUP_FRAME_BYTES: usize = 65536;
 /// DAITA dummy first byte (padding traffic), dropped on the receive path.
 const DAITA_DUMMY_FIRST_BYTE: u8 = 0xFF;
 
@@ -133,6 +134,45 @@ impl From<QuicDialError> for MultihopError {
                 source,
             },
         }
+    }
+}
+
+/// Maps a delegated engine [`warrenguard_transport::multihop::MultiHopError`] to
+/// this crate's [`MultihopError`]. Precise for the variants reachable from the
+/// calls this wrapper actually makes
+/// ([`MultiHopClient::from_established_connection`],
+/// [`MultiHopClient::setup_over_stream`],
+/// [`MultiHopClient::send`]/[`send_packet`](MultiHopClient::send_packet),
+/// [`MultiHopClient::rekey`]); the dial-time-only variants
+/// (`RelayPki`/`Tls`/`Bind`/`Connect`/`Handshake`) are never returned by those
+/// calls (this SDK dials via its own [`dial_quic`] / [`dial_quic_webpki`], never
+/// the engine's own `connect()`), and `Rejected` is never constructed on this
+/// path either (a policy refusal rides the sealed `IpAssign`-reply control
+/// message, decoded in [`MultihopClientTunnel::connect`], not this error type).
+/// Those unreachable variants map generically so the match stays exhaustive
+/// against future engine additions.
+fn map_engine_err(e: EngineMultihopError) -> MultihopError {
+    use EngineMultihopError as E;
+    match e {
+        E::Session(inner) => MultihopError::Setup(SetupError::Session(inner)),
+        E::Encode(p) | E::Decode(p) => {
+            MultihopError::Setup(SetupError::Session(warren_multihop::MultihopError::from(p)))
+        }
+        E::Send(inner) => MultihopError::SendDatagram(inner),
+        E::SetupStream { context, detail } => MultihopError::SetupIo {
+            context,
+            source: detail.into(),
+        },
+        E::Recv(inner) => MultihopError::ReadDatagram(inner),
+        E::UnexpectedExitId => MultihopError::ExitIdentityMismatch,
+        E::RelayIdentity(reason) => MultihopError::RelayIdentity(reason),
+        E::RelayPki(_)
+        | E::Tls(_)
+        | E::Bind { .. }
+        | E::Connect(_)
+        | E::Handshake(_)
+        | E::Rejected(_)
+        | E::Replay { .. } => MultihopError::Setup(SetupError::UnexpectedReply),
     }
 }
 
@@ -277,7 +317,8 @@ impl MultihopClientTunnel {
         // exactly like a browser. In RPK mode (no cover domain), pin the relay's
         // Ed25519 pubkey in the SNI and use the raw-public-key verifier. The
         // relay's Warren identity is verified in-band after the setup frame is
-        // sent (cover-domain mode) or at the TLS layer (RPK mode).
+        // sent (cover-domain mode, inside `setup_over_stream` below) or at the
+        // TLS layer (RPK mode).
         let (endpoint, conn) = if let Some(ref domain) = self.cover_domain {
             dial_quic_webpki(
                 domain,
@@ -296,125 +337,74 @@ impl MultihopClientTunnel {
             .await?
         };
 
-        // Build the per-session HPKE context (one KEM ECDH against the exit's
-        // X25519 multihop key); its encapsulated key rides every frame.
-        let exit_x25519_key = parse_exit_x25519_pubkey(&exit_x25519)
-            .map_err(|e| MultihopError::Setup(SetupError::Session(e)))?;
-        let session = HpkeSession::new(
-            &exit_x25519_key,
+        // X.509 cover-domain mode (ADR-0004): `exit_pubkey` doubles as the
+        // expected relay identity for the in-band proof; the engine verifies it
+        // internally (inside `setup_over_stream`, right after the setup frame is
+        // written and before the reply is read). RPK mode (no cover domain)
+        // pins the identity at the TLS layer already and needs no in-band proof.
+        let relay_auth_pubkey = self
+            .cover_domain
+            .is_some()
+            .then(|| tls::WarrenPubkey::from_bytes(exit_pubkey));
+
+        let mut inner = MultiHopClient::from_established_connection(
+            endpoint,
+            conn.clone(),
             ExitId::from_bytes(exit_id),
-            &mut rand_core::UnwrapErr(rand_core::OsRng),
+            &exit_x25519,
+            relay_auth_pubkey,
         )
-        .map_err(|e| MultihopError::Setup(SetupError::Session(e)))?;
+        .map_err(map_engine_err)?;
+        // This SDK's rekey timing is caller-driven, via `RekeyPolicy` /
+        // `MultihopSession::rekey` below (warren-core's own 8h/5s doctrine), not
+        // the engine's internal frame-count/age auto-trigger (10M frames / 30 min
+        // by default): disable it so `setup_over_stream` / `send_packet` never
+        // rekey on our behalf, only when the caller asks.
+        inner.set_rekey_policy(EngineRekeyPolicy {
+            max_frames: u64::MAX,
+            max_age: Duration::MAX,
+        });
 
-        // Seal the setup IpRequest as the first forward frame (epoch 0, seq 0)
-        // and send it on a reliable bidi stream; read the sealed reply.
-        let request = session
-            .seal_setup_request(Some(&self.signing_key), None, self.wants_ipv6, 0, 0)
-            .map_err(MultihopError::Setup)?;
-        let request_bytes = request.encode().map_err(MultihopError::Frame)?;
-
-        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| MultihopError::Quic {
-            context: "open_bi",
-            source: e,
-        })?;
-        send.write_all(&request_bytes)
+        let opened = inner
+            .setup_over_stream(Some(&self.signing_key), self.wants_ipv6)
             .await
-            .map_err(|e| MultihopError::SetupIo {
-                context: "write request",
-                source: Box::new(e),
-            })?;
-        send.finish().map_err(|e| MultihopError::SetupIo {
-            context: "finish request",
-            source: Box::new(e),
-        })?;
+            .map_err(map_engine_err)?;
 
-        // ADR-0004: in X.509 cover-domain mode, now that the setup frame is on
-        // the wire (proving to the relay that this is a Warren client), verify the
-        // relay's in-band identity proof BEFORE reading the reply or forwarding
-        // any data. A man-in-the-middle holding only a valid cover-domain cert
-        // cannot forge this proof. RPK mode pins the identity at the TLS layer and
-        // needs no in-band proof.
-        if self.cover_domain.is_some() {
-            let relay_pubkey = tls::WarrenPubkey::from_bytes(exit_pubkey);
-            verify_relay_proof(&conn, &relay_pubkey).await?;
-        }
-
-        let reply_bytes =
-            recv.read_to_end(MAX_SETUP_FRAME_BYTES)
-                .await
-                .map_err(|e| MultihopError::SetupIo {
-                    context: "read reply",
-                    source: Box::new(e),
-                })?;
-
-        let reply_frame =
-            WarrenMultihopFrame::decode(&reply_bytes).map_err(MultihopError::Frame)?;
-        // Authenticate the reply (open_setup_reply) before committing its seq to
-        // the reverse window.
-        let assignment = session
-            .open_setup_reply(&reply_frame)
-            .map_err(MultihopError::Setup)?;
-        let mut replay = EpochReplay::new();
-        // The setup reply cannot be a replay (fresh window), but recording it
-        // keeps a later data datagram from reusing that (epoch, seq).
-        let _ = replay.check_and_record(reply_frame.seq, reply_frame.epoch);
+        // `setup_over_stream` succeeds once the reply authenticates, regardless
+        // of which control message it carries (a `Rejected` / `IpExhausted`
+        // policy refusal opens just as cleanly as an `IpAssign`), so interpret
+        // `opened` exactly like `ClientSession::open_setup_reply` would. The
+        // engine already decoded a successful `IpAssign` as a side effect
+        // (`MultiHopClient::assignment`); read it back rather than
+        // reconstructing it here (`IpAssignment` is `#[non_exhaustive]` outside
+        // its defining crate, so this wrapper cannot build one itself).
+        let assignment = match try_decode_control(&opened) {
+            Ok(Some(WarrenControlMessage::IpAssign { .. })) => inner.assignment().expect(
+                "MultiHopClient::setup_over_stream captures the assignment for every IpAssign reply",
+            ),
+            Ok(Some(WarrenControlMessage::Rejected)) => {
+                return Err(MultihopError::Setup(SetupError::Rejected));
+            }
+            Ok(Some(WarrenControlMessage::IpExhausted)) => {
+                return Err(MultihopError::Setup(SetupError::IpExhausted));
+            }
+            Ok(Some(
+                WarrenControlMessage::IpRequest { .. } | WarrenControlMessage::ExitDraining { .. },
+            ))
+            | Ok(None) => {
+                return Err(MultihopError::Setup(SetupError::UnexpectedReply));
+            }
+            Err(e) => return Err(MultihopError::Setup(SetupError::Control(e))),
+        };
 
         Ok(MultihopSession {
-            _endpoint: endpoint,
+            inner,
             conn,
-            session: RwLock::new(session),
-            exit_id,
-            exit_x25519,
-            // Setup consumed forward seq 0; data starts at 1.
-            seq_send: AtomicU64::new(1),
-            replay: Mutex::new(replay),
             assignment,
             metrics: Arc::new(MultihopMetrics::new(0)),
-            last_rekey_at: Mutex::new(Instant::now()),
             drain_tx: tokio::sync::watch::channel(None).0,
         })
     }
-}
-
-/// Reads and verifies the entry relay's in-band identity proof (ADR-0004), which
-/// the relay sends on a SERVER-initiated bi stream once the client has proven it is
-/// a Warren client by sending its setup frame. The proof is
-/// `RELAY_AUTH_PROOF_VERSION || sig`, where `sig` is the relay's Ed25519 signature
-/// over this connection's channel binding. We verify it against
-/// `expected_relay_pubkey` (the pubkey from the signed relay roster), so a
-/// man-in-the-middle that completed the WebPKI handshake with only a valid
-/// cover-domain certificate is rejected. Fails closed on a missing, malformed, or
-/// mis-signed proof.
-async fn verify_relay_proof(
-    conn: &quinn::Connection,
-    expected_relay_pubkey: &tls::WarrenPubkey,
-) -> Result<(), MultihopError> {
-    let cb = tls::channel_binding(conn).map_err(MultihopError::Tls)?;
-    // The relay opens a SERVER-initiated bi stream carrying the proof; we accept
-    // it here. A bi stream (not a server-initiated uni stream) is used because the
-    // multihop client profile advertises zero peer-initiated uni streams but a
-    // non-zero bidi limit, so no transport-config change is required and delivery
-    // is reliable. The relay always opens (never the client) so the same emit path
-    // is safe on unified relay->exit C2 connections whose dialer simply never
-    // calls accept_bi. We read the proof from the recv half.
-    let (_send, mut recv) = tokio::time::timeout(RELAY_PROOF_TIMEOUT, conn.accept_bi())
-        .await
-        .map_err(|_| MultihopError::RelayIdentity("timed out awaiting relay-auth stream"))?
-        .map_err(|_| MultihopError::RelayIdentity("relay opened no auth stream"))?;
-    let bytes = tokio::time::timeout(RELAY_PROOF_TIMEOUT, recv.read_to_end(RELAY_AUTH_PROOF_LEN))
-        .await
-        .map_err(|_| MultihopError::RelayIdentity("timed out reading relay-auth proof"))?
-        .map_err(|_| MultihopError::RelayIdentity("short or oversized relay-auth proof"))?;
-    let sig = decode_relay_auth_proof(&bytes)
-        .map_err(|_| MultihopError::RelayIdentity("malformed relay-auth proof"))?;
-    if !tls::verify_relay_auth(expected_relay_pubkey, &cb, &sig) {
-        conn.close(quinn::VarInt::from_u32(0), b"relay identity proof failed");
-        return Err(MultihopError::RelayIdentity(
-            "relay-auth signature does not match the expected relay pubkey",
-        ));
-    }
-    Ok(())
 }
 
 /// Live data-plane counters for a multihop session, cheaply shareable (`Arc`):
@@ -477,56 +467,6 @@ pub struct MultihopMetricsSnapshot {
     pub epoch: u32,
     /// Seconds since the session was established.
     pub uptime_secs: u64,
-}
-
-/// How many epochs' reverse anti-replay windows are retained at once. Mirrors
-/// the exit's bound (`REPLAY_EPOCHS_KEPT`): the current epoch plus a few recent
-/// ones cover any in-flight old-epoch reverse frame during a rekey overlap.
-const REKEY_EPOCHS_KEPT: usize = 4;
-
-/// Reverse anti-replay across epochs: each epoch has its own seq space (the
-/// exit restarts the reverse counter per epoch), so a single sliding window
-/// would spuriously reject the new epoch's low seqs after a rekey. This keeps
-/// one [`ReplayWindow`] per epoch, evicting the oldest beyond
-/// [`REKEY_EPOCHS_KEPT`].
-struct EpochReplay {
-    windows: BTreeMap<u32, ReplayWindow>,
-}
-
-impl EpochReplay {
-    fn new() -> Self {
-        Self {
-            windows: BTreeMap::new(),
-        }
-    }
-
-    /// Probe `seq` for `epoch` without recording. An epoch never seen yet
-    /// accepts (its window is created on the matching record).
-    fn check(&self, seq: u64, epoch: u32) -> Result<(), warren_multihop::MultihopError> {
-        match self.windows.get(&epoch) {
-            Some(w) => w.check(seq, epoch),
-            None => Ok(()),
-        }
-    }
-
-    /// Record `seq` for `epoch`, creating the epoch's window on first use and
-    /// evicting the oldest epoch once more than [`REKEY_EPOCHS_KEPT`] are held.
-    fn check_and_record(
-        &mut self,
-        seq: u64,
-        epoch: u32,
-    ) -> Result<(), warren_multihop::MultihopError> {
-        let result = self
-            .windows
-            .entry(epoch)
-            .or_default()
-            .check_and_record(seq, epoch);
-        while self.windows.len() > REKEY_EPOCHS_KEPT {
-            // pop_first removes the lowest epoch key: the oldest, safe to forget.
-            self.windows.pop_first();
-        }
-        result
-    }
 }
 
 /// The session rekey doctrine (warren-core doc 19 § 11.6): rotate the HPKE
@@ -632,28 +572,19 @@ impl DrainAdvisory {
 /// `WarrenMultihopFrame`s over QUIC datagrams.
 ///
 /// The session can rotate its HPKE epoch in place ([`rekey`](Self::rekey)) while
-/// the datapath keeps sealing under `&self`: the inner
-/// [`ClientSession`](warren_multihop::ClientSession) sits
-/// behind an `RwLock` (seals take a read lock, a rekey takes the write lock), so
-/// no datagram is sealed against a half-rotated context.
+/// the datapath keeps sealing under `&self`. All of the wire protocol (HPKE
+/// seal/open, rekey/epoch, anti-replay) is delegated to the shared engine
+/// [`MultiHopClient`]; this type keeps only the SDK-specific per-session byte
+/// metrics, the drain-advisory watch, and the drop-and-retry resilience contract
+/// of [`Self::recv_packet`].
 pub struct MultihopSession {
-    // Held so the endpoint outlives the connection.
-    _endpoint: quinn::Endpoint,
+    inner: MultiHopClient,
+    // A cheap clone of the engine's connection (quinn::Connection is an Arc-backed
+    // handle), for `Self::connection`'s `&self -> &Connection` borrow contract:
+    // the engine only exposes to-be-cloned or higher-level accessors.
     conn: quinn::Connection,
-    session: RwLock<HpkeSession>,
-    exit_id: [u8; EXIT_ID_LEN],
-    // The exit's long-lived X25519 multihop pubkey (raw bytes). Held so a rekey
-    // can re-encapsulate against it: the engine `ClientSession::rekey` takes the
-    // recipient key rather than storing it (the session is recipient-stateless
-    // after setup), so the transport owns the bytes and re-parses per rotation.
-    exit_x25519: [u8; 32],
-    seq_send: AtomicU64,
-    replay: Mutex<EpochReplay>,
     assignment: IpAssignment,
     metrics: Arc<MultihopMetrics>,
-    /// When the current epoch was installed (construction or last rekey); drives
-    /// [`RekeyPolicy::is_due`].
-    last_rekey_at: Mutex<Instant>,
     /// ADR 36: republishes a mid-session `ExitDraining` advisory to the upper
     /// layer. Holds `None` until the exit signals a drain.
     drain_tx: tokio::sync::watch::Sender<Option<DrainAdvisory>>,
@@ -681,7 +612,7 @@ impl MultihopSession {
     /// The largest datagram payload the current path can carry, if known.
     #[must_use]
     pub fn max_datagram_size(&self) -> Option<usize> {
-        self.conn.max_datagram_size()
+        self.inner.max_datagram_size()
     }
 
     /// The largest inner IP packet that fits in one sealed datagram: the path
@@ -689,16 +620,14 @@ impl MultihopSession {
     /// 1280-byte base MTU before the first PMTU probe.
     #[must_use]
     pub fn max_inner_payload(&self) -> usize {
-        const BASE_MTU: usize = 1280;
-        let path = self.conn.max_datagram_size().unwrap_or(BASE_MTU);
-        path.saturating_sub(warren_wire::MULTIHOP_FRAME_MAX_OVERHEAD)
+        self.inner.max_inner_payload()
     }
 
     /// The underlying quinn connection, for read-only inspection (stats, RTT,
     /// path MTU) and the datagram pump's lifecycle wiring.
     ///
     /// INVARIANT: callers MUST NOT send raw datagrams on this connection. Every
-    /// uplink datagram has to be a sealed [`WarrenMultihopFrame`] produced by
+    /// uplink datagram has to be a sealed [`WarrenMultihopFrame`](warren_wire::multihop::WarrenMultihopFrame) produced by
     /// [`Self::send_packet`] / [`Self::send_cover_traffic`]; a raw send would put
     /// cleartext on the wire and break the HPKE confidentiality the exit relies
     /// on. Use the sealing methods for all writes.
@@ -715,33 +644,12 @@ impl MultihopSession {
     /// the frame fails to encode, [`MultihopError::SendDatagram`] if quinn
     /// refuses the datagram.
     pub fn send_packet(&self, ip_packet: &[u8]) -> Result<(), MultihopError> {
-        self.seal_and_send(ip_packet)?;
+        self.inner.send_packet(ip_packet).map_err(map_engine_err)?;
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .bytes_sent
             .fetch_add(ip_packet.len() as u64, Ordering::Relaxed);
         Ok(())
-    }
-
-    /// Seals `plaintext` as the next forward frame and sends it as a datagram,
-    /// advancing the forward sequence. Shared by real packets and cover traffic;
-    /// does not touch the app-data metrics (the caller owns that distinction).
-    fn seal_and_send(&self, plaintext: &[u8]) -> Result<(), MultihopError> {
-        // Read-lock the session for the whole seal: a concurrent rekey holds the
-        // write lock, so the epoch read and the seq bump cannot straddle a
-        // rotation (no frame is sealed at the new epoch with a stale seq, nor at
-        // the old epoch after the seq reset).
-        let guard = self.session.read().unwrap_or_else(|e| e.into_inner());
-        let epoch = guard.epoch();
-        let seq = self.seq_send.fetch_add(1, Ordering::AcqRel);
-        let frame = guard
-            .seal(plaintext, epoch, seq)
-            .map_err(|e| MultihopError::Setup(SetupError::Session(e)))?;
-        drop(guard);
-        let bytes = frame.encode().map_err(MultihopError::Frame)?;
-        self.conn
-            .send_datagram(bytes.into())
-            .map_err(MultihopError::SendDatagram)
     }
 
     /// Rotate the HPKE context: a fresh KEM (new `encapsulated_key`), epoch `+1`,
@@ -757,56 +665,36 @@ impl MultihopSession {
     ///
     /// [`MultihopError::Setup`] if the fresh `setup_sender` fails.
     pub fn rekey(&self) -> Result<u32, MultihopError> {
-        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
-        // The engine session does not retain the recipient key, so re-parse the
-        // exit's X25519 pubkey to re-encapsulate (validated at connect time, so
-        // this cannot realistically fail here).
-        let exit_key = parse_exit_x25519_pubkey(&self.exit_x25519)
-            .map_err(|e| MultihopError::Setup(SetupError::Session(e)))?;
-        let mut guard = self.session.write().unwrap_or_else(|e| e.into_inner());
-        // rekey bumps the session's epoch internally and returns the new
-        // encapsulated key (which now rides every frame); the epoch is read back
-        // under the same write lock.
-        guard
-            .rekey(&exit_key, &mut rng)
-            .map_err(|e| MultihopError::Setup(SetupError::Session(e)))?;
-        let new_epoch = guard.epoch();
-        // Publish the seq reset and epoch under the write lock, before any seal
-        // can observe the new epoch (the write lock excludes all read-lock seals).
-        self.seq_send.store(0, Ordering::SeqCst);
+        let new_epoch = self.inner.rekey().map_err(map_engine_err)?;
         self.metrics.epoch.store(new_epoch, Ordering::Relaxed);
-        drop(guard);
-        *self.last_rekey_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
         Ok(new_epoch)
     }
 
     /// End the rekey overlap: drop the previous-epoch context so old-epoch reverse
     /// frames no longer open. Call once the [`RekeyPolicy::overlap`] deadline
     /// elapses. Idempotent.
+    ///
+    /// The engine also lazily auto-prunes the overlap on its own fixed 5-second
+    /// doctrine TTL (matching [`RekeyPolicy::doctrine`]'s default) the next time
+    /// [`Self::send_packet`] / [`Self::recv_packet`] runs; a caller that
+    /// configures a longer [`RekeyPolicy::with_overlap`] should still call this
+    /// explicitly at its own deadline; the engine's fixed 5 s floor is not
+    /// currently overridable from here.
     pub fn prune_old_epoch(&self) {
-        self.session
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .prune_pending_old_epoch();
+        self.inner.prune_old_epoch();
     }
 
     /// The current HPKE epoch (starts at `0`, `+1` per [`rekey`](Self::rekey)).
     #[must_use]
     pub fn current_epoch(&self) -> u32 {
-        self.session
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .epoch()
+        self.inner.current_epoch()
     }
 
     /// Time since the current epoch was installed (construction or last rekey).
     /// Feed it to [`RekeyPolicy::is_due`] to decide when to rotate.
     #[must_use]
     pub fn since_last_rekey(&self) -> Duration {
-        self.last_rekey_at
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .elapsed()
+        self.inner.since_last_rekey()
     }
 
     /// Sends a DAITA cover-traffic (dummy) frame: a sealed frame whose plaintext
@@ -821,10 +709,9 @@ impl MultihopSession {
     ///
     /// Same as [`send_packet`](Self::send_packet) (seal, encode, or datagram send).
     pub fn send_cover_traffic(&self, padding_len: usize) -> Result<(), MultihopError> {
-        let mut dummy = Vec::with_capacity(1 + padding_len);
-        dummy.push(DAITA_DUMMY_FIRST_BYTE);
-        dummy.resize(1 + padding_len, 0);
-        self.seal_and_send(&dummy)?;
+        self.inner
+            .send_cover_traffic(padding_len)
+            .map_err(map_engine_err)?;
         self.metrics
             .cover_packets_sent
             .fetch_add(1, Ordering::Relaxed);
@@ -853,48 +740,25 @@ impl MultihopSession {
     /// [`MultihopError::ReadDatagram`] if the connection closed.
     pub async fn recv_packet(&self) -> Result<Vec<u8>, MultihopError> {
         loop {
-            let datagram = self
-                .conn
-                .read_datagram()
-                .await
-                .map_err(MultihopError::ReadDatagram)?;
-            let Ok(frame) = WarrenMultihopFrame::decode(&datagram) else {
-                continue;
+            let plaintext = match self.inner.recv().await {
+                Ok(p) => p,
+                // `MultiHopClient::recv`'s documented error set is exactly
+                // { Recv, Decode, UnexpectedExitId, Replay, Session }: `Recv`
+                // means the QUIC connection itself closed (fatal, matching this
+                // method's `ReadDatagram` contract below); the other four are
+                // per-frame decode/replay/exit-id/AEAD failures. This session has
+                // always dropped and retried those rather than surfaced them (a
+                // single malformed, hostile, or replayed datagram must never kill
+                // the whole recv path - a hostile relay could otherwise DoS the
+                // downlink with one poisoned frame). Contrast
+                // `warrenguard_pump`'s own consumer, which intentionally treats
+                // the same per-frame errors as fatal at the connection level:
+                // this SDK's drop-and-retry contract is a deliberate, tested
+                // SDK-side choice, preserved here rather than adopting the
+                // engine's own (differently reliable) pump-loop policy.
+                Err(EngineMultihopError::Recv(e)) => return Err(MultihopError::ReadDatagram(e)),
+                Err(_) => continue,
             };
-            if frame.exit_id.as_bytes() != &self.exit_id {
-                continue;
-            }
-            // Probe-open-record. The cheap pre-`check` lets a replayed frame be
-            // dropped WITHOUT spending an AEAD open (a replay-flood DoS guard);
-            // the open then authenticates; only an authenticated frame advances
-            // the window via `check_and_record`. recv_packet has a single consumer
-            // (the datapath pump), so the gap between the pre-check and the record
-            // is not contended; were it ever multi-consumer, two callers could
-            // both open one seq before one loses the record (correct, just one
-            // wasted open). A frame failing any step is dropped, never fatal.
-            {
-                // Recover rather than panic on a poisoned lock: the replay window
-                // is plain integer state and stays consistent across a panic, and a
-                // library must not unwind into an FFI embedder.
-                let replay = self.replay.lock().unwrap_or_else(|e| e.into_inner());
-                if replay.check(frame.seq, frame.epoch).is_err() {
-                    continue;
-                }
-            }
-            let opened = self
-                .session
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .open_response(&frame);
-            let Ok(plaintext) = opened else {
-                continue;
-            };
-            {
-                let mut replay = self.replay.lock().unwrap_or_else(|e| e.into_inner());
-                if replay.check_and_record(frame.seq, frame.epoch).is_err() {
-                    continue;
-                }
-            }
             match plaintext.first() {
                 // DAITA padding or a control message: not an IP packet.
                 Some(&DAITA_DUMMY_FIRST_BYTE) | Some(&CONTROL_FIRST_BYTE) => {
@@ -943,7 +807,7 @@ impl MultihopSession {
 
     /// Close the connection cleanly.
     pub fn disconnect(&self) {
-        self.conn.close(0u32.into(), b"client disconnect");
+        self.inner.close(0, b"client disconnect");
     }
 }
 
@@ -967,21 +831,22 @@ impl MultihopSession {
     fn from_raw_for_test(
         endpoint: quinn::Endpoint,
         conn: quinn::Connection,
-        session: HpkeSession,
         exit_id: [u8; EXIT_ID_LEN],
         exit_x25519: [u8; 32],
     ) -> Self {
+        let inner = MultiHopClient::from_established_connection(
+            endpoint,
+            conn.clone(),
+            ExitId::from_bytes(exit_id),
+            &exit_x25519,
+            None,
+        )
+        .expect("from_established_connection");
         Self {
-            _endpoint: endpoint,
+            inner,
             conn,
-            session: RwLock::new(session),
-            exit_id,
-            exit_x25519,
-            seq_send: AtomicU64::new(0),
-            replay: Mutex::new(EpochReplay::new()),
             assignment: IpAssignment::placeholder_for_test(),
             metrics: Arc::new(MultihopMetrics::new(0)),
-            last_rekey_at: Mutex::new(Instant::now()),
             drain_tx: tokio::sync::watch::channel(None).0,
         }
     }
@@ -1008,6 +873,7 @@ mod real_exit_tests {
     use std::time::Duration;
 
     use warren_multihop::{ClientSession, ExitId, parse_exit_x25519_pubkey};
+    use warren_wire::multihop::WarrenMultihopFrame;
 
     /// Frozen BIP39 test vector. The exit derives BOTH its Ed25519 QUIC RPK
     /// (via the identity HKDF) and its long-lived X25519 multihop key from this
@@ -1222,16 +1088,7 @@ mod real_exit_tests {
 
         let _client_key = SigningKey::from_bytes(&CLIENT_SEED);
         let (endpoint, conn) = dial_with_retry(exit_rpk, addr).await;
-
-        let mut rng = rand_core::UnwrapErr(rand_core::OsRng);
-        let hpke = ClientSession::new(
-            &parse_exit_x25519_pubkey(&exit_x25519).expect("parse exit x25519"),
-            ExitId::from_bytes(TEST_EXIT_ID),
-            &mut rng,
-        )
-        .expect("HPKE setup_sender");
-        let session =
-            MultihopSession::from_raw_for_test(endpoint, conn, hpke, TEST_EXIT_ID, exit_x25519);
+        let session = MultihopSession::from_raw_for_test(endpoint, conn, TEST_EXIT_ID, exit_x25519);
 
         // An IPv4-looking packet (first nibble 4) so recv_packet returns it
         // instead of dropping it as DAITA padding or a control message.
@@ -1527,187 +1384,5 @@ mod policy_tests {
         assert!(!p.is_due(Duration::from_secs(99)));
         assert!(p.is_due(Duration::from_secs(100)));
         assert!(p.is_due(Duration::from_secs(101)));
-    }
-
-    #[test]
-    fn epoch_replay_isolates_seq_spaces_across_epochs() {
-        let mut r = EpochReplay::new();
-        // Same seq in two different epochs is NOT a replay (separate windows).
-        r.check_and_record(0, 0).expect("epoch 0 seq 0");
-        r.check_and_record(0, 1)
-            .expect("epoch 1 seq 0 is independent");
-        // But repeating a seq within one epoch is a replay.
-        assert!(r.check_and_record(0, 0).is_err(), "epoch 0 seq 0 replay");
-        assert!(r.check_and_record(0, 1).is_err(), "epoch 1 seq 0 replay");
-    }
-
-    #[test]
-    fn epoch_replay_evicts_oldest_epochs_beyond_the_cap() {
-        let mut r = EpochReplay::new();
-        // Fill more than the retention cap, then the lowest epoch's window is gone,
-        // so its seqs are accepted again (treated as a fresh epoch).
-        for epoch in 0..(REKEY_EPOCHS_KEPT as u32 + 1) {
-            r.check_and_record(5, epoch).expect("record");
-        }
-        assert!(
-            r.check_and_record(5, 0).is_ok(),
-            "evicted epoch 0 window forgets its seqs"
-        );
-    }
-}
-
-/// Unit tests for the in-band entry-relay identity proof (ADR-0004).
-///
-/// The proof exchange is independent of the TLS cert type, so these tests use
-/// the RPK path (no X.509 cert fixtures needed). A loopback QUIC server opens a
-/// server-initiated bi stream and writes the proof; the client calls
-/// `verify_relay_proof` and the result must match the expectation.
-#[cfg(test)]
-mod relay_proof_tests {
-    use super::*;
-    use ed25519_dalek::SigningKey;
-    use warrenguard_multihop::encode_relay_auth_proof;
-    use warrenguard_tls::{make_server_config, sign_relay_auth};
-
-    /// What the mock relay writes on its server-initiated auth stream.
-    enum MockProof {
-        /// A valid proof signed by this key over the connection's channel binding.
-        SignedBy(SigningKey),
-        /// A well-framed proof signed by the WRONG key (MITM with a valid
-        /// cover-domain cert but not the directory-vouched relay identity key).
-        SignedByWrongKey(SigningKey),
-        /// Garbage bytes (wrong length or version byte): a framing failure.
-        Garbage,
-        /// No proof: the relay never opens the auth stream.
-        Silent,
-    }
-
-    /// Spins up an RPK loopback where the "relay" opens a server-initiated bi
-    /// stream and writes `proof` after the handshake. Returns the established
-    /// client connection plus the endpoint handles to keep alive.
-    async fn loopback_with_mock_proof(
-        proof: MockProof,
-    ) -> (quinn::Connection, quinn::Endpoint, quinn::Endpoint) {
-        let tls_key = SigningKey::from_bytes(&[9u8; 32]);
-        let server_cfg = make_server_config(&tls_key, tls::default_crypto_provider(), &[b"h3"])
-            .expect("server config");
-        let server_ep = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
-            .expect("server bind");
-        let addr = server_ep.local_addr().expect("server addr");
-
-        let server_for_task = server_ep.clone();
-        tokio::spawn(async move {
-            let Some(incoming) = server_for_task.accept().await else {
-                return;
-            };
-            let conn = incoming.await.expect("server handshake");
-            let cb = tls::channel_binding(&conn).expect("server channel binding");
-            let bytes: Vec<u8> = match proof {
-                MockProof::SignedBy(k) | MockProof::SignedByWrongKey(k) => {
-                    encode_relay_auth_proof(&sign_relay_auth(&k, &cb)).to_vec()
-                }
-                MockProof::Garbage => vec![0xFFu8; 10],
-                MockProof::Silent => {
-                    // Hold the connection open without writing anything, so the
-                    // client's bounded read must time out.
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    return;
-                }
-            };
-            let (mut send, _recv) = conn.open_bi().await.expect("open auth stream");
-            send.write_all(&bytes).await.expect("write proof");
-            let _ = send.finish();
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        });
-
-        let client_cfg = tls::make_client_config(tls::default_crypto_provider(), &[b"h3"])
-            .expect("client config");
-        let mut client_ep =
-            quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client bind");
-        client_ep.set_default_client_config(client_cfg);
-        let sni = tls::name::encode(tls::WarrenPubkey::from_bytes(
-            tls_key.verifying_key().to_bytes(),
-        ));
-        let conn = client_ep
-            .connect(addr, &sni)
-            .expect("connect")
-            .await
-            .expect("client handshake");
-        (conn, server_ep, client_ep)
-    }
-
-    #[tokio::test]
-    async fn relay_proof_accepts_the_directory_vouched_identity() {
-        // A proof signed by the relay's real identity key over the channel binding
-        // must verify successfully.
-        let relay_key = SigningKey::from_bytes(&[0x51; 32]);
-        let expected = tls::WarrenPubkey::from_bytes(relay_key.verifying_key().to_bytes());
-        let (conn, _s, _c) = loopback_with_mock_proof(MockProof::SignedBy(relay_key)).await;
-        verify_relay_proof(&conn, &expected)
-            .await
-            .expect("a proof signed by the expected relay key must verify");
-    }
-
-    #[tokio::test]
-    async fn relay_proof_rejects_a_mitm_with_a_valid_cert_but_wrong_key() {
-        // The MITM completed the TLS handshake and holds SOME key, but not the
-        // directory-vouched relay identity. The proof verifies as a well-formed
-        // Ed25519 signature, but against the wrong pubkey; fail closed.
-        let attacker = SigningKey::from_bytes(&[0x66; 32]);
-        let expected_relay = tls::WarrenPubkey::from_bytes(
-            SigningKey::from_bytes(&[0x51; 32])
-                .verifying_key()
-                .to_bytes(),
-        );
-        let (conn, _s, _c) = loopback_with_mock_proof(MockProof::SignedByWrongKey(attacker)).await;
-        let err = verify_relay_proof(&conn, &expected_relay)
-            .await
-            .expect_err("a proof not signed by the expected relay identity must be rejected");
-        assert!(
-            matches!(err, MultihopError::RelayIdentity(_)),
-            "expected RelayIdentity, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn relay_proof_rejects_a_malformed_message() {
-        // Garbage bytes (wrong length, wrong version byte) must fail the framing
-        // check before any signature verification.
-        let expected = tls::WarrenPubkey::from_bytes(
-            SigningKey::from_bytes(&[0x51; 32])
-                .verifying_key()
-                .to_bytes(),
-        );
-        let (conn, _s, _c) = loopback_with_mock_proof(MockProof::Garbage).await;
-        let err = verify_relay_proof(&conn, &expected)
-            .await
-            .expect_err("a malformed proof must be rejected");
-        assert!(
-            matches!(err, MultihopError::RelayIdentity(_)),
-            "expected RelayIdentity, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn relay_proof_times_out_when_relay_is_silent() {
-        // A relay that never opens the auth stream must cause a RelayIdentity
-        // error rather than hanging indefinitely.
-        let expected = tls::WarrenPubkey::from_bytes(
-            SigningKey::from_bytes(&[0x51; 32])
-                .verifying_key()
-                .to_bytes(),
-        );
-        let (conn, _s, _c) = loopback_with_mock_proof(MockProof::Silent).await;
-        let err = tokio::time::timeout(
-            RELAY_PROOF_TIMEOUT + Duration::from_secs(2),
-            verify_relay_proof(&conn, &expected),
-        )
-        .await
-        .expect("verify_relay_proof must respect its own timeout, not hang forever")
-        .expect_err("a silent relay must fail the identity check");
-        assert!(
-            matches!(err, MultihopError::RelayIdentity(_)),
-            "expected RelayIdentity, got {err:?}"
-        );
     }
 }
