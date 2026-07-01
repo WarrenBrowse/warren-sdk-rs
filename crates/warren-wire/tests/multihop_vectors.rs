@@ -86,6 +86,8 @@ struct ControlVec {
     ipv4: Option<[u8; 4]>,
     prefix_len: Option<u8>,
     gateway_ipv4: Option<[u8; 4]>,
+    deadline_unix_secs: Option<u64>,
+    reason_code: Option<u8>,
 }
 
 fn message_for(v: &ControlVec) -> WarrenControlMessage {
@@ -109,6 +111,10 @@ fn message_for(v: &ControlVec) -> WarrenControlMessage {
         },
         "ip_exhausted" => WarrenControlMessage::IpExhausted,
         "rejected" => WarrenControlMessage::Rejected,
+        "exit_draining" => WarrenControlMessage::ExitDraining {
+            deadline_unix_secs: v.deadline_unix_secs.expect("deadline_unix_secs"),
+            reason_code: v.reason_code.expect("reason_code"),
+        },
         other => panic!("unknown control vector name: {other}"),
     }
 }
