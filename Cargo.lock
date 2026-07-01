@@ -2606,7 +2606,19 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
+ "warren-contract",
  "warren-identity",
+]
+
+[[package]]
+name = "warren-contract"
+version = "0.0.1"
+dependencies = [
+ "blake2",
+ "bs58",
+ "serde",
+ "thiserror 2.0.18",
+ "warrenguard-wire",
 ]
 
 [[package]]
