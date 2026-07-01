@@ -20,6 +20,13 @@ ignore = [
     # atomic-polyfill: unmaintained, pulled transitively via the engine smoltcp/heapless
     # netstack deps. Security-clean (no CVE). warren-core ignores the same.
     "RUSTSEC-2023-0089",
+    # rustls-pemfile: unmaintained (archived; folded into rustls-pki-types, which
+    # now reads PEM natively). Reached via engine warrenguard-tls, which uses it
+    # only to parse local PEM cert/key material at config/startup, never
+    # attacker-controlled bytes at runtime, so there is no reachable surface.
+    # warren-core ignores the same. Upgrade path: migrate warrenguard-tls's
+    # certs.rs to rustls_pki_types::pem::PemObject.
+    "RUSTSEC-2025-0134",
 ]
 
 [licenses]
