@@ -2650,14 +2650,13 @@ name = "warren-identity"
 version = "0.0.1"
 dependencies = [
  "bip39",
- "blake2",
- "bs58",
  "ed25519-dalek",
  "hex",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
+ "warren-contract",
  "warrenguard-identity",
 ]
 
