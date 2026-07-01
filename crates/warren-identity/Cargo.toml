@@ -14,13 +14,13 @@ warrenguard-identity = { workspace = true }
 warren-contract = { path = "../../../warren-contract" }
 ed25519-dalek = { workspace = true }
 bip39 = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [lints]
 workspace = true
