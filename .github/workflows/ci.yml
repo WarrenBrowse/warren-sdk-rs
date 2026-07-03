@@ -3,7 +3,7 @@ name: CI
 # Runs exclusively on the WarrenBrowse org self-hosted runners (Default runner
 # group, visibility: all). Label sets are matched against the live runners:
 #   [self-hosted, Linux, X64, macstudio-rosetta] -> macstudio-linux-rosetta (the provisioned Rust runner)
-#   [self-hosted, Windows, X64]  -> win-runner1
+#   [self-hosted, Windows, macstudio-win]  -> macstudio-win (Windows-ARM VM on the Mac Studio)
 #   [self-hosted, macOS, ARM64]  -> axiomStudio
 # Do not switch any job to a GitHub-hosted runner.
 
@@ -49,7 +49,7 @@ jobs:
           - name: linux
             runner: [self-hosted, Linux, X64, macstudio-rosetta]
           - name: windows
-            runner: [self-hosted, Windows, X64]
+            runner: [self-hosted, Windows, macstudio-win]
           - name: macos
             runner: [self-hosted, macOS, ARM64]
     steps:
@@ -78,7 +78,7 @@ jobs:
           - name: linux
             runner: [self-hosted, Linux, X64, macstudio-rosetta]
           - name: windows
-            runner: [self-hosted, Windows, X64]
+            runner: [self-hosted, Windows, macstudio-win]
           - name: macos
             runner: [self-hosted, macOS, ARM64]
     steps:
