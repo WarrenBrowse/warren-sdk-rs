@@ -23,7 +23,11 @@
 
 use std::collections::HashMap;
 
-use crate::exit_id::ExitId;
+/// The stable exit identity used to key measurements: the exit's Ed25519
+/// endpoint pubkey (`Relay::endpoint_id`, also the multihop directory's
+/// `exit_ed25519_pubkey`), so a measurement taken on any dial path keys
+/// the same exit and survives an endpoint-address change.
+pub type EndpointId = [u8; 32];
 
 /// Default freshness window for a measured RTT (24 h), matching the doc's
 /// "cache local par exit (TTL 24 h)".
@@ -51,11 +55,11 @@ struct RttSample {
 /// Per-exit cache of the most recent measured RTT, with TTL expiry.
 ///
 /// Populated by the tunnel after a handshake completes; read by the
-/// selector. Keyed by [`ExitId`] so it survives an endpoint-address change
-/// for the same logical exit.
+/// selector. Keyed by [`EndpointId`] so it survives an endpoint-address
+/// change for the same logical exit.
 #[derive(Debug, Clone, Default)]
 pub struct RttCache {
-    samples: HashMap<ExitId, RttSample>,
+    samples: HashMap<EndpointId, RttSample>,
 }
 
 impl RttCache {
@@ -65,11 +69,11 @@ impl RttCache {
         Self::default()
     }
 
-    /// Record (or overwrite) the RTT measured to `exit_id` at
+    /// Record (or overwrite) the RTT measured to `endpoint_id` at
     /// `now_unix_secs`. The latest measurement always wins.
-    pub fn record(&mut self, exit_id: ExitId, rtt_ms: u32, now_unix_secs: u64) {
+    pub fn record(&mut self, endpoint_id: EndpointId, rtt_ms: u32, now_unix_secs: u64) {
         self.samples.insert(
-            exit_id,
+            endpoint_id,
             RttSample {
                 rtt_ms,
                 measured_at_unix: now_unix_secs,
@@ -77,12 +81,17 @@ impl RttCache {
         );
     }
 
-    /// Fresh RTT for `exit_id`: the sample if it was measured within
+    /// Fresh RTT for `endpoint_id`: the sample if it was measured within
     /// `ttl_secs` of `now_unix_secs`, else `None` (stale or never
     /// measured). Does not mutate; expiry is evaluated at read time.
     #[must_use]
-    pub fn fresh_rtt_ms(&self, exit_id: ExitId, now_unix_secs: u64, ttl_secs: u64) -> Option<u32> {
-        self.samples.get(&exit_id).and_then(|s| {
+    pub fn fresh_rtt_ms(
+        &self,
+        endpoint_id: EndpointId,
+        now_unix_secs: u64,
+        ttl_secs: u64,
+    ) -> Option<u32> {
+        self.samples.get(&endpoint_id).and_then(|s| {
             let age = now_unix_secs.saturating_sub(s.measured_at_unix);
             (age < ttl_secs).then_some(s.rtt_ms)
         })
@@ -126,17 +135,17 @@ pub(crate) fn proximity_score(weight: u64, rtt_ms: u32) -> u64 {
     as_u64.max(1)
 }
 
-/// The RTT (ms) to score `exit_id` at: its fresh cached sample, or the
+/// The RTT (ms) to score `endpoint_id` at: its fresh cached sample, or the
 /// neutral baseline when unprobed/stale.
 #[must_use]
 pub(crate) fn effective_rtt_ms(
     cache: &RttCache,
-    exit_id: ExitId,
+    endpoint_id: EndpointId,
     now_unix_secs: u64,
     ttl_secs: u64,
 ) -> u32 {
     cache
-        .fresh_rtt_ms(exit_id, now_unix_secs, ttl_secs)
+        .fresh_rtt_ms(endpoint_id, now_unix_secs, ttl_secs)
         .unwrap_or(NEUTRAL_RTT_MS)
 }
 
@@ -144,8 +153,8 @@ pub(crate) fn effective_rtt_ms(
 mod tests {
     use super::*;
 
-    fn eid(b: u8) -> ExitId {
-        ExitId::from_bytes([b; 16])
+    fn eid(b: u8) -> EndpointId {
+        [b; 32]
     }
 
     #[test]

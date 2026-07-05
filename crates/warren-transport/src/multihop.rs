@@ -678,6 +678,15 @@ impl MultihopSession {
         &self.conn
     }
 
+    /// QUIC path round-trip time to the first hop of this multihop
+    /// connection, smoothed post-handshake. Feeds the client-side RTT
+    /// proximity cache (doc 52 P4): for a single-region path it is a good
+    /// proximity signal for reaching this exit.
+    #[must_use]
+    pub fn path_rtt(&self) -> std::time::Duration {
+        self.conn.stats().path.rtt
+    }
+
     /// Seal one IP packet and send it as a QUIC datagram.
     ///
     /// # Errors

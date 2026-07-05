@@ -130,7 +130,7 @@ impl ExitSelector {
             .map(|relay| {
                 let rtt = effective_rtt_ms(
                     rtt_cache,
-                    relay.exit_id(),
+                    relay.endpoint_id(),
                     now_unix_secs,
                     DEFAULT_RTT_TTL_SECS,
                 );
@@ -335,8 +335,9 @@ mod tests {
     }
 
     fn relay_id(country: &str, city: &str, weight: u64, id: u8) -> Relay {
+        // Distinct endpoint_id per relay so the RTT cache keys them apart.
         Relay::new(
-            [0u8; 32],
+            [id; 32],
             ExitId::from_bytes([id; 16]),
             vec!["127.0.0.1:7000".parse().unwrap()],
             Location::new(country, city),
@@ -354,8 +355,8 @@ mod tests {
         let sel = ExitSelector::new(RelayList::new(vec![near, far]));
 
         let mut cache = RttCache::new();
-        cache.record(ExitId::from_bytes([1; 16]), 8, 1_000); // near: 8 ms
-        cache.record(ExitId::from_bytes([2; 16]), 220, 1_000); // far: 220 ms
+        cache.record([1; 32], 8, 1_000); // near: 8 ms
+        cache.record([2; 32], 220, 1_000); // far: 220 ms
 
         let mut rng = StdRng::seed_from_u64(7);
         let mut near_hits = 0;

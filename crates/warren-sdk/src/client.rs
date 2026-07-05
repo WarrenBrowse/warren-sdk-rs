@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use warren_api::{HttpTransport, WarrenApiClient};
 use warren_discovery::{
-    ExitSelector, VerifiedExit, verify_multihop_directory, verify_signed_relay_list,
+    ExitQuery, ExitSelector, Relay, RttCache, SelectorError, VerifiedExit,
+    verify_multihop_directory, verify_signed_relay_list,
 };
 use warren_identity::WarrenIdentity;
 use warren_net::{MultihopPacketSink, QuicPacketSink};
@@ -309,6 +310,7 @@ impl WarrenClientBuilder {
             generation_store: self.generation_store,
             multihop_generation_store: self.multihop_generation_store,
             server_key_store: self.server_key_store,
+            rtt_cache: Arc::new(Mutex::new(RttCache::new())),
         })
     }
 }
@@ -342,6 +344,13 @@ pub struct WarrenClient<T> {
     pub(crate) multihop_generation_store: Arc<dyn GenerationStore>,
     /// Trust-on-first-use pin store, when enabled.
     pub(crate) server_key_store: Option<Arc<dyn ServerKeyStore>>,
+    /// Client-side RTT proximity cache (doc 52 P4): every successful
+    /// single-hop connect records the measured path RTT keyed by exit, and
+    /// [`Self::select_exit_by_proximity`] biases selection toward nearer
+    /// exits at equal weight. Shared behind a mutex so `&self` connects can
+    /// populate it. Empty until the first connect, so selection is
+    /// weight-only until real measurements accumulate.
+    pub(crate) rtt_cache: Arc<Mutex<RttCache>>,
 }
 
 impl WarrenClient<()> {
@@ -453,7 +462,55 @@ impl<T: HttpTransport> WarrenClient<T> {
             tunnel = tunnel.with_transport_config(cfg.clone());
         }
         let session = tunnel.connect(exit.endpoint_id(), addr).await?;
+        // Feed the RTT proximity cache (doc 52 P4): the smoothed path RTT is
+        // available post-handshake. Record it keyed by exit before wrapping
+        // the session, so later selections can prefer nearer exits.
+        self.record_rtt(exit.endpoint_id(), session.path_rtt());
         Ok(QuicPacketSink::new(session))
+    }
+
+    /// Record a measured path RTT for the exit identified by its Ed25519
+    /// endpoint pubkey into the proximity cache. Best effort: a poisoned
+    /// lock is silently skipped (proximity is an optimisation, never
+    /// load-bearing).
+    fn record_rtt(&self, endpoint_id: [u8; 32], rtt: std::time::Duration) {
+        let rtt_ms = u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX);
+        if let Ok(mut cache) = self.rtt_cache.lock() {
+            cache.record(endpoint_id, rtt_ms, now_unix_secs());
+        }
+    }
+
+    /// Selects an exit from `selector` weighted by `weight * f(rtt)` using
+    /// the RTT measurements gathered on prior connects (doc 52 P4). At equal
+    /// weight a nearer exit is preferred; before any measurement it is
+    /// exactly [`ExitSelector::select_weighted`]. Returns an owned [`Relay`]
+    /// (ready to pass to [`Self::connect_tunnel`]).
+    ///
+    /// # Errors
+    ///
+    /// [`SelectorError::NoRelayMatch`] if no active, positive-weight relay
+    /// matches, or if the cache lock is poisoned (falls back to an error
+    /// rather than an unweighted pick).
+    pub fn select_exit_by_proximity(
+        &self,
+        selector: &ExitSelector,
+        query: &ExitQuery,
+    ) -> Result<Relay, SelectorError> {
+        let now = now_unix_secs();
+        let cache = self
+            .rtt_cache
+            .lock()
+            .map_err(|_| SelectorError::NoRelayMatch)?;
+        selector
+            .select_weighted_by_proximity(query, &cache, now)
+            .cloned()
+    }
+
+    /// Snapshot of the current RTT proximity cache (doc 52 P4), e.g. for an
+    /// app to surface measured latencies in its UI.
+    #[must_use]
+    pub fn rtt_cache_snapshot(&self) -> RttCache {
+        self.rtt_cache.lock().map(|c| c.clone()).unwrap_or_default()
     }
 
     /// Starts the non-root proxy datapath against `exit`: connects the tunnel,
@@ -614,6 +671,10 @@ impl<T: HttpTransport> WarrenClient<T> {
                 exit.endpoint,
             )
             .await?;
+        // Feed the RTT proximity cache (doc 52 P4): the first-hop path RTT is
+        // available once the multihop handshake completes. Keyed by the exit's
+        // Ed25519 endpoint pubkey, the same key the selector looks up.
+        self.record_rtt(exit.exit_ed25519_pubkey, session.path_rtt());
         if !self.daita {
             return Ok(MultihopPacketSink::new(session));
         }
