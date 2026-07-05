@@ -13,6 +13,7 @@
 
 pub mod exit_id;
 pub mod multihop_directory;
+pub mod proximity;
 pub mod query;
 pub mod relay;
 pub mod selector;
@@ -22,6 +23,7 @@ pub use exit_id::{EXIT_ID_LEN, ExitId, ExitIdError};
 pub use multihop_directory::{
     DirectoryError, VerifiedDirectory, VerifiedEntry, VerifiedExit, verify_multihop_directory,
 };
+pub use proximity::{DEFAULT_RTT_TTL_SECS, RttCache};
 pub use query::{ExitQuery, IpAvailability, LocationConstraint};
 pub use relay::{Location, Relay, RelayList};
 pub use selector::{ExitSelector, SelectorError};

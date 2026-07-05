@@ -4,6 +4,7 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
+use crate::proximity::{DEFAULT_RTT_TTL_SECS, RttCache, effective_rtt_ms, proximity_score};
 use crate::query::ExitQuery;
 use crate::relay::{Relay, RelayList};
 
@@ -87,6 +88,61 @@ impl ExitSelector {
         Ok(weighted_pick(&candidates, rng))
     }
 
+    /// Selects a weighted-random matching relay, biased toward exits with a
+    /// lower measured RTT (doc 52 §6.2 client / P4). The effective score is
+    /// `weight * f(rtt)` per [`crate::proximity`]: at equal weight a nearer
+    /// exit is preferred, an unprobed exit is scored at a neutral baseline,
+    /// and a fleet with no measurements yields exactly the weight-only
+    /// distribution of [`Self::select_weighted`]. `now_unix_secs` drives the
+    /// cache's TTL; the caller passes the clock so selection stays testable.
+    ///
+    /// # Errors
+    ///
+    /// [`SelectorError::NoRelayMatch`] if no active, positive-weight relay
+    /// matches.
+    pub fn select_weighted_by_proximity(
+        &self,
+        query: &ExitQuery,
+        rtt_cache: &RttCache,
+        now_unix_secs: u64,
+    ) -> Result<&Relay, SelectorError> {
+        self.select_by_proximity_with_rng(query, rtt_cache, now_unix_secs, &mut rand::thread_rng())
+    }
+
+    /// [`Self::select_weighted_by_proximity`] with an injected RNG (tests).
+    ///
+    /// # Errors
+    ///
+    /// [`SelectorError::NoRelayMatch`] if no active, positive-weight relay
+    /// matches.
+    pub fn select_by_proximity_with_rng<R: Rng + ?Sized>(
+        &self,
+        query: &ExitQuery,
+        rtt_cache: &RttCache,
+        now_unix_secs: u64,
+        rng: &mut R,
+    ) -> Result<&Relay, SelectorError> {
+        let scored: Vec<(&Relay, u64)> = self
+            .relays
+            .relays()
+            .iter()
+            .filter(|relay| relay.weight() > 0 && query.matches(relay))
+            .map(|relay| {
+                let rtt = effective_rtt_ms(
+                    rtt_cache,
+                    relay.exit_id(),
+                    now_unix_secs,
+                    DEFAULT_RTT_TTL_SECS,
+                );
+                (relay, proximity_score(relay.weight(), rtt))
+            })
+            .collect();
+        if scored.is_empty() {
+            return Err(SelectorError::NoRelayMatch);
+        }
+        Ok(weighted_pick_scored(&scored, rng))
+    }
+
     /// Selects a relay for a given retry attempt. The attempt seeds the RNG so
     /// the same attempt is idempotent and successive attempts explore the space.
     ///
@@ -127,6 +183,28 @@ fn weighted_pick<'a, R: Rng + ?Sized>(candidates: &[&'a Relay], rng: &mut R) -> 
     }
     // Statically unreachable: roll < total = sum(weights).
     candidates[candidates.len() - 1]
+}
+
+/// Weighted random pick over `(relay, score)` pairs. Same saturating-sum +
+/// roll as [`weighted_pick`], but over precomputed scores (proximity).
+fn weighted_pick_scored<'a, R: Rng + ?Sized>(
+    candidates: &[(&'a Relay, u64)],
+    rng: &mut R,
+) -> &'a Relay {
+    let total: u64 = candidates
+        .iter()
+        .fold(0u64, |acc, (_, score)| acc.saturating_add(*score));
+    if total == 0 {
+        return candidates[0].0;
+    }
+    let mut roll = rng.gen_range(0..total);
+    for (relay, score) in candidates {
+        if roll < *score {
+            return relay;
+        }
+        roll -= *score;
+    }
+    candidates[candidates.len() - 1].0
 }
 
 #[cfg(test)]
@@ -254,6 +332,86 @@ mod tests {
             .city()
             .to_owned();
         assert_eq!(a, b, "same attempt must be idempotent");
+    }
+
+    fn relay_id(country: &str, city: &str, weight: u64, id: u8) -> Relay {
+        Relay::new(
+            [0u8; 32],
+            ExitId::from_bytes([id; 16]),
+            vec!["127.0.0.1:7000".parse().unwrap()],
+            Location::new(country, city),
+            weight,
+            true,
+        )
+    }
+
+    #[test]
+    fn proximity_prefers_the_nearer_exit_at_equal_weight() {
+        // Two equal-weight exits; only their measured RTT differs. Over many
+        // draws the low-RTT one must dominate (DoD P4: prefer a close exit).
+        let near = relay_id("FR", "Near", 100, 1);
+        let far = relay_id("FR", "Far", 100, 2);
+        let sel = ExitSelector::new(RelayList::new(vec![near, far]));
+
+        let mut cache = RttCache::new();
+        cache.record(ExitId::from_bytes([1; 16]), 8, 1_000); // near: 8 ms
+        cache.record(ExitId::from_bytes([2; 16]), 220, 1_000); // far: 220 ms
+
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut near_hits = 0;
+        for _ in 0..1000 {
+            let r = sel
+                .select_by_proximity_with_rng(&ExitQuery::any(), &cache, 1_000, &mut rng)
+                .unwrap();
+            if r.location().city() == "Near" {
+                near_hits += 1;
+            }
+        }
+        assert!(
+            near_hits > 700,
+            "near exit should dominate at equal weight, got {near_hits}/1000"
+        );
+    }
+
+    #[test]
+    fn proximity_with_empty_cache_matches_weight_only_distribution() {
+        // No RTT data anywhere: proximity selection must reduce to the
+        // weight-only distribution (heavy dominates, light still reachable),
+        // i.e. zero behavioural change before any probing has happened.
+        let light = relay_id("RO", "Light", 1, 1);
+        let heavy = relay_id("RO", "Heavy", 1_000_000, 2);
+        let sel = ExitSelector::new(RelayList::new(vec![light, heavy]));
+        let cache = RttCache::new();
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut heavy_hits = 0;
+        for _ in 0..1000 {
+            let r = sel
+                .select_by_proximity_with_rng(&ExitQuery::any(), &cache, 0, &mut rng)
+                .unwrap();
+            if r.location().city() == "Heavy" {
+                heavy_hits += 1;
+            }
+        }
+        assert!(
+            heavy_hits > 950,
+            "with no RTT data the weight must still govern, got {heavy_hits}/1000"
+        );
+    }
+
+    #[test]
+    fn proximity_excludes_zero_weight_and_respects_query() {
+        let sel = ExitSelector::new(RelayList::new(vec![
+            relay_id("RO", "Zero", 0, 1),
+            relay_id("DE", "Other", 100, 2),
+            relay_id("RO", "Good", 100, 3),
+        ]));
+        let cache = RttCache::new();
+        let mut rng = StdRng::seed_from_u64(1);
+        let got = sel
+            .select_by_proximity_with_rng(&ExitQuery::country("RO"), &cache, 0, &mut rng)
+            .expect("match");
+        assert_eq!(got.location().city(), "Good");
     }
 
     #[test]
