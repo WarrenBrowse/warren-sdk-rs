@@ -31,6 +31,24 @@ jobs:
     runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
     steps:
       - uses: actions/checkout@v4
+      # CI clones the siblings at the .version files and [patch]es to them, so
+      # a Cargo.toml git rev that diverges from its .version file would ship a
+      # declared dependency nobody tested. Fail closed on any mismatch.
+      - name: check engine + contract pin lockstep
+        run: |
+          set -euo pipefail
+          check_pin() {
+            local host="$1" file="$2" rev mismatch
+            rev="$(tr -d '[:space:]' < "${file}")"
+            mismatch="$(grep -E "${host}.*\brev = \"" Cargo.toml | grep -v "rev = \"${rev}\"" || true)"
+            if [ -n "${mismatch}" ]; then
+              echo "Cargo.toml rev diverges from ${file} (${rev}):"
+              echo "${mismatch}"
+              exit 1
+            fi
+          }
+          check_pin 'warrenguard\.git' .warrenguard-version
+          check_pin 'warren-contract\.git' .warren-contract-version
       - uses: ./.github/actions/checkout-engine
         with:
           token: ${{ secrets.ENGINE_TOKEN }}
