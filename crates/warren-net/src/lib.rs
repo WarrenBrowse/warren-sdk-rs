@@ -60,6 +60,8 @@ pub use portforward::{
 pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy, UdpConnector, UdpFlow};
 pub use sink::{BondedPacketSink, MultihopPacketSink, PacketSink, QuicPacketSink};
 pub use tun_sink::{TunBridge, TunPacketSink, forward_bidirectional, tun_channels};
-/// The NAT-PMP mapping protocol selector (TCP or UDP), re-exported from the wire
-/// codec so callers can name it without depending on `warren-wire` directly.
-pub use warren_wire::natpmp::MapProto;
+/// The NAT-PMP mapping protocol selector (TCP or UDP) and the gateway result
+/// code, re-exported from the wire codec so callers can name them (notably to
+/// classify a strict suggestion refusal) without depending on `warren-wire`
+/// directly.
+pub use warren_wire::natpmp::{MapProto, ResultCode};

@@ -80,6 +80,18 @@ pub enum PortForwardError {
     UnexpectedReply,
 }
 
+impl PortForwardError {
+    /// True when the gateway strictly refused an explicit external-port
+    /// suggestion ([`ResultCode::SuggestedPortUnavailable`]): the port is held
+    /// by another client. The follow policy treats only this as a "conflict"
+    /// (auto rules degrade to a server pick, pinned rules hold), so it must not
+    /// be conflated with transport failures or other refusals.
+    #[must_use]
+    pub fn is_suggested_port_conflict(&self) -> bool {
+        matches!(self, Self::Gateway(ResultCode::SuggestedPortUnavailable))
+    }
+}
+
 /// Renewal delay for a granted lifetime: half of it, per RFC 6886 section 3.3.
 ///
 /// Clamped so a zero or tiny lifetime cannot turn the refresh loop into a busy
@@ -681,6 +693,26 @@ mod tests {
             suggested_external_port: 0,
             lifetime_secs: 3600,
         }
+    }
+
+    #[test]
+    fn suggested_port_conflict_is_classified_distinctly() {
+        // The follow policy (doc 59) must tell "the port is taken by another
+        // client" apart from every other failure: only the strict
+        // honour-or-error refusal of an explicit suggestion qualifies.
+        assert!(
+            PortForwardError::Gateway(ResultCode::SuggestedPortUnavailable)
+                .is_suggested_port_conflict(),
+            "a strict suggestion refusal IS a port conflict"
+        );
+        assert!(
+            !PortForwardError::Gateway(ResultCode::OutOfResources).is_suggested_port_conflict(),
+            "other gateway refusals are not port conflicts"
+        );
+        assert!(
+            !PortForwardError::Timeout.is_suggested_port_conflict(),
+            "a transport timeout is not a port conflict"
+        );
     }
 
     #[tokio::test]
