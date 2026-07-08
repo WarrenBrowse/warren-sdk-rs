@@ -857,15 +857,32 @@ impl<T: HttpTransport> WarrenClient<T> {
         // of waiting for its hard-close to produce the `Err` that rotates).
         let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let drain_cursor = Arc::clone(&cursor);
+        // Durable avoidance on top of the cursor: an exit that failed to
+        // establish (and, once the reserve-then-switch gate is live, one that
+        // conflicted with a pinned port) stays out of rotation for the TTL,
+        // instead of being retried after one full cursor wrap.
+        let avoid = Arc::new(std::sync::Mutex::new(
+            // Keyed by the raw exit id bytes (`VerifiedExit::exit_id`).
+            crate::portfollow::AvoidSet::<[u8; 16]>::default(),
+        ));
         self.spawn_supervised(
             cfg,
             move || {
                 let signing = signing.clone();
                 let exits = exits.clone();
                 let cursor = Arc::clone(&cursor);
+                let avoid = Arc::clone(&avoid);
                 let transport_config = transport_config.clone();
                 async move {
-                    let idx = cursor.load(Ordering::Relaxed) % exits.len();
+                    let idx = {
+                        let avoid = avoid.lock().expect("avoid-set lock poisoned");
+                        let ids: Vec<_> = exits.iter().map(|e| e.exit_id).collect();
+                        crate::portfollow::next_candidate(
+                            cursor.load(Ordering::Relaxed),
+                            &ids,
+                            &*avoid,
+                        )
+                    };
                     match establish_multihop(
                         signing,
                         &exits[idx],
@@ -875,9 +892,16 @@ impl<T: HttpTransport> WarrenClient<T> {
                     )
                     .await
                     {
-                        Ok(tunnel) => Ok(tunnel),
+                        Ok(tunnel) => {
+                            cursor.store(idx, Ordering::Relaxed);
+                            Ok(tunnel)
+                        }
                         Err(e) => {
-                            cursor.fetch_add(1, Ordering::Relaxed);
+                            avoid
+                                .lock()
+                                .expect("avoid-set lock poisoned")
+                                .insert(exits[idx].exit_id);
+                            cursor.store(idx.wrapping_add(1), Ordering::Relaxed);
                             Err(e)
                         }
                     }
@@ -922,14 +946,23 @@ impl<T: HttpTransport> WarrenClient<T> {
 
         let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
         let (forwarder_tx, forwarder_rx) = tokio::sync::watch::channel(None);
+        let (migration_tx, migration_rx) = tokio::sync::watch::channel(None);
         let dns_server = cfg.dns_server;
         let task = tokio::spawn(async move {
             supervise_proxy(
                 socks_listener,
                 http_listener,
                 dns_server,
-                state_tx,
-                forwarder_tx,
+                crate::supervisor::SupervisorOutputs {
+                    state_tx,
+                    forwarder_tx,
+                    migration_tx,
+                },
+                // Reserve-then-switch is OFF by default: the pre-migrate gate
+                // needs the candidate pre-flight (NAT-PMP reservation over the
+                // target exit) that activates with the transactional-migration
+                // rollout; until then a drain migrates unconditionally.
+                None,
                 connect,
                 on_drain,
             )
@@ -941,6 +974,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             http_addr,
             state_rx,
             forwarder_rx,
+            migration_rx,
             task,
         })
     }

@@ -109,8 +109,12 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
                 socks_listener,
                 None,
                 None,
-                state_tx,
-                tokio::sync::watch::channel(None).0,
+                crate::supervisor::SupervisorOutputs {
+                    state_tx,
+                    forwarder_tx: tokio::sync::watch::channel(None).0,
+                    migration_tx: tokio::sync::watch::channel(None).0,
+                },
+                None,
                 move || {
                     let kill_tx = kill_tx.clone();
                     let cycles = Arc::clone(&cycles);
@@ -172,8 +176,12 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
             socks_listener,
             None,
             None,
-            state_tx,
-            forwarder_tx,
+            crate::supervisor::SupervisorOutputs {
+                state_tx,
+                forwarder_tx,
+                migration_tx: tokio::sync::watch::channel(None).0,
+            },
+            None,
             move || {
                 let kill_tx = kill_tx.clone();
                 async move {
@@ -248,17 +256,23 @@ async fn supervise_forward_remaps_across_epochs_and_clears_on_drop() {
         let establishes = Arc::clone(&establishes);
         let first_dropped = Arc::clone(&first_dropped);
         tokio::spawn(async move {
-            supervise_forward(fwd_rx, ext_tx, move |f: FakeForwarder, _suggested: u16| {
-                let establishes = Arc::clone(&establishes);
-                let dropped = Arc::clone(&first_dropped);
-                async move {
-                    establishes.fetch_add(1, Ordering::SeqCst);
-                    Ok::<_, SdkError>(FakePort {
-                        external: f.0,
-                        dropped,
-                    })
-                }
-            })
+            supervise_forward(
+                fwd_rx,
+                ext_tx,
+                tokio::sync::watch::channel(None).0,
+                crate::portfollow::PortFollowConfig::default(),
+                move |f: FakeForwarder, _suggested: u16| {
+                    let establishes = Arc::clone(&establishes);
+                    let dropped = Arc::clone(&first_dropped);
+                    async move {
+                        establishes.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, SdkError>(FakePort {
+                            external: f.0,
+                            dropped,
+                        })
+                    }
+                },
+            )
             .await;
         })
     };
@@ -317,13 +331,19 @@ async fn supervise_forward_resuggests_the_last_granted_external_port() {
     let task = {
         let suggested_seen = Arc::clone(&suggested_seen);
         tokio::spawn(async move {
-            supervise_forward(fwd_rx, ext_tx, move |f: FakeForwarder, suggested: u16| {
-                let suggested_seen = Arc::clone(&suggested_seen);
-                async move {
-                    suggested_seen.lock().unwrap().push(suggested);
-                    Ok::<_, SdkError>(FakePort(f.0))
-                }
-            })
+            supervise_forward(
+                fwd_rx,
+                ext_tx,
+                tokio::sync::watch::channel(None).0,
+                crate::portfollow::PortFollowConfig::default(),
+                move |f: FakeForwarder, suggested: u16| {
+                    let suggested_seen = Arc::clone(&suggested_seen);
+                    async move {
+                        suggested_seen.lock().unwrap().push(suggested);
+                        Ok::<_, SdkError>(FakePort(f.0))
+                    }
+                },
+            )
             .await;
         })
     };
@@ -350,6 +370,362 @@ async fn supervise_forward_resuggests_the_last_granted_external_port() {
     );
 }
 
+/// A port-conflict error exactly as the datapath surfaces it: the gateway's
+/// strict honour-or-error refusal of an explicit suggestion.
+fn conflict_error() -> SdkError {
+    SdkError::PortForward(warren_net::PortForwardError::Gateway(
+        warren_net::ResultCode::SuggestedPortUnavailable,
+    ))
+}
+
+#[test]
+fn sdk_error_classifies_only_the_strict_suggestion_refusal_as_conflict() {
+    assert!(conflict_error().is_port_conflict());
+    assert!(
+        !SdkError::PortForward(warren_net::PortForwardError::Timeout).is_port_conflict(),
+        "a transport timeout is not a port conflict"
+    );
+    assert!(
+        !SdkError::NoMultihopExit.is_port_conflict(),
+        "non-portforward errors are never conflicts"
+    );
+}
+
+#[tokio::test]
+async fn supervise_forward_auto_conflict_degrades_to_a_server_pick() {
+    // C3 (doc 59): a best-effort (auto) rule whose sticky re-suggestion hits a
+    // conflict on the new exit must retry ONCE with `suggested = 0` (server
+    // pick) instead of dying, surface the change, and forget the stale sticky.
+    use std::sync::Mutex;
+
+    use crate::portfollow::{PortFollowConfig, PortFollowOutcome};
+    use crate::supervisor::{ExternalPort, supervise_forward};
+
+    #[derive(Clone)]
+    struct FakeForwarder {
+        taken: u16,
+        auto_pick: u16,
+    }
+    struct FakePort(u16);
+    impl ExternalPort for FakePort {
+        fn external_port(&self) -> u16 {
+            self.0
+        }
+    }
+
+    let (fwd_tx, fwd_rx) = tokio::sync::watch::channel::<Option<FakeForwarder>>(None);
+    let (ext_tx, mut ext_rx) = tokio::sync::watch::channel::<Option<u16>>(None);
+    let (out_tx, mut out_rx) = tokio::sync::watch::channel::<Option<PortFollowOutcome>>(None);
+    let suggested_seen = Arc::new(Mutex::new(Vec::<u16>::new()));
+
+    let task = {
+        let suggested_seen = Arc::clone(&suggested_seen);
+        tokio::spawn(async move {
+            supervise_forward(
+                fwd_rx,
+                ext_tx,
+                out_tx,
+                PortFollowConfig::default(),
+                move |f: FakeForwarder, suggested: u16| {
+                    let suggested_seen = Arc::clone(&suggested_seen);
+                    async move {
+                        suggested_seen.lock().unwrap().push(suggested);
+                        if suggested == f.taken {
+                            return Err(conflict_error());
+                        }
+                        Ok(FakePort(if suggested == 0 {
+                            f.auto_pick
+                        } else {
+                            suggested
+                        }))
+                    }
+                },
+            )
+            .await;
+        })
+    };
+
+    // Epoch 1: first establish (auto), the exit grants 5000.
+    fwd_tx
+        .send(Some(FakeForwarder {
+            taken: 0xFFFF,
+            auto_pick: 5000,
+        }))
+        .unwrap();
+    ext_rx.changed().await.unwrap();
+    assert_eq!(*ext_rx.borrow(), Some(5000));
+
+    // Epoch 2 (new exit): 5000 is taken there. The rule must degrade to a
+    // server pick (7777), not fail.
+    fwd_tx.send(None).unwrap();
+    ext_rx.changed().await.unwrap();
+    fwd_tx
+        .send(Some(FakeForwarder {
+            taken: 5000,
+            auto_pick: 7777,
+        }))
+        .unwrap();
+    ext_rx.changed().await.unwrap();
+    assert_eq!(
+        *ext_rx.borrow(),
+        Some(7777),
+        "the auto rule degraded to the server-assigned port instead of dying"
+    );
+    out_rx.changed().await.ok();
+    assert_eq!(
+        *out_rx.borrow_and_update(),
+        Some(PortFollowOutcome::Changed {
+            previous: Some(5000),
+            port: 7777
+        }),
+        "the degrade is surfaced as a Changed outcome carrying the old port"
+    );
+    assert_eq!(
+        *suggested_seen.lock().unwrap(),
+        vec![0, 5000, 0],
+        "conflict on the sticky re-suggestion retried once with suggested=0"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn supervise_forward_pinned_conflict_stays_without_degrading() {
+    // C2 (doc 59): a PINNED rule never silently degrades. A conflict leaves the
+    // mapping unset for the epoch (ConflictStayed), and the SAME pinned port is
+    // requested again on the next epoch; `suggested = 0` is never sent.
+    use std::sync::Mutex;
+
+    use crate::portfollow::{PortFollowConfig, PortFollowOutcome, PortFollowPolicy};
+    use crate::supervisor::{ExternalPort, supervise_forward};
+
+    #[derive(Clone)]
+    struct FakeForwarder {
+        taken: bool,
+    }
+    struct FakePort(u16);
+    impl ExternalPort for FakePort {
+        fn external_port(&self) -> u16 {
+            self.0
+        }
+    }
+
+    let (fwd_tx, fwd_rx) = tokio::sync::watch::channel::<Option<FakeForwarder>>(None);
+    let (ext_tx, mut ext_rx) = tokio::sync::watch::channel::<Option<u16>>(None);
+    let (out_tx, mut out_rx) = tokio::sync::watch::channel::<Option<PortFollowOutcome>>(None);
+    let suggested_seen = Arc::new(Mutex::new(Vec::<u16>::new()));
+
+    let config = PortFollowConfig {
+        policy: PortFollowPolicy::KeepPortOrStay,
+        pinned_external_port: Some(6000),
+        ..PortFollowConfig::default()
+    };
+    let task = {
+        let suggested_seen = Arc::clone(&suggested_seen);
+        tokio::spawn(async move {
+            supervise_forward(
+                fwd_rx,
+                ext_tx,
+                out_tx,
+                config,
+                move |f: FakeForwarder, suggested: u16| {
+                    let suggested_seen = Arc::clone(&suggested_seen);
+                    async move {
+                        suggested_seen.lock().unwrap().push(suggested);
+                        if f.taken {
+                            return Err(conflict_error());
+                        }
+                        Ok(FakePort(suggested))
+                    }
+                },
+            )
+            .await;
+        })
+    };
+
+    // Epoch 1: the pinned port is granted.
+    fwd_tx.send(Some(FakeForwarder { taken: false })).unwrap();
+    ext_rx.changed().await.unwrap();
+    assert_eq!(*ext_rx.borrow(), Some(6000));
+
+    // Epoch 2 (new exit): 6000 is taken. The rule must NOT degrade; it stays
+    // unmapped and reports the conflict.
+    fwd_tx.send(None).unwrap();
+    ext_rx.changed().await.unwrap();
+    fwd_tx.send(Some(FakeForwarder { taken: true })).unwrap();
+    out_rx
+        .wait_for(|o| matches!(o, Some(PortFollowOutcome::ConflictStayed { pinned: 6000 })))
+        .await
+        .expect("the pinned conflict is surfaced as ConflictStayed");
+    assert_eq!(
+        *ext_rx.borrow(),
+        None,
+        "no mapping exists for the conflicted epoch (never a silent other port)"
+    );
+
+    // Epoch 3: back on an exit where the pin is free; the SAME port returns.
+    // The conflicted epoch published no external change to sync on, so yield
+    // long enough for the task to observe the `None` before the new epoch
+    // (production epochs are seconds apart; a coalesced watch cannot happen).
+    fwd_tx.send(None).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    fwd_tx.send(Some(FakeForwarder { taken: false })).unwrap();
+    ext_rx
+        .wait_for(|p| *p == Some(6000))
+        .await
+        .expect("the pinned port is re-granted once free");
+    out_rx
+        .wait_for(|o| matches!(o, Some(PortFollowOutcome::Kept { port: 6000 })))
+        .await
+        .expect("re-granting the pinned port is a Kept outcome");
+
+    task.abort();
+    assert!(
+        suggested_seen.lock().unwrap().iter().all(|&s| s == 6000),
+        "a pinned rule only ever requests its pin, never suggested=0: {:?}",
+        suggested_seen.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn supervise_forward_disabled_policy_never_resuggests() {
+    // Disabled follow: every epoch asks for a fresh server-assigned port.
+    use std::sync::Mutex;
+
+    use crate::portfollow::{PortFollowConfig, PortFollowPolicy};
+    use crate::supervisor::{ExternalPort, supervise_forward};
+
+    #[derive(Clone)]
+    struct FakeForwarder(u16);
+    struct FakePort(u16);
+    impl ExternalPort for FakePort {
+        fn external_port(&self) -> u16 {
+            self.0
+        }
+    }
+
+    let (fwd_tx, fwd_rx) = tokio::sync::watch::channel::<Option<FakeForwarder>>(None);
+    let (ext_tx, mut ext_rx) = tokio::sync::watch::channel::<Option<u16>>(None);
+    let (out_tx, _out_rx) = tokio::sync::watch::channel(None);
+    let suggested_seen = Arc::new(Mutex::new(Vec::<u16>::new()));
+
+    let config = PortFollowConfig {
+        policy: PortFollowPolicy::Disabled,
+        ..PortFollowConfig::default()
+    };
+    let task = {
+        let suggested_seen = Arc::clone(&suggested_seen);
+        tokio::spawn(async move {
+            supervise_forward(
+                fwd_rx,
+                ext_tx,
+                out_tx,
+                config,
+                move |f: FakeForwarder, suggested: u16| {
+                    let suggested_seen = Arc::clone(&suggested_seen);
+                    async move {
+                        suggested_seen.lock().unwrap().push(suggested);
+                        Ok(FakePort(f.0))
+                    }
+                },
+            )
+            .await;
+        })
+    };
+
+    fwd_tx.send(Some(FakeForwarder(5000))).unwrap();
+    ext_rx.changed().await.unwrap();
+    fwd_tx.send(None).unwrap();
+    ext_rx.changed().await.unwrap();
+    fwd_tx.send(Some(FakeForwarder(9999))).unwrap();
+    ext_rx.changed().await.unwrap();
+    assert_eq!(*ext_rx.borrow(), Some(9999));
+
+    task.abort();
+    assert_eq!(
+        *suggested_seen.lock().unwrap(),
+        vec![0, 0],
+        "Disabled never re-suggests a previous port"
+    );
+}
+
+#[tokio::test]
+async fn supervise_forward_retries_a_transient_failure_within_the_epoch() {
+    // A transient (non-conflict) failure right after connect must not leave the
+    // forward dead for the whole epoch: it retries with a jittered backoff and
+    // recovers without waiting for the next reconnect.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::portfollow::{PortFollowConfig, PortFollowOutcome};
+    use crate::supervisor::{ExternalPort, supervise_forward};
+
+    #[derive(Clone)]
+    struct FakeForwarder;
+    struct FakePort(u16);
+    impl ExternalPort for FakePort {
+        fn external_port(&self) -> u16 {
+            self.0
+        }
+    }
+
+    let (fwd_tx, fwd_rx) = tokio::sync::watch::channel::<Option<FakeForwarder>>(None);
+    let (ext_tx, mut ext_rx) = tokio::sync::watch::channel::<Option<u16>>(None);
+    let (out_tx, out_rx) = tokio::sync::watch::channel(None);
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let config = PortFollowConfig {
+        retry_base: std::time::Duration::from_millis(1),
+        retry_max: std::time::Duration::from_millis(5),
+        ..PortFollowConfig::default()
+    };
+    let task = {
+        let attempts = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            supervise_forward(
+                fwd_rx,
+                ext_tx,
+                out_tx,
+                config,
+                move |_f: FakeForwarder, _suggested: u16| {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                            return Err(SdkError::PortForward(
+                                warren_net::PortForwardError::Timeout,
+                            ));
+                        }
+                        Ok(FakePort(5000))
+                    }
+                },
+            )
+            .await;
+        })
+    };
+
+    fwd_tx.send(Some(FakeForwarder)).unwrap();
+    let granted = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ext_rx.wait_for(|p| p.is_some()),
+    )
+    .await;
+    assert!(
+        granted.is_ok(),
+        "the forward recovered within the epoch (no reconnect happened)"
+    );
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 3,
+        "it retried past the transient failures"
+    );
+    assert_eq!(
+        *out_rx.borrow(),
+        Some(PortFollowOutcome::Changed {
+            previous: None,
+            port: 5000
+        }),
+        "the eventual grant is surfaced"
+    );
+    task.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn supervisor_serves_both_socks_and_http_listeners() {
     // Exercises the dual-listener serve epoch (the `select!` two-branch path):
@@ -366,8 +742,12 @@ async fn supervisor_serves_both_socks_and_http_listeners() {
             socks_listener,
             Some(http_listener),
             None,
-            state_tx,
-            tokio::sync::watch::channel(None).0,
+            crate::supervisor::SupervisorOutputs {
+                state_tx,
+                forwarder_tx: tokio::sync::watch::channel(None).0,
+                migration_tx: tokio::sync::watch::channel(None).0,
+            },
+            None,
             move || {
                 let keep_open = Arc::clone(&keep_open);
                 async move {
@@ -409,8 +789,12 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
             socks_listener,
             None,
             None,
-            state_tx,
-            tokio::sync::watch::channel(None).0,
+            crate::supervisor::SupervisorOutputs {
+                state_tx,
+                forwarder_tx: tokio::sync::watch::channel(None).0,
+                migration_tx: tokio::sync::watch::channel(None).0,
+            },
+            None,
             move || {
                 let cursor = Arc::clone(&cursor);
                 let ok_tx = ok_tx.clone();
@@ -468,8 +852,12 @@ async fn supervisor_failover_rotates_on_drain() {
             socks_listener,
             None,
             None,
-            state_tx,
-            tokio::sync::watch::channel(None).0,
+            crate::supervisor::SupervisorOutputs {
+                state_tx,
+                forwarder_tx: tokio::sync::watch::channel(None).0,
+                migration_tx: tokio::sync::watch::channel(None).0,
+            },
+            None,
             move || {
                 let cursor = Arc::clone(&cursor);
                 let used_tx = used_tx.clone();
@@ -536,8 +924,12 @@ async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
             socks_listener,
             None,
             None,
-            state_tx,
-            tokio::sync::watch::channel(None).0,
+            crate::supervisor::SupervisorOutputs {
+                state_tx,
+                forwarder_tx: tokio::sync::watch::channel(None).0,
+                migration_tx: tokio::sync::watch::channel(None).0,
+            },
+            None,
             move || {
                 let cursor = Arc::clone(&cursor);
                 let used_tx = used_tx.clone();
@@ -607,8 +999,12 @@ async fn supervisor_retries_past_failed_attempts_then_connects() {
                 socks_listener,
                 None,
                 None,
-                state_tx,
-                tokio::sync::watch::channel(None).0,
+                crate::supervisor::SupervisorOutputs {
+                    state_tx,
+                    forwarder_tx: tokio::sync::watch::channel(None).0,
+                    migration_tx: tokio::sync::watch::channel(None).0,
+                },
+                None,
                 move || {
                     let attempts = Arc::clone(&attempts);
                     let keep_open = Arc::clone(&keep_open);
@@ -648,6 +1044,250 @@ async fn supervisor_retries_past_failed_attempts_then_connects() {
     // A successful (third) attempt means the serve loop is now live on the
     // stable address; a bare TCP connect to it succeeds.
     assert!(proxy_accepts(stable_addr).await, "stable listener is live");
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn supervisor_emits_structured_migration_events_on_drain() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::portfollow::{MigrationEvent, MigrationOutcome};
+
+    // Exit 0 drains; the migration proceeds (no gate) onto exit 1. The host app
+    // must see MORE than the bare `Draining` state: a structured event carrying
+    // the advisory's fields, first `Migrating`, then `Completed` once the
+    // reconnect lands.
+    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+    let (migration_tx, mut migration_rx) =
+        tokio::sync::watch::channel::<Option<MigrationEvent>>(None);
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let drain_cursor = Arc::clone(&cursor);
+    let keep_open = Arc::new(tokio::sync::Notify::new());
+
+    let task = tokio::spawn(async move {
+        supervise_proxy(
+            socks_listener,
+            None,
+            None,
+            crate::supervisor::SupervisorOutputs {
+                state_tx,
+                forwarder_tx: tokio::sync::watch::channel(None).0,
+                migration_tx,
+            },
+            None,
+            move || {
+                let cursor = Arc::clone(&cursor);
+                let keep_open = Arc::clone(&keep_open);
+                async move {
+                    let idx = cursor.load(Ordering::Relaxed) % 2;
+                    Ok::<_, SdkError>(EstablishedTunnel {
+                        sink: DrainingSink {
+                            close: Arc::clone(&keep_open),
+                            drain_rx: make_drain_rx(idx == 0),
+                        },
+                        local_ip: "10.66.0.2".parse().unwrap(),
+                        prefix: 24,
+                        gateway: "10.66.0.1".parse().unwrap(),
+                        ipv6: None,
+                    })
+                }
+            },
+            move || {
+                drain_cursor.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .await;
+    });
+
+    let migrating = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        migration_rx.wait_for(|e| e.is_some()),
+    )
+    .await
+    .expect("a migration event is emitted on drain")
+    .expect("watch alive")
+    .expect("event");
+    assert_eq!(
+        migrating,
+        MigrationEvent {
+            deadline_unix_secs: u64::MAX,
+            reason_code: 0,
+            outcome: MigrationOutcome::Migrating,
+        },
+        "the event exposes the drain advisory's fields"
+    );
+
+    let completed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        migration_rx.wait_for(|e| {
+            matches!(
+                e,
+                Some(MigrationEvent {
+                    outcome: MigrationOutcome::Completed,
+                    ..
+                })
+            )
+        }),
+    )
+    .await;
+    assert!(
+        completed.is_ok(),
+        "the post-drain reconnect emits a Completed migration event"
+    );
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn supervisor_gate_veto_cancels_the_migration_and_keeps_serving() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::portfollow::{MigrationEvent, MigrationOutcome};
+
+    // The reserve-then-switch gate refuses every candidate (all pinned ports
+    // conflicted): the migration must be CANCELLED, the cursor must NOT rotate,
+    // no reconnect happens, and the current (draining) session keeps serving.
+    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stable_addr = socks_listener.local_addr().unwrap();
+    let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+    let (migration_tx, mut migration_rx) =
+        tokio::sync::watch::channel::<Option<MigrationEvent>>(None);
+    let connects = Arc::new(AtomicUsize::new(0));
+    let rotations = Arc::new(AtomicUsize::new(0));
+    let rotations_in = Arc::clone(&rotations);
+    let keep_open = Arc::new(tokio::sync::Notify::new());
+
+    let task = {
+        let connects = Arc::clone(&connects);
+        tokio::spawn(async move {
+            supervise_proxy(
+                socks_listener,
+                None,
+                None,
+                crate::supervisor::SupervisorOutputs {
+                    state_tx,
+                    forwarder_tx: tokio::sync::watch::channel(None).0,
+                    migration_tx,
+                },
+                Some(Box::new(|_advisory| Box::pin(async { false }))),
+                move || {
+                    let connects = Arc::clone(&connects);
+                    let keep_open = Arc::clone(&keep_open);
+                    async move {
+                        connects.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, SdkError>(EstablishedTunnel {
+                            sink: DrainingSink {
+                                close: Arc::clone(&keep_open),
+                                drain_rx: make_drain_rx(true),
+                            },
+                            local_ip: "10.66.0.2".parse().unwrap(),
+                            prefix: 24,
+                            gateway: "10.66.0.1".parse().unwrap(),
+                            ipv6: None,
+                        })
+                    }
+                },
+                move || {
+                    rotations_in.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await;
+        })
+    };
+
+    let event = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        migration_rx.wait_for(|e| e.is_some()),
+    )
+    .await
+    .expect("the cancelled migration is surfaced in time")
+    .expect("watch alive")
+    .expect("event");
+    assert_eq!(
+        event.outcome,
+        MigrationOutcome::CancelledPortConflict,
+        "an all-candidates-conflicted verdict surfaces as a cancellation"
+    );
+
+    // The refusal must not have torn the session down or rotated the cursor.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        connects.load(Ordering::SeqCst),
+        1,
+        "no reconnect: the client stays on the draining exit"
+    );
+    assert_eq!(
+        rotations.load(Ordering::SeqCst),
+        0,
+        "the failover cursor does not rotate on a cancelled migration"
+    );
+    assert!(
+        proxy_accepts(stable_addr).await,
+        "the current session keeps serving after the cancellation"
+    );
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn supervisor_gate_approval_lets_the_migration_proceed() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // The gate grants (pre-flight reserved the pinned ports on the candidate):
+    // the migration proceeds exactly like the no-gate path, rotating the cursor.
+    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let drain_cursor = Arc::clone(&cursor);
+    let (used_tx, mut used_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let keep_open = Arc::new(tokio::sync::Notify::new());
+
+    let task = tokio::spawn(async move {
+        supervise_proxy(
+            socks_listener,
+            None,
+            None,
+            crate::supervisor::SupervisorOutputs {
+                state_tx,
+                forwarder_tx: tokio::sync::watch::channel(None).0,
+                migration_tx: tokio::sync::watch::channel(None).0,
+            },
+            Some(Box::new(|_advisory| Box::pin(async { true }))),
+            move || {
+                let cursor = Arc::clone(&cursor);
+                let used_tx = used_tx.clone();
+                let keep_open = Arc::clone(&keep_open);
+                async move {
+                    let idx = cursor.load(Ordering::Relaxed) % 2;
+                    let _ = used_tx.send(idx);
+                    Ok::<_, SdkError>(EstablishedTunnel {
+                        sink: DrainingSink {
+                            close: Arc::clone(&keep_open),
+                            drain_rx: make_drain_rx(idx == 0),
+                        },
+                        local_ip: "10.66.0.2".parse().unwrap(),
+                        prefix: 24,
+                        gateway: "10.66.0.1".parse().unwrap(),
+                        ipv6: None,
+                    })
+                }
+            },
+            move || {
+                drain_cursor.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .await;
+    });
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), used_rx.recv())
+        .await
+        .expect("first connect in time")
+        .expect("first idx");
+    assert_eq!(first, 0);
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), used_rx.recv())
+        .await
+        .expect("the approved migration reconnects in time")
+        .expect("second idx");
+    assert_eq!(second, 1, "the approved migration rotated to the candidate");
     task.abort();
 }
 

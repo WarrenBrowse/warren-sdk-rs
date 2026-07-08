@@ -59,6 +59,7 @@ pub use warren_transport::ConnectionState;
 
 mod client;
 mod error;
+mod portfollow;
 mod proxy;
 mod store;
 mod supervisor;
@@ -70,6 +71,10 @@ pub use client::{
     WarrenClientBuilder,
 };
 pub use error::{BuildError, SdkError};
+pub use portfollow::{
+    AvoidSet, DEFAULT_AVOID_TTL, DEFAULT_PREFLIGHT_TIMEOUT, MigrationDecision, MigrationEvent,
+    MigrationOutcome, PortFollowConfig, PortFollowOutcome, PortFollowPolicy, plan_migration,
+};
 pub use proxy::{ProxyForwarder, ProxyHandle, TunnelState};
 pub use store::{FileGenerationStore, FileServerKeyStore};
 pub use supervisor::{SupervisedForwardedPort, SupervisedProxyHandle};

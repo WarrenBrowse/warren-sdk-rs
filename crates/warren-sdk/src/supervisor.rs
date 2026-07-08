@@ -31,6 +31,8 @@ pub struct SupervisedProxyHandle {
     /// every (re)connect and cleared (`None`) while the tunnel is down. Drives
     /// the self-healing port forwards.
     pub(crate) forwarder_rx: tokio::sync::watch::Receiver<Option<ProxyForwarder>>,
+    pub(crate) migration_rx:
+        tokio::sync::watch::Receiver<Option<crate::portfollow::MigrationEvent>>,
     pub(crate) task: tokio::task::JoinHandle<()>,
 }
 
@@ -61,6 +63,26 @@ impl SupervisedProxyHandle {
         self.state_rx.clone()
     }
 
+    /// The latest maintenance-migration event
+    /// ([`MigrationEvent`](crate::MigrationEvent)), or `None` while no drain has
+    /// been seen. Richer than the bare `Draining` state: it carries the drain
+    /// advisory's deadline and reason plus the outcome (migrating, completed,
+    /// or cancelled because every candidate conflicted with a pinned port).
+    #[must_use]
+    pub fn last_migration(&self) -> Option<crate::portfollow::MigrationEvent> {
+        *self.migration_rx.borrow()
+    }
+
+    /// A watch receiver for migration events, so an app can surface
+    /// "switching server for maintenance" / "migration postponed, port kept"
+    /// as they happen.
+    #[must_use]
+    pub fn watch_migration(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<crate::portfollow::MigrationEvent>> {
+        self.migration_rx.clone()
+    }
+
     /// Forwards a tunnel-side port that survives reconnects: maps `internal_port`
     /// at the exit via NAT-PMP and relays inbound connections to `local_target`,
     /// re-establishing the mapping on every tunnel rebuild. The returned
@@ -82,13 +104,38 @@ impl SupervisedProxyHandle {
         internal_port: u16,
         local_target: SocketAddr,
     ) -> SupervisedForwardedPort {
+        self.forward_port_with_policy(
+            proto,
+            internal_port,
+            local_target,
+            crate::portfollow::PortFollowConfig::default(),
+        )
+    }
+
+    /// Like [`Self::forward_port`], with an explicit follow policy and knobs
+    /// (see [`PortFollowConfig`](crate::PortFollowConfig)): pin the external
+    /// port (`KeepPortOrStay`, never degrades), follow it best-effort (the
+    /// default; a conflict degrades to a server-assigned port), or disable the
+    /// follow. Observe what happened to the port on each rebuild via
+    /// [`SupervisedForwardedPort::watch_outcome`].
+    #[must_use]
+    pub fn forward_port_with_policy(
+        &self,
+        proto: MapProto,
+        internal_port: u16,
+        local_target: SocketAddr,
+        config: crate::portfollow::PortFollowConfig,
+    ) -> SupervisedForwardedPort {
         let (external_tx, external_rx) = tokio::sync::watch::channel(None);
+        let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
         let forwarder_rx = self.forwarder_rx.clone();
         let task = tokio::spawn(async move {
             supervise_forward(
                 forwarder_rx,
                 external_tx,
-                move |forwarder, suggested| async move {
+                outcome_tx,
+                config,
+                move |forwarder: ProxyForwarder, suggested| async move {
                     forwarder
                         .forward_port_with_suggested(proto, internal_port, local_target, suggested)
                         .await
@@ -99,6 +146,7 @@ impl SupervisedProxyHandle {
         SupervisedForwardedPort {
             internal_port,
             external_rx,
+            outcome_rx,
             task,
         }
     }
@@ -121,6 +169,7 @@ impl Drop for SupervisedProxyHandle {
 pub struct SupervisedForwardedPort {
     internal_port: u16,
     external_rx: tokio::sync::watch::Receiver<Option<u16>>,
+    outcome_rx: tokio::sync::watch::Receiver<Option<crate::portfollow::PortFollowOutcome>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -145,6 +194,24 @@ impl SupervisedForwardedPort {
     #[must_use]
     pub fn watch_external_port(&self) -> tokio::sync::watch::Receiver<Option<u16>> {
         self.external_rx.clone()
+    }
+
+    /// What happened to this rule's external port on the latest (re)establish
+    /// ([`PortFollowOutcome`](crate::PortFollowOutcome)): kept, changed to a new
+    /// server pick, held back by a conflict, or failed. `None` before the first
+    /// establish attempt completes.
+    #[must_use]
+    pub fn last_outcome(&self) -> Option<crate::portfollow::PortFollowOutcome> {
+        *self.outcome_rx.borrow()
+    }
+
+    /// A watch receiver for follow outcomes, so an app can surface "port
+    /// re-mapped" / "new auto port" / "conflict, port held" as they happen.
+    #[must_use]
+    pub fn watch_outcome(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<crate::portfollow::PortFollowOutcome>> {
+        self.outcome_rx.clone()
     }
 
     /// Tears the forward down.
@@ -173,13 +240,22 @@ impl ExternalPort for ForwardedPort {
 }
 
 /// Drives one forwarded port across tunnel rebuilds: when a forwarder appears
-/// (re)connect, it establishes the mapping and publishes the granted external
-/// port; when the tunnel goes away (`None`), it drops the mapping and clears the
-/// port. Generic over the forwarder and established-port types so the state
-/// machine is testable without a real NAT-PMP gateway.
+/// (re)connect, it establishes the mapping per the follow policy and publishes
+/// the granted external port and a [`PortFollowOutcome`]; when the tunnel goes
+/// away (`None`), it drops the mapping and clears the port. Generic over the
+/// forwarder and established-port types so the state machine is testable
+/// without a real NAT-PMP gateway.
+///
+/// Conflict semantics (the maintenance-migration service contract): a strict
+/// suggestion refusal on a best-effort rule degrades ONCE to a server pick
+/// (`suggested = 0`, the stale sticky is forgotten); on a pinned rule it holds
+/// with no mapping for the epoch. Either way the loop stays alive. Transient
+/// failures retry within the epoch with a jittered backoff.
 pub(crate) async fn supervise_forward<F, P, E, Fut>(
     mut forwarder_rx: tokio::sync::watch::Receiver<Option<F>>,
     external_tx: tokio::sync::watch::Sender<Option<u16>>,
+    outcome_tx: tokio::sync::watch::Sender<Option<crate::portfollow::PortFollowOutcome>>,
+    config: crate::portfollow::PortFollowConfig,
     mut establish: E,
 ) where
     F: Clone,
@@ -187,29 +263,104 @@ pub(crate) async fn supervise_forward<F, P, E, Fut>(
     E: FnMut(F, u16) -> Fut,
     Fut: std::future::Future<Output = Result<P, SdkError>>,
 {
+    use crate::portfollow::{PortFollowOutcome, PortFollowPolicy};
+
     // Holding `current` keeps the established port alive; replacing or clearing
     // it drops the previous one, which tears its mapping/relay tasks down.
     let mut current: Option<P> = None;
-    // The external port to re-suggest on the next establish so the public port
-    // follows the client across reconnects/exit-changes. `0` (auto) for the very
-    // first establish; the last-granted port thereafter.
-    let mut suggested: u16 = 0;
+    // The last granted external port, re-suggested so the public port follows
+    // the client across reconnects/exit-changes (policy permitting).
+    let mut sticky: Option<u16> = None;
+    // A pinned conflict parks the rule until the next epoch: the port is held
+    // by another client on THIS exit, so re-asking before an exit change would
+    // only hammer the gateway.
+    let mut conflicted_epoch = false;
+    let mut backoff = Backoff {
+        base: config.retry_base,
+        max: config.retry_max,
+    }
+    .forever();
     loop {
         let snapshot = forwarder_rx.borrow_and_update().clone();
         match snapshot {
-            Some(forwarder) if current.is_none() => {
-                // A refusal or transient failure leaves the port unset; the next
-                // epoch change retries. No identity material is logged.
-                if let Ok(port) = establish(forwarder, suggested).await {
-                    // Remember this grant so the next establish re-suggests it and
-                    // the public port follows the client across reconnects.
-                    suggested = port.external_port();
-                    let _ = external_tx.send(Some(port.external_port()));
-                    current = Some(port);
+            Some(forwarder) if current.is_none() && !conflicted_epoch => {
+                let suggested = match config.policy {
+                    PortFollowPolicy::Disabled => 0,
+                    PortFollowPolicy::KeepPortOrStay => {
+                        config.pinned_external_port.or(sticky).unwrap_or(0)
+                    }
+                    PortFollowPolicy::FollowBestEffort => sticky.unwrap_or(0),
+                };
+                // No identity material is logged on any of these paths.
+                match establish(forwarder.clone(), suggested).await {
+                    Ok(port) => {
+                        let granted = port.external_port();
+                        let outcome = if sticky == Some(granted) {
+                            PortFollowOutcome::Kept { port: granted }
+                        } else {
+                            PortFollowOutcome::Changed {
+                                previous: sticky,
+                                port: granted,
+                            }
+                        };
+                        sticky = Some(granted);
+                        let _ = outcome_tx.send(Some(outcome));
+                        let _ = external_tx.send(Some(granted));
+                        current = Some(port);
+                        backoff.reset();
+                    }
+                    Err(e) if e.is_port_conflict() && suggested != 0 => {
+                        if config.policy == PortFollowPolicy::KeepPortOrStay {
+                            // Never degrade a pinned rule: no mapping this
+                            // epoch, the pin stays requested on the next one.
+                            let _ = outcome_tx.send(Some(PortFollowOutcome::ConflictStayed {
+                                pinned: suggested,
+                            }));
+                            conflicted_epoch = true;
+                        } else {
+                            // Best-effort: the sticky port is gone on this exit.
+                            // Forget it and take a server-assigned port instead
+                            // of killing the rule.
+                            sticky = None;
+                            match establish(forwarder, 0).await {
+                                Ok(port) => {
+                                    let granted = port.external_port();
+                                    sticky = Some(granted);
+                                    let _ = outcome_tx.send(Some(PortFollowOutcome::Changed {
+                                        previous: Some(suggested),
+                                        port: granted,
+                                    }));
+                                    let _ = external_tx.send(Some(granted));
+                                    current = Some(port);
+                                    backoff.reset();
+                                }
+                                Err(_) => {
+                                    let _ = outcome_tx.send(Some(PortFollowOutcome::Failed));
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let _ = outcome_tx.send(Some(PortFollowOutcome::Failed));
+                    }
+                }
+                if current.is_none() && !conflicted_epoch {
+                    // Transient failure: retry within the epoch after a jittered
+                    // delay, yielding immediately if the epoch changes first.
+                    tokio::select! {
+                        () = tokio::time::sleep(backoff.next_delay()) => {}
+                        changed = forwarder_rx.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    continue;
                 }
             }
             Some(_) => {}
             None => {
+                conflicted_epoch = false;
                 if current.take().is_some() {
                     let _ = external_tx.send(None);
                 }
@@ -277,18 +428,64 @@ pub(crate) async fn serve_epoch(
     }
 }
 
+/// The async reserve-then-switch gate the supervisor consults when a drain
+/// advisory arrives, BEFORE tearing the current session down: it pre-flights
+/// the migration candidates (reserving every pinned forwarded port) and
+/// resolves `true` to proceed or `false` to cancel the migration (all
+/// candidates conflicted), in which case the client stays on the draining exit
+/// and keeps its ports. The pattern is ported from the engine supervisor's
+/// `pre_swap_check`; here the gate runs before the SDK's break-before-make
+/// reconnect (the SDK userland datapath has no overlap bundle).
+pub(crate) type PreMigrateGate = Box<
+    dyn FnMut(
+            warren_transport::DrainAdvisory,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send,
+>;
+
+/// Upper bound on the pre-migrate gate. Past it the migration is CANCELLED
+/// (fail-safe: an unresponsive pre-flight counts as a conflict, so a pinned
+/// port is never abandoned on a hung check), mirroring the engine supervisor's
+/// pre-swap timeout.
+const PRE_MIGRATE_TIMEOUT: std::time::Duration = crate::portfollow::DEFAULT_PREFLIGHT_TIMEOUT;
+
+/// Applies the optional pre-migrate gate: no gate = proceed, a verdict is
+/// honoured, exceeding `timeout` cancels. Free function so the timeout
+/// semantics are testable without a supervisor.
+async fn pre_migrate_allows(
+    gate: Option<&mut PreMigrateGate>,
+    advisory: warren_transport::DrainAdvisory,
+    timeout: std::time::Duration,
+) -> bool {
+    let Some(gate) = gate else {
+        return true;
+    };
+    (tokio::time::timeout(timeout, gate(advisory)).await).unwrap_or(false)
+}
+
+/// The watch senders a supervisor publishes on: connection state, the
+/// per-epoch forwarder driving self-healing port forwards, and the structured
+/// maintenance-migration events. Grouped so the supervisor signature stays
+/// readable as its outputs grow.
+pub(crate) struct SupervisorOutputs {
+    pub(crate) state_tx: tokio::sync::watch::Sender<ConnectionState>,
+    pub(crate) forwarder_tx: tokio::sync::watch::Sender<Option<ProxyForwarder>>,
+    pub(crate) migration_tx: tokio::sync::watch::Sender<Option<crate::portfollow::MigrationEvent>>,
+}
+
 /// Supervises a proxy datapath across tunnel rebuilds, keeping the local
 /// listeners (and thus the app-facing proxy addresses) stable: it establishes a
 /// tunnel, serves until the tunnel dies, then reconnects (immediately after a
 /// drop, with capped exponential backoff between failed attempts), reporting each
-/// [`ConnectionState`] transition. `connect` is the (re)establish closure; it is
+/// [`ConnectionState`] transition and each maintenance-migration event.
+/// `connect` is the (re)establish closure; it is
 /// generic so the loop is testable with a fake sink and a fake connector.
 pub(crate) async fn supervise_proxy<S, F, Fut, D>(
     socks_listener: tokio::net::TcpListener,
     http_listener: Option<tokio::net::TcpListener>,
     dns_server: Option<std::net::Ipv4Addr>,
-    state_tx: tokio::sync::watch::Sender<ConnectionState>,
-    forwarder_tx: tokio::sync::watch::Sender<Option<ProxyForwarder>>,
+    outputs: SupervisorOutputs,
+    mut pre_migrate: Option<PreMigrateGate>,
     mut connect: F,
     on_drain: D,
 ) where
@@ -314,8 +511,11 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
     }
     .forever();
     let mut first = true;
+    // The advisory of an in-flight drain migration; consumed by the next
+    // successful connect to emit the `Completed` migration event.
+    let mut migrating: Option<warren_transport::DrainAdvisory> = None;
     loop {
-        let _ = state_tx.send(if first {
+        let _ = outputs.state_tx.send(if first {
             ConnectionState::Connecting
         } else {
             ConnectionState::Reconnecting
@@ -339,11 +539,23 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                 // Publish this epoch's forwarder so self-healing port forwards
                 // can re-map on the fresh connector; cleared to `None` below when
                 // the tunnel dies.
-                let _ = forwarder_tx.send(Some(ProxyForwarder {
+                let _ = outputs.forwarder_tx.send(Some(ProxyForwarder {
                     connector: connector.clone(),
                     gateway,
                 }));
-                let _ = state_tx.send(ConnectionState::Connected);
+                let _ = outputs.state_tx.send(ConnectionState::Connected);
+                // A reconnect that follows a drain completes that migration:
+                // tell the host (forwards re-map immediately on the fresh
+                // forwarder published above).
+                if let Some(advisory) = migrating.take() {
+                    let _ = outputs
+                        .migration_tx
+                        .send(Some(crate::portfollow::MigrationEvent {
+                            deadline_unix_secs: advisory.deadline_unix_secs,
+                            reason_code: advisory.reason_code,
+                            outcome: crate::portfollow::MigrationOutcome::Completed,
+                        }));
+                }
                 let up_since = std::time::Instant::now();
                 // Serve until the tunnel dies OR (ADR 36) the exit signals a
                 // maintenance drain. A drain wins the race so we reconnect
@@ -351,23 +563,59 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                 // (below) advances the failover cursor so the reconnect rotates
                 // PAST the draining exit directly (no waiting for its hard-close
                 // `Err`). Single-exit `on_drain` is a no-op (one pinned exit).
+                // With a pre-migrate gate wired, the drain first consults it: a
+                // refusal (all candidates conflicted with a pinned port) CANCELS
+                // the migration and the current session keeps serving; the exit
+                // is left to hard-close at its drain deadline, and the port
+                // survives its swap server-side.
                 let drained = match drain_rx {
                     Some(mut rx) => {
-                        tokio::select! {
-                            () = serve_epoch(
-                                &socks_listener, http_listener.as_ref(), connector, alive_rx,
-                            ) => false,
-                            () = wait_for_drain(&mut rx) => true,
+                        // The serve future is pinned OUTSIDE the drain loop so a
+                        // cancelled migration resumes it (active proxy
+                        // connections survive the refusal) instead of
+                        // re-creating the accept loops.
+                        let serve = serve_epoch(
+                            &socks_listener,
+                            http_listener.as_ref(),
+                            connector,
+                            alive_rx,
+                        );
+                        tokio::pin!(serve);
+                        let mut drain_armed = true;
+                        loop {
+                            tokio::select! {
+                                () = &mut serve => break None,
+                                advisory = wait_for_drain(&mut rx), if drain_armed => {
+                                    if pre_migrate_allows(
+                                        pre_migrate.as_mut(), advisory, PRE_MIGRATE_TIMEOUT,
+                                    )
+                                    .await
+                                    {
+                                        break Some(advisory);
+                                    }
+                                    let _ = outputs.migration_tx.send(Some(
+                                        crate::portfollow::MigrationEvent {
+                                            deadline_unix_secs: advisory.deadline_unix_secs,
+                                            reason_code: advisory.reason_code,
+                                            outcome: crate::portfollow::MigrationOutcome::CancelledPortConflict,
+                                        },
+                                    ));
+                                    // One verdict per epoch: disarm the drain
+                                    // arm so the still-Some advisory does not
+                                    // re-fire in a tight loop.
+                                    drain_armed = false;
+                                }
+                            }
                         }
                     }
                     None => {
                         serve_epoch(&socks_listener, http_listener.as_ref(), connector, alive_rx)
                             .await;
-                        false
+                        None
                     }
                 };
-                let _ = forwarder_tx.send(None);
-                if drained {
+                let _ = outputs.forwarder_tx.send(None);
+                if let Some(advisory) = drained {
                     // Rotate the failover cursor PAST the draining exit so the
                     // reconnect lands on a different one (no-op for single-exit).
                     on_drain();
@@ -375,8 +623,17 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                     // with a DISTINCT `Draining` state (ADR 36) so the app can
                     // show "switching server for maintenance" instead of a
                     // generic reconnect; the loop then sends `Reconnecting` as
-                    // the actual redial proceeds.
-                    let _ = state_tx.send(ConnectionState::Draining);
+                    // the actual redial proceeds. The structured event exposes
+                    // the advisory's fields alongside.
+                    migrating = Some(advisory);
+                    let _ = outputs
+                        .migration_tx
+                        .send(Some(crate::portfollow::MigrationEvent {
+                            deadline_unix_secs: advisory.deadline_unix_secs,
+                            reason_code: advisory.reason_code,
+                            outcome: crate::portfollow::MigrationOutcome::Migrating,
+                        }));
+                    let _ = outputs.state_tx.send(ConnectionState::Draining);
                     // Proactive drain reconnect: ALWAYS jitter-delay (never
                     // reset) so a pinned single-exit does not tight-loop on the
                     // still-draining exit, and the herd spreads (anti-stampede).
@@ -397,15 +654,15 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
     }
 }
 
-/// Resolves when the exit publishes a maintenance-drain advisory on `rx`
-/// (ADR 36). Parks forever if the watch sender is dropped (the session ended),
-/// so on a natural tunnel death `serve_epoch` wins the race instead of this.
+/// Resolves with the advisory when the exit publishes a maintenance drain on
+/// `rx` (ADR 36). Parks forever if the watch sender is dropped (the session
+/// ended), so on a natural tunnel death `serve_epoch` wins the race instead.
 async fn wait_for_drain(
     rx: &mut tokio::sync::watch::Receiver<Option<warren_transport::DrainAdvisory>>,
-) {
+) -> warren_transport::DrainAdvisory {
     loop {
-        if rx.borrow_and_update().is_some() {
-            return;
+        if let Some(advisory) = *rx.borrow_and_update() {
+            return advisory;
         }
         if rx.changed().await.is_err() {
             std::future::pending::<()>().await;
@@ -463,6 +720,42 @@ mod drain_tests {
     use super::*;
     use std::time::Duration;
     use warren_transport::DrainAdvisory;
+
+    fn advisory() -> DrainAdvisory {
+        DrainAdvisory {
+            deadline_unix_secs: 1_700_000_000,
+            reason_code: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_migrate_without_a_gate_proceeds() {
+        // No gate wired (the default): the migration proceeds unconditionally,
+        // the pre-doc-59 behavior.
+        assert!(pre_migrate_allows(None, advisory(), Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn pre_migrate_honours_the_gate_verdict() {
+        let mut allow: PreMigrateGate = Box::new(|_| Box::pin(async { true }));
+        assert!(pre_migrate_allows(Some(&mut allow), advisory(), Duration::from_millis(50)).await);
+        let mut deny: PreMigrateGate = Box::new(|_| Box::pin(async { false }));
+        assert!(
+            !pre_migrate_allows(Some(&mut deny), advisory(), Duration::from_millis(50)).await,
+            "a refusing gate cancels the migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_migrate_timeout_cancels_the_migration() {
+        // Fail-safe: a hung pre-flight must count as a conflict (stay, keep the
+        // port), never as an approval.
+        let mut hung: PreMigrateGate = Box::new(|_| Box::pin(std::future::pending()));
+        assert!(
+            !pre_migrate_allows(Some(&mut hung), advisory(), Duration::from_millis(50)).await,
+            "a gate overrunning its budget cancels the migration"
+        );
+    }
 
     #[tokio::test]
     async fn wait_for_drain_resolves_on_advisory() {

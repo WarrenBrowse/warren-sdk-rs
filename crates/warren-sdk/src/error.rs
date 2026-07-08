@@ -98,6 +98,17 @@ pub enum SdkError {
     Build(#[from] BuildError),
 }
 
+impl SdkError {
+    /// True when the failure is the NAT-PMP gateway's strict refusal of an
+    /// explicit external-port suggestion (the port is held by another client).
+    /// The port-follow policy branches on this: an auto rule degrades to a
+    /// server pick, a pinned rule holds without a mapping.
+    #[must_use]
+    pub fn is_port_conflict(&self) -> bool {
+        matches!(self, Self::PortForward(e) if e.is_suggested_port_conflict())
+    }
+}
+
 /// Reasons [`WarrenClientBuilder::build`](crate::WarrenClientBuilder::build) can
 /// reject a configuration.
 ///
