@@ -1037,10 +1037,9 @@ async fn netstack_resolves_via_a_configured_non_gateway_resolver() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn netstack_resolves_aaaa_over_the_tunnel_then_connects_v6() {
-    // A dual-stack client resolves a v6-only name over the tunnel: the A lookup
-    // yields no record, so it falls back to AAAA, gets fd66::5, and connects to
-    // it over IPv6. Proves v6 egress still works for names without an A record.
-    // No host resolver is consulted.
+    // A dual-stack client resolves a domain over the tunnel: with a v6 assignment
+    // it prefers AAAA, gets fd66::5 (v4 DNS transport to the gateway), and then
+    // connects to it over IPv6. No host resolver is consulted.
     let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
     let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
 
@@ -1075,10 +1074,10 @@ async fn netstack_resolves_aaaa_over_the_tunnel_then_connects_v6() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn netstack_udp_domain_resolves_aaaa_when_v6_assigned() {
-    // UDP-associate domain targets follow the same dual-stack policy as TCP: a
-    // v6-only name (no A record) falls back to AAAA, so a UDP domain target still
-    // reaches the v6 internet. The exit answers AAAA only; a strictly v4 client
-    // would get no record and fail, so this pins the AAAA fallback path.
+    // UDP-associate domain targets follow the same dual-stack policy as TCP: with
+    // a v6 assignment the lookup prefers AAAA, so a UDP domain target reaches the
+    // v6 internet instead of being pinned to A-only. The exit answers AAAA; an
+    // A-only client would get no record and fail, so this pins the AAAA path.
     let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
     let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
 
@@ -1111,11 +1110,10 @@ async fn netstack_udp_domain_resolves_aaaa_when_v6_assigned() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn netstack_prefers_a_and_skips_aaaa_when_the_name_has_an_a_record() {
-    // Dual-stack client: with IPv4 preferred, a name that has an A record is
-    // used directly over IPv4 and the AAAA query is never sent (the exit's v6
-    // egress is not reliably routable, so v4 is the default). The exit answers
-    // every query with an A record and records whether AAAA was ever asked.
+async fn netstack_falls_back_to_a_when_the_name_has_no_aaaa() {
+    // Dual-stack client, but the name has no AAAA: the AAAA lookup yields no
+    // record, so the engine falls back to A and connects over IPv4. The exit
+    // answers every query with an A record (so the AAAA query is unsatisfied).
     let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
     let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
 
@@ -1129,7 +1127,7 @@ async fn netstack_prefers_a_and_skips_aaaa_when_the_name_has_an_a_record() {
     let connector = spawn_engine(config, s2c_rx, c2s_tx);
 
     // Answers A (not AAAA) for any query and records whether an AAAA query was
-    // attempted, so the test fails if the engine queried AAAA despite A existing.
+    // attempted, so the test fails if the engine skipped AAAA (an A-only policy).
     let saw_aaaa = Arc::new(AtomicBool::new(false));
     tokio::spawn(dns_a_only_recording_aaaa(
         "10.66.0.1".parse().unwrap(),
@@ -1144,16 +1142,16 @@ async fn netstack_prefers_a_and_skips_aaaa_when_the_name_has_an_a_record() {
     let mut stream = connector
         .connect(Target::Domain("example.com".to_owned(), 9))
         .await
-        .expect("uses A and connects over v4");
-    stream.write_all(b"a-first-ok").await.expect("write");
+        .expect("falls back to A and connects over v4");
+    stream.write_all(b"a-fallback").await.expect("write");
     stream.flush().await.expect("flush");
     let mut got = [0u8; 10];
     stream.read_exact(&mut got).await.expect("read echo");
-    assert_eq!(&got, b"a-first-ok");
-    // Pins the A-first policy: with an A record present, AAAA is never queried.
+    assert_eq!(&got, b"a-fallback");
+    // Pins the AAAA-first policy: the engine must have tried AAAA before A.
     assert!(
-        !saw_aaaa.load(Ordering::SeqCst),
-        "engine used A without querying AAAA"
+        saw_aaaa.load(Ordering::SeqCst),
+        "engine attempted AAAA before falling back to A"
     );
 }
 
