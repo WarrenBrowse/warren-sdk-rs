@@ -500,6 +500,21 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// none is published, [`SdkError::MultihopDirectory`] on a bad signature or
     /// version, and [`SdkError::StaleMultihopDirectory`] if expired.
     pub async fn fetch_multihop_directory(&self) -> Result<Vec<VerifiedExit>, SdkError> {
+        Ok(self.fetch_multihop_directory_full().await?.exits)
+    }
+
+    /// Like [`Self::fetch_multihop_directory`] but returns the whole verified
+    /// directory, including the [`VerifiedEntry`](warren_discovery::VerifiedEntry)
+    /// view used to compose entry-selected circuits with
+    /// [`VerifiedExit::via_entry`]. Same trust, freshness and anti-rollback
+    /// enforcement.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::fetch_multihop_directory`].
+    pub async fn fetch_multihop_directory_full(
+        &self,
+    ) -> Result<warren_discovery::VerifiedDirectory, SdkError> {
         let json = self
             .api
             .fetch_multihop_directory()
@@ -533,7 +548,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         }
         self.multihop_generation_store
             .store_floor(verified.generation);
-        Ok(verified.exits)
+        Ok(verified)
     }
 
     /// Establishes a multihop tunnel to `exit` (the handshake real exits require:

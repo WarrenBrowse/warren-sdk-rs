@@ -20,7 +20,7 @@ pub mod signed;
 
 pub use exit_id::{EXIT_ID_LEN, ExitId, ExitIdError};
 pub use multihop_directory::{
-    DirectoryError, VerifiedDirectory, VerifiedExit, verify_multihop_directory,
+    DirectoryError, VerifiedDirectory, VerifiedEntry, VerifiedExit, verify_multihop_directory,
 };
 pub use query::{ExitQuery, IpAvailability, LocationConstraint};
 pub use relay::{Location, Relay, RelayList};

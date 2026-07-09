@@ -32,3 +32,29 @@ fn verifies_real_production_directory() {
     // A wrong server pin must be rejected.
     assert!(verify_multihop_directory(json, &[&"00".repeat(32)], &[]).is_err());
 }
+
+#[test]
+fn production_directory_yields_entry_distinct_circuits() {
+    let json = include_str!("fixtures/multihop_directory.json");
+    let dir = verify_multihop_directory(json, &[SERVER_PUBKEY], &[]).expect("verify");
+
+    // Unified dual-role fleet: every vouched node is both an entry and an exit.
+    assert_eq!(dir.entries.len(), dir.exits.len());
+
+    let exit = &dir.exits[0];
+    let entry = dir
+        .entries
+        .iter()
+        .find(|e| e.exit_id != exit.exit_id)
+        .expect("the production fleet has at least two nodes");
+    let dialed = exit.via_entry(entry).expect("distinct nodes form a circuit");
+    assert_eq!(dialed.endpoint, entry.endpoint, "dial target is the entry");
+    assert_eq!(dialed.exit_id, exit.exit_id, "sealed frame still routes to the exit");
+
+    let same = dir
+        .entries
+        .iter()
+        .find(|e| e.exit_id == exit.exit_id)
+        .expect("the exit's own node is an entry too");
+    assert!(exit.via_entry(same).is_none(), "entry == exit node refused");
+}

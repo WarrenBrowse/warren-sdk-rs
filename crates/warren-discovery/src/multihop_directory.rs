@@ -4,7 +4,7 @@
 //! (the freshness metadata the caller enforces) over the neutral verifier's flat
 //! exit view, so the SDK's public API is unchanged.
 
-pub use warren_discovery_core::{DirectoryError, VerifiedExit};
+pub use warren_discovery_core::{DirectoryError, VerifiedEntry, VerifiedExit};
 
 /// Verified directory: trusted exits plus the freshness metadata the caller
 /// enforces (`generation` anti-rollback, `expires_at`).
@@ -12,6 +12,10 @@ pub use warren_discovery_core::{DirectoryError, VerifiedExit};
 pub struct VerifiedDirectory {
     /// The trusted exits (flat client dial view).
     pub exits: Vec<VerifiedExit>,
+    /// The same trusted nodes projected as entry hops; pair one with a
+    /// DISTINCT exit via [`VerifiedExit::via_entry`] for an entry-selected
+    /// circuit.
+    pub entries: Vec<VerifiedEntry>,
     /// Monotonic generation; the caller pins a rollback floor.
     pub generation: u64,
     /// Unix seconds the directory was signed.
@@ -52,6 +56,7 @@ pub fn verify_multihop_directory(
     )?;
     Ok(VerifiedDirectory {
         exits: v.exits(),
+        entries: v.entries(),
         generation: v.generation,
         signed_at: v.signed_at,
         expires_at: v.expires_at,
