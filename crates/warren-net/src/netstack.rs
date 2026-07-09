@@ -40,8 +40,12 @@ use crate::error::NetError;
 use crate::proxy::Connector;
 use crate::socks5::Target;
 
-/// Per-direction smoltcp TCP buffer (64 KiB), matching a typical socket window.
-const TCP_BUFFER: usize = 64 * 1024;
+/// Per-direction smoltcp TCP buffer. This bounds the receive window, so a
+/// single connection's throughput is capped at TCP_BUFFER / RTT: 64 KiB over a
+/// 23 ms WAN path plateaus at ~22 Mbps, which starved the proxy datapath. 1 MiB
+/// saturates links past 300 Mbps at that RTT (window scaling carries it); the
+/// cost is 2 MiB per connection, fine for a client with a handful of them.
+const TCP_BUFFER: usize = 1024 * 1024;
 /// First ephemeral local port handed to outbound connects.
 const EPHEMERAL_BASE: u16 = 49152;
 /// Per-connection app<->engine channel depth (chunks); the backpressure point.
