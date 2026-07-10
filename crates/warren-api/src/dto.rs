@@ -5,6 +5,5 @@ pub use warren_contract::dto::{
     CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
     IncidentPubkeyMismatchRequest, IncidentReason, InitApplePaymentResponse, MobilePaymentResponse,
     PubkeyHex, PubkeySs58, RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest,
-    SessionOpenRequest, SessionOpenResponse, SubscriptionResponse, SupportReportRequest,
-    SupportReportResponse,
+    SessionOpenRequest, SessionOpenResponse, SubscriptionResponse,
 };

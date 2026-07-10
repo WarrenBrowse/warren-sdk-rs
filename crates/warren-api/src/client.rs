@@ -9,7 +9,7 @@ use crate::dto::{
     CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
     IncidentPubkeyMismatchRequest, InitApplePaymentResponse, MobilePaymentResponse,
     RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest, SessionOpenRequest,
-    SessionOpenResponse, SubscriptionResponse, SupportReportRequest, SupportReportResponse,
+    SessionOpenResponse, SubscriptionResponse,
 };
 use crate::transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 
@@ -256,22 +256,6 @@ impl<T: HttpTransport> WarrenApiClient<T> {
             Err(ClientError::ServerStatus { status: 404, .. }) => Ok(None),
             Err(e) => Err(e),
         }
-    }
-
-    /// Signed `POST /v1/support`. Submits a redacted log bundle and a free-form
-    /// message; returns the server-assigned reference id.
-    ///
-    /// # Errors
-    ///
-    /// See [`Self::register`]. `413` payload too large and `422` validation
-    /// failure surface as [`ClientError::ServerStatus`].
-    pub async fn submit_support_report(
-        &self,
-        req: &SupportReportRequest,
-    ) -> Result<SupportReportResponse, ClientError> {
-        let body = serialize(req)?;
-        let http = self.signed_request(Method::Post, "/v1/support", body)?;
-        self.send_json(http).await
     }
 
     /// Signed `POST /v1/incidents/exit-down`. Best-effort failover telemetry;
@@ -929,29 +913,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_support_report_is_signed_post_with_full_body() {
-        let c = client(MockTransport::new(200, r#"{"reference_id":"deadbeef"}"#));
-        let req = SupportReportRequest {
-            user_message: "cannot connect".to_owned(),
-            redacted_logs: "line1\nline2".to_owned(),
-            app_version: "1.2.3".to_owned(),
-            platform: "macos-arm64".to_owned(),
-        };
-        let resp = c.submit_support_report(&req).await.expect("ok");
-        assert_eq!(resp.reference_id, "deadbeef");
-        let g = c.transport.last.lock().unwrap();
-        let r = g.as_ref().unwrap();
-        assert_eq!(r.method, Method::Post);
-        assert_eq!(r.url, "https://api.example.test/v1/support");
-        assert!(header(r, HEADER_PUBKEY).is_some(), "support is signed");
-        let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
-        assert_eq!(body["user_message"], "cannot connect");
-        assert_eq!(body["redacted_logs"], "line1\nline2");
-        assert_eq!(body["app_version"], "1.2.3");
-        assert_eq!(body["platform"], "macos-arm64");
-    }
-
-    #[tokio::test]
     async fn report_exit_down_is_signed_post_with_screaming_reason() {
         let c = client(MockTransport::new(204, ""));
         let req = IncidentExitDownRequest {
@@ -1006,22 +967,6 @@ mod tests {
         let c = client(MockTransport::new(503, "apple payments not configured"));
         let err = c.init_apple_payment().await.expect_err("503 must surface");
         assert!(matches!(err, ClientError::ServerStatus { status: 503, .. }));
-    }
-
-    #[tokio::test]
-    async fn submit_support_report_413_is_server_status() {
-        let c = client(MockTransport::new(413, "payload too large"));
-        let req = SupportReportRequest {
-            user_message: "x".to_owned(),
-            redacted_logs: String::new(),
-            app_version: String::new(),
-            platform: String::new(),
-        };
-        let err = c
-            .submit_support_report(&req)
-            .await
-            .expect_err("413 must surface");
-        assert!(matches!(err, ClientError::ServerStatus { status: 413, .. }));
     }
 
     #[tokio::test]

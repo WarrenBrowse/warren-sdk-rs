@@ -21,8 +21,7 @@ pub use dto::{
     CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
     IncidentPubkeyMismatchRequest, IncidentReason, InitApplePaymentResponse, MobilePaymentResponse,
     PubkeyHex, PubkeySs58, RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest,
-    SessionOpenRequest, SessionOpenResponse, SubscriptionResponse, SupportReportRequest,
-    SupportReportResponse,
+    SessionOpenRequest, SessionOpenResponse, SubscriptionResponse,
 };
 pub use transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 
