@@ -31,6 +31,16 @@ ignore = [
     # Compile-time code generation only, no runtime surface. warren-core and
     # warren-app ignore the same.
     "RUSTSEC-2024-0436",
+    # rsa 0.10-rc: the Marvin timing sidechannel is exploitable only against
+    # variable-time RSA PRIVATE-KEY PKCS#1 v1.5 DECRYPTION of attacker-controlled
+    # ciphertext (a padding oracle). Warren pulls rsa transitively via
+    # blind-rsa-signatures -> warrenguard-token, used solely for RFC 9474 RSA
+    # blind signatures (anonymous session tokens): the client blinds/verifies
+    # with the issuer PUBLIC key and the issuer blind-signs, never PKCS#1 v1.5
+    # decryption, so the vulnerable path is not reachable. No fixed rsa release
+    # exists (the fix needs an upstream API rewrite). warren-core ignores the
+    # same advisory.
+    "RUSTSEC-2023-0071",
 ]
 
 [licenses]
