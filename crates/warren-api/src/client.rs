@@ -780,10 +780,11 @@ mod tests {
             r#"{"admitted":true,"max":5,"current":1}"#,
         ));
         let req = SessionOpenRequest {
-            pubkey_ss58: a_ss58(),
-            device_id_hex: "00".repeat(16),
+            pubkey_ss58: Some(a_ss58()),
+            device_id_hex: Some("00".repeat(16)),
             exit_id: "exit".to_owned(),
             max_devices: None,
+            token_b64: None,
         };
         let resp = c.open_session(&req).await.expect("ok");
         assert!(resp.admitted);
@@ -800,8 +801,10 @@ mod tests {
     async fn close_session_is_signed_post_returning_unit() {
         let c = client(MockTransport::new(200, ""));
         let req = SessionCloseRequest {
-            pubkey_ss58: a_ss58(),
-            device_id_hex: "00".repeat(16),
+            pubkey_ss58: Some(a_ss58()),
+            device_id_hex: Some("00".repeat(16)),
+            serial_hex: None,
+            exit_id: None,
         };
         c.close_session(&req).await.expect("ok");
         let g = c.transport.last.lock().unwrap();
