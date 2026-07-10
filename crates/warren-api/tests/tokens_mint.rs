@@ -175,7 +175,13 @@ async fn keys_fetch_is_unsigned_and_issue_is_wallet_signed() {
     let mut rng = StdRng::seed_from_u64(8);
     mint_tokens(&c, &directory, &[100], &mut rng).await.unwrap();
 
-    let keys_headers = c.transport().last_keys_headers.lock().unwrap().clone().unwrap();
+    let keys_headers = c
+        .transport()
+        .last_keys_headers
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap();
     assert!(
         !keys_headers
             .iter()

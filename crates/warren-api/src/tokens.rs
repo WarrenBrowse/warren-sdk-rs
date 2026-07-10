@@ -117,8 +117,8 @@ pub fn epoch_key(
     let spki = BASE64URL_NOPAD
         .decode(entry.spki_b64.as_bytes())
         .map_err(|_| TokenClientError::BadDirectoryKey { epoch })?;
-    let pk =
-        IssuerPublicKey::from_spki(&spki).map_err(|_| TokenClientError::BadDirectoryKey { epoch })?;
+    let pk = IssuerPublicKey::from_spki(&spki)
+        .map_err(|_| TokenClientError::BadDirectoryKey { epoch })?;
     if pk.key_id().to_hex() != entry.token_key_id {
         return Err(TokenClientError::BadDirectoryKey { epoch });
     }
