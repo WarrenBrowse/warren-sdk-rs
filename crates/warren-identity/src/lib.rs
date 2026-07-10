@@ -114,6 +114,16 @@ impl WarrenIdentity {
         }
     }
 
+    /// Wraps an already-derived Ed25519 signing key (the output of
+    /// [`derive_node_key`]), performing NO further derivation. For callers that
+    /// hold the node key rather than the pre-derivation seed (e.g. an FFI
+    /// boundary that receives the derived key), so the resulting API identity is
+    /// bit-for-bit the same wallet the key authenticates as.
+    #[must_use]
+    pub fn from_signing_key(signing: SigningKey) -> Self {
+        Self { signing }
+    }
+
     /// The 32-byte Ed25519 public key.
     #[must_use]
     pub fn public_key(&self) -> [u8; 32] {
@@ -262,6 +272,19 @@ mod tests {
         id.verifying_key()
             .verify(msg, &sig)
             .expect("signature must verify with its own pubkey");
+    }
+
+    #[test]
+    fn from_signing_key_matches_from_seed_via_derive_node_key() {
+        // The invariant the app FFI relies on: wrapping the already-derived node
+        // key yields the SAME identity as deriving from the seed, so a token
+        // client built from the derived key authenticates as the same wallet the
+        // tunnel signs with.
+        let seed = [0x5c; 32];
+        let from_seed = WarrenIdentity::from_seed(&seed);
+        let from_key = WarrenIdentity::from_signing_key(derive_node_key(&seed));
+        assert_eq!(from_key.public_key(), from_seed.public_key());
+        assert_eq!(from_key.address(), from_seed.address());
     }
 
     #[test]
