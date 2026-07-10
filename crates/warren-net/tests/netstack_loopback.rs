@@ -702,6 +702,102 @@ async fn dns_and_echo_server(
     }
 }
 
+/// Same as [`dns_and_echo_server`], except it silently drops the very first
+/// DNS query it receives (simulating one lost packet on the unreliable
+/// datagram plane) and only answers from the second query onward. `queries`
+/// still counts every query seen, dropped or answered, so a test can assert
+/// exactly how many retransmissions occurred.
+async fn dns_and_echo_server_drop_first_query(
+    ip: std::net::Ipv4Addr,
+    answer: std::net::Ipv4Addr,
+    prefix: u8,
+    gateway: std::net::Ipv4Addr,
+    queries: Arc<AtomicUsize>,
+    mut inbound: mpsc::Receiver<Bytes>,
+    outbound: mpsc::Sender<Bytes>,
+) {
+    let mut device = ChanDevice {
+        rx: VecDeque::new(),
+        tx: outbound,
+    };
+    let base = tokio::time::Instant::now();
+    let now =
+        || SmolInstant::from_micros(i64::try_from(base.elapsed().as_micros()).unwrap_or(i64::MAX));
+
+    let mut config = Config::new(HardwareAddress::Ip);
+    config.random_seed = 0x5345_5256_0005;
+    let mut iface = Interface::new(config, &mut device, now());
+    iface.update_ip_addrs(|a| {
+        let _ = a.push(IpCidr::new(IpAddress::from(ip), prefix));
+        let _ = a.push(IpCidr::new(IpAddress::from(answer), prefix));
+    });
+    let _ = iface.routes_mut().add_default_ipv4_route(gateway);
+
+    let mut sockets = SocketSet::new(Vec::new());
+    let tcp_handle = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+    ));
+    sockets
+        .get_mut::<tcp::Socket<'_>>(tcp_handle)
+        .listen(9)
+        .expect("listen");
+    let udp_handle = sockets.add(udp::Socket::new(
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]),
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]),
+    ));
+    sockets
+        .get_mut::<udp::Socket<'_>>(udp_handle)
+        .bind(53)
+        .expect("bind 53");
+
+    loop {
+        while let Ok(f) = inbound.try_recv() {
+            device.rx.push_back(f);
+        }
+        let _ = iface.poll(now(), &mut device, &mut sockets);
+
+        let request = {
+            let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
+            match sock.recv() {
+                Ok((data, meta)) if data.len() >= 12 => Some((data.to_vec(), meta.endpoint)),
+                _ => None,
+            }
+        };
+        if let Some((query, endpoint)) = request {
+            let seen_before = queries.fetch_add(1, Ordering::SeqCst);
+            // Drop only the very first query; answer every retransmission.
+            if seen_before > 0 {
+                let sock = sockets.get_mut::<udp::Socket<'_>>(udp_handle);
+                let _ = sock.send_slice(&dns_response(&query, answer), endpoint);
+            }
+        }
+
+        let sock = sockets.get_mut::<tcp::Socket<'_>>(tcp_handle);
+        let mut buf = [0u8; 4096];
+        while sock.can_recv() && sock.can_send() {
+            match sock.recv_slice(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let _ = sock.send_slice(&buf[..n]);
+                }
+            }
+        }
+
+        let delay = iface
+            .poll_delay(now(), &sockets)
+            .map(|d| std::time::Duration::from_micros(d.total_micros()))
+            .unwrap_or_else(|| std::time::Duration::from_millis(5));
+        tokio::select! {
+            f = inbound.recv() => match f {
+                Some(f) => device.rx.push_back(f),
+                None => return,
+            },
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
 /// A smoltcp "exit" that echoes UDP datagrams on `port` back to their source.
 async fn udp_echo_server(
     ip: std::net::Ipv4Addr,
@@ -992,6 +1088,60 @@ async fn netstack_caches_dns_so_a_repeat_connect_skips_the_query() {
         queries.load(Ordering::SeqCst),
         1,
         "the second resolution must hit the DNS cache, not re-query the exit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn netstack_retransmits_dns_query_after_the_first_is_lost() {
+    // The exit drops the first query (simulating a lost packet on the
+    // unreliable QUIC datagram plane). Without retransmission the resolve
+    // would only succeed after the full 5s DNS_TIMEOUT (or not at all within a
+    // tighter bound); with retransmission it succeeds around the ~1s first
+    // retry, well short of the timeout.
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+
+    let connector = spawn_engine(
+        NetstackConfig::new(
+            "10.66.0.2".parse().unwrap(),
+            24,
+            "10.66.0.1".parse().unwrap(),
+            MTU,
+        ),
+        s2c_rx,
+        c2s_tx,
+    );
+    let queries = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(dns_and_echo_server_drop_first_query(
+        "10.66.0.1".parse().unwrap(),
+        "10.66.0.5".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        Arc::clone(&queries),
+        c2s_rx,
+        s2c_tx,
+    ));
+
+    let started = std::time::Instant::now();
+    let ip = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        UdpConnector::resolve_host(&connector, "example.com"),
+    )
+    .await
+    .expect("resolves well before the 5s DNS_TIMEOUT thanks to retransmission")
+    .expect("resolve succeeds once the retransmitted query is answered");
+    let elapsed = started.elapsed();
+
+    assert_eq!(ip, "10.66.0.5".parse::<std::net::IpAddr>().unwrap());
+    assert_eq!(
+        queries.load(Ordering::SeqCst),
+        2,
+        "exactly one retransmission: the dropped original plus one retry"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(900),
+        "resolved suspiciously fast ({elapsed:?}); the first query should have \
+         been dropped and only the ~1s retransmission answered"
     );
 }
 

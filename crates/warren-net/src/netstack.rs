@@ -60,6 +60,11 @@ const PENDING_OUT_CAP: usize = 256 * 1024;
 const CONNECT_TIMEOUT: SmolDuration = SmolDuration::from_secs(10);
 /// How long to wait for a DNS response before failing resolution.
 const DNS_TIMEOUT: SmolDuration = SmolDuration::from_secs(5);
+/// First DNS retransmit delay; doubles after each subsequent retransmit. A
+/// single-shot query on the unreliable QUIC datagram plane has no retransmit
+/// timer of its own (unlike TCP), so this recovers from one lost query or
+/// reply well before `DNS_TIMEOUT` gives up.
+const DNS_RETX_INITIAL: SmolDuration = SmolDuration::from_secs(1);
 /// Standard DNS service port (queried on the tunnel gateway / exit forwarder).
 const DNS_PORT: u16 = 53;
 /// UDP buffer for one in-flight DNS query/response (fits an EDNS-sized reply).
@@ -202,6 +207,16 @@ struct PendingResolve {
     rtype: dns::RecordType,
     reply: oneshot::Sender<Result<IpAddr, NetError>>,
     deadline: SmolInstant,
+    /// The encoded query, kept to retransmit verbatim (same transaction id)
+    /// without re-encoding.
+    query: Vec<u8>,
+    /// Next time to re-send the query if no answer has arrived yet. The
+    /// unreliable QUIC datagram plane has no transport-level retransmission,
+    /// unlike TCP, so a lost query or response would otherwise stall the whole
+    /// `DNS_TIMEOUT` window for nothing.
+    next_retx: SmolInstant,
+    /// Current retransmit backoff, doubled after each retransmission.
+    retx_interval: SmolDuration,
 }
 
 /// An app->net write for one connection.
@@ -524,6 +539,9 @@ pub struct NetstackConfig {
     pub ipv6: Option<Ipv6Addressing>,
     /// Inner IP MTU; MUST fit one tunnel frame.
     pub mtu: usize,
+    /// Per-direction smoltcp TCP buffer, in bytes (see [`TCP_BUFFER`] for the
+    /// default and the throughput-vs-memory tradeoff it encodes).
+    pub tcp_buffer_bytes: usize,
 }
 
 /// The IPv6 half of a dual-stack tunnel assignment (the v6 client address, its
@@ -550,7 +568,18 @@ impl NetstackConfig {
             dns_server: gateway,
             ipv6: None,
             mtu,
+            tcp_buffer_bytes: TCP_BUFFER,
         }
+    }
+
+    /// Overrides the per-direction TCP buffer size (default: [`TCP_BUFFER`]).
+    /// A larger buffer raises the throughput ceiling on high-RTT paths at the
+    /// cost of memory per connection; a smaller one trades throughput for a
+    /// tighter memory budget.
+    #[must_use]
+    pub fn with_tcp_buffer_bytes(mut self, tcp_buffer_bytes: usize) -> Self {
+        self.tcp_buffer_bytes = tcp_buffer_bytes;
+        self
     }
 
     /// Overrides the DNS resolver (for `dns_disabled` exits). The resolver is
@@ -607,6 +636,7 @@ pub fn spawn_engine(
         gateway: config.gateway,
         dns_server: config.dns_server,
         ipv6: config.ipv6,
+        tcp_buffer_bytes: config.tcp_buffer_bytes,
         cmd_rx,
         inbound,
         wake: Arc::clone(&wake),
@@ -637,6 +667,8 @@ struct Engine {
     gateway: std::net::Ipv4Addr,
     dns_server: std::net::Ipv4Addr,
     ipv6: Option<Ipv6Addressing>,
+    /// Per-direction TCP socket buffer size, from [`NetstackConfig::tcp_buffer_bytes`].
+    tcp_buffer_bytes: usize,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     inbound: mpsc::Receiver<Bytes>,
     wake: Arc<Notify>,
@@ -696,6 +728,7 @@ impl Engine {
             self.drain_sockets(&mut sockets, now(base));
             self.accept_listeners(&mut sockets, now(base));
             self.drain_resolvers(&mut sockets, now(base));
+            self.retransmit_resolvers(&mut sockets, now(base));
             self.drain_udp(&mut sockets);
 
             let mut delay = iface
@@ -703,9 +736,15 @@ impl Engine {
                 .map_or(std::time::Duration::from_secs(30), |d| {
                     std::time::Duration::from_micros(d.total_micros())
                 });
-            // A single-shot DNS query has no smoltcp retransmit timer to wake the
-            // loop, so bound the sleep by the nearest resolver deadline.
-            if let Some(nearest) = self.resolvers.iter().map(|r| r.deadline).min() {
+            // DNS queries have no smoltcp retransmit timer of their own to wake
+            // the loop, so bound the sleep by the nearest resolver deadline or
+            // retransmit time, whichever comes first.
+            if let Some(nearest) = self
+                .resolvers
+                .iter()
+                .map(|r| r.deadline.min(r.next_retx))
+                .min()
+            {
                 let now_i = now(base);
                 let remaining = if nearest > now_i {
                     std::time::Duration::from_micros((nearest - now_i).total_micros())
@@ -755,8 +794,8 @@ impl Engine {
         now: SmolInstant,
     ) {
         let socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
-            tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
+            tcp::SocketBuffer::new(vec![0u8; self.tcp_buffer_bytes]),
+            tcp::SocketBuffer::new(vec![0u8; self.tcp_buffer_bytes]),
         );
         let handle = sockets.add(socket);
         let Some(local_port) = self.alloc_port() else {
@@ -802,10 +841,14 @@ impl Engine {
     }
 
     /// Creates a fresh socket in `LISTEN` state on `port`.
-    fn new_listen_socket(sockets: &mut SocketSet<'_>, port: u16) -> Option<SocketHandle> {
+    fn new_listen_socket(
+        sockets: &mut SocketSet<'_>,
+        port: u16,
+        tcp_buffer_bytes: usize,
+    ) -> Option<SocketHandle> {
         let socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
-            tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
+            tcp::SocketBuffer::new(vec![0u8; tcp_buffer_bytes]),
+            tcp::SocketBuffer::new(vec![0u8; tcp_buffer_bytes]),
         );
         let handle = sockets.add(socket);
         if sockets
@@ -824,7 +867,7 @@ impl Engine {
     fn start_listen(&mut self, sockets: &mut SocketSet<'_>, cmd: ListenCommand) {
         let mut pending = Vec::with_capacity(LISTEN_BACKLOG);
         for _ in 0..LISTEN_BACKLOG {
-            match Self::new_listen_socket(sockets, cmd.port) {
+            match Self::new_listen_socket(sockets, cmd.port, self.tcp_buffer_bytes) {
                 Some(h) => pending.push(h),
                 None => {
                     for h in pending {
@@ -930,9 +973,10 @@ impl Engine {
         }
 
         // Refill each backlog that lost sockets so the port keeps accepting.
+        let tcp_buffer_bytes = self.tcp_buffer_bytes;
         for (port, count) in refill {
             for _ in 0..count {
-                let Some(h) = Self::new_listen_socket(sockets, port) else {
+                let Some(h) = Self::new_listen_socket(sockets, port, tcp_buffer_bytes) else {
                     break;
                 };
                 if let Some(listener) = self.listeners.iter_mut().find(|l| l.port == port) {
@@ -1000,6 +1044,9 @@ impl Engine {
             rtype: cmd.rtype,
             reply: cmd.reply,
             deadline: now + DNS_TIMEOUT,
+            query,
+            next_retx: now + DNS_RETX_INITIAL,
+            retx_interval: DNS_RETX_INITIAL,
         });
     }
 
@@ -1048,6 +1095,22 @@ impl Engine {
                 self.cache_dns(name, rtype, ip, expiry, now);
             }
             let _ = r.reply.send(res);
+        }
+    }
+
+    /// Re-sends the query for any pending resolution whose retransmit timer has
+    /// elapsed and doubles its backoff. Keeps the same transaction id and
+    /// socket, so a delayed original response still matches.
+    fn retransmit_resolvers(&mut self, sockets: &mut SocketSet<'_>, now: SmolInstant) {
+        let dst = IpEndpoint::new(IpAddress::from(self.dns_server), DNS_PORT);
+        for r in &mut self.resolvers {
+            if now < r.next_retx {
+                continue;
+            }
+            let sock = sockets.get_mut::<udp::Socket<'_>>(r.handle);
+            let _ = sock.send_slice(&r.query, dst);
+            r.retx_interval = SmolDuration::from_micros(r.retx_interval.total_micros() * 2);
+            r.next_retx = now + r.retx_interval;
         }
     }
 
@@ -1379,6 +1442,82 @@ mod tests {
         assert_eq!(overridden.prefix, base.prefix);
         assert_eq!(overridden.gateway, base.gateway);
         assert_eq!(overridden.mtu, base.mtu);
+    }
+
+    #[test]
+    fn config_defaults_tcp_buffer_to_the_1mib_constant() {
+        // Pin the default so a config built with no override keeps the
+        // existing throughput characteristics (see TCP_BUFFER's doc comment).
+        let gw: Ipv4Addr = "10.66.0.1".parse().unwrap();
+        let config = NetstackConfig::new("10.66.0.2".parse().unwrap(), 16, gw, 1280);
+        assert_eq!(config.tcp_buffer_bytes, TCP_BUFFER);
+    }
+
+    #[test]
+    fn with_tcp_buffer_bytes_overrides_only_that_field() {
+        let gw: Ipv4Addr = "10.66.0.1".parse().unwrap();
+        let base = NetstackConfig::new("10.66.0.2".parse().unwrap(), 16, gw, 1280);
+        let overridden = base.with_tcp_buffer_bytes(64 * 1024);
+        assert_eq!(overridden.tcp_buffer_bytes, 64 * 1024);
+        assert_eq!(overridden.local_ip, base.local_ip);
+        assert_eq!(overridden.dns_server, base.dns_server);
+    }
+
+    #[tokio::test]
+    async fn open_allocates_sockets_sized_to_the_configured_tcp_buffer() {
+        // Exercises the real `Engine::open` path (not a stub) with a
+        // non-default buffer size, proving the config knob actually reaches
+        // the smoltcp socket rather than being ignored in favor of the const.
+        let (outbound_tx, _outbound_rx) = mpsc::channel(8);
+        let (_inbound_tx, inbound_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let mut engine = Engine {
+            device: TunnelDevice {
+                rx: VecDeque::new(),
+                tx: outbound_tx,
+                mtu: 1280,
+            },
+            conns: HashMap::new(),
+            resolvers: Vec::new(),
+            dns_cache: HashMap::new(),
+            udp_flows: Vec::new(),
+            listeners: Vec::new(),
+            next_conn_id: 0,
+            next_port: EPHEMERAL_BASE,
+            used_ports: HashSet::new(),
+            local_ip: "10.0.0.2".parse().unwrap(),
+            prefix: 24,
+            gateway: "10.0.0.1".parse().unwrap(),
+            dns_server: "10.0.0.1".parse().unwrap(),
+            ipv6: None,
+            tcp_buffer_bytes: 4096,
+            cmd_rx,
+            inbound: inbound_rx,
+            wake: Arc::new(Notify::new()),
+        };
+        let config = Config::new(HardwareAddress::Ip);
+        let start = SmolInstant::from_millis(0);
+        let mut iface = Interface::new(config, &mut engine.device, start);
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(IpAddress::from(engine.local_ip), engine.prefix));
+        });
+        let _ = iface.routes_mut().add_default_ipv4_route(engine.gateway);
+        let mut sockets = SocketSet::new(Vec::new());
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        engine.open(
+            &mut iface,
+            &mut sockets,
+            OpenCommand {
+                addr: "1.2.3.4:80".parse().unwrap(),
+                reply: reply_tx,
+            },
+            start,
+        );
+
+        let conn = engine.conns.values().next().expect("open tracked one conn");
+        let sock = sockets.get::<tcp::Socket<'_>>(conn.handle);
+        assert_eq!(sock.recv_capacity(), 4096);
+        assert_eq!(sock.send_capacity(), 4096);
     }
 
     #[test]
