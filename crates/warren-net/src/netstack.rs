@@ -48,6 +48,16 @@ use crate::socks5::Target;
 const TCP_BUFFER: usize = 1024 * 1024;
 /// First ephemeral local port handed to outbound connects.
 const EPHEMERAL_BASE: u16 = 49152;
+
+/// A random start point in the ephemeral range `[EPHEMERAL_BASE, u16::MAX]`,
+/// used to seed a fresh engine's port allocator (see the call site for why two
+/// independent sessions must not share a port sequence). Allocation still
+/// increments and wraps within the same range, so a single session's ports stay
+/// unique; only the starting offset differs per instance.
+fn random_ephemeral_start() -> u16 {
+    let span = u16::MAX - EPHEMERAL_BASE;
+    EPHEMERAL_BASE + (rand::random::<u16>() % span)
+}
 /// Per-connection app<->engine channel depth (chunks); the backpressure point.
 const CONN_CHANNEL_DEPTH: usize = 32;
 /// Frame-channel depth toward/from the tunnel. Kept shallow so queueing adds at
@@ -629,7 +639,16 @@ pub fn spawn_engine(
         udp_flows: Vec::new(),
         listeners: Vec::new(),
         next_conn_id: 0,
-        next_port: EPHEMERAL_BASE,
+        // Randomize the first ephemeral port per engine instance. The exit
+        // gives one sticky inner IP to all connections of an account, so two
+        // INDEPENDENT sessions of the same account (e.g. two machines on a
+        // shared wallet) share that inner IP. If both started at a fixed
+        // base they would allocate identical (inner ip, port) tuples to the
+        // same destination, which the exit's NAT collapses into one flow and
+        // no downlink demux can separate. A random start makes the two
+        // sessions' 5-tuples disjoint with overwhelming probability, so the
+        // exit's per-flow routing keeps their return traffic apart.
+        next_port: random_ephemeral_start(),
         used_ports: HashSet::new(),
         local_ip: config.local_ip,
         prefix: config.prefix,
@@ -1442,6 +1461,20 @@ mod tests {
         assert_eq!(overridden.prefix, base.prefix);
         assert_eq!(overridden.gateway, base.gateway);
         assert_eq!(overridden.mtu, base.mtu);
+    }
+
+    #[test]
+    fn random_ephemeral_start_stays_in_the_ephemeral_range() {
+        // Every start must be a valid ephemeral port at or above the base, so
+        // the allocator never hands out a reserved low port. Sampled across
+        // many draws to catch an off-by-one in the modulus range.
+        for _ in 0..10_000 {
+            let p = random_ephemeral_start();
+            assert!(
+                p >= EPHEMERAL_BASE,
+                "start {p} fell below the ephemeral base {EPHEMERAL_BASE}"
+            );
+        }
     }
 
     #[test]
