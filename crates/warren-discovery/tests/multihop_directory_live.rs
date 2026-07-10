@@ -47,9 +47,14 @@ fn production_directory_yields_entry_distinct_circuits() {
         .iter()
         .find(|e| e.exit_id != exit.exit_id)
         .expect("the production fleet has at least two nodes");
-    let dialed = exit.via_entry(entry).expect("distinct nodes form a circuit");
+    let dialed = exit
+        .via_entry(entry)
+        .expect("distinct nodes form a circuit");
     assert_eq!(dialed.endpoint, entry.endpoint, "dial target is the entry");
-    assert_eq!(dialed.exit_id, exit.exit_id, "sealed frame still routes to the exit");
+    assert_eq!(
+        dialed.exit_id, exit.exit_id,
+        "sealed frame still routes to the exit"
+    );
 
     let same = dir
         .entries

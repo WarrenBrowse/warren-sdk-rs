@@ -223,8 +223,16 @@ async fn full_fetch_exposes_entries_for_entry_selected_circuits() {
     assert_eq!(dir.entries.len(), 2, "every node doubles as an entry hop");
 
     // The minted fixture has an RO and an NL node: compose the cross circuit.
-    let exit = dir.exits.iter().find(|e| e.country == "RO").expect("RO exit");
-    let entry = dir.entries.iter().find(|e| e.country == "NL").expect("NL entry");
+    let exit = dir
+        .exits
+        .iter()
+        .find(|e| e.country == "RO")
+        .expect("RO exit");
+    let entry = dir
+        .entries
+        .iter()
+        .find(|e| e.country == "NL")
+        .expect("NL entry");
     let dialed = exit.via_entry(entry).expect("distinct circuit");
     assert_eq!(dialed.endpoint, entry.endpoint);
     assert_eq!(dialed.exit_id, exit.exit_id);
