@@ -16,11 +16,12 @@
 //! Anti-correlation guidance (doc 64): mint on unlock or on a timer, never at
 //! connect time, so issuance timing does not mirror session timing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use data_encoding::BASE64URL_NOPAD;
 use rand010::CryptoRng;
-use warrenguard_token::{IssuerPublicKey, Token, TokenChallenge, TokenError};
+use warrenguard_token::{IssuerPublicKey, TOKEN_LEN, Token, TokenChallenge, TokenError};
 
 use crate::client::{ClientError, WarrenApiClient};
 use crate::dto::{TokenEpochRequest, TokenIssueRequest, TokenIssuerDirectory};
@@ -267,5 +268,125 @@ impl TokenStore {
     /// Drops every epoch strictly before `min_epoch` (spent time is spent).
     pub fn prune_before(&mut self, min_epoch: u64) {
         self.per_epoch = self.per_epoch.split_off(&min_epoch);
+    }
+}
+
+struct ManagerState {
+    store: TokenStore,
+    directory: Option<TokenIssuerDirectory>,
+    /// Epochs already submitted to `/v1/tokens/issue` this process. The issuer
+    /// signs an account+epoch at most once, so re-minting a spent-then-emptied
+    /// epoch would just get `already_issued`; tracking it lets `refresh` mint
+    /// only genuinely new future epochs.
+    minted: BTreeSet<u64>,
+}
+
+/// Keeps a [`TokenStore`] topped up and vends the per-session token stack the
+/// app presents to the exit (as serialized token bytes; the tunnel layer wraps
+/// each in its wire `SessionToken`).
+///
+/// Anti-correlation (doc 64): drive [`Self::refresh`] on unlock and on a coarse
+/// timer, never at connect time, so issuance timing does not mirror session
+/// timing. [`Self::take_current_stack`] never mints (no issuer call at connect);
+/// it only pops. On exhaustion it returns an empty stack, and the tunnel falls
+/// back to the v6 wallet-signed path (availability over a temporary anonymity
+/// downgrade; the per-epoch quota bounds concurrent sessions anyway).
+pub struct TokenManager<T> {
+    client: Arc<WarrenApiClient<T>>,
+    state: Arc<Mutex<ManagerState>>,
+}
+
+impl<T: HttpTransport> TokenManager<T> {
+    /// Builds a manager over a wallet-signed API client. Empty until the first
+    /// [`Self::refresh`].
+    #[must_use]
+    pub fn new(client: Arc<WarrenApiClient<T>>) -> Self {
+        Self {
+            client,
+            state: Arc::new(Mutex::new(ManagerState {
+                store: TokenStore::new(),
+                directory: None,
+                minted: BTreeSet::new(),
+            })),
+        }
+    }
+
+    /// Fetches the issuer directory, prunes spent epochs, and mints every
+    /// published epoch from the current one forward that has not been minted
+    /// yet. Per-epoch minting is isolated: one refused epoch (e.g. already
+    /// issued by a previous run) does not block the others.
+    ///
+    /// # Errors
+    /// [`TokenClientError`] only when the directory fetch itself fails; a
+    /// per-epoch mint refusal is swallowed (the epoch is marked attempted).
+    pub async fn refresh<R: CryptoRng + ?Sized>(
+        &self,
+        now_unix_secs: u64,
+        rng: &mut R,
+    ) -> Result<(), TokenClientError> {
+        let directory = self.client.token_keys().await?;
+        let Some(current) = current_epoch(&directory, now_unix_secs) else {
+            return Err(TokenClientError::BadDirectoryPolicy);
+        };
+
+        // Snapshot which epochs still need minting under the lock, then mint
+        // WITHOUT holding it (mint_tokens awaits the network).
+        let targets: Vec<u64> = {
+            let mut st = self.state.lock().expect("token manager mutex poisoned");
+            st.store.prune_before(current);
+            st.minted.retain(|&e| e >= current);
+            st.directory = Some(directory.clone());
+            directory
+                .keys
+                .iter()
+                .map(|k| k.epoch)
+                .filter(|&e| e >= current && !st.minted.contains(&e))
+                .collect()
+        };
+
+        for epoch in targets {
+            let outcome = mint_tokens(&self.client, &directory, &[epoch], rng).await;
+            let mut st = self.state.lock().expect("token manager mutex poisoned");
+            st.minted.insert(epoch);
+            match outcome {
+                Ok(mut batches) => {
+                    if let Some(batch) = batches.pop() {
+                        st.store.insert(batch);
+                    }
+                }
+                Err(_) => { /* attempted-marked above; retried only if it re-enters the window */ }
+            }
+        }
+        Ok(())
+    }
+
+    /// Tokens currently available for `epoch` (test/observability).
+    #[must_use]
+    pub fn available(&self, epoch: u64) -> usize {
+        self.state
+            .lock()
+            .expect("token manager mutex poisoned")
+            .store
+            .available(epoch)
+    }
+
+    /// Pops ONE token for the epoch `now` falls in and returns it serialized (a
+    /// single-element stack; the tunnel presents the same stack on every bonded
+    /// connection so they share one anonymous serial). An empty vec means "no
+    /// token this epoch": the tunnel then uses the v6 path. Never mints.
+    #[must_use]
+    pub fn take_current_stack(&self, now_unix_secs: u64) -> Vec<[u8; TOKEN_LEN]> {
+        let mut st = self.state.lock().expect("token manager mutex poisoned");
+        let Some(epoch) = st
+            .directory
+            .as_ref()
+            .and_then(|d| current_epoch(d, now_unix_secs))
+        else {
+            return Vec::new();
+        };
+        match st.store.take(epoch) {
+            Some(token) => vec![token.serialize()],
+            None => Vec::new(),
+        }
     }
 }

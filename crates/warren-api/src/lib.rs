@@ -26,7 +26,9 @@ pub use dto::{
     TokenEpochRequest, TokenEpochResponse, TokenIssueRequest, TokenIssueResponse,
     TokenIssuerDirectory, TokenIssuerKey,
 };
-pub use tokens::{MintedEpoch, TokenClientError, TokenStore, current_epoch, mint_tokens};
+pub use tokens::{
+    MintedEpoch, TokenClientError, TokenManager, TokenStore, current_epoch, mint_tokens,
+};
 pub use transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 
 #[cfg(feature = "reqwest-transport")]

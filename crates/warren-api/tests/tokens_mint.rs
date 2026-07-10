@@ -300,3 +300,41 @@ fn current_epoch_follows_the_directory_policy() {
     broken.epoch_secs = 0;
     assert_eq!(current_epoch(&broken, 10), None, "zero policy fails closed");
 }
+
+#[tokio::test]
+async fn token_manager_refreshes_then_vends_one_serialized_token_per_session() {
+    use std::sync::Arc;
+    use warren_api::TokenManager;
+
+    // Current epoch 100; the directory also publishes 101 (prefetch horizon).
+    let now = 100 * EPOCH_SECS + 5;
+    let manager = TokenManager::new(Arc::new(client(FakeIssuer::new(&[100, 101]))));
+    let mut rng = StdRng::seed_from_u64(11);
+    manager.refresh(now, &mut rng).await.expect("refresh mints");
+
+    // Current epoch is fully stocked; the prefetch horizon stocked the next.
+    assert_eq!(manager.available(100), QUOTA as usize);
+    assert!(manager.available(101) > 0, "prefetch horizon stocks future epochs");
+
+    // The provider vends exactly one serialized token per call, pinned to the
+    // clock's epoch, until drained; then an empty stack (v6 fallback).
+    for _ in 0..QUOTA {
+        let stack = manager.take_current_stack(now);
+        assert_eq!(stack.len(), 1, "one token per session");
+    }
+    assert!(
+        manager.take_current_stack(now).is_empty(),
+        "a drained epoch yields an empty stack (v6 fallback)"
+    );
+    assert_eq!(manager.available(100), 0);
+}
+
+#[tokio::test]
+async fn token_manager_provider_is_empty_before_any_refresh() {
+    use std::sync::Arc;
+    use warren_api::TokenManager;
+    // No directory yet: the provider must yield an empty stack (never panic),
+    // so a connect before the first refresh cleanly uses the v6 path.
+    let manager = TokenManager::new(Arc::new(client(FakeIssuer::new(&[100]))));
+    assert!(manager.take_current_stack(100 * EPOCH_SECS).is_empty());
+}
