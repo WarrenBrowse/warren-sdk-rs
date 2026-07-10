@@ -360,6 +360,18 @@ impl<T: HttpTransport> TokenManager<T> {
         Ok(())
     }
 
+    /// [`Self::refresh`] with an OS-seeded CSPRNG built internally, so callers
+    /// (the daemon's refresh task) need no `rand` dependency of their own.
+    ///
+    /// # Errors
+    /// As [`Self::refresh`].
+    pub async fn refresh_auto(&self, now_unix_secs: u64) -> Result<(), TokenClientError> {
+        use rand010::SeedableRng;
+        // Seed synchronously (the !Send thread rng never crosses the await).
+        let mut rng = rand010::rngs::StdRng::from_rng(&mut rand010::rng());
+        self.refresh(now_unix_secs, &mut rng).await
+    }
+
     /// Tokens currently available for `epoch` (test/observability).
     #[must_use]
     pub fn available(&self, epoch: u64) -> usize {
