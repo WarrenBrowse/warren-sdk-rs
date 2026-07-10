@@ -12,10 +12,16 @@ publish.workspace = true
 [dependencies]
 warren-contract = { workspace = true }
 warren-identity = { path = "../warren-identity" }
+warrenguard-token = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
+# The engine's token crate is built on rand/rand_core 0.10, one major ahead of
+# the workspace-wide rand 0.8 used for signing nonces; renamed so both can be
+# named side by side in this crate.
+rand010 = { package = "rand", version = "0.10" }
+data-encoding = { workspace = true }
 thiserror = { workspace = true }
 
 # Optional batteries-included transport. Off by default so the pure request

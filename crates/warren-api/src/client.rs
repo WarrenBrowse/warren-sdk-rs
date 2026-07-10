@@ -9,7 +9,8 @@ use crate::dto::{
     CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
     IncidentPubkeyMismatchRequest, InitApplePaymentResponse, MobilePaymentResponse,
     RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest, SessionOpenRequest,
-    SessionOpenResponse, SubscriptionResponse,
+    SessionOpenResponse, SubscriptionResponse, TokenIssueRequest, TokenIssueResponse,
+    TokenIssuerDirectory,
 };
 use crate::transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 
@@ -94,6 +95,13 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     #[must_use]
     pub fn address(&self) -> String {
         self.identity.address()
+    }
+
+    /// The underlying transport (e.g. to inspect a test double, or reuse a
+    /// configured HTTP stack).
+    #[must_use]
+    pub fn transport(&self) -> &T {
+        &self.transport
     }
 
     /// Unsigned `GET /v1/exits`. Returns the raw server-signed relay list JSON
@@ -187,6 +195,40 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         let body = serialize(req)?;
         let http = self.signed_request(Method::Post, "/v1/session/close", body)?;
         self.send(http).await.map(|_| ())
+    }
+
+    /// Unsigned `GET /v1/tokens/keys`. The public, self-describing issuer
+    /// directory for anonymous session tokens (Privacy Pass): epoch keys plus
+    /// the policy (epoch length, batch quota, challenge context label) a
+    /// client needs to mint. Unsigned on purpose: fetching keys must not link
+    /// the wallet to a timing pattern.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`]. A `503` status surfaces as
+    /// [`ClientError::ServerStatus`] when issuance is not configured
+    /// server-side.
+    pub async fn token_keys(&self) -> Result<TokenIssuerDirectory, ClientError> {
+        let http = self.unsigned_request(Method::Get, "/v1/tokens/keys", Vec::new());
+        self.send_json(http).await
+    }
+
+    /// Signed `POST /v1/tokens/issue`. Submits blinded token requests for the
+    /// listed epochs; the issuer enforces subscription coverage and the
+    /// once-per-account-epoch quota, and returns blind signatures. This is the
+    /// only token step that names the wallet; the finalized tokens are
+    /// unlinkable to it.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`].
+    pub async fn issue_tokens(
+        &self,
+        req: &TokenIssueRequest,
+    ) -> Result<TokenIssueResponse, ClientError> {
+        let body = serialize(req)?;
+        let http = self.signed_request(Method::Post, "/v1/tokens/issue", body)?;
+        self.send_json(http).await
     }
 
     /// Signed `DELETE /v1/account`. Deletes the account's subscription.

@@ -11,6 +11,7 @@
 
 pub mod client;
 pub mod dto;
+pub mod tokens;
 pub mod transport;
 
 #[cfg(feature = "reqwest-transport")]
@@ -21,8 +22,11 @@ pub use dto::{
     CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
     IncidentPubkeyMismatchRequest, IncidentReason, InitApplePaymentResponse, MobilePaymentResponse,
     PubkeyHex, PubkeySs58, RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest,
-    SessionOpenRequest, SessionOpenResponse, SubscriptionResponse,
+    SessionOpenRequest, SessionOpenResponse, SessionRejectReason, SubscriptionResponse,
+    TokenEpochRequest, TokenEpochResponse, TokenIssueRequest, TokenIssueResponse,
+    TokenIssuerDirectory, TokenIssuerKey,
 };
+pub use tokens::{MintedEpoch, TokenClientError, TokenStore, current_epoch, mint_tokens};
 pub use transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 
 #[cfg(feature = "reqwest-transport")]
