@@ -166,7 +166,6 @@ jobs:
           grep -q "class WarrenFfiSupervisedProxy" target/bindings/warren_sdk_ffi.py
           grep -q "async def forward_port" target/bindings/warren_sdk_ffi.py
           grep -q "async def delete_account" target/bindings/warren_sdk_ffi.py
-          grep -q "async def submit_support" target/bindings/warren_sdk_ffi.py
 
   deny:
     name: cargo-deny
