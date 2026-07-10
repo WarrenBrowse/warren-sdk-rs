@@ -39,7 +39,7 @@ pinned by golden vectors where a wire format is involved. warren-core
 
 ## P4: warren-discovery
 
-- Verify the signed relay list (v7): canonical JSON, Ed25519 against the pinned
+- Verify the signed relay list (v8): canonical JSON, Ed25519 against the pinned
   server pubkey, generation anti-rollback, expiry anti-freeze.
 - Weighted relay selector with geography, IP availability and deterministic
   per-attempt failover. Golden vectors for the signed list.
@@ -381,7 +381,7 @@ backpressure, and the smoltcp netstack all belong to that datapath work):
      NL/Amsterdam exit) and confirmed egress (a TCP handshake to a public host
      completes through the sealed tunnel via `cargo run -p warren-sdk --example
      live_proxy`). Frame, control `/v2` and PoP cross-language vectors are frozen
-     under `vectors/`. The signed relay list is now v7 (minimized node/endpoint
+     under `vectors/`. The signed relay list is now v8 (minimized node/endpoint
      model: roles structural, no per-IP geoip, egress as node-level capability
      booleans): the SDK fetches and verifies the live list under the pinned
      server key, the multihop directory cross-checks against it (with the exit
