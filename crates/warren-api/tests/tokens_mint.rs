@@ -314,7 +314,10 @@ async fn token_manager_refreshes_then_vends_one_serialized_token_per_session() {
 
     // Current epoch is fully stocked; the prefetch horizon stocked the next.
     assert_eq!(manager.available(100), QUOTA as usize);
-    assert!(manager.available(101) > 0, "prefetch horizon stocks future epochs");
+    assert!(
+        manager.available(101) > 0,
+        "prefetch horizon stocks future epochs"
+    );
 
     // The provider vends exactly one serialized token per call, pinned to the
     // clock's epoch, until drained; then an empty stack (v6 fallback).
