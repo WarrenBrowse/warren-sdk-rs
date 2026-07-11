@@ -3478,6 +3478,8 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "hex",
+ "nix 0.30.1",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -3502,6 +3504,7 @@ dependencies = [
  "tokio",
  "uniffi",
  "warren-sdk",
+ "zeroize",
 ]
 
 [[package]]
@@ -3538,6 +3541,7 @@ dependencies = [
  "warren-wire",
  "warrenguard-backoff",
  "warrenguard-multihop",
+ "warrenguard-socket-bypass",
  "warrenguard-tls",
  "warrenguard-transport",
  "warrenguard-transport-core",

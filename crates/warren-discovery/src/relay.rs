@@ -47,6 +47,7 @@ pub struct Relay {
     active: bool,
     ipv6_egress: bool,
     cover_domain: Option<String>,
+    port_forward: Option<bool>,
 }
 
 impl Relay {
@@ -70,6 +71,7 @@ impl Relay {
             active,
             ipv6_egress: false,
             cover_domain: None,
+            port_forward: None,
         }
     }
 
@@ -84,6 +86,16 @@ impl Relay {
     #[must_use]
     pub fn with_cover_domain(mut self, cover_domain: Option<String>) -> Self {
         self.cover_domain = cover_domain;
+        self
+    }
+
+    /// Sets the exit's NAT-PMP port-forwarding capability (doc 79): `Some(true)`
+    /// if it runs an enabled gateway, `Some(false)` if explicitly disabled,
+    /// `None` if the roster carried no flag (unknown). The SDK only offers or
+    /// prefers port forwarding when this is `Some(true)`.
+    #[must_use]
+    pub fn with_port_forward(mut self, port_forward: Option<bool>) -> Self {
+        self.port_forward = port_forward;
         self
     }
 
@@ -147,6 +159,23 @@ impl Relay {
     #[must_use]
     pub fn cover_domain(&self) -> Option<&str> {
         self.cover_domain.as_deref()
+    }
+
+    /// The exit's NAT-PMP port-forwarding capability (doc 79): `Some(true)` if
+    /// it runs an enabled gateway, `Some(false)` if explicitly disabled, `None`
+    /// if the roster carried no flag (unknown).
+    #[must_use]
+    pub fn port_forward(&self) -> Option<bool> {
+        self.port_forward
+    }
+
+    /// `true` only when the exit explicitly advertises an enabled NAT-PMP
+    /// gateway. The SDK gates the port-forwarding feature on this: an unknown
+    /// (`None`, legacy roster) or explicitly-disabled (`Some(false)`) exit is
+    /// treated as not supporting it.
+    #[must_use]
+    pub fn supports_port_forward(&self) -> bool {
+        self.port_forward == Some(true)
     }
 }
 

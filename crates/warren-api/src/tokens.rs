@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use data_encoding::BASE64URL_NOPAD;
 use rand010::CryptoRng;
+use serde::{Deserialize, Serialize};
 use warrenguard_token::{IssuerPublicKey, TOKEN_LEN, Token, TokenChallenge, TokenError};
 
 use crate::client::{ClientError, WarrenApiClient};
@@ -269,6 +270,17 @@ impl TokenStore {
     pub fn prune_before(&mut self, min_epoch: u64) {
         self.per_epoch = self.per_epoch.split_off(&min_epoch);
     }
+
+    /// Non-consuming snapshot of every remaining token, serialized, keyed by
+    /// epoch. Used to export the store for cross-process persistence (iOS
+    /// app-group), where the consumer only needs the serialized bearer bytes.
+    #[must_use]
+    pub fn snapshot_serialized(&self) -> Vec<(u64, Vec<[u8; TOKEN_LEN]>)> {
+        self.per_epoch
+            .iter()
+            .map(|(epoch, tokens)| (*epoch, tokens.iter().map(Token::serialize).collect()))
+            .collect()
+    }
 }
 
 struct ManagerState {
@@ -400,5 +412,222 @@ impl<T: HttpTransport> TokenManager<T> {
             Some(token) => vec![token.serialize()],
             None => Vec::new(),
         }
+    }
+
+    /// Exports the current token store as a self-contained, seed-free bundle for
+    /// cross-process persistence (iOS app-group container, doc 64
+    /// anti-correlation): the main app mints on unlock/timer and persists this,
+    /// the Network Extension loads it and CONSUMES pre-minted tokens WITHOUT
+    /// minting at connect from the device's real IP.
+    ///
+    /// Returns `None` until the first [`Self::refresh`] has fetched the issuer
+    /// directory (the bundle carries the epoch length so the consumer needs no
+    /// directory of its own). The bundle holds only anonymous bearer tokens,
+    /// never the wallet seed or pubkey.
+    #[must_use]
+    pub fn export_persistable(&self) -> Option<PersistedTokens> {
+        let st = self.state.lock().expect("token manager mutex poisoned");
+        let epoch_secs = st.directory.as_ref().map(|d| d.epoch_secs)?;
+        Some(PersistedTokens::from_snapshot(
+            epoch_secs,
+            st.store.snapshot_serialized(),
+        ))
+    }
+}
+
+/// A self-contained, seed-free bundle of pre-minted anonymous tokens.
+///
+/// The iOS main app persists this into the app-group container so the Network
+/// Extension can consume pre-minted tokens without minting at connect time (the
+/// doc 64 anti-correlation requirement). It holds only anonymous bearer tokens
+/// (never the wallet seed or pubkey) plus the published epoch length, so the
+/// consumer maps "now" to the current epoch with no issuer-directory fetch and
+/// no network. Double-spend within the prefetch window is the accepted price of
+/// unlinkability (ADR-0006), bounded by the issuance quota.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PersistedTokens {
+    /// Published epoch length in seconds; the current epoch is `now / epoch_secs`.
+    epoch_secs: u64,
+    /// Serialized tokens (base64url, no pad) keyed by epoch.
+    epochs: BTreeMap<u64, Vec<String>>,
+}
+
+impl std::fmt::Debug for PersistedTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Tokens are bearer credentials: render epoch -> count, never the bytes.
+        let counts: Vec<(u64, usize)> = self.epochs.iter().map(|(e, v)| (*e, v.len())).collect();
+        f.debug_struct("PersistedTokens")
+            .field("epoch_secs", &self.epoch_secs)
+            .field("epochs", &counts)
+            .finish()
+    }
+}
+
+impl PersistedTokens {
+    fn from_snapshot(epoch_secs: u64, snapshot: Vec<(u64, Vec<[u8; TOKEN_LEN]>)>) -> Self {
+        let epochs = snapshot
+            .into_iter()
+            .map(|(epoch, tokens)| {
+                let encoded = tokens
+                    .iter()
+                    .map(|t| BASE64URL_NOPAD.encode(t))
+                    .collect::<Vec<_>>();
+                (epoch, encoded)
+            })
+            .collect();
+        Self { epoch_secs, epochs }
+    }
+
+    /// Parses a persisted bundle from its JSON form.
+    ///
+    /// # Errors
+    /// [`TokenClientError::BadDirectoryPolicy`] if the body is not the expected
+    /// JSON shape (kept typed and no-log; the untrusted body is never echoed).
+    pub fn from_json(body: &str) -> Result<Self, TokenClientError> {
+        serde_json::from_str(body).map_err(|_| TokenClientError::BadDirectoryPolicy)
+    }
+
+    /// Serializes the bundle to JSON for persistence into the app-group file.
+    ///
+    /// # Errors
+    /// [`TokenClientError::BadDirectoryPolicy`] on the (practically unreachable)
+    /// serialization failure.
+    pub fn to_json(&self) -> Result<String, TokenClientError> {
+        serde_json::to_string(self).map_err(|_| TokenClientError::BadDirectoryPolicy)
+    }
+
+    /// Tokens remaining for the epoch `now` falls in.
+    #[must_use]
+    pub fn available(&self, now_unix_secs: u64) -> usize {
+        match self.current_epoch(now_unix_secs) {
+            Some(epoch) => self.epochs.get(&epoch).map_or(0, Vec::len),
+            None => 0,
+        }
+    }
+
+    /// Pops ONE pre-minted token for the current epoch, consume-only (no mint,
+    /// no network), matching [`TokenManager::take_current_stack`]. An empty vec
+    /// means "no pre-minted token this epoch"; the tunnel then rides the v6 path.
+    #[must_use]
+    pub fn take_current_stack(&mut self, now_unix_secs: u64) -> Vec<[u8; TOKEN_LEN]> {
+        let Some(epoch) = self.current_epoch(now_unix_secs) else {
+            return Vec::new();
+        };
+        let Some(tokens) = self.epochs.get_mut(&epoch) else {
+            return Vec::new();
+        };
+        // Skip any entry that fails to decode (corrupt persisted blob) rather
+        // than handing malformed bytes to the wire.
+        while let Some(encoded) = tokens.pop() {
+            if let Ok(bytes) = BASE64URL_NOPAD.decode(encoded.as_bytes())
+                && let Ok(token) = <[u8; TOKEN_LEN]>::try_from(bytes)
+            {
+                if tokens.is_empty() {
+                    self.epochs.remove(&epoch);
+                }
+                return vec![token];
+            }
+        }
+        self.epochs.remove(&epoch);
+        Vec::new()
+    }
+
+    fn current_epoch(&self, now_unix_secs: u64) -> Option<u64> {
+        (self.epoch_secs > 0).then(|| now_unix_secs / self.epoch_secs)
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    // A well-formed (but cryptographically meaningless) token: only the byte
+    // layout matters for the persistence codec, which never verifies. `marker`
+    // varies the nonce so distinct tokens are distinguishable.
+    fn fake_token(marker: u8) -> Token {
+        let mut bytes = [0u8; TOKEN_LEN];
+        bytes[0..2].copy_from_slice(&0x0002u16.to_be_bytes());
+        bytes[2] = marker;
+        Token::parse(&bytes).expect("well-formed token bytes parse")
+    }
+
+    #[test]
+    fn store_snapshot_serializes_every_token_non_destructively() {
+        let mut store = TokenStore::new();
+        store.insert(MintedEpoch {
+            epoch: 7,
+            tokens: vec![fake_token(1), fake_token(2)],
+        });
+        let snap = store.snapshot_serialized();
+        assert_eq!(
+            snap,
+            vec![(
+                7,
+                vec![fake_token(1).serialize(), fake_token(2).serialize()]
+            )]
+        );
+        // Non-destructive: the store still holds both tokens.
+        assert_eq!(store.available(7), 2);
+    }
+
+    #[test]
+    fn persisted_bundle_round_trips_through_json_and_pops_one_token() {
+        let bundle = PersistedTokens::from_snapshot(
+            100,
+            vec![(
+                5,
+                vec![fake_token(1).serialize(), fake_token(2).serialize()],
+            )],
+        );
+        let json = bundle.to_json().expect("serialize");
+        let mut restored = PersistedTokens::from_json(&json).expect("parse");
+        // now=550 falls in epoch 5 (550/100).
+        assert_eq!(restored.available(550), 2);
+        let stack = restored.take_current_stack(550);
+        assert_eq!(stack.len(), 1);
+        assert_eq!(restored.available(550), 1);
+    }
+
+    #[test]
+    fn persisted_bundle_empties_the_epoch_and_then_yields_nothing() {
+        let mut bundle =
+            PersistedTokens::from_snapshot(60, vec![(2, vec![fake_token(9).serialize()])]);
+        // now=150 -> epoch 2.
+        assert_eq!(bundle.take_current_stack(150).len(), 1);
+        assert!(bundle.take_current_stack(150).is_empty());
+    }
+
+    #[test]
+    fn persisted_bundle_yields_nothing_for_an_epoch_without_tokens() {
+        let mut bundle =
+            PersistedTokens::from_snapshot(60, vec![(2, vec![fake_token(9).serialize()])]);
+        // now=600 -> epoch 10, which holds no tokens.
+        assert!(bundle.take_current_stack(600).is_empty());
+    }
+
+    #[test]
+    fn persisted_bundle_with_zero_epoch_length_is_inert() {
+        let mut bundle =
+            PersistedTokens::from_snapshot(0, vec![(0, vec![fake_token(1).serialize()])]);
+        assert!(bundle.take_current_stack(123).is_empty());
+        assert_eq!(bundle.available(123), 0);
+    }
+
+    #[test]
+    fn persisted_bundle_debug_never_renders_token_bytes() {
+        let bundle =
+            PersistedTokens::from_snapshot(60, vec![(2, vec![fake_token(0xAB).serialize()])]);
+        let rendered = format!("{bundle:?}");
+        // Only epoch -> count is shown, never the base64 token payload.
+        assert!(rendered.contains("epoch_secs"));
+        assert!(!rendered.contains(&BASE64URL_NOPAD.encode(&fake_token(0xAB).serialize())));
+    }
+
+    #[test]
+    fn rejects_a_malformed_persisted_body() {
+        assert!(matches!(
+            PersistedTokens::from_json("not json"),
+            Err(TokenClientError::BadDirectoryPolicy)
+        ));
     }
 }

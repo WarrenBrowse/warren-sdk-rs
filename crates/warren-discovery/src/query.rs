@@ -37,6 +37,7 @@ pub struct ExitQuery {
     location: LocationConstraint,
     ip_availability: IpAvailability,
     require_ipv6_egress: bool,
+    require_port_forward: bool,
 }
 
 impl ExitQuery {
@@ -73,6 +74,17 @@ impl ExitQuery {
         self
     }
 
+    /// Requires exits that advertise an enabled NAT-PMP port-forwarding gateway
+    /// (doc 79). Set this when the app wants port forwarding so the selector
+    /// only returns capable exits, rather than picking one that would refuse
+    /// the mapping. An unknown (legacy roster) or explicitly-disabled exit is
+    /// excluded.
+    #[must_use]
+    pub fn with_require_port_forward(mut self, require: bool) -> Self {
+        self.require_port_forward = require;
+        self
+    }
+
     /// `true` if `relay` satisfies every constraint.
     #[must_use]
     pub(crate) fn matches(&self, relay: &Relay) -> bool {
@@ -86,6 +98,9 @@ impl ExitQuery {
             return false;
         }
         if self.require_ipv6_egress && !relay.ipv6_egress() {
+            return false;
+        }
+        if self.require_port_forward && !relay.supports_port_forward() {
             return false;
         }
         true
@@ -172,6 +187,26 @@ mod tests {
     }
 
     #[test]
+    fn require_port_forward_excludes_non_capable_and_unknown_relays() {
+        // doc 79: when the app requests port forwarding, the selector must only
+        // return exits that explicitly advertise an enabled NAT-PMP gateway. An
+        // exit with no flag (legacy roster, unknown) or an explicitly-disabled
+        // one must be excluded, so the app never lands on an exit that would
+        // refuse the mapping.
+        let unknown = relay_with(&["127.0.0.1:443"], true);
+        let disabled = relay_with(&["127.0.0.1:443"], true).with_port_forward(Some(false));
+        let capable = relay_with(&["127.0.0.1:443"], true).with_port_forward(Some(true));
+
+        let q = ExitQuery::any().with_require_port_forward(true);
+        assert!(!q.matches(&unknown), "unknown capability must be excluded");
+        assert!(!q.matches(&disabled), "disabled NAT-PMP must be excluded");
+        assert!(q.matches(&capable), "enabled NAT-PMP must match");
+        // Without the requirement, all three pass.
+        assert!(ExitQuery::any().matches(&unknown));
+        assert!(ExitQuery::any().matches(&disabled));
+    }
+
+    #[test]
     fn location_constraint_matches_country_and_city_case_insensitively() {
         let relay = relay_with(&["127.0.0.1:443"], true);
         assert!(ExitQuery::country("ro").matches(&relay));
@@ -201,5 +236,13 @@ mod tests {
         assert_eq!(relay.location().country_code(), "RO");
         assert_eq!(relay.location().city(), "Bucharest");
         assert_eq!(relay.addrs().len(), 2);
+        // doc 79: NAT-PMP capability defaults to unknown, and unknown is not a
+        // supported exit for the gate.
+        assert_eq!(relay.port_forward(), None);
+        assert!(!relay.supports_port_forward(), "unknown is not supported");
+        assert!(
+            relay.with_port_forward(Some(true)).supports_port_forward(),
+            "an enabled NAT-PMP exit is supported"
+        );
     }
 }

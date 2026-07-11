@@ -19,9 +19,17 @@ warren-daita = { path = "../warren-daita" }
 # Privileged TUN device open for the experimental `start_tun_multihop` facade
 # (feature-gated; the default build pulls none of it and stays unsafe-free).
 warren-tun = { path = "../warren-tun", optional = true }
+# Safe `if_nametoindex` for the macOS carrier-socket `IP_BOUND_IF` bypass in
+# `start_tun_multihop` (Port Fail fix): the workspace forbids unsafe, so the FFI
+# is delegated to nix rather than an in-crate `libc` call. Feature-gated with the
+# TUN facade, so the default userland build never pulls it.
+nix = { version = "0.30", default-features = false, features = ["net"], optional = true }
 thiserror = { workspace = true }
 # Needed to bind the local SOCKS5 listener and spawn the proxy datapath task.
 tokio = { workspace = true }
+# Parse the am.i.warren egress-oracle verdict (control-plane leak self-check).
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 # Bundle the reqwest transport so an app can build a working client with one
@@ -31,7 +39,7 @@ reqwest-transport = ["warren-api/reqwest-transport"]
 # The experimental privileged TUN datapath facade (`start_tun_multihop`). Pulls
 # warren-tun's device open + warren-net's TUN datapath. EXPERIMENTAL, Unix-only,
 # NOT yet validated against a real exit (needs root + a device).
-experimental-tun = ["dep:warren-tun", "warren-net/experimental-tun"]
+experimental-tun = ["dep:warren-tun", "dep:nix", "warren-net/experimental-tun"]
 
 # Document the full surface on docs.rs (the facade re-exports every layer).
 [package.metadata.docs.rs]

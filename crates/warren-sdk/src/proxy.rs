@@ -29,6 +29,12 @@ pub enum TunnelState {
 pub struct ProxyForwarder {
     pub(crate) connector: warren_net::TunnelConnector,
     pub(crate) gateway: std::net::Ipv4Addr,
+    /// doc 79: whether the selected exit advertises an enabled NAT-PMP gateway.
+    /// The forward-port calls fail closed with [`SdkError::PortForwardUnsupported`]
+    /// when this is `false`, so the SDK never emits a mapping an exit would
+    /// reject. Defaults `true` for datapaths whose exit capability is not known
+    /// on this path (e.g. multihop), preserving prior behaviour.
+    pub(crate) port_forward_supported: bool,
 }
 
 impl ProxyForwarder {
@@ -68,6 +74,15 @@ impl ProxyForwarder {
         local_target: SocketAddr,
         suggested_external_port: u16,
     ) -> Result<warren_net::ForwardedPort, SdkError> {
+        // doc 79: gate the feature on the exit's advertised capability. Warren
+        // is mono-IP, so an exit that does not run NAT-PMP cannot honour a
+        // mapping; refuse up front with a clear typed error rather than emit a
+        // request the exit would reject. This is the single choke point for
+        // ProxyHandle::forward_port, ProxyForwarder::forward_port and the
+        // supervised self-healing forward.
+        if !self.port_forward_supported {
+            return Err(SdkError::PortForwardUnsupported);
+        }
         warren_net::forward_port_with_suggested(
             &self.connector,
             self.gateway,
@@ -88,6 +103,12 @@ pub struct ProxyHandle {
     pub(crate) state_rx: tokio::sync::watch::Receiver<TunnelState>,
     pub(crate) forward_connector: warren_net::TunnelConnector,
     pub(crate) gateway: std::net::Ipv4Addr,
+    /// doc 79: the selected exit's NAT-PMP capability, threaded onto every
+    /// [`ProxyForwarder`] this handle hands out so [`Self::forward_port`] gates
+    /// on it. `true` by default (set by [`serve_proxy_over_sink`]); the
+    /// single-hop [`start_proxy`](crate::WarrenClient::start_proxy) overrides it
+    /// from the resolved relay's roster flag.
+    pub(crate) port_forward_supported: bool,
     pub(crate) tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Live session counters, present for the multihop datapath (`None` for the
     /// single-hop `start_proxy`, which has no sealed-session metrics).
@@ -162,6 +183,7 @@ impl ProxyHandle {
         ProxyForwarder {
             connector: self.forward_connector.clone(),
             gateway: self.gateway,
+            port_forward_supported: self.port_forward_supported,
         }
     }
 
@@ -272,6 +294,10 @@ where
         state_rx,
         forward_connector,
         gateway,
+        // Default to permissive: the exit's roster capability is not known on
+        // this shared path (multihop carries no such flag yet). The single-hop
+        // start_proxy overrides this from the resolved relay (doc 79).
+        port_forward_supported: true,
         tasks,
         metrics: None,
     })

@@ -20,6 +20,9 @@ crate-type = ["lib", "cdylib"]
 warren-sdk = { path = "../warren-sdk" }
 hex = { workspace = true }
 thiserror = { workspace = true }
+# Wipes the backup mnemonic held by the opaque WarrenWallet handle on drop, so
+# the seed is not left in Rust heap memory after the one-shot backup reveal.
+zeroize = { workspace = true }
 # The FFI binding generator. "cli" provides the uniffi-bindgen entry point used
 # by the src/bin/uniffi-bindgen.rs helper to emit Swift/Kotlin/Python/Ruby.
 # "tokio" lets async exports run on the host app's tokio runtime.

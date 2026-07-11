@@ -58,6 +58,7 @@ pub use warren_transport as transport;
 pub use warren_transport::ConnectionState;
 
 mod client;
+pub mod egress;
 mod error;
 mod portfollow;
 mod proxy;

@@ -8,7 +8,7 @@ use warren_discovery::{
 };
 use warren_identity::WarrenIdentity;
 use warren_net::{MultihopPacketSink, QuicPacketSink};
-use warren_transport::{ClientTunnel, ConnectionState, MultihopClientTunnel};
+use warren_transport::{ClientTunnel, ConnectionState, MultihopClientTunnel, SocketBypass};
 
 #[cfg(feature = "reqwest-transport")]
 use warren_api::ReqwestTransport;
@@ -478,7 +478,12 @@ impl<T: HttpTransport> WarrenClient<T> {
         // Single-hop SetupAck carries no subnet (and no v6 gateway/prefix), so
         // fall back to the frozen v4 tunnel defaults (10.66.0.0/16, gw 10.66.0.1)
         // and stay v4-only.
-        serve_proxy_over_sink(sink, local_ip, TUNNEL_PREFIX, TUNNEL_GATEWAY, None, cfg).await
+        let mut handle =
+            serve_proxy_over_sink(sink, local_ip, TUNNEL_PREFIX, TUNNEL_GATEWAY, None, cfg).await?;
+        // doc 79: gate port forwarding on the selected exit's roster capability.
+        // The client only offers the feature where the exit runs NAT-PMP.
+        handle.port_forward_supported = exit.supports_port_forward();
+        Ok(handle)
     }
 
     /// Fetches and verifies the signed multihop directory, returning the trusted
@@ -566,6 +571,22 @@ impl<T: HttpTransport> WarrenClient<T> {
         &self,
         exit: &VerifiedExit,
     ) -> Result<MultihopPacketSink, SdkError> {
+        // The userland proxy installs no OS tunnel, so its carrier socket is never
+        // marked/bound (no bypass): the privileged TUN datapath is the only caller
+        // that sets one, via `connect_multihop_with_bypass`.
+        self.connect_multihop_with_bypass(exit, None).await
+    }
+
+    /// [`Self::connect_multihop`] with an explicit carrier-socket bypass. The
+    /// privileged TUN datapath passes `Some(..)` so the QUIC socket is kept on the
+    /// physical link (`SO_MARK` / `IP_BOUND_IF`) BEFORE its first send, which is
+    /// what lets the split-default routing drop the `<exit_ip>/32` host route
+    /// (Port Fail / TunnelCrack ServerIP fix). `None` is the userland proxy path.
+    async fn connect_multihop_with_bypass(
+        &self,
+        exit: &VerifiedExit,
+        socket_bypass: Option<SocketBypass>,
+    ) -> Result<MultihopPacketSink, SdkError> {
         let mut tunnel = MultihopClientTunnel::new(self.signing.clone());
         if self.auto_local_ip {
             tunnel = tunnel.with_auto_local_ip();
@@ -581,6 +602,9 @@ impl<T: HttpTransport> WarrenClient<T> {
         // and keeps the historical RPK path otherwise.
         if exit.cover_domain.is_some() {
             tunnel = tunnel.with_cover_domain(exit.cover_domain.clone());
+        }
+        if let Some(bypass) = socket_bypass {
+            tunnel = tunnel.with_socket_bypass(bypass);
         }
         let session = tunnel
             .connect(
@@ -644,7 +668,18 @@ impl<T: HttpTransport> WarrenClient<T> {
     ) -> Result<TunDatapathHandle, SdkError> {
         use warren_tun::{RoutingPlan, TunConfig};
 
-        let sink = self.connect_multihop(exit).await?;
+        // Resolve the physical egress and its per-OS carrier-socket bypass BEFORE
+        // dialing: the QUIC socket must be marked/bound to the physical link at
+        // bind time (`SO_MARK` on Linux, `IP_BOUND_IF` on macOS) so that once the
+        // split-default capture is installed the carrier stays out of the tunnel.
+        // This is what lets the routing/killswitch drop the `<exit_ip>/32` host
+        // route; the two MUST be set together (removing the destination escape
+        // without marking the socket is fail-closed but non-functional).
+        let (socket_bypass, phys_iface) = datapath_socket_bypass()?;
+
+        let sink = self
+            .connect_multihop_with_bypass(exit, Some(socket_bypass))
+            .await?;
         let session = sink.session();
         let ipv4 = session.assigned_ipv4();
         // /32 host address on the tunnel; the split-default routes capture the
@@ -667,19 +702,23 @@ impl<T: HttpTransport> WarrenClient<T> {
             dns: vec![std::net::Ipv4Addr::new(10, 66, 0, 1).into()],
         };
 
-        let gateway = warren_tun::gateway::discover_default_gateway().map_err(SdkError::Tun)?;
         // Bring the device up + address it BEFORE routing (a fresh TUN is down).
         warren_tun::apply::configure_interface(&config).map_err(SdkError::Tun)?;
         let routing = RoutingPlan::split_default(&config);
         // Fail-safe: if routing or the killswitch fails mid-setup, revert what was
         // applied before returning, so a partial setup never strands the host with
         // a captured default route or a closed killswitch and no handle to undo it.
-        if let Err(e) = warren_tun::apply::apply_routing(&routing, &dev_name, gateway) {
-            warren_tun::apply::revert_routing(&routing, &dev_name, gateway);
+        // The exit carrier stays reachable via the socket bypass set above, not a
+        // route, so the applier no longer needs the physical gateway.
+        if let Err(e) = warren_tun::apply::apply_routing(&routing, &dev_name) {
+            warren_tun::apply::revert_routing(&routing, &dev_name);
             return Err(SdkError::Tun(e));
         }
-        if let Err(e) = warren_tun::apply::apply_killswitch(&config) {
-            warren_tun::apply::revert_routing(&routing, &dev_name, gateway);
+        // `phys_iface` scopes the macOS pf exit accept to the physical interface
+        // the carrier socket is bound to; Linux keys the accept on the socket mark
+        // and ignores it.
+        if let Err(e) = warren_tun::apply::apply_killswitch(&config, &phys_iface) {
+            warren_tun::apply::revert_routing(&routing, &dev_name);
             let _ = warren_tun::apply::teardown_killswitch();
             return Err(SdkError::Tun(e));
         }
@@ -689,7 +728,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         // before it: undo DNS, routing and the killswitch if the push fails.
         if let Err(e) = warren_tun::apply::apply_dns(&config) {
             warren_tun::apply::revert_dns(&config);
-            warren_tun::apply::revert_routing(&routing, &dev_name, gateway);
+            warren_tun::apply::revert_routing(&routing, &dev_name);
             let _ = warren_tun::apply::teardown_killswitch();
             return Err(SdkError::Tun(e));
         }
@@ -703,7 +742,6 @@ impl<T: HttpTransport> WarrenClient<T> {
             pump,
             routing,
             config,
-            gateway,
         })
     }
 
@@ -1046,6 +1084,101 @@ pub(crate) fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The carrier-socket bypass for THIS OS given the physical interface index.
+/// Linux keys the tunnel escape on the firewall mark (index unused, matched by
+/// the fwmark `ip rule` and the `meta mark` killswitch accept); macOS binds the
+/// socket to the physical interface index via `IP_BOUND_IF`.
+#[cfg(all(feature = "experimental-tun", target_os = "linux"))]
+fn socket_bypass_from_ifindex(_ifindex: u32) -> SocketBypass {
+    SocketBypass::Fwmark(warren_tun::plan::WARREN_TUNNEL_FWMARK)
+}
+
+#[cfg(all(feature = "experimental-tun", target_os = "macos"))]
+fn socket_bypass_from_ifindex(ifindex: u32) -> SocketBypass {
+    SocketBypass::BoundIf(ifindex)
+}
+
+/// Parses the physical default-route interface from macOS `netstat -rn -f inet`:
+/// the first `default` row whose gateway column is an IP address. Interface-bound
+/// default routes (another VPN's `utunN`, shown as `link#N`) are skipped, so the
+/// PHYSICAL interface is found even behind an active tunnel. Its `Netif` column
+/// (Destination Gateway Flags Netif [Expire]) is returned. Pure; the command
+/// runner is [`discover_physical_iface`].
+#[cfg(all(target_os = "macos", feature = "experimental-tun"))]
+fn parse_netstat_physical_iface(netstat_output: &str) -> Option<String> {
+    for line in netstat_output.lines() {
+        let mut tokens = line.split_whitespace();
+        if tokens.next() != Some("default") {
+            continue;
+        }
+        let gateway = tokens.next()?;
+        if gateway.parse::<std::net::IpAddr>().is_err() {
+            continue;
+        }
+        let _flags = tokens.next()?;
+        let netif = tokens.next()?;
+        return Some(netif.to_owned());
+    }
+    None
+}
+
+/// Discovers the physical egress interface name on macOS by parsing the live
+/// routing table (`netstat -rn -f inet`), before the tunnel is installed.
+#[cfg(all(target_os = "macos", feature = "experimental-tun"))]
+fn discover_physical_iface() -> Result<String, SdkError> {
+    let out = std::process::Command::new("netstat")
+        .args(["-rn", "-f", "inet"])
+        .output()
+        .map_err(SdkError::Tun)?;
+    if !out.status.success() {
+        return Err(SdkError::Tun(std::io::Error::other("netstat -rn failed")));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_netstat_physical_iface(&text)
+        .ok_or_else(|| SdkError::Tun(std::io::Error::other("no physical default interface found")))
+}
+
+/// Resolves the per-OS carrier-socket bypass and physical egress interface name
+/// for the privileged TUN datapath (Port Fail fix). Linux returns the fwmark
+/// bypass and an empty interface name (the killswitch keys on the mark, not the
+/// interface); macOS discovers the physical interface, resolves its index and
+/// returns the `IP_BOUND_IF` bypass plus the interface name for the pf accept
+/// scope. Call this BEFORE dialing so it observes the real physical default route.
+///
+/// # Errors
+///
+/// [`SdkError::Tun`] on macOS if the physical interface or its index cannot be
+/// resolved.
+#[cfg(all(feature = "experimental-tun", target_os = "linux"))]
+fn datapath_socket_bypass() -> Result<(SocketBypass, String), SdkError> {
+    Ok((socket_bypass_from_ifindex(0), String::new()))
+}
+
+#[cfg(all(feature = "experimental-tun", target_os = "macos"))]
+fn datapath_socket_bypass() -> Result<(SocketBypass, String), SdkError> {
+    let iface = discover_physical_iface()?;
+    // Safe FFI via nix (the workspace forbids unsafe): resolve the interface
+    // index the socket binds to. An index of 0 is never valid.
+    let ifindex = nix::net::if_::if_nametoindex(iface.as_str()).map_err(|e| {
+        SdkError::Tun(std::io::Error::other(format!(
+            "if_nametoindex({iface}) failed: {e}"
+        )))
+    })?;
+    Ok((socket_bypass_from_ifindex(ifindex), iface))
+}
+
+#[cfg(all(
+    unix,
+    feature = "experimental-tun",
+    not(any(target_os = "linux", target_os = "macos"))
+))]
+fn datapath_socket_bypass() -> Result<(SocketBypass, String), SdkError> {
+    Err(SdkError::Tun(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "socket-level tunnel bypass is only implemented for Linux and macOS",
+    )))
+}
+
 /// Handle to a running privileged TUN datapath (from
 /// [`WarrenClient::start_tun_multihop`]). Dropping it stops the datapath: both
 /// background tasks are aborted, which closes the device and the tunnel.
@@ -1058,7 +1191,6 @@ pub struct TunDatapathHandle {
     pump: tokio::task::JoinHandle<Result<(), warren_net::NetError>>,
     routing: warren_tun::RoutingPlan,
     config: warren_tun::TunConfig,
-    gateway: std::net::IpAddr,
 }
 
 #[cfg(all(unix, feature = "experimental-tun"))]
@@ -1070,7 +1202,147 @@ impl Drop for TunDatapathHandle {
         self.driver.abort();
         self.pump.abort();
         warren_tun::apply::revert_dns(&self.config);
-        warren_tun::apply::revert_routing(&self.routing, &self.config.name, self.gateway);
+        warren_tun::apply::revert_routing(&self.routing, &self.config.name);
         let _ = warren_tun::apply::teardown_killswitch();
+    }
+}
+
+// The privileged TUN datapath's Port Fail wiring: per-OS socket bypass selection,
+// the split-default plan carrying no exit host route, and the socket-scoped
+// killswitch. These exercise the pieces `start_tun_multihop` composes; the
+// end-to-end datapath itself is validated rooted against a real device.
+#[cfg(all(test, unix, feature = "experimental-tun"))]
+mod portfail_tests {
+    use super::*;
+
+    fn sample_config() -> warren_tun::TunConfig {
+        warren_tun::TunConfig {
+            name: "warren0".into(),
+            mtu: 1280,
+            ipv4: (std::net::Ipv4Addr::new(10, 66, 0, 2), 32),
+            ipv6: None,
+            exit_endpoint: "203.0.113.9:443".parse().expect("static addr parses"),
+            dns: vec![std::net::Ipv4Addr::new(10, 66, 0, 1).into()],
+        }
+    }
+
+    #[test]
+    fn socket_bypass_is_selected_per_os() {
+        // The escape is keyed on the socket: a Linux fwmark, a macOS interface
+        // bind. Picking the wrong mechanism for the OS would fail closed at bind.
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            socket_bypass_from_ifindex(7),
+            SocketBypass::Fwmark(warren_tun::plan::WARREN_TUNNEL_FWMARK)
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(socket_bypass_from_ifindex(7), SocketBypass::BoundIf(7));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn datapath_socket_bypass_is_the_fwmark_on_linux() {
+        let (bypass, iface) = datapath_socket_bypass().expect("linux selection is infallible");
+        assert_eq!(
+            bypass,
+            SocketBypass::Fwmark(warren_tun::plan::WARREN_TUNNEL_FWMARK)
+        );
+        assert!(
+            iface.is_empty(),
+            "linux keys the escape on the mark, not the interface"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_netstat_picks_the_physical_default_skipping_interface_bound_ones() {
+        // A live VPN's interface-bound default (gateway shown as `link#N`) must be
+        // skipped so the PHYSICAL interface is found even behind another tunnel.
+        let out = "Routing tables\n\nInternet:\n\
+                   Destination        Gateway            Flags        Netif Expire\n\
+                   default            link#25            UCSIg        utun4\n\
+                   default            192.168.1.254      UGScg        en0\n";
+        assert_eq!(parse_netstat_physical_iface(out).as_deref(), Some("en0"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn datapath_socket_bypass_binds_the_physical_interface_on_macos() {
+        // Real discovery against the host routing table (needs a physical default
+        // route). The bind must target a valid, non-zero interface index.
+        let (bypass, iface) =
+            datapath_socket_bypass().expect("a physical default route must be present");
+        assert!(
+            matches!(bypass, SocketBypass::BoundIf(i) if i > 0),
+            "macOS must bind a real interface index, got {bypass:?}"
+        );
+        assert!(
+            !iface.is_empty(),
+            "the physical interface name must resolve"
+        );
+    }
+
+    #[test]
+    fn split_default_routing_never_pins_a_host_route_to_the_exit() {
+        // The exit's carrier stays on the physical link via the socket bypass, not
+        // a `<exit>/32` route, so the split-default must capture EVERY destination
+        // including the exit IP (this is the leak Port Fail closes).
+        let config = sample_config();
+        let exit_ip = config.exit_endpoint.ip().to_string();
+        let plan = warren_tun::RoutingPlan::split_default(&config);
+        for op in &plan.ops {
+            let warren_tun::RouteOp::RouteViaTun { cidr } = op;
+            assert!(
+                !cidr.contains(&exit_ip),
+                "routing plan must not pin the exit destination: {cidr}"
+            );
+        }
+        assert!(
+            plan.ops.iter().any(
+                |op| matches!(op, warren_tun::RouteOp::RouteViaTun { cidr } if cidr == "0.0.0.0/1")
+            ),
+            "the /1 split-default capture must still be present"
+        );
+        #[cfg(target_os = "macos")]
+        let cmds = plan.to_macos_commands("warren0", "add");
+        #[cfg(not(target_os = "macos"))]
+        let cmds = plan.to_ip_commands("warren0");
+        for argv in cmds {
+            assert!(
+                !argv.iter().any(|a| a.contains(&exit_ip)),
+                "no rendered routing command may reference the exit: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn datapath_killswitch_scopes_the_exit_accept_to_the_socket_not_the_destination() {
+        let config = sample_config();
+        let exit_ip = config.exit_endpoint.ip().to_string();
+        #[cfg(target_os = "linux")]
+        {
+            let ks = warren_tun::KillswitchPlan::nftables(&config).nftables;
+            assert!(
+                ks.contains(&format!(
+                    "meta mark {:#x} accept",
+                    warren_tun::plan::WARREN_TUNNEL_FWMARK
+                )),
+                "linux killswitch must accept the socket mark, got:\n{ks}"
+            );
+            assert!(
+                !ks.contains(&format!("ip daddr {exit_ip}")),
+                "the per-exit destination accept must be gone (that is the leak):\n{ks}"
+            );
+            assert!(ks.contains("policy drop;"), "fail-closed preserved");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let rules = warren_tun::KillswitchPlan::pf_rules(&config, "en0");
+            assert!(
+                rules.contains(&format!("on en0 proto udp from any to {exit_ip}")),
+                "macOS exit accept must be scoped to the physical interface, got:\n{rules}"
+            );
+            assert!(rules.contains("block out all"), "fail-closed preserved");
+        }
     }
 }

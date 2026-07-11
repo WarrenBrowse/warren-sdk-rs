@@ -40,6 +40,7 @@ async fn start_proxy_multihop_routes_socks5_through_a_sealed_tunnel() {
         weight: 100,
         dns_disabled: false,
         cover_domain: None,
+        edge_cert_sha256: None,
     };
 
     let cfg = ProxyConfig {

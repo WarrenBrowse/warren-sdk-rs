@@ -93,6 +93,13 @@ pub enum SdkError {
     /// A port-forwarding (NAT-PMP) operation failed.
     #[error(transparent)]
     PortForward(#[from] warren_net::PortForwardError),
+    /// The selected exit does not advertise an enabled NAT-PMP port-forwarding
+    /// gateway (doc 79), so the SDK refuses to attempt a mapping up front rather
+    /// than emitting one the exit would reject. Warren is mono-IP: this reflects
+    /// the exit's `--enable-natpmp` toggle, not a per-client restriction. Pick a
+    /// capable exit (e.g. `ExitQuery::with_require_port_forward(true)`).
+    #[error("the selected exit does not support port forwarding (NAT-PMP is disabled on it)")]
+    PortForwardUnsupported,
     /// The client builder was misconfigured.
     #[error(transparent)]
     Build(#[from] BuildError),
