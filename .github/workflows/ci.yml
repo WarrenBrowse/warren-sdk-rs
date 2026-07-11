@@ -18,6 +18,12 @@ env:
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-D warnings"
+  # Rosetta-stable linker for the x86-linux jobs: rustc's default `cc` (gnu
+  # ld/collect2) SIGSEGVs under Rosetta on heavy links; clang+lld is stable and
+  # memory-light. Target-scoped, so the macos/windows matrix jobs are unaffected;
+  # a LINKER var (not RUSTFLAGS) so the `-D warnings` above still applies. The
+  # `clang-lld` wrapper is baked into the runner image.
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang-lld
 
 concurrency:
   # A single self-hosted Linux runner serves these jobs; cancel superseded runs
