@@ -63,6 +63,7 @@ use warrenguard_transport::multihop::{
 
 use crate::client::{QuicDialError, dial_quic, dial_quic_webpki, effective_bind};
 use crate::tls;
+use warrenguard_socket_bypass::SocketBypass;
 
 /// DAITA dummy first byte (padding traffic), dropped on the receive path.
 const DAITA_DUMMY_FIRST_BYTE: u8 = 0xFF;
@@ -195,6 +196,13 @@ pub struct MultihopClientTunnel {
     /// server-initiated bi stream after the setup frame is sent. `None` keeps
     /// the historical RPK path.
     cover_domain: Option<String>,
+    /// When `Some`, the QUIC carrier socket is marked/bound to the physical link
+    /// (`SO_MARK` / `IP_BOUND_IF` / `IP_UNICAST_IF`) before its first send, so a
+    /// privileged TUN datapath's split-default capture keeps it out of the tunnel
+    /// and can drop the `<exit_ip>/32` host route (Port Fail / TunnelCrack
+    /// ServerIP fix). `None` (default) for the userland proxy (no OS tunnel) and
+    /// mobile (`VpnService.protect`). Set via [`Self::with_socket_bypass`].
+    socket_bypass: Option<SocketBypass>,
 }
 
 impl MultihopClientTunnel {
@@ -209,6 +217,7 @@ impl MultihopClientTunnel {
             transport_config: None,
             idle_cover: false,
             cover_domain: None,
+            socket_bypass: None,
         }
     }
 
@@ -275,6 +284,26 @@ impl MultihopClientTunnel {
         self
     }
 
+    /// Keep the QUIC carrier socket on the physical link, out of the full-tunnel
+    /// capture a system-VPN datapath installs, via a socket-level mark/bind
+    /// (`SO_MARK` on Linux, `IP_BOUND_IF` on macOS, `IP_UNICAST_IF` on Windows).
+    /// The privileged TUN datapath sets this so it can drop the `<exit_ip>/32`
+    /// host route: with the escape keyed on the socket instead of the exit
+    /// destination, application traffic to the exit IP is tunnelled like anything
+    /// else and cannot leak (Port Fail / TunnelCrack ServerIP). Leave unset for
+    /// the userland proxy (no OS tunnel) and mobile (`VpnService.protect`).
+    #[must_use]
+    pub fn with_socket_bypass(mut self, bypass: SocketBypass) -> Self {
+        self.socket_bypass = Some(bypass);
+        self
+    }
+
+    /// The socket bypass pinned by [`Self::with_socket_bypass`], if any.
+    #[must_use]
+    pub fn socket_bypass(&self) -> Option<SocketBypass> {
+        self.socket_bypass
+    }
+
     /// The account public key (TLS identity and PoP key).
     #[must_use]
     pub fn node_id(&self) -> [u8; 32] {
@@ -325,6 +354,7 @@ impl MultihopClientTunnel {
                 exit_addr,
                 effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
                 transport_config,
+                self.socket_bypass,
             )
             .await?
         } else {
@@ -333,6 +363,7 @@ impl MultihopClientTunnel {
                 exit_addr,
                 effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
                 transport_config,
+                self.socket_bypass,
             )
             .await?
         };
@@ -983,8 +1014,14 @@ mod real_exit_tests {
         addr: SocketAddr,
     ) -> (quinn::Endpoint, quinn::Connection) {
         for attempt in 0..50u32 {
-            match crate::client::dial_quic(exit_rpk, addr, effective_bind(None, false, addr), None)
-                .await
+            match crate::client::dial_quic(
+                exit_rpk,
+                addr,
+                effective_bind(None, false, addr),
+                None,
+                None,
+            )
+            .await
             {
                 Ok(pair) => return pair,
                 Err(_) if attempt < 49 => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -1322,6 +1359,25 @@ mod real_exit_tests {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    #[test]
+    fn socket_bypass_is_threaded_from_the_builder() {
+        // A privileged TUN datapath keys its carrier-socket escape on a socket
+        // mark/bind (Port Fail fix), which the tunnel must carry down to the QUIC
+        // socket bind. The builder pins it and exposes it for the dialer.
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let bypass = SocketBypass::Fwmark(0x7761_7272);
+        let tunnel = MultihopClientTunnel::new(key).with_socket_bypass(bypass);
+        assert_eq!(tunnel.socket_bypass(), Some(bypass));
+    }
+
+    #[test]
+    fn no_socket_bypass_by_default_so_the_userland_proxy_is_unaffected() {
+        // The userland proxy installs no OS tunnel, so it must never mark/bind
+        // its socket; the default is `None` (verbatim bind).
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        assert_eq!(MultihopClientTunnel::new(key).socket_bypass(), None);
+    }
 
     #[test]
     fn multihop_error_display_never_leaks_the_source_detail() {
