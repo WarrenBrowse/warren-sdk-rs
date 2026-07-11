@@ -52,6 +52,11 @@ warrenguard-tun-core = { git = "https://github.com/WarrenBrowse/warrenguard.git"
 warrenguard-tun-device = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
 warrenguard-backoff = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
 warrenguard-token = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
+# Per-OS carrier-socket bypass (SO_MARK / IP_BOUND_IF / IP_UNICAST_IF): keeps the
+# QUIC socket on the physical link so the split-default TUN datapath can drop the
+# `<exit_ip>/32` host route (Port Fail / TunnelCrack ServerIP fix). Consumed by
+# `warren-transport`'s dialer and passed a bypass value by `warren-sdk`.
+warrenguard-socket-bypass = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
 # Client-side tunnel transport: the multihop protocol logic (HPKE seal/open,
 # rekey/epoch, setup-over-stream, sync datagram send/recv) lives once in
 # `warrenguard_transport::multihop::MultiHopClient`; `warren-transport`'s
@@ -178,6 +183,13 @@ warrenguard-tun-core = { path = "../warrenguard/crates/warrenguard-tun-core" }
 warrenguard-tun-device = { path = "../warrenguard/crates/warrenguard-tun-device" }
 warrenguard-backoff = { path = "../warrenguard/crates/warrenguard-backoff" }
 warrenguard-token = { path = "../warrenguard/crates/warrenguard-token" }
+# NOTE (integration): once the socket-bypass engine change lands on warrenguard
+# main and `.warrenguard-version` is bumped, add the sibling override here to
+# mirror the other crates:
+#   warrenguard-socket-bypass = { path = "../warrenguard/crates/warrenguard-socket-bypass" }
+# Until then the crate does not exist in the `../warrenguard` (main) checkout, so
+# listing it here would break resolution; local dev overrides it to the Port Fail
+# worktree via `.cargo/config.toml` instead.
 warrenguard-transport = { path = "../warrenguard/crates/warrenguard-transport" }
 warrenguard-transport-core = { path = "../warrenguard/crates/warrenguard-transport-core" }
 

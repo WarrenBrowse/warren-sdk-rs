@@ -31,3 +31,7 @@ pub use reconnect::{
     connect_with_state,
 };
 pub use tls::{WarrenTlsError, default_crypto_provider, make_client_config, make_server_config};
+// The per-OS carrier-socket bypass value a privileged TUN datapath pins on the
+// tunnel (via `MultihopClientTunnel::with_socket_bypass`) so the SDK can name it
+// without depending on the engine crate directly.
+pub use warrenguard_socket_bypass::SocketBypass;

@@ -29,6 +29,12 @@ warrenguard-transport-core = { workspace = true }
 # Full-jitter reconnection backoff, single-homed in the engine (re-exported by
 # the `reconnect` module so the SDK and warren-core share one schedule).
 warrenguard-backoff = { workspace = true }
+# Per-OS carrier-socket bypass (SO_MARK / IP_BOUND_IF / IP_UNICAST_IF): the
+# privileged TUN datapath marks/binds the QUIC socket to the physical link so
+# the split-default tunnel can drop the old `<exit_ip>/32` host route (Port Fail
+# / TunnelCrack ServerIP fix). Lightweight (libc/windows-sys only) and the
+# userland proxy simply configures no bypass, so it stays in that closure too.
+warrenguard-socket-bypass = { workspace = true }
 warren-wire = { path = "../warren-wire" }
 warren-multihop = { path = "../warren-multihop" }
 warren-daita = { path = "../warren-daita" }

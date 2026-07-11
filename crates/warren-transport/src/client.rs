@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use warren_wire::DEVICE_ID_LEN;
+use warrenguard_socket_bypass::{SocketBypass, apply as apply_socket_bypass};
 use warrenguard_transport_core::error::TunnelError as EngineTunnelError;
 
 use crate::tls;
@@ -70,18 +71,60 @@ pub(crate) enum QuicDialError {
     Quic(quinn::ConnectionError),
 }
 
+/// Binds the carrier UDP socket for a QUIC endpoint and applies the per-OS
+/// tunnel bypass to it BEFORE it can send, so a privileged TUN datapath's
+/// split-default capture keeps this socket on the physical link instead of
+/// looping it into the tunnel (`SO_MARK` on Linux, `IP_BOUND_IF` on macOS,
+/// `IP_UNICAST_IF` on Windows). This is what lets the datapath drop the old
+/// `<exit_ip>/32` host route, closing Port Fail / TunnelCrack ServerIP.
+///
+/// Fail-closed: a bypass this OS cannot honour is returned as a [`QuicDialError::Bind`],
+/// so a mis-wired caller refuses the socket rather than letting the carrier leak.
+pub(crate) fn bind_endpoint_socket(
+    bind: SocketAddr,
+    socket_bypass: Option<SocketBypass>,
+) -> Result<std::net::UdpSocket, QuicDialError> {
+    let socket = std::net::UdpSocket::bind(bind).map_err(QuicDialError::Bind)?;
+    if let Some(bypass) = socket_bypass {
+        apply_socket_bypass(&socket, bypass).map_err(QuicDialError::Bind)?;
+    }
+    Ok(socket)
+}
+
+/// Builds the QUIC client endpoint bound to `bind`. With no bypass this is
+/// `Endpoint::client` verbatim (userland proxy, mobile): the userland datapath
+/// installs no OS tunnel, so its socket must never be marked/bound. With a bypass
+/// the socket is bound and pinned to the physical link first, then handed to
+/// quinn (privileged TUN datapath).
+fn build_client_endpoint(
+    bind: SocketAddr,
+    socket_bypass: Option<SocketBypass>,
+) -> Result<quinn::Endpoint, QuicDialError> {
+    if socket_bypass.is_none() {
+        return quinn::Endpoint::client(bind).map_err(QuicDialError::Bind);
+    }
+    let socket = bind_endpoint_socket(bind, socket_bypass)?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| QuicDialError::Bind(std::io::Error::other("no quinn async runtime")))?;
+    quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
+        .map_err(QuicDialError::Bind)
+}
+
 /// Dials and authenticates a QUIC connection to `exit_addr`: builds the TLS
 /// raw-public-key client config, binds a local endpoint matching the address
 /// family (unless `bind_local_ip` pins one), connects with the SNI-encoded exit
 /// key, and confirms the authenticated peer key equals `exit_pubkey`. The shared
 /// prefix of every Warren tunnel handshake (single-hop and multihop).
-/// Returns the dialed `(Endpoint, Connection)`. The endpoint drives the
-/// connection's I/O, so the caller must keep it alive for the session's lifetime.
+/// `socket_bypass` keeps the carrier socket on the physical link for a privileged
+/// TUN datapath (`None` for the userland proxy). Returns the dialed
+/// `(Endpoint, Connection)`. The endpoint drives the connection's I/O, so the
+/// caller must keep it alive for the session's lifetime.
 pub(crate) async fn dial_quic(
     exit_pubkey: [u8; 32],
     exit_addr: SocketAddr,
     bind_local_ip: Option<SocketAddr>,
     transport_config: Option<Arc<quinn::TransportConfig>>,
+    socket_bypass: Option<SocketBypass>,
 ) -> Result<(quinn::Endpoint, quinn::Connection), QuicDialError> {
     // v5: the client is anonymous at the TLS layer (no client cert). The exit
     // identity is pinned via the SNI: the server-cert verifier fails the
@@ -99,7 +142,7 @@ pub(crate) async fn dial_quic(
             SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
         }
     });
-    let mut endpoint = quinn::Endpoint::client(bind).map_err(QuicDialError::Bind)?;
+    let mut endpoint = build_client_endpoint(bind, socket_bypass)?;
     endpoint.set_default_client_config(client_cfg);
 
     let server_name = tls::name::encode(tls::WarrenPubkey::from_bytes(exit_pubkey));
@@ -124,6 +167,7 @@ pub(crate) async fn dial_quic_webpki(
     exit_addr: SocketAddr,
     bind_local_ip: Option<SocketAddr>,
     transport_config: Option<Arc<quinn::TransportConfig>>,
+    socket_bypass: Option<SocketBypass>,
 ) -> Result<(quinn::Endpoint, quinn::Connection), QuicDialError> {
     let mut client_cfg = tls::make_client_config_webpki(
         tls::mozilla_root_store(),
@@ -140,7 +184,7 @@ pub(crate) async fn dial_quic_webpki(
             SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
         }
     });
-    let mut endpoint = quinn::Endpoint::client(bind).map_err(QuicDialError::Bind)?;
+    let mut endpoint = build_client_endpoint(bind, socket_bypass)?;
     endpoint.set_default_client_config(client_cfg);
 
     let conn = endpoint
@@ -460,6 +504,9 @@ impl ClientTunnel {
             exit_addr,
             effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
             transport_config,
+            // Single-hop is not a privileged system-VPN datapath, so its carrier
+            // socket is never bypassed (the desktop TUN datapath uses multihop).
+            None,
         )
         .await?;
 
@@ -650,6 +697,34 @@ impl crate::idle_cover::CoverSink for ClientSession {
 mod tests {
     use super::*;
     use std::error::Error;
+
+    #[test]
+    fn bind_endpoint_socket_applies_the_bypass_and_fails_closed_on_a_wrong_os_variant() {
+        // The dialer routes the carrier socket through the per-OS bypass before
+        // it can send. A bypass this OS cannot honour must fail closed (the
+        // socket is refused), never bind silently and leak the carrier: the
+        // routing/killswitch have dropped the destination escape, so an
+        // unmarked/unbound socket would be captured into the tunnel. If the
+        // dialer ignored the bypass this call would wrongly return `Ok`.
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        // No bypass (userland proxy): a plain bind, unchanged.
+        assert!(bind_endpoint_socket(bind, None).is_ok());
+
+        // The variant this OS cannot honour (a macOS/Windows interface-bind on
+        // Linux, a Linux fwmark on Apple) must be refused as a Bind failure.
+        #[cfg(target_vendor = "apple")]
+        let wrong = SocketBypass::Fwmark(0x7761_7272);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let wrong = SocketBypass::BoundIf(1);
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+        assert!(
+            matches!(
+                bind_endpoint_socket(bind, Some(wrong)),
+                Err(QuicDialError::Bind(_))
+            ),
+            "a wrong-OS bypass variant must be refused (fail-closed)"
+        );
+    }
 
     #[tokio::test]
     async fn negotiated_daita_flows_through_the_delegated_session() {
