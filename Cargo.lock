@@ -3502,6 +3502,7 @@ dependencies = [
  "tokio",
  "uniffi",
  "warren-sdk",
+ "zeroize",
 ]
 
 [[package]]

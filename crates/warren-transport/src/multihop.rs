@@ -389,9 +389,13 @@ impl MultihopClientTunnel {
                 return Err(MultihopError::Setup(SetupError::IpExhausted));
             }
             Ok(Some(
-                WarrenControlMessage::IpRequest { .. } | WarrenControlMessage::ExitDraining { .. },
+                WarrenControlMessage::IpRequest { .. }
+                | WarrenControlMessage::IpRequestV7 { .. }
+                | WarrenControlMessage::ExitDraining { .. },
             ))
             | Ok(None) => {
+                // Request-type frames (v6 or v7) are client-to-exit only; a
+                // client receiving one back is an unexpected reply.
                 return Err(MultihopError::Setup(SetupError::UnexpectedReply));
             }
             Err(e) => return Err(MultihopError::Setup(SetupError::Control(e))),

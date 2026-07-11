@@ -40,6 +40,7 @@ use warren_sdk::{
     DefaultClient, FileGenerationStore, FileServerKeyStore, ProxyForwarder, ProxyHandle, SdkError,
     SupervisedProxyHandle, WarrenClient,
 };
+use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
 
@@ -142,6 +143,127 @@ impl std::fmt::Debug for FfiIdentity {
             .field("mnemonic", &"<redacted>")
             .field("address", &self.address)
             .field("public_key_hex", &self.public_key_hex)
+            .finish()
+    }
+}
+
+/// An opaque wallet handle that owns the secret identity inside Rust.
+///
+/// Prefer this over the free `*_from_mnemonic` functions and the string-taking
+/// client constructors: the seed never crosses the FFI boundary through the
+/// handle. Address, public key and request signing are read by method off
+/// derived, non-secret data, and building a client consumes the handle, not a
+/// phrase. The single documented exception is
+/// [`WarrenWallet::reveal_mnemonic_for_backup`], the one point at which the
+/// backup phrase is handed to the host to store in the platform keystore. The
+/// legacy string surface remains only for bindings not yet migrated; new
+/// bindings should use this handle so a garbage-collected foreign copy of the
+/// phrase never exists.
+#[derive(uniffi::Object)]
+pub struct WarrenWallet {
+    identity: WarrenIdentity,
+    // Present only right after `generate`, so the host can read the phrase ONCE
+    // for secure-store backup; `reveal_mnemonic_for_backup` takes it and it is
+    // zeroized on drop. A wallet restored via `from_mnemonic` carries `None`
+    // (the host already holds the phrase it imported), so a restored wallet
+    // never re-emits a seed.
+    backup: Mutex<Option<Zeroizing<String>>>,
+}
+
+#[uniffi::export]
+impl WarrenWallet {
+    /// Generates a fresh wallet. The backup phrase is deliberately NOT returned
+    /// here: read it exactly once with
+    /// [`reveal_mnemonic_for_backup`](Self::reveal_mnemonic_for_backup).
+    #[uniffi::constructor]
+    #[must_use]
+    pub fn generate() -> Arc<Self> {
+        let (identity, mnemonic) = WarrenIdentity::generate();
+        Arc::new(Self {
+            identity,
+            backup: Mutex::new(Some(Zeroizing::new(mnemonic))),
+        })
+    }
+
+    /// Restores a wallet from a BIP39 mnemonic. The phrase crosses the boundary
+    /// once here: the host MUST pass it straight from the platform secure store
+    /// and drop its own copy immediately. Rust wipes its copy after derivation.
+    /// The restored wallet exposes no backup phrase.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InvalidMnemonic`] if the phrase is not valid BIP39.
+    #[uniffi::constructor]
+    pub fn from_mnemonic(mnemonic: String) -> Result<Arc<Self>, FfiError> {
+        let phrase = Zeroizing::new(mnemonic);
+        let identity =
+            WarrenIdentity::from_mnemonic(&phrase).map_err(|_| FfiError::InvalidMnemonic)?;
+        Ok(Arc::new(Self {
+            identity,
+            backup: Mutex::new(None),
+        }))
+    }
+
+    /// The canonical SS58 `wb…` address.
+    #[must_use]
+    pub fn address(&self) -> String {
+        self.identity.address()
+    }
+
+    /// The 32-byte Ed25519 public key as 64 hex chars.
+    #[must_use]
+    pub fn public_key_hex(&self) -> String {
+        hex::encode(self.identity.public_key())
+    }
+
+    /// Signs a Warren API request, returning the four header values. The seed
+    /// stays in Rust; only the derived signature crosses the boundary. See
+    /// [`sign_request`] for the argument contract.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InvalidHex`] if `nonce_hex` is not 16 bytes of hex.
+    pub fn sign_request(
+        &self,
+        method: String,
+        path: String,
+        body_utf8: String,
+        timestamp: u64,
+        nonce_hex: String,
+    ) -> Result<FfiSignedHeaders, FfiError> {
+        let nonce = hex16(&nonce_hex)?;
+        let sig =
+            self.identity
+                .sign_request(&method, &path, body_utf8.as_bytes(), timestamp, nonce);
+        Ok(FfiSignedHeaders {
+            pubkey_ss58: sig.pubkey_ss58,
+            signature_hex: sig.signature_hex,
+            timestamp: sig.timestamp,
+            nonce_hex: sig.nonce_hex,
+        })
+    }
+
+    /// Returns the backup phrase EXACTLY ONCE, for the host to store in the
+    /// platform secure enclave/keychain. This is the SINGLE FFI surface on the
+    /// handle that exposes the seed phrase. After the first call it returns
+    /// `None` (a wallet restored via [`from_mnemonic`](Self::from_mnemonic)
+    /// returns `None` from the start). The host MUST wipe its copy right after
+    /// persisting it: Rust cannot wipe the foreign garbage-collected copy.
+    #[must_use]
+    pub fn reveal_mnemonic_for_backup(&self) -> Option<String> {
+        self.backup
+            .lock()
+            .expect("wallet backup mutex is never poisoned")
+            .take()
+            .map(|phrase| phrase.to_string())
+    }
+}
+
+impl std::fmt::Debug for WarrenWallet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never render the seed or signing key; the address is the safe handle.
+        f.debug_struct("WarrenWallet")
+            .field("address", &self.identity.address())
             .finish()
     }
 }
@@ -352,6 +474,57 @@ pub struct WarrenFfiClient {
     inner: DefaultClient,
 }
 
+/// Shared builder wiring for the string and handle client constructors, so the
+/// option-bag plumbing (roots, persistence, DAITA, censorship, dual-stack)
+/// lives in exactly one place to audit. Kept a free function (not an associated
+/// item) so it stays out of the `#[uniffi::export]` impl surface.
+fn build_client_with_identity(
+    identity: WarrenIdentity,
+    api_base: String,
+    server_pubkey_pin: String,
+    options: FfiClientOptions,
+) -> Result<Arc<WarrenFfiClient>, FfiError> {
+    let mut builder = WarrenClient::builder()
+        .identity(identity)
+        .api_base(api_base)
+        .server_pubkey_pin(server_pubkey_pin);
+    for root in options.multihop_root_pubkey_pins {
+        builder = builder.multihop_root_pubkey_pin(root);
+    }
+    if let Some(state_dir) = options.state_dir.as_deref() {
+        let dir = std::path::Path::new(state_dir);
+        let io_err = |_| FfiError::Client {
+            message: "persistence state directory is not usable".to_owned(),
+        };
+        std::fs::create_dir_all(dir).map_err(io_err)?;
+        let relay_gen = FileGenerationStore::new(dir.join("relay_generation")).map_err(io_err)?;
+        let mh_gen = FileGenerationStore::new(dir.join("multihop_generation")).map_err(io_err)?;
+        let key_store = FileServerKeyStore::new(dir.join("server_key")).map_err(io_err)?;
+        builder = builder
+            .generation_store(Arc::new(relay_gen))
+            .multihop_generation_store(Arc::new(mh_gen))
+            .server_key_store(Arc::new(key_store));
+    }
+    if let Some(machine) = options.daita_machine {
+        builder = builder.daita_machine(machine);
+    } else if options.daita {
+        builder = builder.daita();
+    }
+    if !options.api_alternative_hosts.is_empty() {
+        builder = builder.api_alternative_hosts(options.api_alternative_hosts);
+    }
+    if options.request_ipv6 {
+        builder = builder.request_ipv6();
+    }
+    if options.auto_local_ip {
+        builder = builder.auto_local_ip();
+    }
+    let inner = builder.build().map_err(|e| FfiError::Client {
+        message: e.to_string(),
+    })?;
+    Ok(Arc::new(WarrenFfiClient { inner }))
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl WarrenFfiClient {
     /// Builds a client from a BIP39 mnemonic, the API base URL (no trailing
@@ -461,47 +634,29 @@ impl WarrenFfiClient {
     ) -> Result<Arc<Self>, FfiError> {
         let identity =
             WarrenIdentity::from_mnemonic(&mnemonic).map_err(|_| FfiError::InvalidMnemonic)?;
-        let mut builder = WarrenClient::builder()
-            .identity(identity)
-            .api_base(api_base)
-            .server_pubkey_pin(server_pubkey_pin);
-        for root in options.multihop_root_pubkey_pins {
-            builder = builder.multihop_root_pubkey_pin(root);
-        }
-        if let Some(state_dir) = options.state_dir.as_deref() {
-            let dir = std::path::Path::new(state_dir);
-            let io_err = |_| FfiError::Client {
-                message: "persistence state directory is not usable".to_owned(),
-            };
-            std::fs::create_dir_all(dir).map_err(io_err)?;
-            let relay_gen =
-                FileGenerationStore::new(dir.join("relay_generation")).map_err(io_err)?;
-            let mh_gen =
-                FileGenerationStore::new(dir.join("multihop_generation")).map_err(io_err)?;
-            let key_store = FileServerKeyStore::new(dir.join("server_key")).map_err(io_err)?;
-            builder = builder
-                .generation_store(Arc::new(relay_gen))
-                .multihop_generation_store(Arc::new(mh_gen))
-                .server_key_store(Arc::new(key_store));
-        }
-        if let Some(machine) = options.daita_machine {
-            builder = builder.daita_machine(machine);
-        } else if options.daita {
-            builder = builder.daita();
-        }
-        if !options.api_alternative_hosts.is_empty() {
-            builder = builder.api_alternative_hosts(options.api_alternative_hosts);
-        }
-        if options.request_ipv6 {
-            builder = builder.request_ipv6();
-        }
-        if options.auto_local_ip {
-            builder = builder.auto_local_ip();
-        }
-        let inner = builder.build().map_err(|e| FfiError::Client {
-            message: e.to_string(),
-        })?;
-        Ok(Arc::new(Self { inner }))
+        build_client_with_identity(identity, api_base, server_pubkey_pin, options)
+    }
+
+    /// Builds a client from an opaque [`WarrenWallet`] handle instead of a raw
+    /// mnemonic string, so the seed never crosses the FFI boundary. Same option
+    /// bag as [`with_options`](Self::with_options); prefer this constructor in
+    /// new bindings.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::Client`] if a persistence `state_dir` cannot be created or
+    /// read.
+    #[uniffi::constructor]
+    pub fn from_wallet(
+        wallet: Arc<WarrenWallet>,
+        api_base: String,
+        server_pubkey_pin: String,
+        options: FfiClientOptions,
+    ) -> Result<Arc<Self>, FfiError> {
+        // Reconstruct an owned identity from the wallet's signing key (which
+        // zeroizes on drop); the seed phrase is never marshalled.
+        let identity = WarrenIdentity::from_signing_key(wallet.identity.signing_key());
+        build_client_with_identity(identity, api_base, server_pubkey_pin, options)
     }
 
     /// The wallet SS58 `wb…` address of this client.
@@ -1096,6 +1251,85 @@ mod tests {
         assert!(rendered.contains("<redacted>"));
         // The public address stays visible for debugging.
         assert!(rendered.contains(&id.address));
+    }
+
+    #[test]
+    fn wallet_signs_identically_to_the_string_path() {
+        // Wire-compat guard: the opaque handle must derive the SAME key and emit
+        // the SAME signature bytes as the proven string surface, for a fixed
+        // mnemonic/timestamp/nonce. If the handle drifts, this goes red.
+        let (method, path, ts, nonce) = (
+            "GET".to_owned(),
+            "/v1/subscription".to_owned(),
+            1_700_000_000_u64,
+            "00112233445566778899aabbccddeeff".to_owned(),
+        );
+        let via_string = sign_request(
+            ZERO_ENTROPY_24W.to_owned(),
+            method.clone(),
+            path.clone(),
+            String::new(),
+            ts,
+            nonce.clone(),
+        )
+        .expect("string sign");
+        let wallet = WarrenWallet::from_mnemonic(ZERO_ENTROPY_24W.to_owned()).expect("valid");
+        let via_wallet = wallet
+            .sign_request(method, path, String::new(), ts, nonce)
+            .expect("wallet sign");
+        assert_eq!(via_wallet.signature_hex, via_string.signature_hex);
+        assert_eq!(via_wallet.pubkey_ss58, via_string.pubkey_ss58);
+        assert_eq!(
+            wallet.address(),
+            "wbDSf2fncAfyDQkNbkyqjuhi8kpg3z8kCHqL2TYDSM2F1nVED"
+        );
+    }
+
+    #[test]
+    fn wallet_reveals_backup_exactly_once() {
+        let wallet = WarrenWallet::generate();
+        let phrase = wallet
+            .reveal_mnemonic_for_backup()
+            .expect("first reveal returns the phrase");
+        // The revealed phrase must reproduce the same wallet.
+        assert_eq!(
+            address_from_mnemonic(phrase).expect("valid phrase"),
+            wallet.address()
+        );
+        assert!(
+            wallet.reveal_mnemonic_for_backup().is_none(),
+            "the backup phrase is single-use"
+        );
+    }
+
+    #[test]
+    fn restored_wallet_never_reveals_a_seed() {
+        let wallet = WarrenWallet::from_mnemonic(ZERO_ENTROPY_24W.to_owned()).expect("valid");
+        assert!(
+            wallet.reveal_mnemonic_for_backup().is_none(),
+            "a restored wallet holds no backup phrase to leak"
+        );
+    }
+
+    #[test]
+    fn wallet_debug_never_contains_the_seed() {
+        let wallet = WarrenWallet::generate();
+        let rendered = format!("{wallet:?}");
+        assert!(!rendered.contains("backup"));
+        assert!(rendered.contains(&wallet.address()));
+    }
+
+    #[test]
+    fn client_from_wallet_builds_without_a_phrase_string() {
+        let wallet = WarrenWallet::from_mnemonic(ZERO_ENTROPY_24W.to_owned()).expect("valid");
+        let client = WarrenFfiClient::from_wallet(
+            wallet.clone(),
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+            FfiClientOptions::default(),
+        )
+        .expect("build from handle");
+        assert_eq!(client.address(), wallet.address());
     }
 
     #[test]
