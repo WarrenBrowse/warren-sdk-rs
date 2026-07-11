@@ -542,6 +542,9 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                 let _ = outputs.forwarder_tx.send(Some(ProxyForwarder {
                     connector: connector.clone(),
                     gateway,
+                    // Supervised path is multihop, which carries no per-exit
+                    // NAT-PMP flag yet; stay permissive (doc 79).
+                    port_forward_supported: true,
                 }));
                 let _ = outputs.state_tx.send(ConnectionState::Connected);
                 // A reconnect that follows a drain completes that migration:

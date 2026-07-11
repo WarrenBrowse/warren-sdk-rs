@@ -1600,6 +1600,39 @@ async fn connect_tunnel_refuses_an_x509_cover_domain_exit() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forward_port_is_refused_when_exit_lacks_port_forward_capability() {
+    // doc 79: the port-forward offer is gated on the selected exit's advertised
+    // NAT-PMP capability. When the exit does not run NAT-PMP, the SDK must
+    // refuse the mapping up front with a clear typed error, without emitting a
+    // request the exit would reject. This is the datapath-facing half of the
+    // gate; ExitQuery::with_require_port_forward covers selection.
+    let sink = ClosableSink {
+        close: Arc::new(tokio::sync::Notify::new()),
+    };
+    let gw = std::net::Ipv4Addr::new(10, 66, 0, 1);
+    let config =
+        warren_net::NetstackConfig::new(std::net::Ipv4Addr::new(10, 66, 0, 2), 16, gw, 1280);
+    let (connector, _alive) = warren_net::spawn_over_sink(Arc::new(sink), config);
+    let forwarder = crate::proxy::ProxyForwarder {
+        connector,
+        gateway: gw,
+        port_forward_supported: false,
+    };
+    let err = forwarder
+        .forward_port(
+            warren_net::MapProto::Tcp,
+            8080,
+            "127.0.0.1:9000".parse().unwrap(),
+        )
+        .await
+        .expect_err("a non-capable exit must refuse the forward");
+    assert!(
+        matches!(err, SdkError::PortForwardUnsupported),
+        "gate must fail closed with the typed capability error, got {err:?}"
+    );
+}
+
 /// A transport that is never actually called by these builder tests.
 struct NullTransport;
 

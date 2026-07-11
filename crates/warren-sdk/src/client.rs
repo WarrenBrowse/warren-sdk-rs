@@ -478,7 +478,12 @@ impl<T: HttpTransport> WarrenClient<T> {
         // Single-hop SetupAck carries no subnet (and no v6 gateway/prefix), so
         // fall back to the frozen v4 tunnel defaults (10.66.0.0/16, gw 10.66.0.1)
         // and stay v4-only.
-        serve_proxy_over_sink(sink, local_ip, TUNNEL_PREFIX, TUNNEL_GATEWAY, None, cfg).await
+        let mut handle =
+            serve_proxy_over_sink(sink, local_ip, TUNNEL_PREFIX, TUNNEL_GATEWAY, None, cfg).await?;
+        // doc 79: gate port forwarding on the selected exit's roster capability.
+        // The client only offers the feature where the exit runs NAT-PMP.
+        handle.port_forward_supported = exit.supports_port_forward();
+        Ok(handle)
     }
 
     /// Fetches and verifies the signed multihop directory, returning the trusted
