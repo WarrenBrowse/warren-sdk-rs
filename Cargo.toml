@@ -42,26 +42,26 @@ publish = false
 # override these with the sibling `../warrenguard` via the `[patch]` at the foot of
 # this file (CI's checkout-engine action clones it there at the same rev). Keep the
 # rev below in lockstep with `.warrenguard-version`.
-warrenguard-wire = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
-warrenguard-identity = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
-warrenguard-multihop = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
-warrenguard-daita = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
-warrenguard-tls = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
-warrenguard-natpmp-protocol = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
-warrenguard-tun-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
-warrenguard-tun-device = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
-warrenguard-backoff = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
-warrenguard-token = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
+warrenguard-wire = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "b4f88ce321c71411917b3303ad7c6dda09963521" }
+warrenguard-identity = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "b4f88ce321c71411917b3303ad7c6dda09963521" }
+warrenguard-multihop = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "b4f88ce321c71411917b3303ad7c6dda09963521" }
+warrenguard-daita = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "b4f88ce321c71411917b3303ad7c6dda09963521" }
+warrenguard-tls = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "b4f88ce321c71411917b3303ad7c6dda09963521" }
+warrenguard-natpmp-protocol = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "b4f88ce321c71411917b3303ad7c6dda09963521" }
+warrenguard-tun-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "b4f88ce321c71411917b3303ad7c6dda09963521" }
+warrenguard-tun-device = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "b4f88ce321c71411917b3303ad7c6dda09963521" }
+warrenguard-backoff = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "b4f88ce321c71411917b3303ad7c6dda09963521" }
+warrenguard-token = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "b4f88ce321c71411917b3303ad7c6dda09963521" }
 # Client-side tunnel transport: the multihop protocol logic (HPKE seal/open,
 # rekey/epoch, setup-over-stream, sync datagram send/recv) lives once in
 # `warrenguard_transport::multihop::MultiHopClient`; `warren-transport`'s
 # MultihopSession/MultihopClientTunnel are thin wrappers around it. Same for
 # the single-hop `client` module: ClientSession/ClientTunnel wrap
 # `warrenguard_transport::client::{ClientSession, ClientTunnel}`.
-warrenguard-transport = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
+warrenguard-transport = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "b4f88ce321c71411917b3303ad7c6dda09963521" }
 # Sealed error type `warrenguard_transport::client`'s Result is built on;
 # needed directly so `warren-transport` can name and map its variants.
-warrenguard-transport-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0546e0b07e8206b5856b0e03a323304a26302690" }
+warrenguard-transport-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "b4f88ce321c71411917b3303ad7c6dda09963521" }
 
 # Neutral client<->server contract (SS58, X-Warren signing, /v1 DTOs) and the
 # signed-relay-list discovery core. Git-dep + rev so the SDK self-resolves for a
