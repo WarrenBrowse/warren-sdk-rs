@@ -381,10 +381,10 @@ impl<T: HttpTransport> WarrenApiClient<T> {
 
     /// Sends a request through the anti-censorship fallback sequence: the
     /// primary host with SNI, then each alternative host with SNI, then the
-    /// primary host without SNI. Only connect failures advance the sequence; a
-    /// connected response (any status) or a non-connect transport error stops
-    /// it. Returns [`ClientError::AllHostsBlocked`] if every attempt fails to
-    /// connect.
+    /// primary host without SNI, then each alternative host without SNI. Only
+    /// connect failures advance the sequence; a connected response (any status)
+    /// or a non-connect transport error stops it. Returns
+    /// [`ClientError::AllHostsBlocked`] if every attempt fails to connect.
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, ClientError> {
         let primary_url = request.url.clone();
 
@@ -406,14 +406,30 @@ impl<T: HttpTransport> WarrenApiClient<T> {
             }
         }
 
-        // 3. Primary host, without SNI.
+        // 3. Primary host, without SNI (defeats SNI-based DPI on the primary).
         let no_sni = HttpRequest {
             use_sni: false,
-            ..request
+            ..request.clone()
         };
         match self.attempt(&no_sni).await? {
             AttemptOutcome::Response(resp) => return self.finish(resp),
             AttemptOutcome::Blocked => {}
+        }
+
+        // 4. Alternative hosts, without SNI. Covers a censor that reaches an
+        // alternative ingress IP but drops the Warren SNI in the ClientHello:
+        // the alt is reachable, only the SNI is the tell, so retry it no-SNI
+        // before giving up. Cert validation still binds to the host SAN.
+        for host in &self.alternative_hosts {
+            let alt_no_sni = HttpRequest {
+                url: replace_host(&primary_url, host),
+                use_sni: false,
+                ..request.clone()
+            };
+            match self.attempt(&alt_no_sni).await? {
+                AttemptOutcome::Response(resp) => return self.finish(resp),
+                AttemptOutcome::Blocked => {}
+            }
         }
 
         Err(ClientError::AllHostsBlocked)
@@ -764,7 +780,27 @@ mod tests {
         let c = fallback_client(ScriptedTransport::new(|_| connect_fail()));
         let err = c.list_exits().await.expect_err("all blocked");
         assert!(matches!(err, ClientError::AllHostsBlocked));
-        assert_eq!(c.transport.attempts.lock().unwrap().len(), 3);
+        // primary+SNI, alt+SNI, primary no-SNI, alt no-SNI (one alt configured).
+        assert_eq!(c.transport.attempts.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn fallback_tries_alt_host_without_sni_before_giving_up() {
+        // The alt ingress is reachable but only a no-SNI ClientHello passes
+        // (SNI-based DPI). Everything else is blocked, so the alt-no-SNI rung is
+        // the only path that answers.
+        let c = fallback_client(ScriptedTransport::new(|req| {
+            if req.url.contains("alt.example.test") && !req.use_sni {
+                ok_200("{}")
+            } else {
+                connect_fail()
+            }
+        }));
+        c.list_exits().await.expect("alt no-SNI answers");
+        let attempts = c.transport.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 4);
+        assert!(!attempts[3].use_sni);
+        assert_eq!(attempts[3].url, "https://alt.example.test/v1/exits");
     }
 
     #[tokio::test]
