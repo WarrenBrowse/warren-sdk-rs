@@ -3658,6 +3658,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "warrenguard-socket-bypass"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "warrenguard-tun-core",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "warrenguard-tls"
 version = "0.1.0"
 dependencies = [
@@ -3706,6 +3715,7 @@ dependencies = [
  "warrenguard-daita",
  "warrenguard-multihop",
  "warrenguard-pump",
+ "warrenguard-socket-bypass",
  "warrenguard-tls",
  "warrenguard-transport-core",
  "warrenguard-wire",
