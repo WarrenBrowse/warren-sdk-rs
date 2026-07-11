@@ -26,6 +26,9 @@ warrenguard-transport = { workspace = true }
 # Sealed error type of `warrenguard_transport::client`'s Result, needed to name
 # and map its variants in `client::map_engine_err`.
 warrenguard-transport-core = { workspace = true }
+# `CoverDefenses` + `cover_defenses()`: the resolved DAITA / idle-cover knob
+# switch the client builder threads (`ClientTunnel::with_cover_defenses`).
+warrenguard-config = { workspace = true }
 # Full-jitter reconnection backoff, single-homed in the engine (re-exported by
 # the `reconnect` module so the SDK and warren-core share one schedule).
 warrenguard-backoff = { workspace = true }

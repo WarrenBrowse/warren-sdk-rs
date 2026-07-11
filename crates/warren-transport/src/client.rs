@@ -463,6 +463,42 @@ impl ClientTunnel {
         self
     }
 
+    /// Resolves the client's cover-defense request from a single
+    /// [`warrenguard_config::knobs::CoverDefenses`] and flips
+    /// [`with_daita`](Self::with_daita) and
+    /// [`with_idle_cover`](Self::with_idle_cover) together.
+    ///
+    /// This is the knob-driven switch (the equivalent of a Stealth profile
+    /// toggle): the caller resolves the coupled decision once from the process
+    /// knobs via [`warrenguard_config::knobs::cover_defenses`] (which enforces
+    /// the DAITA / idle-cover mutual exclusion, DAITA superseding idle cover)
+    /// and threads it here, so the handshake advertisement and the idle-cover
+    /// transport config can never disagree. Off by default: a client that never
+    /// calls this requests neither defense.
+    #[must_use]
+    pub fn with_cover_defenses(
+        mut self,
+        defenses: warrenguard_config::knobs::CoverDefenses,
+    ) -> Self {
+        self.daita_support = defenses.daita;
+        self.idle_cover = defenses.idle_cover;
+        self
+    }
+
+    /// True if the client advertises DAITA support in the handshake. The exit
+    /// decides whether to honour it from its own pool configuration.
+    #[must_use]
+    pub fn daita_support(&self) -> bool {
+        self.daita_support
+    }
+
+    /// True if the client disables the keep-alive PING in favour of idle cover.
+    /// The caller MUST drive the cover driver when this is set.
+    #[must_use]
+    pub fn idle_cover(&self) -> bool {
+        self.idle_cover
+    }
+
     /// The client's 32-byte Ed25519 public key.
     #[must_use]
     pub fn node_id(&self) -> [u8; 32] {
@@ -723,6 +759,37 @@ mod tests {
                 Err(QuicDialError::Bind(_))
             ),
             "a wrong-OS bypass variant must be refused (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn with_cover_defenses_threads_the_resolved_knob_switch() {
+        use warrenguard_config::knobs::resolve_cover_defenses;
+
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+
+        // Opt-in only: a fresh client requests neither defense, so a build
+        // that never calls the switch is byte-identical to before.
+        let fresh = ClientTunnel::new(key.clone());
+        assert!(
+            !fresh.daita_support() && !fresh.idle_cover(),
+            "a fresh ClientTunnel must default to no cover defense"
+        );
+
+        // DAITA supersedes idle cover: even with both knobs on, the resolver
+        // suppresses idle cover and the switch flips only DAITA on.
+        let daita =
+            ClientTunnel::new(key.clone()).with_cover_defenses(resolve_cover_defenses(true, true));
+        assert!(
+            daita.daita_support() && !daita.idle_cover(),
+            "requesting DAITA must advertise DAITA and keep idle cover off (mutual exclusion)"
+        );
+
+        // Idle-cover-only defenses flip idle cover on and leave DAITA off.
+        let idle = ClientTunnel::new(key).with_cover_defenses(resolve_cover_defenses(false, true));
+        assert!(
+            idle.idle_cover() && !idle.daita_support(),
+            "idle-cover-only defenses must enable idle cover and leave DAITA off"
         );
     }
 

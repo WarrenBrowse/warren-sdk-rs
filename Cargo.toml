@@ -67,6 +67,9 @@ warrenguard-transport = { git = "https://github.com/WarrenBrowse/warrenguard.git
 # Sealed error type `warrenguard_transport::client`'s Result is built on;
 # needed directly so `warren-transport` can name and map its variants.
 warrenguard-transport-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0e49c49d6e428728eb9e143af335af25e398f86a" }
+# Central knob registry: `CoverDefenses` + `cover_defenses()` resolve the coupled
+# DAITA / idle-cover client switch that `warren-transport::ClientTunnel` threads.
+warrenguard-config = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "0e49c49d6e428728eb9e143af335af25e398f86a" }
 
 # Neutral client<->server contract (SS58, X-Warren signing, /v1 DTOs) and the
 # signed-relay-list discovery core. Git-dep + rev so the SDK self-resolves for a
@@ -186,6 +189,7 @@ warrenguard-token = { path = "../warrenguard/crates/warrenguard-token" }
 warrenguard-socket-bypass = { path = "../warrenguard/crates/warrenguard-socket-bypass" }
 warrenguard-transport = { path = "../warrenguard/crates/warrenguard-transport" }
 warrenguard-transport-core = { path = "../warrenguard/crates/warrenguard-transport-core" }
+warrenguard-config = { path = "../warrenguard/crates/warrenguard-config" }
 
 [patch."https://github.com/WarrenBrowse/warren-contract.git"]
 warren-contract = { path = "../warren-contract" }
