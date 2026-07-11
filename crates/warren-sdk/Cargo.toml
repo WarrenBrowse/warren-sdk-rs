@@ -22,6 +22,9 @@ warren-tun = { path = "../warren-tun", optional = true }
 thiserror = { workspace = true }
 # Needed to bind the local SOCKS5 listener and spawn the proxy datapath task.
 tokio = { workspace = true }
+# Parse the am.i.warren egress-oracle verdict (control-plane leak self-check).
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 # Bundle the reqwest transport so an app can build a working client with one

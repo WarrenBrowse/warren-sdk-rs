@@ -3478,6 +3478,7 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "hex",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -3502,6 +3503,7 @@ dependencies = [
  "tokio",
  "uniffi",
  "warren-sdk",
+ "zeroize",
 ]
 
 [[package]]
