@@ -12,6 +12,7 @@ pub mod daita_driver;
 pub mod idle_cover;
 pub mod multihop;
 pub mod reconnect;
+pub(crate) mod tcp_fallback;
 pub mod tls;
 
 pub use client::{ClientSession, ClientTunnel, TunnelError, local_ip_for_endpoint};

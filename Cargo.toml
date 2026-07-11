@@ -47,6 +47,9 @@ warrenguard-identity = { git = "https://github.com/WarrenBrowse/warrenguard.git"
 warrenguard-multihop = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "261c807c3a45081232222947b91a576a6084fe76" }
 warrenguard-daita = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "261c807c3a45081232222947b91a576a6084fe76" }
 warrenguard-tls = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "261c807c3a45081232222947b91a576a6084fe76" }
+# Opt-in TLS-over-TCP fallback carrier (anti-censorship datapath): the client
+# shim + auto-activation policy `warren-transport` wraps around its UDP dial.
+warrenguard-tcp-fallback = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "261c807c3a45081232222947b91a576a6084fe76" }
 warrenguard-natpmp-protocol = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "261c807c3a45081232222947b91a576a6084fe76" }
 warrenguard-tun-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "261c807c3a45081232222947b91a576a6084fe76" }
 warrenguard-tun-device = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "261c807c3a45081232222947b91a576a6084fe76" }
@@ -181,6 +184,7 @@ warrenguard-identity = { path = "../warrenguard/crates/warrenguard-identity" }
 warrenguard-multihop = { path = "../warrenguard/crates/warrenguard-multihop" }
 warrenguard-daita = { path = "../warrenguard/crates/warrenguard-daita" }
 warrenguard-tls = { path = "../warrenguard/crates/warrenguard-tls" }
+warrenguard-tcp-fallback = { path = "../warrenguard/crates/warrenguard-tcp-fallback" }
 warrenguard-natpmp-protocol = { path = "../warrenguard/crates/warrenguard-natpmp-protocol" }
 warrenguard-tun-core = { path = "../warrenguard/crates/warrenguard-tun-core" }
 warrenguard-tun-device = { path = "../warrenguard/crates/warrenguard-tun-device" }

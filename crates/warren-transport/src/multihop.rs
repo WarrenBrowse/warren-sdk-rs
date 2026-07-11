@@ -134,6 +134,13 @@ impl From<QuicDialError> for MultihopError {
                 context: "connect",
                 source,
             },
+            // Unreachable on the multihop path: it dials via `dial_quic` /
+            // `dial_quic_webpki` (no fallback), never `dial_quic_with_fallback`,
+            // so the TLS-over-TCP carrier race never produces this variant here.
+            // Mapped generically so the match stays exhaustive.
+            QuicDialError::Fallback(_) => MultihopError::Bind(std::io::Error::other(
+                "tcp fallback is not used on the multihop dial path",
+            )),
         }
     }
 }

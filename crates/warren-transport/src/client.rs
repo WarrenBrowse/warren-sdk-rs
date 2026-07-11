@@ -69,6 +69,23 @@ pub(crate) enum QuicDialError {
     Bind(std::io::Error),
     Connect(quinn::ConnectError),
     Quic(quinn::ConnectionError),
+    /// The opt-in TLS-over-TCP fallback race ended without a connection: the UDP
+    /// handshake failed or timed out and the TCP carrier was disabled or also
+    /// failed. Carries the engine's typed outcome (its `Display` has no address).
+    Fallback(warrenguard_tcp_fallback::FallbackError),
+}
+
+/// Builds the inner QUIC client config shared by the UDP dial and the
+/// TLS-over-TCP carrier: RPK TLS 1.3 pinning the exit pubkey via the SNI, the
+/// `h3` ALPN, and the effective (obfuscated) transport config. Keeping it in one
+/// place is what makes the carrier's QUIC handshake byte-for-byte the UDP one.
+pub(crate) fn build_inner_rpk_client_config(
+    transport_config: Option<Arc<quinn::TransportConfig>>,
+) -> Result<quinn::ClientConfig, QuicDialError> {
+    let mut client_cfg = tls::make_client_config(tls::default_crypto_provider(), &[ALPN_H3])
+        .map_err(QuicDialError::Tls)?;
+    client_cfg.transport_config(effective_transport_config(transport_config));
+    Ok(client_cfg)
 }
 
 /// Binds the carrier UDP socket for a QUIC endpoint and applies the per-OS
@@ -131,9 +148,7 @@ pub(crate) async fn dial_quic(
     // handshake unless the exit proves possession of `exit_pubkey`, so a
     // separate post-handshake peer-pubkey check is redundant. The CLIENT proves
     // its own identity in-band when it sends `Setup` (see `connect`).
-    let mut client_cfg = tls::make_client_config(tls::default_crypto_provider(), &[ALPN_H3])
-        .map_err(QuicDialError::Tls)?;
-    client_cfg.transport_config(effective_transport_config(transport_config));
+    let client_cfg = build_inner_rpk_client_config(transport_config)?;
 
     let bind = bind_local_ip.unwrap_or_else(|| {
         if exit_addr.is_ipv6() {
@@ -300,6 +315,16 @@ pub enum TunnelError {
     /// user needs to provision or renew access.
     #[error("exit rejected the handshake: identity not authorized")]
     AuthRejected,
+    /// The opt-in TLS-over-TCP fallback race ended without a connection: UDP
+    /// failed or timed out and the carrier was disabled or also failed. The
+    /// engine's typed outcome is attached via `source()`; its `Display` carries
+    /// no address (no-log discipline).
+    #[error("tcp fallback dial failed")]
+    TcpFallback {
+        /// The engine's auto-activation outcome.
+        #[source]
+        source: warrenguard_tcp_fallback::FallbackError,
+    },
     /// The account already has the maximum number of simultaneous devices.
     #[error("device limit reached for this account")]
     DeviceLimitReached,
@@ -352,6 +377,7 @@ impl From<QuicDialError> for TunnelError {
                 context: "connect",
                 source,
             },
+            QuicDialError::Fallback(source) => TunnelError::TcpFallback { source },
         }
     }
 }
@@ -367,6 +393,7 @@ pub struct ClientTunnel {
     auto_local_ip: bool,
     transport_config: Option<Arc<quinn::TransportConfig>>,
     idle_cover: bool,
+    tcp_fallback: bool,
 }
 
 // Manual Debug (no-log discipline): render only a short public-key prefix and the
@@ -400,6 +427,7 @@ impl ClientTunnel {
             auto_local_ip: false,
             transport_config: None,
             idle_cover: false,
+            tcp_fallback: false,
         }
     }
 
@@ -485,6 +513,24 @@ impl ClientTunnel {
         self
     }
 
+    /// Opts this client into the TLS-over-TCP fallback carrier (anti-censorship
+    /// datapath). Off by default. This is only the deployer's arm switch: the
+    /// fallback still fires only for an exit whose signed roster advertises the
+    /// carrier and carries a cover domain, and only after the UDP handshake
+    /// fails or times out (see [`connect_with_tcp_fallback`](Self::connect_with_tcp_fallback)).
+    #[must_use]
+    pub fn with_tcp_fallback(mut self, enable: bool) -> Self {
+        self.tcp_fallback = enable;
+        self
+    }
+
+    /// True if the client is armed for the TLS-over-TCP fallback carrier. The
+    /// fallback still gates on the per-exit roster capability and cover domain.
+    #[must_use]
+    pub fn tcp_fallback(&self) -> bool {
+        self.tcp_fallback
+    }
+
     /// True if the client advertises DAITA support in the handshake. The exit
     /// decides whether to honour it from its own pool configuration.
     #[must_use]
@@ -529,13 +575,61 @@ impl ClientTunnel {
         exit_pubkey: [u8; 32],
         exit_addr: SocketAddr,
     ) -> Result<ClientSession, TunnelError> {
+        // No roster capability is known here, so the fallback stays off (its
+        // gate needs the exit's advertised flag): this is the plain UDP dial.
+        self.connect_with_tcp_fallback(exit_pubkey, exit_addr, false, None)
+            .await
+    }
+
+    /// Like [`connect`](Self::connect) but the dial may fall back to the
+    /// TLS-over-TCP carrier when UDP is blocked.
+    ///
+    /// `exit_advertises_fallback` and `cover_domain` come from the selected
+    /// exit's signed roster ([`warrenguard_wire::WarrenExitAddr::tcp_fallback`]
+    /// and `cover_domain`). The fallback fires only when this client was armed
+    /// with [`with_tcp_fallback(true)`](Self::with_tcp_fallback), the exit
+    /// advertises the carrier, a cover domain is present, AND the UDP handshake
+    /// fails or times out; otherwise the dial is UDP-only and unchanged. On
+    /// fallback the same QUIC handshake (RPK identity, `Setup`/`SetupAck`) runs
+    /// over the carrier, so the resulting session is indistinguishable.
+    ///
+    /// # Errors
+    /// See [`TunnelError`]; the carrier race surfaces as
+    /// [`TunnelError::TcpFallback`].
+    pub async fn connect_with_tcp_fallback(
+        &self,
+        exit_pubkey: [u8; 32],
+        exit_addr: SocketAddr,
+        exit_advertises_fallback: bool,
+        cover_domain: Option<&str>,
+    ) -> Result<ClientSession, TunnelError> {
         // An explicit override wins; else, when idle cover is on, use the
         // keep-alive-disabled config so the cover driver replaces the beacon.
         let transport_config = self.transport_config.clone().or_else(|| {
             self.idle_cover
                 .then(|| Arc::new(warren_transport_config_with_idle_cover(true)))
         });
-        let (endpoint, conn) = dial_quic(
+
+        let policy = crate::tcp_fallback::resolve_fallback_policy(
+            self.tcp_fallback,
+            exit_advertises_fallback,
+            cover_domain,
+        );
+        // Build the cover-domain WebPKI client config (roots + a plausible TCP
+        // ALPN) only when the policy is armed; a disabled policy never touches
+        // the carrier. `resolve_fallback_policy` guarantees a cover domain here.
+        let cover = if policy.tcp_fallback_enabled {
+            let client_config = tls_webpki_cover_config()?;
+            cover_domain.map(|domain| crate::tcp_fallback::CoverTls {
+                addr: SocketAddr::new(exit_addr.ip(), crate::tcp_fallback::COVER_TCP_PORT),
+                domain,
+                client_config,
+            })
+        } else {
+            None
+        };
+
+        let (endpoint, conn) = crate::tcp_fallback::dial_quic_with_fallback(
             exit_pubkey,
             exit_addr,
             effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
@@ -543,6 +637,8 @@ impl ClientTunnel {
             // Single-hop is not a privileged system-VPN datapath, so its carrier
             // socket is never bypassed (the desktop TUN datapath uses multihop).
             None,
+            &policy,
+            cover,
         )
         .await?;
 
@@ -569,6 +665,19 @@ impl ClientTunnel {
             exit_pubkey,
         })
     }
+}
+
+/// Builds the WebPKI client config for the cover-domain TLS handshake of the
+/// fallback carrier: standard Mozilla roots and the plausible TCP ALPN, exactly
+/// as a browser dialling the cover host over HTTPS.
+fn tls_webpki_cover_config() -> Result<Arc<rustls::ClientConfig>, TunnelError> {
+    let cfg = warrenguard_tls::build_client_rustls_config_webpki(
+        tls::mozilla_root_store(),
+        tls::default_crypto_provider(),
+        crate::tcp_fallback::COVER_TCP_ALPN,
+    )
+    .map_err(TunnelError::Tls)?;
+    Ok(Arc::new(cfg))
 }
 
 /// An established tunnel session over which IP packets travel as QUIC
