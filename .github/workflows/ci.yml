@@ -213,12 +213,11 @@ jobs:
 
   coverage:
     name: cargo llvm-cov
-    runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
-    env:
-      # Cap concurrent rustc under Rosetta x86 emulation: unbounded parallelism
-      # spikes memory/jobserver pressure and intermittently SIGSEGVs rustc
-      # (observed compiling libc under coverage instrumentation on this runner).
-      CARGO_BUILD_JOBS: "6"
+    # Native ARM64 Linux, NOT the x86 Rosetta runner: `-C instrument-coverage`
+    # intermittently SIGSEGVs rustc under Rosetta emulation (the plain
+    # test/clippy builds are un-instrumented and fine; only the coverage build
+    # crashes). Native ARM avoids the emulation entirely.
+    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
     steps:
       # Coverage runs the test suite, which reads the golden vectors submodule.
       - uses: actions/checkout@v4
