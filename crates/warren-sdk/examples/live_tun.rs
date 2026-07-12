@@ -70,7 +70,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  curl -s https://checkip.amazonaws.com   # should show the exit IP");
     println!("  ip route                                # split-default via {TUN_NAME}");
 
-    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+    // A Ctrl-C that kills the process without running `handle`'s Drop would
+    // strand the host behind the killswitch (block-all pf/nftables, hijacked
+    // DNS) until the next apply reconciles it. Catch the signal and fall
+    // through to the explicit drop instead.
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => {}
+        _ = tokio::signal::ctrl_c() => {
+            println!("interrupted; tearing the datapath down first...");
+        }
+    }
 
     drop(handle);
     println!("datapath torn down.");
