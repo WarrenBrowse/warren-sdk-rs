@@ -214,6 +214,11 @@ jobs:
   coverage:
     name: cargo llvm-cov
     runs-on: [self-hosted, Linux, X64, macstudio-rosetta]
+    env:
+      # Cap concurrent rustc under Rosetta x86 emulation: unbounded parallelism
+      # spikes memory/jobserver pressure and intermittently SIGSEGVs rustc
+      # (observed compiling libc under coverage instrumentation on this runner).
+      CARGO_BUILD_JOBS: "6"
     steps:
       # Coverage runs the test suite, which reads the golden vectors submodule.
       - uses: actions/checkout@v4
@@ -237,5 +242,13 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
+      - name: install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: measure coverage
-        run: cargo llvm-cov --workspace --locked --summary-only
+        # Run coverage THROUGH nextest so the same retry policy as the cargo-test
+        # job (--retries 2) absorbs the in-process quinn / DNS loopback timing
+        # flakes. Plain `cargo llvm-cov` has no retries and turns those transient
+        # timeouts into hard coverage failures.
+        run: cargo llvm-cov nextest --workspace --locked --summary-only --retries 2
