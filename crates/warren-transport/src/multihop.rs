@@ -157,8 +157,9 @@ impl From<QuicDialError> for MultihopError {
 /// the engine's own `connect()`), and `Rejected` is never constructed on this
 /// path either (a policy refusal rides the sealed `IpAssign`-reply control
 /// message, decoded in [`MultihopClientTunnel::connect`], not this error type).
-/// Those unreachable variants map generically so the match stays exhaustive
-/// against future engine additions.
+/// Those unreachable variants map generically; the engine enum is
+/// `#[non_exhaustive]`, so unknown future variants take the same generic
+/// arm instead of a compile error.
 fn map_engine_err(e: EngineMultihopError) -> MultihopError {
     use EngineMultihopError as E;
     match e {
@@ -181,6 +182,7 @@ fn map_engine_err(e: EngineMultihopError) -> MultihopError {
         | E::Handshake(_)
         | E::Rejected(_)
         | E::Replay { .. } => MultihopError::Setup(SetupError::UnexpectedReply),
+        _ => MultihopError::Setup(SetupError::UnexpectedReply),
     }
 }
 
