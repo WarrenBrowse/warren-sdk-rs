@@ -42,37 +42,37 @@ publish = false
 # override these with the sibling `../warrenguard` via the `[patch]` at the foot of
 # this file (CI's checkout-engine action clones it there at the same rev). Keep the
 # rev below in lockstep with `.warrenguard-version`.
-warrenguard-wire = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
-warrenguard-identity = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
-warrenguard-multihop = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
-warrenguard-daita = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
-warrenguard-tls = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
+warrenguard-wire = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
+warrenguard-identity = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
+warrenguard-multihop = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
+warrenguard-daita = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
+warrenguard-tls = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
 # Opt-in TLS-over-TCP fallback carrier (anti-censorship datapath): the client
 # shim + auto-activation policy `warren-transport` wraps around its UDP dial.
-warrenguard-tcp-fallback = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
-warrenguard-natpmp-protocol = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
-warrenguard-tun-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
-warrenguard-tun-device = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
-warrenguard-backoff = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
-warrenguard-token = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
+warrenguard-tcp-fallback = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
+warrenguard-natpmp-protocol = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
+warrenguard-tun-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
+warrenguard-tun-device = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
+warrenguard-backoff = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
+warrenguard-token = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
 # Per-OS carrier-socket bypass (SO_MARK / IP_BOUND_IF / IP_UNICAST_IF): keeps the
 # QUIC socket on the physical link so the split-default TUN datapath can drop the
 # `<exit_ip>/32` host route (Port Fail / TunnelCrack ServerIP fix). Consumed by
 # `warren-transport`'s dialer and passed a bypass value by `warren-sdk`.
-warrenguard-socket-bypass = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
+warrenguard-socket-bypass = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
 # Client-side tunnel transport: the multihop protocol logic (HPKE seal/open,
 # rekey/epoch, setup-over-stream, sync datagram send/recv) lives once in
 # `warrenguard_transport::multihop::MultiHopClient`; `warren-transport`'s
 # MultihopSession/MultihopClientTunnel are thin wrappers around it. Same for
 # the single-hop `client` module: ClientSession/ClientTunnel wrap
 # `warrenguard_transport::client::{ClientSession, ClientTunnel}`.
-warrenguard-transport = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
+warrenguard-transport = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
 # Sealed error type `warrenguard_transport::client`'s Result is built on;
 # needed directly so `warren-transport` can name and map its variants.
-warrenguard-transport-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
+warrenguard-transport-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
 # Central knob registry: `CoverDefenses` + `cover_defenses()` resolve the coupled
 # DAITA / idle-cover client switch that `warren-transport::ClientTunnel` threads.
-warrenguard-config = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "6b70acc" }
+warrenguard-config = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "49518b7316ec6e196cdde33ad5209de29f34712c" }
 
 # Neutral client<->server contract (SS58, X-Warren signing, /v1 DTOs) and the
 # signed-relay-list discovery core. Git-dep + rev so the SDK self-resolves for a
