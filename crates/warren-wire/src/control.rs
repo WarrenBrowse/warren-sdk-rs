@@ -5,6 +5,6 @@
 //! compatibility is pinned by the shared golden vectors and the engine tests.
 
 pub use warrenguard_multihop::{
-    CONTROL_FIRST_BYTE, CONTROL_VERSION_V2, ControlError, PopSignature, WarrenControlMessage,
+    CONTROL_FIRST_BYTE, CONTROL_VERSION_V3, ControlError, PopSignature, WarrenControlMessage,
     encode_control, try_decode_control,
 };

@@ -41,6 +41,7 @@ async fn start_proxy_multihop_routes_socks5_through_a_sealed_tunnel() {
         dns_disabled: false,
         cover_domain: None,
         edge_cert_sha256: None,
+        exit_mlkem768_pubkey: None,
     };
 
     let cfg = ProxyConfig {

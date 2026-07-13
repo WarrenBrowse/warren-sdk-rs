@@ -1,11 +1,14 @@
 //! Replays the shared multihop golden vectors in `vectors/multihop_frame.json`
 //! and `vectors/control.json`. These pin the cross-language wire bytes for the
-//! HPKE dispatch frame and the `/v2` control messages: every sibling-language
+//! HPKE dispatch frame and the `/v3` control messages: every sibling-language
 //! SDK must reproduce them byte-for-byte. A failure means the wire layout moved.
 
 use serde::Deserialize;
 use warren_wire::multihop::WarrenMultihopFrame;
-use warren_wire::{PopSignature, WarrenControlMessage, encode_control};
+use warren_wire::{
+    CONTROL_VERSION_V3, ControlError, DaitaConfig, PopSignature, WarrenControlMessage,
+    encode_control, try_decode_control,
+};
 
 fn read(rel: &str) -> String {
     let path = format!("{}/../../{rel}", env!("CARGO_MANIFEST_DIR"));
@@ -67,10 +70,11 @@ fn multihop_frame_vectors_match() {
     }
 }
 
-// ---- control messages (/v2) ----
+// ---- control messages (/v3) ----
 
 #[derive(Deserialize)]
 struct ControlFile {
+    version: u8,
     vectors: Vec<ControlVec>,
 }
 
@@ -83,11 +87,21 @@ struct ControlVec {
     #[serde(default)]
     wants_ipv6: bool,
     pop_sig_hex: Option<String>,
+    #[serde(default)]
+    wants_daita: bool,
     ipv4: Option<[u8; 4]>,
     prefix_len: Option<u8>,
     gateway_ipv4: Option<[u8; 4]>,
+    daita_spec: Option<DaitaSpecVec>,
     deadline_unix_secs: Option<u64>,
     reason_code: Option<u8>,
+}
+
+#[derive(Deserialize)]
+struct DaitaSpecVec {
+    machine_specs: Vec<String>,
+    max_padding_frac: f64,
+    max_blocking_frac: f64,
 }
 
 fn message_for(v: &ControlVec) -> WarrenControlMessage {
@@ -100,14 +114,20 @@ fn message_for(v: &ControlVec) -> WarrenControlMessage {
                 .pop_sig_hex
                 .as_ref()
                 .map(|h| PopSignature(hex::decode(h).expect("hex").try_into().expect("64 bytes"))),
+            wants_daita: v.wants_daita,
         },
-        "ip_assign" => WarrenControlMessage::IpAssign {
+        "ip_assign" | "ip_assign_with_daita" => WarrenControlMessage::IpAssign {
             ipv4: v.ipv4.expect("ipv4"),
             prefix_len: v.prefix_len.expect("prefix_len"),
             gateway_ipv4: v.gateway_ipv4.expect("gateway_ipv4"),
             ipv6: None,
             prefix_len_v6: 0,
             gateway_ipv6: None,
+            daita_spec: v.daita_spec.as_ref().map(|s| DaitaConfig {
+                machine_specs: s.machine_specs.clone(),
+                max_padding_frac: s.max_padding_frac,
+                max_blocking_frac: s.max_blocking_frac,
+            }),
         },
         "ip_exhausted" => WarrenControlMessage::IpExhausted,
         "rejected" => WarrenControlMessage::Rejected,
@@ -122,17 +142,49 @@ fn message_for(v: &ControlVec) -> WarrenControlMessage {
 #[test]
 fn control_vectors_match() {
     let f: ControlFile = serde_json::from_str(&read("vectors/control.json")).expect("parse");
+    assert_eq!(
+        f.version, CONTROL_VERSION_V3,
+        "vector file version must match the SDK's control version byte"
+    );
     assert!(
-        f.vectors.len() >= 5,
-        "expected the full /v2 control message set"
+        f.vectors.len() >= 7,
+        "expected the full /v3 control message set (incl. ip_assign_with_daita)"
+    );
+    assert!(
+        f.vectors.iter().any(|v| v.name == "ip_assign_with_daita"),
+        "the granted-DAITA IpAssign vector must be replayed"
     );
     for v in &f.vectors {
         let msg = message_for(v);
+        let encoded = encode_control(&msg).expect("encode");
         assert_eq!(
-            hex::encode(encode_control(&msg).expect("encode")),
+            hex::encode(&encoded),
             v.bytes_hex,
             "control message `{}` encode bytes drifted from the frozen vector",
             v.name
         );
+        assert_eq!(
+            try_decode_control(&encoded).expect("decode"),
+            Some(msg),
+            "control message `{}` did not round-trip",
+            v.name
+        );
+    }
+}
+
+#[test]
+fn retired_control_versions_are_rejected() {
+    // A 0x01/0x02 peer cannot express whether the traffic-analysis defense is
+    // running; decoding either would reintroduce the silent-fallback bug /v3
+    // exists to prevent, so both must fail loudly.
+    for retired in [0x01u8, 0x02u8] {
+        let frame = [0xC0, retired, 0x02];
+        match try_decode_control(&frame) {
+            Err(ControlError::UnsupportedVersion { got, expected }) => {
+                assert_eq!(got, retired);
+                assert_eq!(expected, CONTROL_VERSION_V3);
+            }
+            other => panic!("version 0x{retired:02x} must be rejected, got {other:?}"),
+        }
     }
 }

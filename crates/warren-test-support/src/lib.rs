@@ -437,6 +437,7 @@ pub async fn spawn_fake_multihop_exit(exit_key: SigningKey) -> (SocketAddr, Mult
             ipv6: None,
             prefix_len_v6: 0,
             gateway_ipv6: None,
+            daita_spec: None,
         };
         let reply_plaintext = encode_control(&assign).expect("encode IpAssign");
         // Reverse seq starts at 0 for the setup reply; data replies use 1, 2, ...
@@ -543,6 +544,7 @@ pub async fn spawn_netstack_multihop_exit(exit_key: SigningKey) -> (SocketAddr, 
             ipv6: None,
             prefix_len_v6: 0,
             gateway_ipv6: None,
+            daita_spec: None,
         };
         let reply = exit_seal(
             &ctx,
@@ -698,6 +700,7 @@ pub async fn spawn_replaying_multihop_exit(exit_key: SigningKey) -> (SocketAddr,
             ipv6: None,
             prefix_len_v6: 0,
             gateway_ipv6: None,
+            daita_spec: None,
         };
         let reply = exit_seal(
             &ctx,

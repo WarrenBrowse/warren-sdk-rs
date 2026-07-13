@@ -1307,6 +1307,7 @@ fn fake_verified_exit(
         dns_disabled: false,
         cover_domain: None,
         edge_cert_sha256: None,
+        exit_mlkem768_pubkey: None,
     }
 }
 
@@ -1543,6 +1544,7 @@ async fn start_proxy_multihop_refuses_a_dns_disabled_exit_without_a_resolver() {
         dns_disabled: true,
         cover_domain: None,
         edge_cert_sha256: None,
+        exit_mlkem768_pubkey: None,
     };
     let cfg = warren_net::ProxyConfig {
         socks5: "127.0.0.1:0".parse().unwrap(),
@@ -1718,6 +1720,7 @@ fn exit_with_dns(dns_disabled: bool) -> VerifiedExit {
         dns_disabled,
         cover_domain: None,
         edge_cert_sha256: None,
+        exit_mlkem768_pubkey: None,
     }
 }
 

@@ -405,8 +405,12 @@ impl MultihopClientTunnel {
             max_age: Duration::MAX,
         });
 
+        // wants_daita stays false: this userland datapath does not drive a
+        // maybenot machine on its uplink yet, and asking the exit to pad its
+        // downlink while the client pads nothing would misreport the session
+        // as defended, the exact lie the /v3 capability echo exists to prevent.
         let opened = inner
-            .setup_over_stream(Some(&self.signing_key), self.wants_ipv6)
+            .setup_over_stream(Some(&self.signing_key), self.wants_ipv6, false)
             .await
             .map_err(map_engine_err)?;
 
