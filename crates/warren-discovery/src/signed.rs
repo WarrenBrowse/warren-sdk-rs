@@ -123,6 +123,7 @@ mod tests {
             }],
             cover_domain: None,
             port_forward,
+            tcp_fallback: None,
         }
     }
 

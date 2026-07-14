@@ -57,6 +57,7 @@ fn signed_list(server: &SigningKey, generation: u64, expires_at: u64) -> String 
         }],
         cover_domain: None,
         port_forward: None,
+        tcp_fallback: None,
     };
     // Keep the signed validity window within the verifier's cap (7 days).
     let signed_at = expires_at.saturating_sub(86_400);
