@@ -48,6 +48,7 @@ pub struct Relay {
     ipv6_egress: bool,
     cover_domain: Option<String>,
     port_forward: Option<bool>,
+    tcp_fallback: Option<bool>,
 }
 
 impl Relay {
@@ -72,6 +73,7 @@ impl Relay {
             ipv6_egress: false,
             cover_domain: None,
             port_forward: None,
+            tcp_fallback: None,
         }
     }
 
@@ -96,6 +98,17 @@ impl Relay {
     #[must_use]
     pub fn with_port_forward(mut self, port_forward: Option<bool>) -> Self {
         self.port_forward = port_forward;
+        self
+    }
+
+    /// Sets the exit's TLS-over-TCP fallback carrier capability (roster v10):
+    /// `Some(true)` if it terminates the anti-censorship carrier on `:443/tcp`,
+    /// `Some(false)` if explicitly disabled, `None` if the roster carried no
+    /// flag. The SDK only arms the UDP->TCP carrier race when this is
+    /// `Some(true)` and the exit advertises a cover domain.
+    #[must_use]
+    pub fn with_tcp_fallback(mut self, tcp_fallback: Option<bool>) -> Self {
+        self.tcp_fallback = tcp_fallback;
         self
     }
 
@@ -176,6 +189,23 @@ impl Relay {
     #[must_use]
     pub fn supports_port_forward(&self) -> bool {
         self.port_forward == Some(true)
+    }
+
+    /// The exit's TLS-over-TCP fallback carrier capability (roster v10):
+    /// `Some(true)` if it terminates the carrier, `Some(false)` if explicitly
+    /// disabled, `None` if the roster carried no flag (unknown).
+    #[must_use]
+    pub fn tcp_fallback(&self) -> Option<bool> {
+        self.tcp_fallback
+    }
+
+    /// `true` only when the exit explicitly advertises the TLS-over-TCP carrier.
+    /// The SDK gates the anti-censorship UDP->TCP fallback race on this: an
+    /// unknown (`None`) or explicitly-disabled (`Some(false)`) exit is dialed
+    /// over UDP only.
+    #[must_use]
+    pub fn supports_tcp_fallback(&self) -> bool {
+        self.tcp_fallback == Some(true)
     }
 }
 

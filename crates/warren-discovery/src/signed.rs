@@ -53,6 +53,13 @@ fn relay_from_warren(wr: &WarrenRelay) -> Relay {
     .with_ipv6_egress(wr.egress_v6())
     .with_cover_domain(wr.endpoint_addr().cover_domain.clone())
     .with_port_forward(wr.port_forward())
+    // The v10 carrier flag rides inside `endpoint_addr` (only set when the
+    // signed roster carried `Some(true)`), mirroring `cover_domain`.
+    .with_tcp_fallback(if wr.endpoint_addr().tcp_fallback {
+        Some(true)
+    } else {
+        None
+    })
 }
 
 fn project(v: warren_discovery_core::VerifiedRelayList) -> VerifiedRelayList {
@@ -165,6 +172,43 @@ mod tests {
         assert!(
             !relay.supports_port_forward(),
             "unknown capability is not supported for the gate"
+        );
+    }
+
+    #[test]
+    fn signed_v10_list_projects_tcp_fallback_capability_onto_flat_relay() {
+        // roster v10: the per-exit TLS-over-TCP carrier flag must reach the
+        // SDK's flat `Relay` through the projection (JsonNode -> WarrenRelay ->
+        // Relay) so the client can gate the anti-censorship UDP->TCP fallback.
+        let key = SigningKey::from_bytes(&[0x09; 32]);
+        let pin = hex::encode(key.verifying_key().as_bytes());
+        let mut carrier = node(None);
+        carrier.tcp_fallback = Some(true);
+        let signed = sign_relay_list(vec![carrier], &key, 1, 1_700_000_000, 1_700_086_400);
+        let json = serde_json::to_string(&signed).expect("serialize");
+
+        let verified = verify_signed_relay_list(&json, Some(&pin)).expect("verify must pass");
+        let relay = &verified.relays.relays()[0];
+        assert_eq!(relay.tcp_fallback(), Some(true));
+        assert!(
+            relay.supports_tcp_fallback(),
+            "an advertised carrier is supported by the gate"
+        );
+    }
+
+    #[test]
+    fn signed_list_without_tcp_fallback_projects_as_unknown_and_unsupported() {
+        let key = SigningKey::from_bytes(&[0x0a; 32]);
+        let pin = hex::encode(key.verifying_key().as_bytes());
+        let signed = sign_relay_list(vec![node(None)], &key, 1, 1_700_000_000, 1_700_086_400);
+        let json = serde_json::to_string(&signed).expect("serialize");
+
+        let verified = verify_signed_relay_list(&json, Some(&pin)).expect("verify must pass");
+        let relay = &verified.relays.relays()[0];
+        assert_eq!(relay.tcp_fallback(), None, "no flag surfaces as unknown");
+        assert!(
+            !relay.supports_tcp_fallback(),
+            "unknown carrier capability is not supported for the gate"
         );
     }
 }
