@@ -122,6 +122,12 @@ pub enum MultihopError {
     /// must not be dialed through.
     #[error("entry relay identity proof failed: {0}")]
     RelayIdentity(&'static str),
+    /// The opt-in TLS-over-TCP carrier race ended without a connection: the UDP
+    /// handshake to the entry failed or timed out and the carrier was disabled or
+    /// also failed. Carries the engine's typed outcome (its `Display` has no
+    /// address). Only reachable in cover-domain mode with the carrier armed.
+    #[error("tcp fallback carrier failed")]
+    TcpFallback(#[source] warrenguard_tcp_fallback::FallbackError),
 }
 
 impl From<QuicDialError> for MultihopError {
@@ -134,13 +140,11 @@ impl From<QuicDialError> for MultihopError {
                 context: "connect",
                 source,
             },
-            // Unreachable on the multihop path: it dials via `dial_quic` /
-            // `dial_quic_webpki` (no fallback), never `dial_quic_with_fallback`,
-            // so the TLS-over-TCP carrier race never produces this variant here.
-            // Mapped generically so the match stays exhaustive.
-            QuicDialError::Fallback(_) => MultihopError::Bind(std::io::Error::other(
-                "tcp fallback is not used on the multihop dial path",
-            )),
+            // Reachable only in cover-domain mode with the carrier armed
+            // (`with_tcp_fallback`), where the entry dial uses
+            // `dial_quic_webpki_with_fallback`; the RPK and un-armed webpki dials
+            // never produce it. Carries the engine's typed carrier outcome.
+            QuicDialError::Fallback(e) => MultihopError::TcpFallback(e),
         }
     }
 }
@@ -205,6 +209,13 @@ pub struct MultihopClientTunnel {
     /// server-initiated bi stream after the setup frame is sent. `None` keeps
     /// the historical RPK path.
     cover_domain: Option<String>,
+    /// Arms the TLS-over-TCP anti-censorship carrier for the entry dial (roster
+    /// v10). Set by the SDK caller only when the dialed entry advertises the
+    /// carrier; the race fires solely in cover-domain mode (the carrier needs the
+    /// SNI, and prod carrier hops are all X.509 cover-posture) and only when the
+    /// UDP handshake fails, so arming it whenever available is free on an
+    /// uncensored path. Off by default. Set via [`Self::with_tcp_fallback`].
+    tcp_fallback: bool,
     /// When `Some`, the QUIC carrier socket is marked/bound to the physical link
     /// (`SO_MARK` / `IP_BOUND_IF` / `IP_UNICAST_IF`) before its first send, so a
     /// privileged TUN datapath's split-default capture keeps it out of the tunnel
@@ -226,6 +237,7 @@ impl MultihopClientTunnel {
             transport_config: None,
             idle_cover: false,
             cover_domain: None,
+            tcp_fallback: false,
             socket_bypass: None,
         }
     }
@@ -293,6 +305,19 @@ impl MultihopClientTunnel {
         self
     }
 
+    /// Arms the TLS-over-TCP anti-censorship carrier (roster v10) for the entry
+    /// dial: when the UDP/QUIC handshake to the entry fails on a UDP-hostile
+    /// network, retry the SAME QUIC datagrams inside one cover-domain TLS stream
+    /// on the entry's `:443/tcp`. Effective ONLY in cover-domain mode (see
+    /// [`Self::with_cover_domain`]); the SDK caller sets this only when the dialed
+    /// entry advertises the carrier. The carrier is dormant unless UDP fails, so
+    /// arming it whenever available costs nothing on an open path. Off by default.
+    #[must_use]
+    pub fn with_tcp_fallback(mut self, enabled: bool) -> Self {
+        self.tcp_fallback = enabled;
+        self
+    }
+
     /// Keep the QUIC carrier socket on the physical link, out of the full-tunnel
     /// capture a system-VPN datapath installs, via a socket-level mark/bind
     /// (`SO_MARK` on Linux, `IP_BOUND_IF` on macOS, `IP_UNICAST_IF` on Windows).
@@ -357,20 +382,61 @@ impl MultihopClientTunnel {
         // relay's Warren identity is verified in-band after the setup frame is
         // sent (cover-domain mode, inside `setup_over_stream` below) or at the
         // TLS layer (RPK mode).
+        let bind = effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr);
         let (endpoint, conn) = if let Some(ref domain) = self.cover_domain {
-            dial_quic_webpki(
-                domain,
-                exit_addr,
-                effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
-                transport_config,
-                self.socket_bypass,
-            )
-            .await?
+            if self.tcp_fallback {
+                // Carrier armed (roster v10): race the UDP/QUIC handshake against
+                // the cover-domain TLS-over-TCP carrier on the entry's :443/tcp, so
+                // a UDP-blocked network still connects. Both legs use the WebPKI
+                // cover posture; the relay identity is proven in-band below exactly
+                // as the plain webpki dial. The policy gate folds the armed signal
+                // (opt-in + advertised, decided by the caller) with the cover domain
+                // we are already inside; a disabled policy would make the fallback
+                // dial the plain `dial_quic_webpki` verbatim.
+                let policy = crate::tcp_fallback::resolve_fallback_policy(
+                    self.tcp_fallback,
+                    self.tcp_fallback,
+                    Some(domain),
+                );
+                let cover = policy
+                    .tcp_fallback_enabled
+                    .then(|| -> Result<_, MultihopError> {
+                        Ok(crate::tcp_fallback::CoverTls {
+                            addr: SocketAddr::new(
+                                exit_addr.ip(),
+                                crate::tcp_fallback::COVER_TCP_PORT,
+                            ),
+                            domain,
+                            client_config: crate::client::cover_tls_client_config()
+                                .map_err(MultihopError::Tls)?,
+                        })
+                    })
+                    .transpose()?;
+                crate::tcp_fallback::dial_quic_webpki_with_fallback(
+                    domain,
+                    exit_addr,
+                    bind,
+                    transport_config,
+                    self.socket_bypass,
+                    &policy,
+                    cover,
+                )
+                .await?
+            } else {
+                dial_quic_webpki(
+                    domain,
+                    exit_addr,
+                    bind,
+                    transport_config,
+                    self.socket_bypass,
+                )
+                .await?
+            }
         } else {
             dial_quic(
                 exit_pubkey,
                 exit_addr,
-                effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr),
+                bind,
                 transport_config,
                 self.socket_bypass,
             )

@@ -1306,6 +1306,7 @@ fn fake_verified_exit(
         weight: 100,
         dns_disabled: false,
         cover_domain: None,
+        tcp_fallback: false,
         edge_cert_sha256: None,
         exit_mlkem768_pubkey: None,
     }
@@ -1334,6 +1335,28 @@ async fn connect_multihop_against_a_fake_exit_assigns_ip() {
         .connect_multihop(&exit)
         .await
         .expect("multihop connect succeeds against the fake exit");
+    assert_eq!(
+        sink.session().assigned_ipv4(),
+        std::net::Ipv4Addr::new(10, 66, 0, 2)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn arming_the_carrier_on_a_non_cover_exit_is_inert_and_still_connects() {
+    // roster v10: an exit that advertises `tcp_fallback` but carries NO cover
+    // domain must keep the RPK multihop dial (the carrier needs a cover-domain
+    // SNI). Arming must not divert onto the WebPKI/carrier path, which the RPK
+    // fake exit would reject: this guards the `cover_domain`-gated arm in
+    // `MultihopClientTunnel::connect`.
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let (addr, keys) = warren_test_support::spawn_fake_multihop_exit(exit_key).await;
+    let mut exit = fake_verified_exit(addr, &keys);
+    exit.tcp_fallback = true;
+
+    let sink = test_client()
+        .connect_multihop(&exit)
+        .await
+        .expect("an armed carrier stays dormant on a non-cover exit and connects over UDP");
     assert_eq!(
         sink.session().assigned_ipv4(),
         std::net::Ipv4Addr::new(10, 66, 0, 2)
@@ -1543,6 +1566,7 @@ async fn start_proxy_multihop_refuses_a_dns_disabled_exit_without_a_resolver() {
         weight: 1,
         dns_disabled: true,
         cover_domain: None,
+        tcp_fallback: false,
         edge_cert_sha256: None,
         exit_mlkem768_pubkey: None,
     };
@@ -1719,6 +1743,7 @@ fn exit_with_dns(dns_disabled: bool) -> VerifiedExit {
         weight: 100,
         dns_disabled,
         cover_domain: None,
+        tcp_fallback: false,
         edge_cert_sha256: None,
         exit_mlkem768_pubkey: None,
     }

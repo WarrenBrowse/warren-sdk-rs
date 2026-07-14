@@ -699,6 +699,12 @@ pub(crate) async fn establish_multihop(
     if exit.cover_domain.is_some() {
         tunnel = tunnel.with_cover_domain(exit.cover_domain.clone());
     }
+    // Arm the TLS-over-TCP anti-censorship carrier (roster v10) when the dialed
+    // entry advertises it: a UDP-blocked handshake then retries over the entry's
+    // :443/tcp. Dormant unless UDP fails, so no cost on an open path.
+    if exit.tcp_fallback {
+        tunnel = tunnel.with_tcp_fallback(true);
+    }
     let session = tunnel
         .connect(
             exit.exit_ed25519_pubkey,

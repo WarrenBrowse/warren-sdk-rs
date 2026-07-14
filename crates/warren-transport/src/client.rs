@@ -88,6 +88,25 @@ pub(crate) fn build_inner_rpk_client_config(
     Ok(client_cfg)
 }
 
+/// WebPKI (X.509 cover-domain) analogue of [`build_inner_rpk_client_config`]: the
+/// inner QUIC config for the cover-posture dial, validating the exit's real
+/// certificate chain against Mozilla roots with the cover domain as SNI, the `h3`
+/// ALPN, and the effective transport config. Keeping it here is what makes the
+/// carrier's inner QUIC handshake byte-for-byte the [`dial_quic_webpki`] UDP one,
+/// so the only thing that changes over the carrier is the socket underneath.
+pub(crate) fn build_inner_webpki_client_config(
+    transport_config: Option<Arc<quinn::TransportConfig>>,
+) -> Result<quinn::ClientConfig, QuicDialError> {
+    let mut client_cfg = tls::make_client_config_webpki(
+        tls::mozilla_root_store(),
+        tls::default_crypto_provider(),
+        &[ALPN_H3],
+    )
+    .map_err(QuicDialError::Tls)?;
+    client_cfg.transport_config(effective_transport_config(transport_config));
+    Ok(client_cfg)
+}
+
 /// Binds the carrier UDP socket for a QUIC endpoint and applies the per-OS
 /// tunnel bypass to it BEFORE it can send, so a privileged TUN datapath's
 /// split-default capture keeps this socket on the physical link instead of
@@ -669,15 +688,20 @@ impl ClientTunnel {
 
 /// Builds the WebPKI client config for the cover-domain TLS handshake of the
 /// fallback carrier: standard Mozilla roots and the plausible TCP ALPN, exactly
-/// as a browser dialling the cover host over HTTPS.
-fn tls_webpki_cover_config() -> Result<Arc<rustls::ClientConfig>, TunnelError> {
+/// as a browser dialling the cover host over HTTPS. Shared by the single-hop and
+/// multihop carrier paths (each maps the error into its own tunnel error).
+pub(crate) fn cover_tls_client_config() -> Result<Arc<rustls::ClientConfig>, tls::WarrenTlsError> {
     let cfg = warrenguard_tls::build_client_rustls_config_webpki(
         tls::mozilla_root_store(),
         tls::default_crypto_provider(),
         crate::tcp_fallback::COVER_TCP_ALPN,
-    )
-    .map_err(TunnelError::Tls)?;
+    )?;
     Ok(Arc::new(cfg))
+}
+
+/// Single-hop wrapper over [`cover_tls_client_config`] mapping to [`TunnelError`].
+fn tls_webpki_cover_config() -> Result<Arc<rustls::ClientConfig>, TunnelError> {
+    cover_tls_client_config().map_err(TunnelError::Tls)
 }
 
 /// An established tunnel session over which IP packets travel as QUIC
