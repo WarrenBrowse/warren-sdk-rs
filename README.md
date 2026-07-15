@@ -41,7 +41,7 @@ IPv6, and the port-forwarding primitives. Applications depend on a single crate,
 | Non-custodial identity (BIP39, SS58 `wb…`, request signing) | `warren-identity` | done, golden vectors |
 | Wire codecs: handshake, NAT-PMP, multihop HPKE frame, control `/v2`, PoP | `warren-wire` | done, golden vectors |
 | Signed account API client (transport-agnostic) incl. anti-censorship host fallback (primary / alternatives / no-SNI) and payments/support/incidents | `warren-api` | done |
-| Signed relay list verify (v8) + weighted selector; multihop directory PKI verify | `warren-discovery` | done, golden vectors |
+| Signed relay list verify (v10) + weighted selector; multihop directory PKI verify | `warren-discovery` | done, golden vectors |
 | QUIC transport (RFC 7250 raw-public-key TLS 1.3) + reconnect/backoff supervisor | `warren-transport` | done; validated against a real exit. The sealed multihop tunnel is the path real exits accept |
 | Multihop HPKE session (X25519 / HKDF-SHA256 / ChaCha20Poly1305, epoch/seq replay) | `warren-multihop` | done; live-validated |
 | Non-root proxy datapath: smoltcp userspace netstack over the tunnel, SOCKS5 + HTTP CONNECT, DNS-over-tunnel (A/AAAA, configurable resolver), UDP associate, dual-stack IPv6, port-forwarding (NAT-PMP client + inbound listen/relay) | `warren-net` | feature-complete, e2e in-process over single-hop and sealed multihop; per-OS privileged TUN backend pending |
@@ -56,7 +56,7 @@ SDK against the production API and real exits:
 
 | Example | Proves |
 |---|---|
-| `live_exit` | signed v8 exit list + multihop directory verify and cross-check; sealed handshake reaches the exit policy gate (no subscription needed) |
+| `live_exit` | signed v10 exit list + multihop directory verify and cross-check; sealed handshake reaches the exit policy gate (no subscription needed) |
 | `live_proxy` | full multihop tunnel: real `IpAssign` + egress through the sealed tunnel |
 | `live_reconnect` | app-driven reconnect: independent sessions each rebuild from a fresh `IpAssign` and egress |
 | `live_supervised` | self-healing supervised proxy: stable address, reaches `Connected`, egresses |
