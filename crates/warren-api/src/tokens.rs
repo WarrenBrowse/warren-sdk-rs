@@ -70,6 +70,10 @@ pub enum TokenClientError {
         /// The epoch whose response batch is malformed.
         epoch: u64,
     },
+    /// A persisted token bundle ([`PersistedTokens`]) failed to parse or
+    /// serialize. The body is never echoed (it carries bearer tokens).
+    #[error("persisted token bundle is malformed")]
+    BadPersistedBundle,
     /// A token-crypto operation failed (blinding, finalization, or a token
     /// that does not verify under the key it was requested from).
     #[error(transparent)]
@@ -483,19 +487,19 @@ impl PersistedTokens {
     /// Parses a persisted bundle from its JSON form.
     ///
     /// # Errors
-    /// [`TokenClientError::BadDirectoryPolicy`] if the body is not the expected
+    /// [`TokenClientError::BadPersistedBundle`] if the body is not the expected
     /// JSON shape (kept typed and no-log; the untrusted body is never echoed).
     pub fn from_json(body: &str) -> Result<Self, TokenClientError> {
-        serde_json::from_str(body).map_err(|_| TokenClientError::BadDirectoryPolicy)
+        serde_json::from_str(body).map_err(|_| TokenClientError::BadPersistedBundle)
     }
 
     /// Serializes the bundle to JSON for persistence into the app-group file.
     ///
     /// # Errors
-    /// [`TokenClientError::BadDirectoryPolicy`] on the (practically unreachable)
+    /// [`TokenClientError::BadPersistedBundle`] on the (practically unreachable)
     /// serialization failure.
     pub fn to_json(&self) -> Result<String, TokenClientError> {
-        serde_json::to_string(self).map_err(|_| TokenClientError::BadDirectoryPolicy)
+        serde_json::to_string(self).map_err(|_| TokenClientError::BadPersistedBundle)
     }
 
     /// Tokens remaining for the epoch `now` falls in.
@@ -629,7 +633,7 @@ mod persistence_tests {
     fn rejects_a_malformed_persisted_body() {
         assert!(matches!(
             PersistedTokens::from_json("not json"),
-            Err(TokenClientError::BadDirectoryPolicy)
+            Err(TokenClientError::BadPersistedBundle)
         ));
     }
 }
