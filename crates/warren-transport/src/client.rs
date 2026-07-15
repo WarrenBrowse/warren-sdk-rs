@@ -820,9 +820,9 @@ impl ClientSession {
     }
 
     /// The QUIC path round-trip time estimate for this connection, as
-    /// smoothed by the congestion controller after the handshake. Feeds
-    /// the client-side RTT proximity cache (doc 52 P4). Meaningful once at
-    /// least one RTT sample has been taken (post-handshake), which is
+    /// smoothed by the congestion controller after the handshake. Feeds the
+    /// client-side RTT proximity cache (doc 52 §6.2 client). Meaningful once
+    /// at least one RTT sample has been taken (post-handshake), which is
     /// always true for a returned [`ClientSession`].
     #[must_use]
     pub fn path_rtt(&self) -> std::time::Duration {

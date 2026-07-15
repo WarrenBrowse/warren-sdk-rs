@@ -1,4 +1,4 @@
-//! Client-side RTT proximity scoring (doc 52 §6.2 client / P4).
+//! Client-side RTT proximity scoring (doc 52 §6.2 client).
 //!
 //! The signed relay list already carries a server-computed `weight`. This
 //! module lets the client bias selection toward *nearer* exits at equal
@@ -30,7 +30,7 @@ use std::collections::HashMap;
 pub type EndpointId = [u8; 32];
 
 /// Default freshness window for a measured RTT (24 h), matching the doc's
-/// "cache local par exit (TTL 24 h)".
+/// per-exit local cache TTL of 24 h.
 pub const DEFAULT_RTT_TTL_SECS: u64 = 24 * 60 * 60;
 
 /// Reference RTT (ms) shaping the proximity curve `f(rtt) = K / (K + rtt)`.

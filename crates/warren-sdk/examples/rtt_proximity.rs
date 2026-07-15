@@ -1,4 +1,4 @@
-//! Live validation of client RTT proximity scoring (doc 52 P4).
+//! Live validation of client RTT proximity scoring (doc 52 §6.2 client).
 //!
 //! Run with a SUBSCRIBED wallet (routing requires it):
 //!   `WARREN_MNEMONIC="word1 ... word12" cargo run -p warren-sdk --example rtt_proximity`
@@ -8,8 +8,8 @@
 //!      (`ClientSession`/`MultihopSession::path_rtt`), recorded into the
 //!      client's [`RttCache`] keyed by the exit's Ed25519 endpoint pubkey.
 //!   2. `select_exit_by_proximity` biases weighted selection toward the
-//!      lower-RTT exit at comparable weight (the P4 DoD:
-//!      "sélection préfère un exit proche").
+//!      lower-RTT exit at comparable weight (doc 52 §6.2 client: selection
+//!      prefers a nearby exit).
 //!
 //! Without `WARREN_MNEMONIC` the exit refuses routing after the handshake,
 //! so no session (and no RTT) is returned; the example says so and exits.
@@ -47,7 +47,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !subscribed {
         println!(
             "no WARREN_MNEMONIC: real exits refuse routing after the handshake, so no RTT \
-             can be measured. Re-run with a subscribed mnemonic to validate P4 end-to-end."
+             can be measured. Re-run with a subscribed mnemonic to validate proximity \
+             scoring end-to-end."
         );
     }
 
@@ -152,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         far_exit.country, far_exit.city
     );
     if near_hits > far_hits {
-        println!("PASS: proximity selection favoured the lower-RTT exit (doc 52 P4 DoD).");
+        println!("PASS: proximity selection favoured the lower-RTT exit (doc 52 §6.2 client).");
     } else {
         println!(
             "NOTE: near did not out-pick far; their RTTs may be too close, or their server \

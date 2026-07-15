@@ -207,10 +207,12 @@ pub async fn mint_tokens<T: HttpTransport, R: CryptoRng + ?Sized>(
 /// per connection admission ([`TokenStore::take`] pops it); tokens for past
 /// epochs are dead weight and are dropped by [`TokenStore::prune_before`].
 ///
-/// Deliberately RAM-only: tokens are bearer credentials with a bounded
+/// RAM-only by default: tokens are bearer credentials with a bounded
 /// lifetime (the prefetch window), and a lost store is recovered by minting
-/// at the next epoch, so persisting them would add a disk-theft surface for
-/// no availability win.
+/// at the next epoch, so persisting them adds a disk-theft surface for no
+/// availability win. The single documented exception is the seed-free iOS
+/// app-group export ([`PersistedTokens`]), where cross-process handoff to
+/// the Network Extension requires it.
 #[derive(Default)]
 pub struct TokenStore {
     per_epoch: BTreeMap<u64, Vec<Token>>,

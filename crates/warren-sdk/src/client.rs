@@ -344,7 +344,7 @@ pub struct WarrenClient<T> {
     pub(crate) multihop_generation_store: Arc<dyn GenerationStore>,
     /// Trust-on-first-use pin store, when enabled.
     pub(crate) server_key_store: Option<Arc<dyn ServerKeyStore>>,
-    /// Client-side RTT proximity cache (doc 52 P4): every successful
+    /// Client-side RTT proximity cache (doc 52 §6.2 client): every successful
     /// single-hop connect records the measured path RTT keyed by exit, and
     /// [`Self::select_exit_by_proximity`] biases selection toward nearer
     /// exits at equal weight. Shared behind a mutex so `&self` connects can
@@ -462,7 +462,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             tunnel = tunnel.with_transport_config(cfg.clone());
         }
         let session = tunnel.connect(exit.endpoint_id(), addr).await?;
-        // Feed the RTT proximity cache (doc 52 P4): the smoothed path RTT is
+        // Feed the RTT proximity cache (doc 52 §6.2 client): the smoothed path RTT is
         // available post-handshake. Record it keyed by exit before wrapping
         // the session, so later selections can prefer nearer exits.
         self.record_rtt(exit.endpoint_id(), session.path_rtt());
@@ -481,10 +481,10 @@ impl<T: HttpTransport> WarrenClient<T> {
     }
 
     /// Selects an exit from `selector` weighted by `weight * f(rtt)` using
-    /// the RTT measurements gathered on prior connects (doc 52 P4). At equal
-    /// weight a nearer exit is preferred; before any measurement it is
-    /// exactly [`ExitSelector::select_weighted`]. Returns an owned [`Relay`]
-    /// (ready to pass to [`Self::connect_tunnel`]).
+    /// the RTT measurements gathered on prior connects (doc 52 §6.2 client).
+    /// At equal weight a nearer exit is preferred; before any measurement it
+    /// is exactly [`ExitSelector::select_weighted`]. Returns an owned
+    /// [`Relay`] (ready to pass to [`Self::connect_tunnel`]).
     ///
     /// # Errors
     ///
@@ -506,8 +506,8 @@ impl<T: HttpTransport> WarrenClient<T> {
             .cloned()
     }
 
-    /// Snapshot of the current RTT proximity cache (doc 52 P4), e.g. for an
-    /// app to surface measured latencies in its UI.
+    /// Snapshot of the current RTT proximity cache (doc 52 §6.2 client),
+    /// e.g. for an app to surface measured latencies in its UI.
     #[must_use]
     pub fn rtt_cache_snapshot(&self) -> RttCache {
         self.rtt_cache.lock().map(|c| c.clone()).unwrap_or_default()
@@ -677,7 +677,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                 exit.endpoint,
             )
             .await?;
-        // Feed the RTT proximity cache (doc 52 P4): the first-hop path RTT is
+        // Feed the RTT proximity cache (doc 52 §6.2 client): the first-hop path RTT is
         // available once the multihop handshake completes. Keyed by the exit's
         // Ed25519 endpoint pubkey, the same key the selector looks up.
         self.record_rtt(exit.exit_ed25519_pubkey, session.path_rtt());
@@ -1160,6 +1160,11 @@ fn socket_bypass_from_ifindex(_ifindex: u32) -> SocketBypass {
     SocketBypass::Fwmark(warren_tun::plan::WARREN_TUNNEL_FWMARK)
 }
 
+// warren-app retired this bare IP_BOUND_IF bind (no /32 host route) after the
+// 2026-07-13 carrier-blackhole incident: on multi-interface hosts it loses ALL
+// egress once the default route swaps (see warren-app talpid-warren-tunnel
+// carrier_egress_guard). Do not promote this experimental-tun path without
+// real-exit multi-interface validation recorded in warren-core docs/49.
 #[cfg(all(feature = "experimental-tun", target_os = "macos"))]
 fn socket_bypass_from_ifindex(ifindex: u32) -> SocketBypass {
     SocketBypass::BoundIf(ifindex)

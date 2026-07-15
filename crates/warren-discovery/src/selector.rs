@@ -89,7 +89,7 @@ impl ExitSelector {
     }
 
     /// Selects a weighted-random matching relay, biased toward exits with a
-    /// lower measured RTT (doc 52 §6.2 client / P4). The effective score is
+    /// lower measured RTT (doc 52 §6.2 client). The effective score is
     /// `weight * f(rtt)` per [`crate::proximity`]: at equal weight a nearer
     /// exit is preferred, an unprobed exit is scored at a neutral baseline,
     /// and a fleet with no measurements yields exactly the weight-only
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn proximity_prefers_the_nearer_exit_at_equal_weight() {
         // Two equal-weight exits; only their measured RTT differs. Over many
-        // draws the low-RTT one must dominate (DoD P4: prefer a close exit).
+        // draws the low-RTT one must dominate.
         let near = relay_id("FR", "Near", 100, 1);
         let far = relay_id("FR", "Far", 100, 2);
         let sel = ExitSelector::new(RelayList::new(vec![near, far]));
