@@ -13,9 +13,18 @@
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
 use warren_tun_core::{Framing, RawTunDevice};
+use warrenguard_config::{TUNNEL_GATEWAY_IP, TUNNEL_GATEWAY_IPV6};
+use warrenguard_transport_core::{build_frag_needed, clamp_syn_mss, is_tcp_syn};
 
 use crate::error::NetError;
 use crate::sink::PacketSink;
+
+/// Subtracted from the tunnel's own (exactly-known) transmit budget when
+/// clamping an OUTBOUND SYN/SYN-ACK (device -> tunnel direction): the option
+/// governs segments the EXIT will later send back on ITS OWN budget, which
+/// this client cannot read. Mirrors the engine's client uplink pumps; see
+/// `93-REDUCED-MTU-ADAPTATION.md`.
+const UPLINK_ASYMMETRY_MARGIN: u16 = 48;
 
 /// Channel depth for each direction (bounds memory under a burst; backpressure
 /// is `try_send`-drop on egress, matching the netstack's TX behavior).
@@ -73,12 +82,65 @@ pub fn tun_channels<D: RawTunDevice>(
     (sink, bridge)
 }
 
-/// Forwards one direction: read IP packets from `from` and send them to `to`,
-/// until either side's read/write fails (the tunnel or device closed).
-async fn pump<R: PacketSink, S: PacketSink>(from: &R, to: &S) -> Result<(), NetError> {
+/// Forwards device -> tunnel (the uplink: the local OS is the sender of
+/// everything on this leg). Mirrors the engine's client uplink pump
+/// (`93-REDUCED-MTU-ADAPTATION.md`): an outbound SYN/SYN-ACK has its MSS
+/// option clamped to the tunnel's current budget minus
+/// [`UPLINK_ASYMMETRY_MARGIN`] (that option governs segments the EXIT will
+/// send back on ITS OWN budget, which this client cannot read), and a packet
+/// that the tunnel's CURRENT budget cannot carry is turned back into an ICMP
+/// Fragmentation-Needed / Packet-Too-Big written into the device instead of
+/// being sent (and silently dropped): the local OS's own PMTUD then converges
+/// on later packets rather than the flow black-holing.
+async fn pump_uplink<D: PacketSink, T: PacketSink>(device: &D, tunnel: &T) -> Result<(), NetError> {
     loop {
-        let packet = from.recv_packet().await?;
-        to.send_packet(&packet).await?;
+        let packet = device.recv_packet().await?;
+        let budget = tunnel.max_payload();
+        if packet.len() > budget {
+            let effective = u16::try_from(budget).unwrap_or(u16::MAX);
+            if let Some(ptb) =
+                build_frag_needed(&packet, effective, TUNNEL_GATEWAY_IP, TUNNEL_GATEWAY_IPV6)
+            {
+                // Best-effort: a failure to write the PTB back just leaves the
+                // sender waiting for its own retransmit/timeout, no worse than
+                // before this fix existed.
+                let _ = device.send_packet(&ptb).await;
+            }
+            continue;
+        }
+        if is_tcp_syn(&packet) {
+            let clamp_to = u16::try_from(budget)
+                .unwrap_or(u16::MAX)
+                .saturating_sub(UPLINK_ASYMMETRY_MARGIN);
+            let mut owned = packet.to_vec();
+            let _ = clamp_syn_mss(&mut owned, clamp_to);
+            tunnel.send_packet(&owned).await?;
+        } else {
+            tunnel.send_packet(&packet).await?;
+        }
+    }
+}
+
+/// Forwards tunnel -> device (the downlink). Mirrors the engine's client
+/// downlink pump: an inbound SYN/SYN-ACK has its MSS option clamped to the
+/// tunnel's current budget EXACTLY (this node's own transmit budget, known
+/// precisely, unlike the uplink leg's), so a locally-initiated flow's peer
+/// never learns an MSS larger than this client's own tunnel-bound segments
+/// can later carry.
+async fn pump_downlink<T: PacketSink, D: PacketSink>(
+    tunnel: &T,
+    device: &D,
+) -> Result<(), NetError> {
+    loop {
+        let packet = tunnel.recv_packet().await?;
+        if is_tcp_syn(&packet) {
+            let clamp_to = u16::try_from(tunnel.max_payload()).unwrap_or(u16::MAX);
+            let mut owned = packet.to_vec();
+            let _ = clamp_syn_mss(&mut owned, clamp_to);
+            device.send_packet(&owned).await?;
+        } else {
+            device.send_packet(&packet).await?;
+        }
     }
 }
 
@@ -98,7 +160,11 @@ pub async fn forward_bidirectional<A: PacketSink, B: PacketSink>(
     device: A,
     tunnel: B,
 ) -> Result<(), NetError> {
-    tokio::try_join!(pump(&device, &tunnel), pump(&tunnel, &device)).map(|_| ())
+    tokio::try_join!(
+        pump_uplink(&device, &tunnel),
+        pump_downlink(&tunnel, &device)
+    )
+    .map(|_| ())
 }
 
 impl<D: RawTunDevice> TunBridge<D> {
@@ -427,6 +493,165 @@ mod tests {
         drop(tun_in_tx);
         let result = forward_bidirectional(device, tunnel).await;
         assert!(matches!(result, Err(NetError::Tun(_))));
+    }
+
+    /// Like `MockSink` but with a settable `max_payload`, needed to exercise
+    /// the budget-dependent clamp/reflect decisions in
+    /// `pump_uplink`/`pump_downlink`.
+    struct ConfigurableSink {
+        inbound: Mutex<mpsc::Receiver<Bytes>>,
+        outbound: mpsc::Sender<Vec<u8>>,
+        payload: usize,
+    }
+
+    impl PacketSink for ConfigurableSink {
+        async fn send_packet(&self, packet: &[u8]) -> Result<(), NetError> {
+            self.outbound.send(packet.to_vec()).await.map_err(|_| {
+                NetError::Tun(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                ))
+            })
+        }
+
+        async fn recv_packet(&self) -> Result<Bytes, NetError> {
+            self.inbound.lock().await.recv().await.ok_or_else(|| {
+                NetError::Tun(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                ))
+            })
+        }
+
+        fn max_payload(&self) -> usize {
+            self.payload
+        }
+    }
+
+    /// A minimal IPv4 TCP SYN with a single MSS option. Neither `is_tcp_syn`
+    /// nor `clamp_syn_mss` verify the checksum before rewriting, so this test
+    /// packet never bothers computing a valid one.
+    fn syn_packet(mss: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 44]; // 20-byte IPv4 header + 20-byte TCP header + 4-byte MSS option
+        pkt[0] = 0x45; // version 4, IHL 5 (20 bytes, no options)
+        pkt[9] = 6; // protocol = TCP
+        let tcp = 20;
+        pkt[tcp + 12] = 6 << 4; // data offset = 24 bytes (20 + the MSS option)
+        pkt[tcp + 13] = 0x02; // SYN
+        pkt[tcp + 20] = 2; // option kind = MSS
+        pkt[tcp + 21] = 4; // option length
+        pkt[tcp + 22..tcp + 24].copy_from_slice(&mss.to_be_bytes());
+        pkt
+    }
+
+    /// Reads back the MSS option `syn_packet` wrote (or `clamp_syn_mss` rewrote).
+    fn syn_mss(frame: &[u8]) -> u16 {
+        u16::from_be_bytes([frame[20 + 22], frame[20 + 23]])
+    }
+
+    #[tokio::test]
+    async fn pump_uplink_clamps_a_syn_with_the_asymmetry_margin() {
+        let (dev_in_tx, dev_in_rx) = mpsc::channel::<Bytes>(4);
+        let (dev_out_tx, _dev_out_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (_tun_in_tx, tun_in_rx) = mpsc::channel::<Bytes>(4);
+        let (tun_out_tx, mut tun_out_rx) = mpsc::channel::<Vec<u8>>(4);
+        let device = ConfigurableSink {
+            inbound: Mutex::new(dev_in_rx),
+            outbound: dev_out_tx,
+            payload: 1280,
+        };
+        let tunnel = ConfigurableSink {
+            inbound: Mutex::new(tun_in_rx),
+            outbound: tun_out_tx,
+            payload: 1000,
+        };
+
+        dev_in_tx.send(Bytes::from(syn_packet(1460))).await.unwrap();
+        drop(dev_in_tx); // ends the pump's loop after this one packet
+
+        let _ = pump_uplink(&device, &tunnel).await;
+
+        let forwarded = tun_out_rx.try_recv().expect("the SYN reached the tunnel");
+        assert_eq!(
+            syn_mss(&forwarded),
+            1000 - UPLINK_ASYMMETRY_MARGIN - 40,
+            "clamped to the tunnel's budget minus the asymmetry margin, minus the v4 header overhead"
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_uplink_reflects_a_too_large_packet_as_ptb_and_drops_it() {
+        let (dev_in_tx, dev_in_rx) = mpsc::channel::<Bytes>(4);
+        let (dev_out_tx, mut dev_out_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (_tun_in_tx, tun_in_rx) = mpsc::channel::<Bytes>(4);
+        let (tun_out_tx, mut tun_out_rx) = mpsc::channel::<Vec<u8>>(4);
+        let device = ConfigurableSink {
+            inbound: Mutex::new(dev_in_rx),
+            outbound: dev_out_tx,
+            payload: 1280,
+        };
+        let tunnel = ConfigurableSink {
+            inbound: Mutex::new(tun_in_rx),
+            outbound: tun_out_tx,
+            payload: 1000,
+        };
+
+        // A well-formed-enough IPv4 packet (unicast source, no ICMP error) that
+        // exceeds the tunnel's 1000-byte budget.
+        let mut too_big = vec![0u8; 2000];
+        too_big[0] = 0x45;
+        too_big[9] = 6;
+        too_big[12..16].copy_from_slice(&[10, 66, 0, 5]);
+        dev_in_tx.send(Bytes::from(too_big)).await.unwrap();
+        drop(dev_in_tx);
+
+        let _ = pump_uplink(&device, &tunnel).await;
+
+        assert!(
+            tun_out_rx.try_recv().is_err(),
+            "an over-budget packet must never reach the tunnel"
+        );
+        let ptb = dev_out_rx
+            .recv()
+            .await
+            .expect("a PTB was reflected back to the device");
+        assert_eq!(ptb[0] >> 4, 4, "IPv4");
+        assert_eq!(ptb[9], 1, "ICMP");
+        assert_eq!(
+            u16::from_be_bytes([ptb[26], ptb[27]]),
+            1000,
+            "next-hop MTU carries the tunnel's current budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_downlink_clamps_a_syn_exactly_with_no_margin() {
+        let (_dev_in_tx, dev_in_rx) = mpsc::channel::<Bytes>(4);
+        let (dev_out_tx, mut dev_out_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (tun_in_tx, tun_in_rx) = mpsc::channel::<Bytes>(4);
+        let (tun_out_tx, _tun_out_rx) = mpsc::channel::<Vec<u8>>(4);
+        let device = ConfigurableSink {
+            inbound: Mutex::new(dev_in_rx),
+            outbound: dev_out_tx,
+            payload: 1280,
+        };
+        let tunnel = ConfigurableSink {
+            inbound: Mutex::new(tun_in_rx),
+            outbound: tun_out_tx,
+            payload: 1000,
+        };
+
+        tun_in_tx.send(Bytes::from(syn_packet(1460))).await.unwrap();
+        drop(tun_in_tx);
+
+        let _ = pump_downlink(&tunnel, &device).await;
+
+        let forwarded = dev_out_rx.try_recv().expect("the SYN reached the device");
+        assert_eq!(
+            syn_mss(&forwarded),
+            1000 - 40,
+            "clamped to the tunnel's budget EXACTLY: no asymmetry margin on this leg"
+        );
     }
 }
 

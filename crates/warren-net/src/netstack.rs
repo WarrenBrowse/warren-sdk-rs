@@ -23,6 +23,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
@@ -92,6 +93,12 @@ const UDP_CHANNEL_DEPTH: usize = 64;
 const LISTEN_BACKLOG: usize = 8;
 /// Accepted-connection queue depth per listener before inbound SYNs are refused.
 const ACCEPT_CHANNEL_DEPTH: usize = 32;
+/// Smallest inner MTU the engine will ever apply to the device. smoltcp derives
+/// each TCP segment's MSS as `ip_mtu - ip_header_len - TCP_HEADER_LEN` (20 or 40
+/// bytes of header); below this floor that subtraction can underflow. Matches
+/// the classic IPv4 minimum-required-support MTU, the same floor rationale as
+/// `warrenguard_transport_core::inner_mtu`'s `MSS_FLOOR`.
+const MIN_NETSTACK_MTU: usize = 576;
 
 /// A smoltcp [`Device`] over IP-packet channels. Frames are zero-copy [`Bytes`].
 struct TunnelDevice {
@@ -144,6 +151,17 @@ impl Device for TunnelDevice {
         caps.checksum.tcp = Checksum::Both;
         caps
     }
+}
+
+/// Decides whether the device's MTU must change: clamps `candidate` (the
+/// sink's live transmit budget) to [`MIN_NETSTACK_MTU`] and reports the new
+/// value only when it actually differs from `current`, so a caller only pays
+/// for a smoltcp interface rebuild on a genuine change (see
+/// [`Engine::refresh_mtu`]).
+#[must_use]
+fn next_device_mtu(current: usize, candidate: usize) -> Option<usize> {
+    let clamped = candidate.max(MIN_NETSTACK_MTU);
+    (clamped != current).then_some(clamped)
 }
 
 /// A request from a [`TunnelConnector`] to the engine.
@@ -617,12 +635,27 @@ impl NetstackConfig {
 ///
 /// `config` carries the client addressing, routing gateway, DNS resolver and
 /// MTU (see [`NetstackConfig`]). `inbound` delivers IP packets arriving from the
-/// tunnel; `outbound` receives IP packets the stack wants to send.
+/// tunnel; `outbound` receives IP packets the stack wants to send. The device
+/// MTU is fixed at `config.mtu` for the connector's lifetime; use
+/// [`spawn_over_sink`] when the path budget can change mid-session.
 #[must_use]
 pub fn spawn_engine(
     config: NetstackConfig,
     inbound: mpsc::Receiver<Bytes>,
     outbound: mpsc::Sender<Bytes>,
+) -> TunnelConnector {
+    spawn_engine_inner(config, inbound, outbound, None)
+}
+
+/// Shared implementation behind [`spawn_engine`] and [`spawn_over_sink`].
+/// `live_mtu`, when set, is polled once per engine loop iteration
+/// ([`Engine::refresh_mtu`]) so a mid-session PMTU shrink or growth reaches
+/// smoltcp's device capabilities.
+fn spawn_engine_inner(
+    config: NetstackConfig,
+    inbound: mpsc::Receiver<Bytes>,
+    outbound: mpsc::Sender<Bytes>,
+    live_mtu: Option<Arc<AtomicUsize>>,
 ) -> TunnelConnector {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let wake = Arc::new(Notify::new());
@@ -659,6 +692,7 @@ pub fn spawn_engine(
         cmd_rx,
         inbound,
         wake: Arc::clone(&wake),
+        live_mtu,
     };
     tokio::spawn(engine.run());
 
@@ -691,19 +725,24 @@ struct Engine {
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     inbound: mpsc::Receiver<Bytes>,
     wake: Arc<Notify>,
+    /// Tracks the sink's live transmit budget (see [`crate::PacketSink::max_payload`]);
+    /// `None` for a fixed-MTU connector ([`spawn_engine`] called directly).
+    live_mtu: Option<Arc<AtomicUsize>>,
 }
 
 impl Engine {
-    async fn run(mut self) {
-        let base = tokio::time::Instant::now();
-        let now = |b: tokio::time::Instant| {
-            SmolInstant::from_micros(i64::try_from(b.elapsed().as_micros()).unwrap_or(i64::MAX))
-        };
-
+    /// Builds a fresh smoltcp interface over the current device (whose `mtu`
+    /// reflects the latest live budget), re-adding this engine's addressing and
+    /// default routes. Needed both at startup and on a live MTU change: smoltcp
+    /// bakes `DeviceCapabilities` into the interface once at construction and
+    /// never re-reads them (`capabilities()` is called only from `Interface::new`),
+    /// so applying a runtime MTU change needs a fresh `Interface`. Existing TCP
+    /// sockets are unaffected: they live in the separate `SocketSet`, not here.
+    fn build_interface(&mut self, now: SmolInstant) -> Interface {
         let mut config = Config::new(HardwareAddress::Ip);
         // Randomize the TCP ISN seed (RFC 6528) rather than a fixed constant.
         config.random_seed = rand::random();
-        let mut iface = Interface::new(config, &mut self.device, now(base));
+        let mut iface = Interface::new(config, &mut self.device, now);
         let v6 = self.ipv6;
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::new(IpAddress::from(self.local_ip), self.prefix));
@@ -718,9 +757,35 @@ impl Engine {
         if let Some(v6) = v6 {
             let _ = iface.routes_mut().add_default_ipv6_route(v6.gateway);
         }
+        iface
+    }
+
+    /// Reads the sink's live transmit budget (if tracked) and, on a genuine
+    /// change, applies it to the device and rebuilds `iface` so smoltcp's
+    /// baked-in capabilities follow a mid-session PMTU shrink or growth (see
+    /// `93-REDUCED-MTU-ADAPTATION.md`). A no-op when nothing changed or no live
+    /// cell is tracked (a fixed-MTU connector).
+    fn refresh_mtu(&mut self, iface: &mut Interface, now: SmolInstant) {
+        let Some(live) = &self.live_mtu else {
+            return;
+        };
+        if let Some(mtu) = next_device_mtu(self.device.mtu, live.load(Ordering::Relaxed)) {
+            self.device.mtu = mtu;
+            *iface = self.build_interface(now);
+        }
+    }
+
+    async fn run(mut self) {
+        let base = tokio::time::Instant::now();
+        let now = |b: tokio::time::Instant| {
+            SmolInstant::from_micros(i64::try_from(b.elapsed().as_micros()).unwrap_or(i64::MAX))
+        };
+
+        let mut iface = self.build_interface(now(base));
         let mut sockets = SocketSet::new(Vec::new());
 
         loop {
+            self.refresh_mtu(&mut iface, now(base));
             while let Ok(cmd) = self.cmd_rx.try_recv() {
                 match cmd {
                     Command::Open(c) => self.open(&mut iface, &mut sockets, c, now(base)),
@@ -1347,6 +1412,14 @@ impl Engine {
 /// (for example a PMTU `TooLarge`) drops that one packet and continues; the
 /// whole datapath only tears down when the tunnel read side closes.
 ///
+/// The engine's device MTU tracks `sink.max_payload()` for the life of the
+/// connector (not just at connect time): both tasks below refresh a shared
+/// cell on every frame they handle, and the engine polls it once per loop
+/// iteration ([`Engine::refresh_mtu`]). This is what heals the reduced-MTU
+/// black-hole (`93-REDUCED-MTU-ADAPTATION.md`): a multihop session's transmit
+/// budget can shrink mid-session (a fresh PMTU probe on the path) or recover,
+/// and smoltcp otherwise bakes in the connect-time MTU forever.
+///
 /// Returns the connector and a liveness watch that flips to `false` when the
 /// tunnel read side closes (the datapath is dead): a caller can surface that as
 /// a disconnect so an app reacts to the leak window.
@@ -1363,10 +1436,13 @@ where
     let (inbound_tx, inbound_rx) = mpsc::channel(FRAME_CHANNEL_DEPTH);
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(FRAME_CHANNEL_DEPTH);
     let (alive_tx, alive_rx) = watch::channel(true);
+    let live_mtu = Arc::new(AtomicUsize::new(config.mtu));
 
     let reader = Arc::clone(&sink);
+    let reader_mtu = Arc::clone(&live_mtu);
     tokio::spawn(async move {
         while let Ok(packet) = reader.recv_packet().await {
+            reader_mtu.store(reader.max_payload(), Ordering::Relaxed);
             if inbound_tx.send(packet).await.is_err() {
                 break;
             }
@@ -1374,15 +1450,20 @@ where
         // The tunnel read side closed (or the engine is gone): signal down.
         let _ = alive_tx.send(false);
     });
+    let writer_mtu = Arc::clone(&live_mtu);
     tokio::spawn(async move {
         while let Some(frame) = outbound_rx.recv().await {
+            writer_mtu.store(sink.max_payload(), Ordering::Relaxed);
             // Drop-and-continue on a per-packet send error; tunnel teardown is
             // detected by the reader task closing `inbound`.
             let _ = sink.send_packet(&frame).await;
         }
     });
 
-    (spawn_engine(config, inbound_rx, outbound_tx), alive_rx)
+    (
+        spawn_engine_inner(config, inbound_rx, outbound_tx, Some(live_mtu)),
+        alive_rx,
+    )
 }
 
 impl crate::proxy::UdpFlow for NetstackUdpSocket {
@@ -1527,6 +1608,7 @@ mod tests {
             cmd_rx,
             inbound: inbound_rx,
             wake: Arc::new(Notify::new()),
+            live_mtu: None,
         };
         let config = Config::new(HardwareAddress::Ip);
         let start = SmolInstant::from_millis(0);
@@ -1573,5 +1655,119 @@ mod tests {
         // The v4 half is untouched by enabling v6.
         assert_eq!(dual.local_ip, base.local_ip);
         assert_eq!(dual.gateway, base.gateway);
+    }
+
+    #[test]
+    fn next_device_mtu_clamps_to_the_floor_and_only_signals_real_changes() {
+        // A shrink above the floor is reported verbatim.
+        assert_eq!(next_device_mtu(1400, 900), Some(900));
+        // No change: reported as `None` so the caller skips the interface rebuild.
+        assert_eq!(next_device_mtu(900, 900), None);
+        // A candidate below the floor is clamped up to it.
+        assert_eq!(next_device_mtu(1400, 100), Some(MIN_NETSTACK_MTU));
+        // Already at the floor, and the candidate clamps to that same floor:
+        // no change reported (a prior refresh already applied it).
+        assert_eq!(next_device_mtu(MIN_NETSTACK_MTU, 50), None);
+        // Growth (a recovered path) is reported too, not just shrinks.
+        assert_eq!(next_device_mtu(900, 1400), Some(1400));
+    }
+
+    /// Parses a raw IPv4/TCP frame's announced MSS option via smoltcp's own
+    /// wire parser (rather than hand-rolled byte offsets, which would just
+    /// duplicate smoltcp's layout assumptions).
+    fn syn_mss(frame: &[u8]) -> u16 {
+        let ip = smoltcp::wire::Ipv4Packet::new_checked(frame).expect("valid ipv4");
+        let tcp = smoltcp::wire::TcpPacket::new_checked(ip.payload()).expect("valid tcp");
+        let repr = smoltcp::wire::TcpRepr::parse(
+            &tcp,
+            &IpAddress::from(ip.src_addr()),
+            &IpAddress::from(ip.dst_addr()),
+            &smoltcp::phy::ChecksumCapabilities::default(),
+        )
+        .expect("valid tcp repr");
+        repr.max_seg_size.expect("SYN carries an MSS option")
+    }
+
+    #[test]
+    fn refresh_mtu_updates_the_mss_smoltcp_announces_in_a_new_syn() {
+        // Proves the live-MTU plumbing reaches smoltcp itself, not just the
+        // `TunnelDevice.mtu` field: smoltcp bakes `DeviceCapabilities` into the
+        // `Interface` once at construction (see `Engine::build_interface`'s
+        // doc), so if `refresh_mtu` only updated the device without rebuilding
+        // the interface, a NEW connection opened after a shrink would still
+        // announce the OLD, oversized MSS and smoltcp would keep emitting
+        // segments too large for the shrunk path.
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+        let (_inbound_tx, inbound_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let live_mtu = Arc::new(AtomicUsize::new(1400));
+        let mut engine = Engine {
+            device: TunnelDevice {
+                rx: VecDeque::new(),
+                tx: outbound_tx,
+                mtu: 1400,
+            },
+            conns: HashMap::new(),
+            resolvers: Vec::new(),
+            dns_cache: HashMap::new(),
+            udp_flows: Vec::new(),
+            listeners: Vec::new(),
+            next_conn_id: 0,
+            next_port: EPHEMERAL_BASE,
+            used_ports: HashSet::new(),
+            local_ip: "10.0.0.2".parse().unwrap(),
+            prefix: 24,
+            gateway: "10.0.0.1".parse().unwrap(),
+            dns_server: "10.0.0.1".parse().unwrap(),
+            ipv6: None,
+            tcp_buffer_bytes: 4096,
+            cmd_rx,
+            inbound: inbound_rx,
+            wake: Arc::new(Notify::new()),
+            live_mtu: Some(Arc::clone(&live_mtu)),
+        };
+        let start = SmolInstant::from_millis(0);
+        let mut iface = engine.build_interface(start);
+        let mut sockets = SocketSet::new(Vec::new());
+
+        // First connection at the initial 1400-byte MTU: announced MSS is
+        // 1400 - 20 (IPv4 header) - 20 (TCP header) = 1360.
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        engine.open(
+            &mut iface,
+            &mut sockets,
+            OpenCommand {
+                addr: "1.2.3.4:80".parse().unwrap(),
+                reply: reply_tx,
+            },
+            start,
+        );
+        while iface.poll(start, &mut engine.device, &mut sockets) != PollResult::None {}
+        let first_syn = outbound_rx.try_recv().expect("first SYN sent");
+        assert_eq!(syn_mss(&first_syn), 1360, "MSS at the initial MTU");
+
+        // Shrink the live budget (a fresh PMTU probe on the underlay) and
+        // refresh: the interface must be rebuilt, not just the device field.
+        live_mtu.store(700, Ordering::Relaxed);
+        engine.refresh_mtu(&mut iface, start);
+        assert_eq!(engine.device.mtu, 700, "the device field itself is updated");
+
+        let (reply_tx2, _reply_rx2) = oneshot::channel();
+        engine.open(
+            &mut iface,
+            &mut sockets,
+            OpenCommand {
+                addr: "1.2.3.4:81".parse().unwrap(),
+                reply: reply_tx2,
+            },
+            start,
+        );
+        while iface.poll(start, &mut engine.device, &mut sockets) != PollResult::None {}
+        let second_syn = outbound_rx.try_recv().expect("second SYN sent");
+        assert_eq!(
+            syn_mss(&second_syn),
+            660,
+            "a NEW connection after the shrink must announce the smaller MSS"
+        );
     }
 }

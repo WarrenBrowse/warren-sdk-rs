@@ -13,6 +13,15 @@ publish.workspace = true
 warren-transport = { path = "../warren-transport" }
 # NAT-PMP wire codec for the port-forwarding client (RFC 6886 + Warren trailer).
 warren-wire = { path = "../warren-wire" }
+# Shared reduced-MTU adaptation helpers (SYN/SYN-ACK MSS clamp, ICMP
+# Fragmentation-Needed / Packet-Too-Big synthesis): the TUN datapath's own pump
+# (`tun_sink`) needs the same sender-side fix the engine's `supervised_pump`
+# already has, since this SDK does not ride that pump. Always-on (not
+# feature-gated): `tun_sink` itself compiles unconditionally.
+warrenguard-transport-core = { workspace = true }
+# The tunnel gateway constants (`TUNNEL_GATEWAY_IP`/`TUNNEL_GATEWAY_IPV6`), used
+# as the reflected ICMP's source address in the TUN uplink pump.
+warrenguard-config = { workspace = true }
 # The TUN bridge needs only the safe seam (the `RawTunDevice` trait + framing) to
 # adapt an injected device to a `PacketSink`; this is the always-on, unsafe-free,
 # privileged-code-free core. The real kernel device open lives in `warren-tun`,

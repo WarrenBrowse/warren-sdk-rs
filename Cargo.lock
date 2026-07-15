@@ -3493,6 +3493,8 @@ dependencies = [
  "warren-tun",
  "warren-tun-core",
  "warren-wire",
+ "warrenguard-config",
+ "warrenguard-transport-core",
 ]
 
 [[package]]
