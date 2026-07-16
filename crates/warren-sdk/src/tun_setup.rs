@@ -9,7 +9,12 @@
 //! killswitch and DNS policy it composes are all in the shared engine crates.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr};
+// `IpAddr` is only spelled by the macOS carrier host-route helpers below (the
+// exit endpoint); on Linux the datapath addresses with Ipv4Addr/Ipv6Addr only,
+// so an unconditional import would be unused there (`-D warnings`).
+#[cfg(target_os = "macos")]
+use std::net::IpAddr;
 use std::process::{Command, Stdio};
 
 /// Runs `argv`, mapping a non-zero exit to an error. The child's stdout/stderr
