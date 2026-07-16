@@ -267,11 +267,11 @@ impl MultihopClientTunnel {
         self
     }
 
-    /// Overrides the QUIC transport config (advanced). The default applies the
-    /// SDK's upstream-quinn settings; a fork-patched system-VPN workspace passes
-    /// the engine's obfuscated config here to match warren-app's anti-DPI
-    /// handshake. The `quinn::TransportConfig` type is fork-agnostic. See
-    /// ARCHITECTURE.md "QUIC handshake obfuscation".
+    /// Overrides the QUIC transport config (advanced). The default is already the
+    /// shared production engine client profile (anti-DPI obfuscation, spin-bit
+    /// defense, fast dead-exit detection), so this is only for a caller that needs
+    /// a bespoke `quinn::TransportConfig`. See ARCHITECTURE.md "QUIC handshake
+    /// obfuscation".
     #[must_use]
     pub fn with_transport_config(mut self, cfg: std::sync::Arc<quinn::TransportConfig>) -> Self {
         self.transport_config = Some(cfg);
@@ -370,9 +370,8 @@ impl MultihopClientTunnel {
         // An explicit override wins; else, when idle cover is on, use the
         // keep-alive-disabled config so the cover driver replaces the beacon.
         let transport_config = self.transport_config.clone().or_else(|| {
-            self.idle_cover.then(|| {
-                std::sync::Arc::new(crate::client::warren_transport_config_with_idle_cover(true))
-            })
+            self.idle_cover
+                .then(|| crate::client::warren_transport_config_with_idle_cover(true))
         });
 
         // In X.509 cover-domain mode, dial the cover domain as the SNI and

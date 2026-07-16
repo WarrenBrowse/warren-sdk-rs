@@ -2,7 +2,6 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use warren_wire::DEVICE_ID_LEN;
@@ -13,17 +12,6 @@ use crate::tls;
 
 /// ALPN offered by the client: IETF HTTP/3, mimicking a casual h3 dial.
 const ALPN_H3: &[u8] = b"h3";
-
-/// Client-side QUIC tuning for a VPN datagram workload. Mirrors warren-core's
-/// pinned constants: large datagram buffers to absorb internet jitter, an idle
-/// timeout and keepalive to detect dead peers and survive NAT expiry, and an
-/// initial MTU of 1280 (IPv6 minimum, safe on every path) to start PMTU
-/// discovery one round trip ahead.
-const DATAGRAM_RECV_BUFFER: usize = 8 * 1024 * 1024;
-const DATAGRAM_SEND_BUFFER: usize = 4 * 1024 * 1024;
-const MAX_IDLE_TIMEOUT_SECS: u64 = 180;
-const KEEP_ALIVE_INTERVAL_SECS: u64 = 20;
-const INITIAL_MTU: u16 = 1280;
 
 /// Resolves the QUIC endpoint bind address: an explicit pin wins; else, when
 /// `auto` is set, the detected default-route source IP (port 0); else `None`
@@ -230,22 +218,18 @@ pub(crate) async fn dial_quic_webpki(
     Ok((endpoint, conn))
 }
 
-pub(crate) fn warren_transport_config() -> quinn::TransportConfig {
-    let mut tc = quinn::TransportConfig::default();
-    tc.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
-    tc.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
-    tc.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_INTERVAL_SECS)));
-    tc.initial_mtu(INITIAL_MTU);
-    // Anti-ossification Initial fragmentation, on by default so every consumer
-    // of this SDK (proxy mode included) presents the same handshake shape: cap
-    // the first CRYPTO fragment and pad the first Initial datagram(s) so the
-    // handshake spans two or more UDP datagrams.
-    tc.initial_crypto_first_fragment_size(Some(64));
-    tc.initial_datagram_min_size(INITIAL_MTU);
-    if let Ok(idle) = quinn::IdleTimeout::try_from(Duration::from_secs(MAX_IDLE_TIMEOUT_SECS)) {
-        tc.max_idle_timeout(Some(idle));
-    }
-    tc
+/// The Warren userland **client** QUIC transport profile: the single,
+/// production-proven engine profile
+/// ([`warrenguard_transport_core::warren_transport_config_client`]), shared with
+/// warren-app and warren-core. The SDK builds on the same warren-quinn fork, so
+/// it consumes this directly rather than keeping a private, drifting copy. It
+/// carries fast dead-exit detection (5 s keep-alive / 25 s idle), the RFC 9312
+/// spin-bit fingerprint defense (`allow_spin(false)`), BBR with tuned windows
+/// and DPLPMTUD from a 1200-byte floor, and the Initial-obfuscation knobs
+/// (ClientHello split + first-datagram padding) every consumer, proxy mode
+/// included, presents.
+pub(crate) fn warren_transport_config() -> Arc<quinn::TransportConfig> {
+    warrenguard_transport_core::warren_transport_config_client()
 }
 
 /// Transport config for ADR-0006 idle cover. When `idle_cover` is true the
@@ -257,24 +241,21 @@ pub(crate) fn warren_transport_config() -> quinn::TransportConfig {
 /// liveness mechanism beyond the idle timeout. With `idle_cover` false this is
 /// identical to [`warren_transport_config`].
 #[must_use]
-pub(crate) fn warren_transport_config_with_idle_cover(idle_cover: bool) -> quinn::TransportConfig {
-    let mut tc = warren_transport_config();
-    if idle_cover {
-        tc.keep_alive_interval(None);
-    }
-    tc
+pub(crate) fn warren_transport_config_with_idle_cover(
+    idle_cover: bool,
+) -> Arc<quinn::TransportConfig> {
+    warrenguard_transport_core::warren_transport_config_client_with_idle_cover(true, idle_cover)
 }
 
 /// Picks the transport config for a dial: an explicit caller override wins, else
-/// the SDK's upstream-quinn default ([`warren_transport_config`]). The override
-/// is how a fork-patched workspace (the privileged system-VPN daemon) injects
-/// the engine's QUIC-Initial obfuscation config without this crate ever naming a
-/// fork-only quinn API, so the SDK keeps building on upstream quinn. See
-/// ARCHITECTURE.md "QUIC handshake obfuscation".
+/// the shared engine client profile ([`warren_transport_config`]). The override
+/// seam is kept for a caller that needs a bespoke `quinn::TransportConfig` (a
+/// custom bench or a differently-tuned datapath); it is not needed to obtain the
+/// obfuscation or liveness profile any more, since that is now the default.
 pub(crate) fn effective_transport_config(
     override_cfg: Option<Arc<quinn::TransportConfig>>,
 ) -> Arc<quinn::TransportConfig> {
-    override_cfg.unwrap_or_else(|| Arc::new(warren_transport_config()))
+    override_cfg.unwrap_or_else(warren_transport_config)
 }
 
 /// Errors from establishing or driving a tunnel.
@@ -487,11 +468,11 @@ impl ClientTunnel {
         self
     }
 
-    /// Overrides the QUIC transport config (advanced). The default applies the
-    /// SDK's upstream-quinn settings; a fork-patched system-VPN workspace passes
-    /// the engine's obfuscated config here to match warren-app's anti-DPI
-    /// handshake. The `quinn::TransportConfig` type is fork-agnostic. See
-    /// ARCHITECTURE.md "QUIC handshake obfuscation".
+    /// Overrides the QUIC transport config (advanced). The default is already the
+    /// shared production engine client profile (anti-DPI obfuscation, spin-bit
+    /// defense, fast dead-exit detection), so this is only for a caller that needs
+    /// a bespoke `quinn::TransportConfig`. See ARCHITECTURE.md "QUIC handshake
+    /// obfuscation".
     #[must_use]
     pub fn with_transport_config(mut self, cfg: Arc<quinn::TransportConfig>) -> Self {
         self.transport_config = Some(cfg);
@@ -626,7 +607,7 @@ impl ClientTunnel {
         // keep-alive-disabled config so the cover driver replaces the beacon.
         let transport_config = self.transport_config.clone().or_else(|| {
             self.idle_cover
-                .then(|| Arc::new(warren_transport_config_with_idle_cover(true)))
+                .then(|| warren_transport_config_with_idle_cover(true))
         });
 
         let policy = crate::tcp_fallback::resolve_fallback_policy(
@@ -1019,7 +1000,7 @@ mod tests {
     fn effective_transport_config_prefers_the_caller_override() {
         // The override is the seam a fork-patched system-VPN workspace uses to
         // inject the engine's obfuscated config; when present it is used verbatim.
-        let custom = Arc::new(warren_transport_config());
+        let custom = warren_transport_config();
         let chosen = effective_transport_config(Some(Arc::clone(&custom)));
         assert!(
             Arc::ptr_eq(&custom, &chosen),
@@ -1029,12 +1010,48 @@ mod tests {
 
     #[test]
     fn effective_transport_config_falls_back_to_the_default() {
-        // No override: a fresh default (SDK upstream-quinn settings) is built.
+        // No override: a fresh default (the shared engine client profile) is built.
         let a = effective_transport_config(None);
         let b = effective_transport_config(None);
         assert!(
             !Arc::ptr_eq(&a, &b),
             "the default path builds a fresh config each call (no shared override)"
+        );
+    }
+
+    #[test]
+    fn default_transport_config_is_the_engine_userland_client_profile() {
+        // Anti-drift: the SDK's default dial profile MUST be the single,
+        // production-proven engine client profile, not a private copy that
+        // silently mirrored the SERVER idle/keep-alive pair. These are the facts
+        // the profile pins and the old SDK copy got wrong: fast dead-exit
+        // detection (5 s keep-alive / 25 s idle, not 20 s / 180 s), the RFC 9312
+        // spin-bit fingerprint defense (allow_spin off), the 1200-byte min-MTU
+        // floor, and the Initial-obfuscation knobs.
+        let rendered = format!("{:?}", warren_transport_config());
+        assert!(
+            rendered.contains("keep_alive_interval: Some(5s)"),
+            "keep-alive must be 5 s (engine client profile), got: {rendered}"
+        );
+        assert!(
+            rendered.contains("max_idle_timeout: Some(25000)"),
+            "idle timeout must be 25 s (engine client profile), got: {rendered}"
+        );
+        assert!(
+            rendered.contains("allow_spin: false"),
+            "the RFC 9312 spin-bit defense must be on (allow_spin false), got: {rendered}"
+        );
+        assert!(
+            rendered.contains("min_mtu: 1200"),
+            "the min-MTU floor must be 1200 (engine client profile), got: {rendered}"
+        );
+        assert!(
+            rendered.contains("initial_crypto_first_fragment_size: Some(64)"),
+            "the ClientHello-split obfuscation knob must be set, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("initial_datagram_min_size: 1280"),
+            "the first-Initial padding obfuscation knob must be set to 1280, got: {rendered}"
         );
     }
 
