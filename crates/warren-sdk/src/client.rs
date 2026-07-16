@@ -749,6 +749,11 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// It also reuses [`Self::connect_multihop`], `warren_tun::device::open_tun`,
     /// `warren_net::tun_channels` and `warren_net::forward_bidirectional`.
     ///
+    /// The datapath is brought up and PROVEN to forward (an in-tunnel DNS probe to
+    /// the exit resolver) BEFORE the fail-closed killswitch is armed and before this
+    /// returns Ok: a datapath that never comes up fails OPEN (host left as found),
+    /// never fail-closed on a dead tunnel.
+    ///
     /// EXPERIMENTAL, Unix-only (Linux + macOS), requires root / `CAP_NET_ADMIN`.
     /// Behind the `experimental-tun` feature.
     ///
@@ -828,16 +833,15 @@ impl<T: HttpTransport> WarrenClient<T> {
         // Bring the device up + address it BEFORE routing (a fresh TUN is down).
         crate::tun_setup::configure_interface(&dev_name, ipv4, ipv6, mtu).map_err(SdkError::Tun)?;
 
-        // Fail-closed FIRST: install the killswitch before any route change so no
-        // window lets traffic escape off-tunnel. The already-connected carrier is
-        // the one allowed exception (its SO_MARK on Linux, its `<exit>` destination
-        // on macOS). Every guard below is RAII: if a later step fails, the ones
-        // installed so far revert on drop, so a partial setup never strands the
-        // host fail-closed or with a captured route.
-        let ks_opts = build_killswitch_opts(exit_ip, &dev_name, socket_bypass);
-        let killswitch = KsBackend::install_with(&ks_opts)
-            .await
-            .map_err(|e| SdkError::Tun(std::io::Error::other(format!("killswitch: {e}"))))?;
+        // Bring the datapath up and PROVE it forwards BEFORE arming the killswitch.
+        // Arming fail-closed first (the reverted B1 order) emitted Connected on a
+        // datapath that never came up and stranded the whole host behind the pf
+        // anchor with a dead tunnel (2026-07-16 macOS outage). Order now: split
+        // capture -> carrier escape -> DNS -> forward -> verify egress -> only then
+        // the killswitch. Every guard here is RAII: on any failure before the
+        // killswitch, the guards installed so far revert on their drops and no
+        // killswitch is left behind, so a broken setup fails OPEN (host left as
+        // found) instead of fail-closed on a tunnel that carries no traffic.
 
         // Split-default capture, single-homed in the engine route-split.
         let route_guard = current_platform()
@@ -845,7 +849,15 @@ impl<T: HttpTransport> WarrenClient<T> {
             .await
             .map_err(|e| SdkError::Tun(std::io::Error::other(format!("route split: {e}"))))?;
 
-        // macOS: the unbound carrier's escape from the `/1` capture.
+        // macOS: the unbound carrier's escape from the `/1` capture. This MUST come
+        // AFTER the split: the engine route-split is built for the socket-keyed
+        // (IP_BOUND_IF) bypass and its install deletes any `<exit>` host route as a
+        // stale destination-keyed leftover. This macOS path deliberately does not
+        // bind the carrier (the 2026-07-13 IP_BOUND_IF multi-interface blackhole),
+        // so it needs the `<exit>/32` escape instead; adding it after the split lets
+        // the more-specific host route win and keeps the QUIC carrier off the tunnel
+        // (before the split deleted it, the carrier looped into its own tunnel and
+        // downlink was zero).
         #[cfg(target_os = "macos")]
         let carrier_route = {
             crate::tun_setup::add_carrier_host_route_macos(exit_ip, &phys_gateway)
@@ -860,10 +872,30 @@ impl<T: HttpTransport> WarrenClient<T> {
             .await
             .map_err(|e| SdkError::Tun(std::io::Error::other(format!("dns push: {e}"))))?;
 
+        // Start forwarding so the device actually carries traffic, then verify.
         let (tun_sink, bridge) =
             warren_net::tun_channels(device, warren_tun::Framing::for_target_os(), mtu);
         let driver = tokio::spawn(bridge.run());
         let pump = tokio::spawn(warren_net::forward_bidirectional(tun_sink, sink));
+
+        // Verify the tunnel forwards end to end, then (and only then) arm the
+        // killswitch. On a dead verdict or a killswitch error the helper aborts the
+        // forwarding tasks and returns Err; `route_guard`, `dns_guard` and the macOS
+        // `carrier_route` revert on their drops here, so the host fails open.
+        let killswitch = arm_killswitch_on_verified_egress(
+            verify_tunnel_egress,
+            move || async move {
+                KsBackend::install_with(&build_killswitch_opts(exit_ip, &dev_name, socket_bypass))
+                    .await
+                    .map_err(|e| SdkError::Tun(std::io::Error::other(format!("killswitch: {e}"))))
+            },
+            || {
+                driver.abort();
+                pump.abort();
+            },
+        )
+        .await?;
+
         Ok(TunDatapathHandle {
             driver,
             pump,
@@ -1251,6 +1283,140 @@ fn build_killswitch_opts(
     }
 }
 
+/// Arms the fail-closed killswitch ONLY once `verify` has proven the datapath
+/// forwards, and never otherwise. On a failed verification, or a killswitch
+/// install error, it runs `abort` (tearing down the forwarding tasks) and returns
+/// the error WITHOUT a killswitch, so a datapath that never comes up fails OPEN,
+/// leaving the host as found rather than stranded behind a fail-closed anchor with
+/// a dead tunnel (the reverted B1 order caused exactly that, the 2026-07-16 macOS
+/// outage). Generic over the killswitch type so this ordering invariant is unit
+/// tested with fakes: `start_tun_multihop` itself needs a real device + privilege.
+#[cfg(all(unix, feature = "experimental-tun"))]
+async fn arm_killswitch_on_verified_egress<K, VFut, AFut>(
+    verify: impl FnOnce() -> VFut,
+    arm: impl FnOnce() -> AFut,
+    abort: impl FnOnce(),
+) -> Result<K, SdkError>
+where
+    VFut: std::future::Future<Output = Result<(), SdkError>>,
+    AFut: std::future::Future<Output = Result<K, SdkError>>,
+{
+    if let Err(e) = verify().await {
+        abort();
+        return Err(e);
+    }
+    match arm().await {
+        Ok(killswitch) => Ok(killswitch),
+        Err(e) => {
+            abort();
+            Err(e)
+        }
+    }
+}
+
+/// Total wall-clock budget for [`verify_tunnel_egress`]: a freshly dialled circuit
+/// can take a beat to forward its first datagrams, so retry within this window.
+#[cfg(all(unix, feature = "experimental-tun"))]
+const TUN_EGRESS_VERIFY_BUDGET: std::time::Duration = std::time::Duration::from_secs(12);
+/// Gap between egress-verification attempts within the budget.
+#[cfg(all(unix, feature = "experimental-tun"))]
+const TUN_EGRESS_VERIFY_RETRY_GAP: std::time::Duration = std::time::Duration::from_millis(500);
+/// Per-attempt wait for an in-tunnel DNS answer (two sends inside).
+#[cfg(all(unix, feature = "experimental-tun"))]
+const TUN_EGRESS_VERIFY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Retransmit offset of the second datagram in one attempt, so a single lost UDP
+/// packet does not fail the attempt.
+#[cfg(all(unix, feature = "experimental-tun"))]
+const TUN_EGRESS_VERIFY_RETRANSMIT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Name the verification resolves: Warren infrastructure, queried against Warren's
+/// own exit resolver, so no third party learns anything.
+#[cfg(all(unix, feature = "experimental-tun"))]
+const TUN_EGRESS_VERIFY_QNAME: &str = "warrenbrowse.com";
+
+/// Proves the freshly brought-up TUN datapath actually forwards, by resolving a
+/// name through the in-tunnel gateway resolver ([`TUNNEL_GATEWAY_IP`]). The
+/// gateway is reachable only across the new device (its point-to-point peer, and
+/// the `/1` split capture), so a genuine matching DNS answer proves the whole
+/// chain: device up + addressed, routes captured, and the exit decapsulating and
+/// forwarding. Retried over [`TUN_EGRESS_VERIFY_BUDGET`].
+///
+/// Strict on purpose, unlike the periodic liveness
+/// [`warren_transport::egress_probe::probe_gateway_dns`] which reports inconclusive
+/// local errors as alive: this gates arming the killswitch, so a bind/connect/send
+/// failure or no answer is "not proven" and must fail open.
+///
+/// # Errors
+///
+/// [`SdkError::Tun`] if no in-tunnel DNS answer arrives within the budget.
+#[cfg(all(unix, feature = "experimental-tun"))]
+async fn verify_tunnel_egress() -> Result<(), SdkError> {
+    let gateway = SocketAddr::new(std::net::IpAddr::V4(TUNNEL_GATEWAY_IP), 53);
+    let deadline = tokio::time::Instant::now() + TUN_EGRESS_VERIFY_BUDGET;
+    loop {
+        if probe_gateway_dns_strict(gateway).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(SdkError::Tun(std::io::Error::other(
+                "tunnel egress not verified: no in-tunnel DNS answer, the datapath \
+                 is not forwarding",
+            )));
+        }
+        tokio::time::sleep(TUN_EGRESS_VERIFY_RETRY_GAP).await;
+    }
+}
+
+/// One strict in-tunnel DNS round trip to `gateway`: `true` only on a genuine
+/// matching answer. A local socket error (bind/connect/send) or a timeout is
+/// `false` (not proven), because a false positive here would arm the killswitch on
+/// a dead datapath.
+#[cfg(all(unix, feature = "experimental-tun"))]
+async fn probe_gateway_dns_strict(gateway: SocketAddr) -> bool {
+    use warren_transport::egress_probe::{build_dns_query, is_matching_response};
+
+    let sock = match tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).await {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if sock.connect(gateway).await.is_err() {
+        return false;
+    }
+    let txid = next_probe_txid();
+    let query = build_dns_query(txid, TUN_EGRESS_VERIFY_QNAME);
+    if sock.send(&query).await.is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    let deadline = tokio::time::Instant::now() + TUN_EGRESS_VERIFY_PROBE_TIMEOUT;
+    let retransmit = tokio::time::sleep(TUN_EGRESS_VERIFY_RETRANSMIT);
+    tokio::pin!(retransmit);
+    let mut retransmitted = false;
+    loop {
+        tokio::select! {
+            () = &mut retransmit, if !retransmitted => {
+                retransmitted = true;
+                let _ = sock.send(&query).await;
+            }
+            recv = sock.recv(&mut buf) => match recv {
+                Ok(n) if is_matching_response(&buf[..n], txid) => return true,
+                Ok(_) => {} // unrelated datagram, keep reading
+                Err(_) => return false,
+            },
+            () = tokio::time::sleep_until(deadline) => return false,
+        }
+    }
+}
+
+/// A per-probe DNS transaction id. Seedless is fine: each probe uses a fresh
+/// ephemeral source port, so a stale datagram from a prior probe never reaches
+/// this socket; the id only guards against an unrelated in-flight answer within
+/// one probe.
+#[cfg(all(unix, feature = "experimental-tun"))]
+fn next_probe_txid() -> u16 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed) as u16
+}
+
 /// macOS: RAII owner of the carrier host-route escape (`<exit>/32` via the
 /// physical gateway). Its `Drop` removes the route, so it is torn down whether
 /// `start_tun_multihop` returns early on a later setup failure or the datapath
@@ -1399,6 +1565,88 @@ mod portfail_tests {
         assert!(
             !rules.is_empty(),
             "the pf sub-anchor killswitch must install rules (fail-closed)"
+        );
+    }
+
+    // A stand-in killswitch: the ordering invariant is exercised without a real
+    // pf/nft install (which needs privilege and a device).
+    #[derive(Debug, PartialEq)]
+    struct FakeKs;
+
+    #[tokio::test]
+    async fn arms_the_killswitch_only_once_egress_is_verified() {
+        let armed = std::cell::Cell::new(false);
+        let aborted = std::cell::Cell::new(false);
+        let ks: FakeKs = arm_killswitch_on_verified_egress(
+            || async { Ok(()) },
+            || async {
+                armed.set(true);
+                Ok(FakeKs)
+            },
+            || aborted.set(true),
+        )
+        .await
+        .expect("a verified datapath must arm the killswitch and connect");
+        assert_eq!(ks, FakeKs);
+        assert!(
+            armed.get(),
+            "the killswitch must be armed once egress is proven"
+        );
+        assert!(
+            !aborted.get(),
+            "a healthy setup must not tear the forwarding datapath down"
+        );
+    }
+
+    #[tokio::test]
+    async fn never_arms_the_killswitch_when_egress_is_not_verified() {
+        // The reverted B1 order armed the killswitch on a datapath that never
+        // forwarded, stranding the host fail-closed with a dead tunnel (the
+        // 2026-07-16 macOS outage). It must fail OPEN instead: NO killswitch, and
+        // the forwarding tasks torn down.
+        let armed = std::cell::Cell::new(false);
+        let aborted = std::cell::Cell::new(false);
+        let err = arm_killswitch_on_verified_egress::<FakeKs, _, _>(
+            || async {
+                Err(SdkError::Tun(std::io::Error::other(
+                    "datapath not forwarding",
+                )))
+            },
+            || async {
+                armed.set(true);
+                Ok(FakeKs)
+            },
+            || aborted.set(true),
+        )
+        .await
+        .expect_err("an unverified datapath must not connect");
+        assert!(matches!(err, SdkError::Tun(_)));
+        assert!(
+            !armed.get(),
+            "the killswitch must NEVER engage on an unverified datapath (fail open)"
+        );
+        assert!(
+            aborted.get(),
+            "the forwarding datapath must be torn down when egress is not proven"
+        );
+    }
+
+    #[tokio::test]
+    async fn tears_down_and_fails_open_when_the_killswitch_install_fails() {
+        // Egress is proven but the killswitch itself cannot install: still abort the
+        // forwarding tasks and surface the error, leaving no killswitch behind.
+        let aborted = std::cell::Cell::new(false);
+        let err = arm_killswitch_on_verified_egress::<FakeKs, _, _>(
+            || async { Ok(()) },
+            || async { Err(SdkError::Tun(std::io::Error::other("pf busy"))) },
+            || aborted.set(true),
+        )
+        .await
+        .expect_err("a killswitch install failure must fail the connect");
+        assert!(matches!(err, SdkError::Tun(_)));
+        assert!(
+            aborted.get(),
+            "a failed killswitch install must tear the datapath down"
         );
     }
 }
