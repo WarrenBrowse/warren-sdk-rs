@@ -1183,23 +1183,22 @@ pub(crate) fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// The carrier-socket bypass for THIS OS given the physical interface index.
-/// Linux keys the tunnel escape on the firewall mark (index unused, matched by
-/// the fwmark `ip rule` and the `meta mark` killswitch accept); macOS binds the
-/// socket to the physical interface index via `IP_BOUND_IF`.
-#[cfg(all(feature = "experimental-tun", target_os = "linux"))]
-fn socket_bypass_from_ifindex(_ifindex: u32) -> SocketBypass {
-    SocketBypass::Fwmark(warren_tun::plan::WARREN_TUNNEL_FWMARK)
-}
-
-// warren-app retired this bare IP_BOUND_IF bind (no /32 host route) after the
-// 2026-07-13 carrier-blackhole incident: on multi-interface hosts it loses ALL
-// egress once the default route swaps (see warren-app talpid-warren-tunnel
-// carrier_egress_guard). Do not promote this experimental-tun path without
-// real-exit multi-interface validation recorded in warren-core docs/49.
-#[cfg(all(feature = "experimental-tun", target_os = "macos"))]
+/// The carrier-socket bypass for THIS OS given the physical interface index,
+/// delegating to the engine's single picker so the SDK never re-derives the
+/// per-OS mechanism (Linux `SO_MARK` keyed on the fwmark, index unused; macOS
+/// `IP_BOUND_IF` bound to the physical interface index). This is the doc-94 B2
+/// repoint: the picker carries the post-incident carrier policy in one home
+/// (`warrenguard_route_split::socket_bypass` + its `carrier_egress_guard`), so
+/// the macOS bind is PREFERRED not mandatory and the guard reverts to the
+/// `<carrier_ip>/32` route escape on a black-holing bind (2026-07-13 incident).
+/// Wiring that guard into this privileged path lands with the route-split
+/// datapath migration (real-exit validated), not this picker repoint.
+#[cfg(all(
+    feature = "experimental-tun",
+    any(target_os = "linux", target_os = "macos")
+))]
 fn socket_bypass_from_ifindex(ifindex: u32) -> SocketBypass {
-    SocketBypass::BoundIf(ifindex)
+    warrenguard_route_split::socket_bypass::tunnel_socket_bypass(ifindex)
 }
 
 /// Parses the physical default-route interface from macOS `netstat -rn -f inet`:
@@ -1341,6 +1340,24 @@ mod portfail_tests {
         );
         #[cfg(target_os = "macos")]
         assert_eq!(socket_bypass_from_ifindex(7), SocketBypass::BoundIf(7));
+    }
+
+    #[test]
+    fn socket_bypass_delegates_to_the_shared_route_split_picker() {
+        // Anti-regrowth pin (doc-94 B2): the SDK must NOT re-derive its own
+        // per-OS carrier bypass; it delegates to the engine's single picker so
+        // the 2026-07-13 post-incident policy (bind-preferred + egress guard)
+        // has one home. If a future change re-open-codes a private SDK picker
+        // that drifts from the engine's, this equality breaks and this test
+        // goes red.
+        for idx in [0_u32, 1, 7, 42, 65535] {
+            assert_eq!(
+                socket_bypass_from_ifindex(idx),
+                warrenguard_route_split::socket_bypass::tunnel_socket_bypass(idx),
+                "the SDK carrier bypass must stay identical to the shared \
+                 warrenguard_route_split picker (no private re-derivation)"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
