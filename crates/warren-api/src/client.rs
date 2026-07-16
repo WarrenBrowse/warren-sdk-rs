@@ -381,52 +381,28 @@ impl<T: HttpTransport> WarrenApiClient<T> {
 
     /// Sends a request through the anti-censorship fallback sequence: the
     /// primary host with SNI, then each alternative host with SNI, then the
-    /// primary host without SNI, then each alternative host without SNI. Only
-    /// connect failures advance the sequence; a connected response (any status)
-    /// or a non-connect transport error stops it. Returns
-    /// [`ClientError::AllHostsBlocked`] if every attempt fails to connect.
+    /// primary host without SNI. Only connect failures advance the sequence; a
+    /// connected response (any status) or a non-connect transport error stops
+    /// it. Returns [`ClientError::AllHostsBlocked`] if every attempt fails to
+    /// connect.
+    ///
+    /// The candidate order is the canonical sequence single-homed in
+    /// [`warren_contract::fallback::fallback_candidates`], so the SDK, the TS
+    /// SDK and warren-core cannot drift (an alt host is only ever tried with
+    /// SNI; only the primary is retried without it).
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, ClientError> {
         let primary_url = request.url.clone();
+        let primary_host = host_of(&primary_url);
 
-        // 1. Primary host, with SNI.
-        match self.attempt(&request).await? {
-            AttemptOutcome::Response(resp) => return self.finish(resp),
-            AttemptOutcome::Blocked => {}
-        }
-
-        // 2. Alternative hosts, with SNI.
-        for host in &self.alternative_hosts {
-            let alt = HttpRequest {
-                url: replace_host(&primary_url, host),
+        for candidate in
+            warren_contract::fallback::fallback_candidates(primary_host, &self.alternative_hosts)
+        {
+            let attempt = HttpRequest {
+                url: replace_host(&primary_url, &candidate.host),
+                use_sni: candidate.sni,
                 ..request.clone()
             };
-            match self.attempt(&alt).await? {
-                AttemptOutcome::Response(resp) => return self.finish(resp),
-                AttemptOutcome::Blocked => {}
-            }
-        }
-
-        // 3. Primary host, without SNI (defeats SNI-based DPI on the primary).
-        let no_sni = HttpRequest {
-            use_sni: false,
-            ..request.clone()
-        };
-        match self.attempt(&no_sni).await? {
-            AttemptOutcome::Response(resp) => return self.finish(resp),
-            AttemptOutcome::Blocked => {}
-        }
-
-        // 4. Alternative hosts, without SNI. Covers a censor that reaches an
-        // alternative ingress IP but drops the Warren SNI in the ClientHello:
-        // the alt is reachable, only the SNI is the tell, so retry it no-SNI
-        // before giving up. Cert validation still binds to the host SAN.
-        for host in &self.alternative_hosts {
-            let alt_no_sni = HttpRequest {
-                url: replace_host(&primary_url, host),
-                use_sni: false,
-                ..request.clone()
-            };
-            match self.attempt(&alt_no_sni).await? {
+            match self.attempt(&attempt).await? {
                 AttemptOutcome::Response(resp) => return self.finish(resp),
                 AttemptOutcome::Blocked => {}
             }
@@ -468,6 +444,18 @@ enum AttemptOutcome {
     Response(HttpResponse),
     /// The host failed to connect; advance to the next host.
     Blocked,
+}
+
+/// Extracts the bare DNS host from an `http(s)://host[:port]/path` URL (no
+/// scheme, no port, no path), the `primary_host` input the canonical fallback
+/// sequence keys on. Returns the whole input if it has no `://` authority.
+fn host_of(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => authority,
+    }
 }
 
 /// Swaps the host of an `http(s)://host[:port]/path` URL, preserving scheme,
@@ -780,15 +768,16 @@ mod tests {
         let c = fallback_client(ScriptedTransport::new(|_| connect_fail()));
         let err = c.list_exits().await.expect_err("all blocked");
         assert!(matches!(err, ClientError::AllHostsBlocked));
-        // primary+SNI, alt+SNI, primary no-SNI, alt no-SNI (one alt configured).
-        assert_eq!(c.transport.attempts.lock().unwrap().len(), 4);
+        // primary+SNI, alt+SNI, primary no-SNI (one alt configured): the
+        // canonical 3-step sequence, never an alt-without-SNI rung.
+        assert_eq!(c.transport.attempts.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
-    async fn fallback_tries_alt_host_without_sni_before_giving_up() {
-        // The alt ingress is reachable but only a no-SNI ClientHello passes
-        // (SNI-based DPI). Everything else is blocked, so the alt-no-SNI rung is
-        // the only path that answers.
+    async fn alternative_host_is_never_tried_without_sni() {
+        // Canonical policy: no-SNI is only ever attempted on the PRIMARY host.
+        // An alt reachable solely over a no-SNI ClientHello is deliberately not
+        // pursued, so a censor cannot be probed for per-alt SNI sensitivity.
         let c = fallback_client(ScriptedTransport::new(|req| {
             if req.url.contains("alt.example.test") && !req.use_sni {
                 ok_200("{}")
@@ -796,11 +785,19 @@ mod tests {
                 connect_fail()
             }
         }));
-        c.list_exits().await.expect("alt no-SNI answers");
+        let err = c
+            .list_exits()
+            .await
+            .expect_err("an alt reachable only no-SNI must not answer");
+        assert!(matches!(err, ClientError::AllHostsBlocked));
         let attempts = c.transport.attempts.lock().unwrap();
-        assert_eq!(attempts.len(), 4);
-        assert!(!attempts[3].use_sni);
-        assert_eq!(attempts[3].url, "https://alt.example.test/v1/exits");
+        assert_eq!(attempts.len(), 3, "no alt-without-SNI rung exists");
+        assert!(
+            !attempts
+                .iter()
+                .any(|a| a.url.contains("alt.example.test") && !a.use_sni),
+            "an alternative host must never be attempted without SNI"
+        );
     }
 
     #[tokio::test]

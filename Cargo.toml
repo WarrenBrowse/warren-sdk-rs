@@ -83,8 +83,8 @@ warrenguard-pump = { git = "https://github.com/WarrenBrowse/warrenguard.git", re
 # downstream consumer with no sibling checkout; local dev and CI override with
 # the `../warren-contract` sibling via the `[patch]` at the foot of this file.
 # Keep the rev in lockstep with `.warren-contract-version`.
-warren-contract = { git = "https://github.com/WarrenBrowse/warren-contract.git", rev = "93074371f93e81d169c6237b02f5ae4217bdd6f8" }
-warren-discovery-core = { git = "https://github.com/WarrenBrowse/warren-contract.git", rev = "93074371f93e81d169c6237b02f5ae4217bdd6f8" }
+warren-contract = { git = "https://github.com/WarrenBrowse/warren-contract.git", rev = "1c8f733689dbfd092f56591a4d16e0b287823526" }
+warren-discovery-core = { git = "https://github.com/WarrenBrowse/warren-contract.git", rev = "1c8f733689dbfd092f56591a4d16e0b287823526" }
 
 # Identity / crypto. Leaf RustCrypto and ecosystem crates, kept minimal
 # so each can be mapped 1:1 to the other language SDKs.
