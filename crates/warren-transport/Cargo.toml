@@ -37,6 +37,9 @@ warrenguard-transport-core = { workspace = true }
 # `CoverDefenses` + `cover_defenses()`: the resolved DAITA / idle-cover knob
 # switch the client builder threads (`ClientTunnel::with_cover_defenses`).
 warrenguard-config = { workspace = true }
+# Single home of the idle-cover scheduler + driver (CoverSink / IdleCoverDriver);
+# the SDK sessions implement the trait and re-export the driver.
+warrenguard-pump = { workspace = true }
 # Full-jitter reconnection backoff, single-homed in the engine (re-exported by
 # the `reconnect` module so the SDK and warren-core share one schedule).
 warrenguard-backoff = { workspace = true }

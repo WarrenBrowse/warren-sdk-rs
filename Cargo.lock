@@ -3626,6 +3626,7 @@ dependencies = [
  "warrenguard-backoff",
  "warrenguard-config",
  "warrenguard-multihop",
+ "warrenguard-pump",
  "warrenguard-socket-bypass",
  "warrenguard-tcp-fallback",
  "warrenguard-tls",

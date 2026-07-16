@@ -9,14 +9,19 @@
 
 pub mod client;
 pub mod daita_driver;
-pub mod idle_cover;
 pub mod multihop;
 pub mod reconnect;
 pub(crate) mod tcp_fallback;
 pub mod tls;
 
 pub use client::{ClientSession, ClientTunnel, TunnelError, local_ip_for_endpoint};
-pub use idle_cover::{CoverSink, IdleCover, IdleCoverDriver, IdleCoverDriverHandle};
+// ADR-0006 idle cover: the scheduler + driver live in the engine
+// (`warrenguard_pump::idle_cover`), the single home. Re-exported here so SDK
+// consumers keep the `warren_transport::{CoverSink, IdleCoverDriver, ..}` path;
+// the SDK's `ClientSession`/`MultihopSession` implement the engine `CoverSink`.
+pub use warrenguard_pump::idle_cover::{
+    CoverSink, IdleCover, IdleCoverDriver, IdleCoverDriverHandle,
+};
 // Re-export so callers can build a custom transport config (e.g. a fork-patched
 // system-VPN workspace injecting the engine's obfuscated config) and pass it to
 // `with_transport_config` without depending on quinn directly. The type is

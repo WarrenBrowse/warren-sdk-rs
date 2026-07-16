@@ -234,7 +234,7 @@ pub(crate) fn warren_transport_config() -> Arc<quinn::TransportConfig> {
 
 /// Transport config for ADR-0006 idle cover. When `idle_cover` is true the
 /// keep-alive PING is DISABLED: the idle cover driver
-/// ([`crate::idle_cover::IdleCoverDriver`]) refreshes the NAT mapping and resets
+/// ([`warrenguard_pump::idle_cover::IdleCoverDriver`]) refreshes the NAT mapping and resets
 /// the idle timeout with jittered, size-varied dummies instead, removing the
 /// fixed keep-alive beacon. The idle timeout still detects a dead exit. The
 /// caller MUST run the cover driver when this is set, or the connection has no
@@ -516,7 +516,7 @@ impl ClientTunnel {
     }
 
     /// Enables ADR-0006 idle cover traffic: the keep-alive PING is disabled and
-    /// the caller drives [`crate::idle_cover::IdleCoverDriver`] over the returned
+    /// the caller drives [`warrenguard_pump::idle_cover::IdleCoverDriver`] over the returned
     /// session so jittered, size-varied dummies replace the fixed keep-alive
     /// beacon. No effect when an explicit [`with_transport_config`](Self::with_transport_config)
     /// override is set (the override's keep-alive wins). Off by default. The
@@ -877,7 +877,7 @@ impl ClientSession {
     }
 }
 
-impl crate::idle_cover::CoverSink for ClientSession {
+impl warrenguard_pump::idle_cover::CoverSink for ClientSession {
     fn send_cover(&self, padding_len: usize) -> bool {
         self.send_cover_traffic(padding_len).is_ok()
     }

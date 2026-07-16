@@ -316,7 +316,7 @@ impl MultihopClientTunnel {
     }
 
     /// Enables ADR-0006 idle cover traffic: the keep-alive PING is disabled and
-    /// the caller drives [`crate::idle_cover::IdleCoverDriver`] over the returned
+    /// the caller drives [`warrenguard_pump::idle_cover::IdleCoverDriver`] over the returned
     /// session so jittered, size-varied dummies replace the fixed keep-alive
     /// beacon. No effect when an explicit
     /// [`with_transport_config`](Self::with_transport_config) override is set. Off
@@ -970,7 +970,7 @@ impl MultihopSession {
     }
 }
 
-impl crate::idle_cover::CoverSink for MultihopSession {
+impl warrenguard_pump::idle_cover::CoverSink for MultihopSession {
     fn send_cover(&self, padding_len: usize) -> bool {
         self.send_cover_traffic(padding_len).is_ok()
     }
