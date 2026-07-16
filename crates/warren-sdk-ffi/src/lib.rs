@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use warren_sdk::api::{ClientError, PubkeySs58, RegisterAccountRequest};
 use warren_sdk::identity::{WarrenIdentity, ss58};
 use warren_sdk::net::{ForwardedPort, MapProto, ProxyConfig};
-use warren_sdk::transport::{Backoff, ConnectionState, RetryError, connect_with_state};
+use warren_sdk::transport::{Backoff, ConnectionState, FatalCause, RetryError, connect_with_state};
 use warren_sdk::{
     DefaultClient, FileGenerationStore, FileServerKeyStore, ProxyForwarder, ProxyHandle, SdkError,
     SupervisedProxyHandle, WarrenClient,
@@ -90,6 +90,28 @@ pub enum FfiConnectionState {
     Draining,
     /// Every attempt failed; the supervisor gave up.
     Failed,
+}
+
+/// Why the supervisor gave up ([`FfiConnectionState::Failed`] with a definitive
+/// cause), mirroring [`warren_sdk::transport::FatalCause`] across the FFI so the
+/// host can distinguish an unauthorized account, a device-limit rejection and an
+/// opaque policy refusal instead of collapsing them to one "tunnel failed" kind.
+/// The engine owns this classification; the binding maps, it never re-decides.
+///
+/// Read via [`WarrenFfiSupervisedProxy::fatal_cause`]. `Failed` reached by mere
+/// retry exhaustion (a transient failure that never resolved) carries NO fatal
+/// cause, so the accessor returns `None` there: a present cause is precisely the
+/// "no redial or other exit will help, tell the user" signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiFatalCause {
+    /// The identity has no active subscription, or is not in the exit allowlist.
+    /// The user must provision or renew; retrying reproduces it.
+    NotAuthorized,
+    /// The account already holds its maximum simultaneous devices.
+    DeviceLimit,
+    /// The exit closed with the opaque policy-rejection code and no sealed cause
+    /// arrived: definitive, but the specific reason is unknown to the client.
+    PolicyRefused,
 }
 
 /// Receives connection-state transitions during [`WarrenFfiClient::start_proxy`].
@@ -1103,6 +1125,21 @@ impl WarrenFfiSupervisedProxy {
             .unwrap_or(FfiConnectionState::Failed)
     }
 
+    /// The definitive cause behind a [`FfiConnectionState::Failed`], or `None`
+    /// when the state is not a fatal give-up (still connecting/retrying, or
+    /// `Failed` only by transient-retry exhaustion). The host reads this on a
+    /// `Failed` transition to tell an unauthorized account, a device-limit
+    /// rejection and an opaque policy refusal apart, instead of looping
+    /// "Reconnecting" forever on a rejection no redial can fix.
+    #[must_use]
+    pub fn fatal_cause(&self) -> Option<FfiFatalCause> {
+        self.handle
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|h| h.last_fatal()))
+            .map(map_fatal_cause)
+    }
+
     /// Stops the supervisor and tears down the datapath, and stops forwarding
     /// state to the observer. Idempotent.
     pub fn shutdown(&self) {
@@ -1145,6 +1182,19 @@ fn map_connection_state(state: ConnectionState) -> Option<FfiConnectionState> {
         ConnectionState::Draining => Some(FfiConnectionState::Draining),
         ConnectionState::Failed => Some(FfiConnectionState::Failed),
         _ => None,
+    }
+}
+
+/// Maps the engine's fatal verdict to its FFI mirror. `FatalCause` is
+/// `#[non_exhaustive]`: a future cause the binding does not yet model degrades to
+/// [`FfiFatalCause::PolicyRefused`] (still surfaced as a definitive refusal, never
+/// silently dropped into a retry loop) until the binding adds an explicit arm.
+fn map_fatal_cause(cause: FatalCause) -> FfiFatalCause {
+    match cause {
+        FatalCause::NotAuthorized => FfiFatalCause::NotAuthorized,
+        FatalCause::DeviceLimit => FfiFatalCause::DeviceLimit,
+        FatalCause::PolicyRefused => FfiFatalCause::PolicyRefused,
+        _ => FfiFatalCause::PolicyRefused,
     }
 }
 
@@ -1808,6 +1858,30 @@ mod tests {
             states.contains(&FfiConnectionState::Reconnecting),
             "retries report Reconnecting"
         );
+    }
+
+    #[test]
+    fn fatal_cause_kinds_stay_distinguishable_across_the_ffi() {
+        // The A4 guarantee: the engine's three definitive fatal causes must reach
+        // the host as distinct kinds, not collapse to one opaque "failed", so a
+        // subscription lapse, a device-limit rejection and an opaque policy
+        // refusal each drive their own UI instead of an endless "Reconnecting".
+        assert_eq!(
+            map_fatal_cause(FatalCause::NotAuthorized),
+            FfiFatalCause::NotAuthorized
+        );
+        assert_eq!(
+            map_fatal_cause(FatalCause::DeviceLimit),
+            FfiFatalCause::DeviceLimit
+        );
+        assert_eq!(
+            map_fatal_cause(FatalCause::PolicyRefused),
+            FfiFatalCause::PolicyRefused
+        );
+        // No two engine causes may collapse to the same FFI kind.
+        assert_ne!(FfiFatalCause::NotAuthorized, FfiFatalCause::DeviceLimit);
+        assert_ne!(FfiFatalCause::DeviceLimit, FfiFatalCause::PolicyRefused);
+        assert_ne!(FfiFatalCause::NotAuthorized, FfiFatalCause::PolicyRefused);
     }
 
     #[test]
