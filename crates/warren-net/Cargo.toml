@@ -22,6 +22,10 @@ warrenguard-transport-core = { workspace = true }
 # The tunnel gateway constants (`TUNNEL_GATEWAY_IP`/`TUNNEL_GATEWAY_IPV6`), used
 # as the reflected ICMP's source address in the TUN uplink pump.
 warrenguard-config = { workspace = true }
+# Single home of the idle-cover driver (ADR-0006): the sinks arm teardown-safe
+# cover over their session so the userland datapath emits the same jittered,
+# size-varied idle footprint as the app, instead of the fixed keep-alive PING.
+warrenguard-pump = { workspace = true }
 # The TUN bridge needs only the safe seam (the `RawTunDevice` trait + framing) to
 # adapt an injected device to a `PacketSink`; this is the always-on, unsafe-free,
 # privileged-code-free core. The real kernel device open lives in `warren-tun`,
@@ -61,6 +65,9 @@ experimental-tun = ["dep:warren-tun", "warren-tun/experimental-tun"]
 tokio = { workspace = true, features = ["test-util"] }
 ed25519-dalek = { workspace = true }
 warren-test-support = { path = "../warren-test-support" }
+# Build a real DAITA driver handle to prove the idle-cover / DAITA mutual
+# exclusion at the sink boundary.
+warren-daita = { path = "../warren-daita" }
 # Golden-byte assertions for the DNS codec tests.
 hex = { workspace = true }
 # Bytes for the UDP-flow connector used in the UDP-associate proxy test.

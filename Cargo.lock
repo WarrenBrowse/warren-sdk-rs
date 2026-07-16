@@ -3488,12 +3488,14 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "warren-daita",
  "warren-test-support",
  "warren-transport",
  "warren-tun",
  "warren-tun-core",
  "warren-wire",
  "warrenguard-config",
+ "warrenguard-pump",
  "warrenguard-transport-core",
 ]
 

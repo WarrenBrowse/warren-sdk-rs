@@ -454,6 +454,10 @@ impl<T: HttpTransport> WarrenClient<T> {
             return Err(SdkError::CoverDomainUnsupported);
         }
         let addr: SocketAddr = *exit.addrs().first().ok_or(SdkError::NoExitAddress)?;
+        // Resolve the coupled cover-defense switch from the engine knobs (idle
+        // cover default ON, DAITA mutual exclusion), the single home shared with
+        // the app, so the SDK never runs cover off while the fleet assumes it on.
+        let cover = warrenguard_config::knobs::cover_defenses();
         let mut tunnel = ClientTunnel::new(self.signing.clone());
         if self.auto_local_ip {
             tunnel = tunnel.with_auto_local_ip();
@@ -461,12 +465,17 @@ impl<T: HttpTransport> WarrenClient<T> {
         if let Some(cfg) = &self.transport_config {
             tunnel = tunnel.with_transport_config(cfg.clone());
         }
+        if cover.idle_cover {
+            // Disable the fixed keep-alive PING; the armed cover driver replaces
+            // it with a jittered, size-varied idle footprint.
+            tunnel = tunnel.with_idle_cover(true);
+        }
         let session = tunnel.connect(exit.endpoint_id(), addr).await?;
         // Feed the RTT proximity cache (doc 52 §6.2 client): the smoothed path RTT is
         // available post-handshake. Record it keyed by exit before wrapping
         // the session, so later selections can prefer nearer exits.
         self.record_rtt(exit.endpoint_id(), session.path_rtt());
-        Ok(QuicPacketSink::new(session))
+        Ok(QuicPacketSink::new(session).arm_idle_cover(cover.idle_cover))
     }
 
     /// Record a measured path RTT for the exit identified by its Ed25519
@@ -651,6 +660,11 @@ impl<T: HttpTransport> WarrenClient<T> {
         exit: &VerifiedExit,
         socket_bypass: Option<SocketBypass>,
     ) -> Result<MultihopPacketSink, SdkError> {
+        // Resolve the coupled cover-defense switch from the engine knobs (idle
+        // cover default ON, DAITA mutual exclusion), the single home shared with
+        // the app. The SDK's DAITA is builder-driven (`self.daita`), so cover is
+        // armed only on the non-DAITA path below.
+        let cover = warrenguard_config::knobs::cover_defenses();
         let mut tunnel = MultihopClientTunnel::new(self.signing.clone());
         if self.auto_local_ip {
             tunnel = tunnel.with_auto_local_ip();
@@ -676,6 +690,12 @@ impl<T: HttpTransport> WarrenClient<T> {
         if let Some(bypass) = socket_bypass {
             tunnel = tunnel.with_socket_bypass(bypass);
         }
+        if !self.daita && cover.idle_cover {
+            // Disable the fixed keep-alive PING; the armed cover driver replaces
+            // it with a jittered, size-varied idle footprint. DAITA runs its own
+            // cover, so this is the non-DAITA path only.
+            tunnel = tunnel.with_idle_cover(true);
+        }
         let session = tunnel
             .connect(
                 exit.exit_ed25519_pubkey,
@@ -689,7 +709,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         // Ed25519 endpoint pubkey, the same key the selector looks up.
         self.record_rtt(exit.exit_ed25519_pubkey, session.path_rtt());
         if !self.daita {
-            return Ok(MultihopPacketSink::new(session));
+            return Ok(MultihopPacketSink::new(session).arm_idle_cover(cover.idle_cover));
         }
         // DAITA on: pick the uplink machine, build the driver over a shared
         // session, and spawn its padding loop. The loop self-terminates when the

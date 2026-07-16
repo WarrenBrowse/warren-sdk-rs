@@ -12,8 +12,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
 use warren_transport::{ClientSession, DaitaDriverHandle, MultihopSession};
+use warrenguard_pump::idle_cover::{CoverSink, CoverStop, run_idle_cover};
 
 use crate::error::NetError;
+
+/// Arms teardown-safe idle cover over `session` when `enabled`, spawning the
+/// engine cover loop and returning the drop-to-stop guard the datapath owns.
+///
+/// `run_idle_cover` holds only a WEAK reference to the session, so cover can
+/// never keep a torn-down tunnel alive (the leak class: a strong-ref driver plus
+/// the idle timeout that cover keeps resetting). Dropping the returned
+/// [`CoverStop`] (when the owning sink is dropped) stops the loop promptly; the
+/// weak reference is the safety net if the guard is somehow leaked.
+fn arm_idle_cover_over<S: CoverSink>(session: &Arc<S>, enabled: bool) -> Option<CoverStop> {
+    enabled.then(|| {
+        let (fut, stop) = run_idle_cover(session);
+        tokio::spawn(fut);
+        stop
+    })
+}
 
 /// Moves inner IP packets to and from the tunnel.
 pub trait PacketSink: Send + Sync {
@@ -91,22 +108,55 @@ pub trait PacketSink: Send + Sync {
 }
 
 /// A [`PacketSink`] backed by a QUIC tunnel session (RFC 9221 datagrams).
-#[derive(Debug)]
 pub struct QuicPacketSink {
-    session: ClientSession,
+    session: Arc<ClientSession>,
+    /// Drop-to-stop guard for the idle-cover loop, when armed (see
+    /// [`Self::arm_idle_cover`]). Held here so cover is torn down with the sink
+    /// (the connection lifecycle) and never outlives the tunnel.
+    cover: Option<CoverStop>,
+}
+
+// Manual Debug: `CoverStop` is not Debug, and the guard has no observable state
+// worth rendering, so it is omitted.
+impl std::fmt::Debug for QuicPacketSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicPacketSink")
+            .field("session", &self.session)
+            .finish_non_exhaustive()
+    }
 }
 
 impl QuicPacketSink {
-    /// Wraps an established session.
+    /// Wraps an established session (idle cover not yet armed).
     #[must_use]
     pub fn new(session: ClientSession) -> Self {
-        Self { session }
+        Self {
+            session: Arc::new(session),
+            cover: None,
+        }
+    }
+
+    /// Arms teardown-safe idle cover over the session when `idle_cover` is set,
+    /// so the userland datapath emits the jittered, size-varied idle footprint
+    /// instead of the fixed keep-alive PING. The stop guard is owned by this
+    /// sink, so cover is torn down when the sink (the datapath) is dropped.
+    #[must_use]
+    pub fn arm_idle_cover(mut self, idle_cover: bool) -> Self {
+        self.cover = arm_idle_cover_over(&self.session, idle_cover);
+        self
     }
 
     /// The underlying session.
     #[must_use]
     pub fn session(&self) -> &ClientSession {
         &self.session
+    }
+
+    /// True while the idle-cover loop is armed for this sink (the datapath is
+    /// emitting the jittered cover footprint instead of the keep-alive PING).
+    #[must_use]
+    pub fn cover_is_armed(&self) -> bool {
+        self.cover.is_some()
     }
 }
 
@@ -140,10 +190,14 @@ pub struct MultihopPacketSink {
     /// When present, real traffic is reported to a DAITA driver so it can
     /// schedule uplink cover traffic (the driver itself emits via the session).
     daita: Option<DaitaDriverHandle>,
+    /// Drop-to-stop guard for the idle-cover loop, when armed (see
+    /// [`Self::arm_idle_cover`]). Held here so cover is torn down with the sink
+    /// (the connection lifecycle) and never outlives the tunnel.
+    cover: Option<CoverStop>,
 }
 
 impl MultihopPacketSink {
-    /// Wraps an established multihop session (no DAITA defense).
+    /// Wraps an established multihop session (no DAITA defense, cover not armed).
     #[must_use]
     pub fn new(session: MultihopSession) -> Self {
         Self::from_arc(Arc::new(session), None)
@@ -154,7 +208,30 @@ impl MultihopPacketSink {
     /// sink (which carries real traffic) drive the same tunnel.
     #[must_use]
     pub fn from_arc(session: Arc<MultihopSession>, daita: Option<DaitaDriverHandle>) -> Self {
-        Self { session, daita }
+        Self {
+            session,
+            daita,
+            cover: None,
+        }
+    }
+
+    /// Arms teardown-safe idle cover over the session when `idle_cover` is set
+    /// AND DAITA is not active on this sink (the engine's mutual exclusion: DAITA
+    /// already rains its own cover, so idle cover must not double it). The stop
+    /// guard is owned by this sink, so cover is torn down when the sink (the
+    /// datapath) is dropped and never outlives the tunnel.
+    #[must_use]
+    pub fn arm_idle_cover(mut self, idle_cover: bool) -> Self {
+        let enabled = idle_cover && self.daita.is_none();
+        self.cover = arm_idle_cover_over(&self.session, enabled);
+        self
+    }
+
+    /// True while the idle-cover loop is armed for this sink (the datapath is
+    /// emitting the jittered cover footprint instead of the keep-alive PING).
+    #[must_use]
+    pub fn cover_is_armed(&self) -> bool {
+        self.cover.is_some()
     }
 
     /// The underlying session.
@@ -396,6 +473,128 @@ mod tests {
         assert_eq!(
             got,
             vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
+        );
+    }
+
+    /// A fake cover-session boundary: counts the cover datagrams the driver
+    /// asks it to send, so a test observes cover starting and stopping. The
+    /// concrete tunnel session is a system boundary here (a real network
+    /// object), so a fake at the `CoverSink` seam is the right test double.
+    struct RecordingCoverSink {
+        sent: std::sync::Mutex<usize>,
+    }
+    impl CoverSink for RecordingCoverSink {
+        fn send_cover(&self, _padding_len: usize) -> bool {
+            *self.sent.lock().unwrap() += 1;
+            true
+        }
+        fn max_inner_payload(&self) -> usize {
+            1280
+        }
+        fn cover_seed(&self) -> u64 {
+            0x51
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arming_drives_cover_then_stops_when_the_guard_is_dropped() {
+        let session = Arc::new(RecordingCoverSink {
+            sent: std::sync::Mutex::new(0),
+        });
+        let guard = arm_idle_cover_over(&session, true).expect("an enabled gate must arm cover");
+
+        // Cover must flow while the datapath (which owns the guard) is alive.
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            *session.sent.lock().unwrap() > 0,
+            "cover must be emitted while the stop guard is held"
+        );
+
+        // Dropping the guard is the teardown path: the loop must stop, so no
+        // further cover is emitted even after more idle intervals elapse. The
+        // session stays strong-held here, so ONLY the guard drop can stop it.
+        drop(guard);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let after_teardown = *session.sent.lock().unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *session.sent.lock().unwrap(),
+            after_teardown,
+            "dropping the CoverStop guard must stop cover: it never outlives the datapath"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arming_is_a_noop_when_the_gate_is_off() {
+        let session = Arc::new(RecordingCoverSink {
+            sent: std::sync::Mutex::new(0),
+        });
+        assert!(
+            arm_idle_cover_over(&session, false).is_none(),
+            "a disabled gate must not arm cover"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *session.sent.lock().unwrap(),
+            0,
+            "no cover datagram may be emitted when the gate is off"
+        );
+    }
+
+    async fn loopback_multihop_session() -> MultihopSession {
+        use ed25519_dalek::SigningKey;
+        use warren_test_support::spawn_fake_multihop_exit;
+        use warren_transport::MultihopClientTunnel;
+
+        let exit_key = SigningKey::from_bytes(&[6u8; 32]);
+        let (exit_addr, keys) = spawn_fake_multihop_exit(exit_key).await;
+        MultihopClientTunnel::new(SigningKey::from_bytes(&[3u8; 32]))
+            .connect(
+                keys.ed25519_pubkey,
+                keys.x25519_pubkey,
+                keys.exit_id,
+                exit_addr,
+            )
+            .await
+            .expect("loopback multihop connect")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multihop_sink_arms_cover_only_when_the_gate_is_on() {
+        let armed = MultihopPacketSink::new(loopback_multihop_session().await).arm_idle_cover(true);
+        assert!(
+            armed.cover_is_armed(),
+            "the enabled idle-cover gate must arm the sink's cover loop"
+        );
+
+        let off = MultihopPacketSink::new(loopback_multihop_session().await).arm_idle_cover(false);
+        assert!(
+            !off.cover_is_armed(),
+            "a disabled gate must leave the sink cover unarmed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multihop_sink_never_arms_cover_when_daita_is_active() {
+        // DAITA rains its own cover, so idle cover must not double it (the engine
+        // mutual exclusion): even with the idle gate on, a DAITA-active sink stays
+        // unarmed.
+        let session = Arc::new(loopback_multihop_session().await);
+        let cfg = warren_daita::DaitaPool::default_pool()
+            .pick_os()
+            .expect("the default DAITA pool is non-empty");
+        let state = warren_daita::DaitaState::from_config(&cfg, std::time::Instant::now())
+            .expect("DAITA state builds from a curated config");
+        let handle = warren_transport::DaitaDriver::new(Arc::clone(&session), state).handle();
+
+        let sink = MultihopPacketSink::from_arc(session, Some(handle)).arm_idle_cover(true);
+        assert!(
+            !sink.cover_is_armed(),
+            "an active-DAITA sink must not also arm idle cover (mutual exclusion)"
         );
     }
 }
