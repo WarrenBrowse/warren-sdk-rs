@@ -328,6 +328,20 @@ pub enum TunnelError {
     /// The account already has the maximum number of simultaneous devices.
     #[error("device limit reached for this account")]
     DeviceLimitReached,
+    /// The exit is draining for planned maintenance and refused this NEW
+    /// session. The account is fine, but redialing THIS exit re-hits the
+    /// refusal, so the caller reselects another exit
+    /// ([`Retryability::RetryReselect`](warrenguard_transport::Retryability)).
+    /// Distinct from [`TunnelError::Internal`] so the engine's
+    /// `ExitDrainingRefused` keeps its reselect signal instead of being
+    /// flattened.
+    #[error("exit is draining: new sessions refused")]
+    ExitDraining,
+    /// The exit's tunnel IP pool is exhausted. Like [`TunnelError::ExitDraining`]
+    /// this reselects a different exit rather than surfacing fatal or hammering
+    /// the full one (aligns with multi-hop `IpExhausted`, audit C3.3).
+    #[error("exit ip pool exhausted")]
+    PoolExhausted,
     /// Catch-all for a delegated engine transport error that cannot occur on
     /// the codepath [`ClientTunnel::connect`] delegates to (dial-time-only,
     /// exit-side-only, or TUN/DAITA variants); kept so [`map_engine_err`]
@@ -335,6 +349,23 @@ pub enum TunnelError {
     /// as it grows.
     #[error("internal tunnel error: {0}")]
     Internal(String),
+}
+
+impl TunnelError {
+    /// The engine's reconnect verdict for this failure, mapped (never
+    /// re-decided) from the engine's own classification: business rejections
+    /// are fatal, the drain/pool-exhaustion refusals reselect another exit, and
+    /// every transport-level loss retries the same target.
+    #[must_use]
+    pub fn retryability(&self) -> warrenguard_transport::Retryability {
+        use warrenguard_transport::{FatalCause, Retryability};
+        match self {
+            TunnelError::AuthRejected => Retryability::Fatal(FatalCause::NotAuthorized),
+            TunnelError::DeviceLimitReached => Retryability::Fatal(FatalCause::DeviceLimit),
+            TunnelError::ExitDraining | TunnelError::PoolExhausted => Retryability::RetryReselect,
+            _ => Retryability::RetrySameTarget,
+        }
+    }
 }
 
 /// Maps a delegated engine
@@ -357,6 +388,11 @@ fn map_engine_err(e: EngineTunnelError) -> TunnelError {
         E::ExitAuthFailed => TunnelError::ExitIdentityMismatch,
         E::AuthRejected => TunnelError::AuthRejected,
         E::DeviceLimitReached => TunnelError::DeviceLimitReached,
+        // Carry the reselect-worthy refusals with their own kinds instead of
+        // flattening them to `Internal` (which loses the "re-select another
+        // exit" signal the supervisor needs).
+        E::ExitDrainingRefused => TunnelError::ExitDraining,
+        E::PoolExhausted => TunnelError::PoolExhausted,
         E::QuicStream { source, .. } | E::SetupWire { source, .. } => TunnelError::HandshakeIo {
             context: "setup handshake",
             source,

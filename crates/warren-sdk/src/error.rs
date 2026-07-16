@@ -114,6 +114,22 @@ impl SdkError {
     pub fn is_port_conflict(&self) -> bool {
         matches!(self, Self::PortForward(e) if e.is_suggested_port_conflict())
     }
+
+    /// The engine's reconnect verdict for a (re)connect failure, mapped (never
+    /// re-decided) from the transport error the engine classified. A supervisor
+    /// consults it to STOP on a fatal business rejection, reselect a different
+    /// exit on a drain/exhaustion refusal, or retry the same target on a
+    /// transient loss. Non-transport failures (pre-dial API/discovery/config
+    /// errors) retry the same target: they are the connect step's own transient
+    /// failures, not an exit-driven verdict.
+    #[must_use]
+    pub fn retryability(&self) -> warren_transport::Retryability {
+        match self {
+            SdkError::Multihop(e) => e.retryability(),
+            SdkError::Tunnel(e) => e.retryability(),
+            _ => warren_transport::Retryability::RetrySameTarget,
+        }
+    }
 }
 
 /// Reasons [`WarrenClientBuilder::build`](crate::WarrenClientBuilder::build) can

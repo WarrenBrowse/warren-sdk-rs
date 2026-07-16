@@ -149,6 +149,43 @@ impl From<QuicDialError> for MultihopError {
     }
 }
 
+impl MultihopError {
+    /// The engine's reconnect verdict for this dial/setup failure, mapped (never
+    /// re-decided) from the engine's own classification.
+    ///
+    /// The setup-policy verdict is owned by the engine's `SetupError` (a policy
+    /// rejection is fatal, exhaustion reselects). A dial that closed with the
+    /// exit's maintenance-drain code reselects another exit (redialing this
+    /// circuit re-hits the drain), matching the engine's
+    /// `MultiHopError::dial_refusal` classification. Everything else is a
+    /// transient dial failure worth retrying the same target.
+    #[must_use]
+    pub fn retryability(&self) -> warrenguard_transport::Retryability {
+        use warrenguard_transport::Retryability;
+        match self {
+            MultihopError::Setup(e) => e.retryability(),
+            MultihopError::Quic { source, .. } | MultihopError::ReadDatagram(source)
+                if is_exit_drain_close(source) =>
+            {
+                Retryability::RetryReselect
+            }
+            _ => Retryability::RetrySameTarget,
+        }
+    }
+}
+
+/// Whether a QUIC connection error is the exit's maintenance-drain application
+/// close (`WARREN_MH_DRAINING`): a reselect signal, not a transient loss. Reads
+/// the engine's wire constant, so the SDK maps the engine's decision rather than
+/// re-deciding the policy.
+fn is_exit_drain_close(err: &quinn::ConnectionError) -> bool {
+    matches!(
+        err,
+        quinn::ConnectionError::ApplicationClosed(ac)
+            if u64::from(ac.error_code) == u64::from(warrenguard_multihop::WARREN_MH_DRAINING)
+    )
+}
+
 /// Maps a delegated engine [`warrenguard_transport::multihop::MultiHopError`] to
 /// this crate's [`MultihopError`]. Precise for the variants reachable from the
 /// calls this wrapper actually makes

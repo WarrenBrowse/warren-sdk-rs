@@ -45,11 +45,11 @@ fn production_directory_yields_entry_distinct_circuits() {
     let entry = dir
         .entries
         .iter()
-        .find(|e| e.exit_id != exit.exit_id)
-        .expect("the production fleet has at least two nodes");
+        .find(|e| dir.policy.permits(e, exit))
+        .expect("the production fleet offers a country/AS-diverse entry");
     let dialed = exit
-        .via_entry(entry)
-        .expect("distinct nodes form a circuit");
+        .via_entry(entry, &dir.policy)
+        .expect("a policy-permitted pair forms a circuit");
     assert_eq!(dialed.endpoint, entry.endpoint, "dial target is the entry");
     assert_eq!(
         dialed.exit_id, exit.exit_id,
@@ -61,5 +61,8 @@ fn production_directory_yields_entry_distinct_circuits() {
         .iter()
         .find(|e| e.exit_id == exit.exit_id)
         .expect("the exit's own node is an entry too");
-    assert!(exit.via_entry(same).is_none(), "entry == exit node refused");
+    assert!(
+        exit.via_entry(same, &dir.policy).is_none(),
+        "entry == exit node refused"
+    );
 }

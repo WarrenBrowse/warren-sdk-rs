@@ -32,6 +32,10 @@ pub use reconnect::{
     connect_with_state,
 };
 pub use tls::{WarrenTlsError, default_crypto_provider, make_client_config, make_server_config};
+// The engine's reconnect verdict (fatal / retry-same / retry-reselect) and its
+// fatal cause, re-exported so a supervisor consuming a `TunnelError` /
+// `MultihopError` verdict names them without depending on the engine crate.
+pub use warrenguard_transport::{FatalCause, Retryability};
 // The per-OS carrier-socket bypass value a privileged TUN datapath pins on the
 // tunnel (via `MultihopClientTunnel::with_socket_bypass`) so the SDK can name it
 // without depending on the engine crate directly.

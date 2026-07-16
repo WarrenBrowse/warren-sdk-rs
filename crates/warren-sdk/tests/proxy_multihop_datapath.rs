@@ -36,6 +36,7 @@ async fn start_proxy_multihop_routes_socks5_through_a_sealed_tunnel() {
         exit_x25519_multihop_pubkey: keys.x25519_pubkey,
         endpoint: exit_addr,
         country: "RO".to_owned(),
+        asn: 0,
         city: "Bucharest".to_owned(),
         weight: 100,
         dns_disabled: false,

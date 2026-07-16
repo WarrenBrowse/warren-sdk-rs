@@ -21,7 +21,8 @@ pub mod signed;
 
 pub use exit_id::{EXIT_ID_LEN, ExitId, ExitIdError};
 pub use multihop_directory::{
-    DirectoryError, VerifiedDirectory, VerifiedEntry, VerifiedExit, verify_multihop_directory,
+    CircuitPolicy, DirectoryError, VerifiedDirectory, VerifiedEntry, VerifiedExit,
+    verify_multihop_directory,
 };
 pub use proximity::{DEFAULT_RTT_TTL_SECS, RttCache};
 pub use query::{ExitQuery, IpAvailability, LocationConstraint};

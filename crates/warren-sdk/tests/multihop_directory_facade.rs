@@ -233,7 +233,66 @@ async fn full_fetch_exposes_entries_for_entry_selected_circuits() {
         .iter()
         .find(|e| e.country == "NL")
         .expect("NL entry");
-    let dialed = exit.via_entry(entry).expect("distinct circuit");
+    let dialed = exit
+        .via_entry(entry, &dir.policy)
+        .expect("distinct cross-country circuit");
     assert_eq!(dialed.endpoint, entry.endpoint);
     assert_eq!(dialed.exit_id, exit.exit_id);
+}
+
+#[tokio::test]
+async fn sdk_selected_circuit_respects_country_and_as_diversity() {
+    use warren_sdk::discovery::{CircuitPolicy, VerifiedEntry, VerifiedExit};
+
+    fn exit(tag: u8, country: &str, asn: u32) -> VerifiedExit {
+        VerifiedExit {
+            exit_id: [tag; 16],
+            exit_ed25519_pubkey: [tag; 32],
+            exit_x25519_multihop_pubkey: [tag; 32],
+            endpoint: format!("198.51.100.{tag}:443").parse().unwrap(),
+            country: country.to_owned(),
+            asn,
+            city: "City".to_owned(),
+            weight: 100,
+            dns_disabled: false,
+            cover_domain: None,
+            tcp_fallback: false,
+            edge_cert_sha256: None,
+            exit_mlkem768_pubkey: None,
+        }
+    }
+    fn entry(tag: u8, country: &str, asn: u32) -> VerifiedEntry {
+        VerifiedEntry {
+            relay_ed25519_pubkey: [tag; 32],
+            endpoint: format!("198.51.100.{tag}:443").parse().unwrap(),
+            country: country.to_owned(),
+            asn,
+            city: "City".to_owned(),
+            weight: 100,
+            cover_domain: None,
+            tcp_fallback: false,
+            edge_cert_sha256: None,
+            exit_id: [tag; 16],
+        }
+    }
+
+    // Fleet spans AS100 and AS200, so AS diversity is mandatory.
+    let de = exit(1, "DE", 100);
+    let same_country = entry(2, "DE", 200);
+    let same_as = entry(3, "NL", 100);
+    let diverse = entry(4, "NL", 200);
+    let policy = CircuitPolicy::from_asns([100, 200]);
+
+    assert!(
+        de.via_entry(&same_country, &policy).is_none(),
+        "an SDK client must not build a same-country circuit"
+    );
+    assert!(
+        de.via_entry(&same_as, &policy).is_none(),
+        "an SDK client must not build a same-AS circuit on a multi-AS fleet"
+    );
+    assert!(
+        de.via_entry(&diverse, &policy).is_some(),
+        "a country- and AS-diverse pair still composes"
+    );
 }
