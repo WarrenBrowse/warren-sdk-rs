@@ -12,6 +12,8 @@ publish = false
 [dependencies]
 warren-transport = { path = "../warren-transport" }
 warren-wire = { path = "../warren-wire" }
+# Single home of the client ALPN, so the fake exit matches the real client.
+warrenguard-config = { workspace = true }
 ed25519-dalek = { workspace = true }
 quinn = { workspace = true }
 tokio = { workspace = true }

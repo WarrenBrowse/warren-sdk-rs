@@ -5,11 +5,6 @@ use warren_transport::MultihopSession;
 
 use crate::error::SdkError;
 
-/// Tunnel network prefix length (`10.66.0.0/16`), matching warren-core.
-pub(crate) const TUNNEL_PREFIX: u8 = 16;
-/// Tunnel gateway (exit side), matching warren-core's `10.66.0.1`.
-pub(crate) const TUNNEL_GATEWAY: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 66, 0, 1);
-
 /// Liveness of a running proxy datapath's tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

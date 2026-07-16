@@ -30,9 +30,8 @@ use warren_wire::{
     WARREN_HPKE_AAD_V1, WARREN_HPKE_VERSION_V1, WarrenControlMessage, encode_control,
     try_decode_control,
 };
-
-/// ALPN the fake exit accepts, matching the client.
-const ALPN_H3: &[u8] = b"h3";
+// The fake exit accepts the same single-home ALPN the real client offers.
+use warrenguard_config::ALPN_H3;
 
 /// TCP port the netstack exit echoes on.
 pub const NETSTACK_EXIT_PORT: u16 = 9;

@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use warren_wire::DEVICE_ID_LEN;
+// The client ALPN (IETF HTTP/3, mimicking a casual h3 dial) has a single home in
+// the engine config, shared with the fake exit and the real exit.
+use warrenguard_config::ALPN_H3;
 use warrenguard_socket_bypass::{SocketBypass, apply as apply_socket_bypass};
 use warrenguard_transport_core::error::TunnelError as EngineTunnelError;
 
 use crate::tls;
-
-/// ALPN offered by the client: IETF HTTP/3, mimicking a casual h3 dial.
-const ALPN_H3: &[u8] = b"h3";
 
 /// Resolves the QUIC endpoint bind address: an explicit pin wins; else, when
 /// `auto` is set, the detected default-route source IP (port 0); else `None`

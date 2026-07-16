@@ -3567,6 +3567,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "warren-api",
+ "warren-contract",
  "warren-daita",
  "warren-discovery",
  "warren-identity",
@@ -3574,6 +3575,7 @@ dependencies = [
  "warren-test-support",
  "warren-transport",
  "warren-tun",
+ "warrenguard-config",
 ]
 
 [[package]]
@@ -3602,6 +3604,7 @@ dependencies = [
  "warren-quinn",
  "warren-transport",
  "warren-wire",
+ "warrenguard-config",
 ]
 
 [[package]]

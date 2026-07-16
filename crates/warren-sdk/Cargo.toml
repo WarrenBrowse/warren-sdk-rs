@@ -16,6 +16,11 @@ warren-discovery = { path = "../warren-discovery" }
 warren-transport = { path = "../warren-transport" }
 warren-net = { path = "../warren-net" }
 warren-daita = { path = "../warren-daita" }
+# Single home of the product anchors (API base URL) and the QUIC/tunnel
+# constants (gateway IP, pool prefix, initial MTU) the datapath addresses with,
+# so the SDK imports them rather than re-declaring drifting copies.
+warren-contract = { workspace = true }
+warrenguard-config = { workspace = true }
 # Privileged TUN device open for the experimental `start_tun_multihop` facade
 # (feature-gated; the default build pulls none of it and stays unsafe-free).
 warren-tun = { path = "../warren-tun", optional = true }

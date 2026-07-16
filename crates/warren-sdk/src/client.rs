@@ -14,10 +14,10 @@ use warren_transport::{ClientTunnel, ConnectionState, MultihopClientTunnel, Sock
 #[cfg(feature = "reqwest-transport")]
 use warren_api::ReqwestTransport;
 
+use warrenguard_config::{TUNNEL_GATEWAY_IP, TUNNEL_POOL_PREFIX};
+
 use crate::error::{BuildError, SdkError};
-use crate::proxy::{
-    ProxyHandle, TUNNEL_GATEWAY, TUNNEL_PREFIX, addressing_from_session, serve_proxy_over_sink,
-};
+use crate::proxy::{ProxyHandle, addressing_from_session, serve_proxy_over_sink};
 use crate::supervisor::{
     EstablishedTunnel, SupervisedProxyHandle, establish_multihop, supervise_proxy,
 };
@@ -535,8 +535,15 @@ impl<T: HttpTransport> WarrenClient<T> {
         // Single-hop SetupAck carries no subnet (and no v6 gateway/prefix), so
         // fall back to the frozen v4 tunnel defaults (10.66.0.0/16, gw 10.66.0.1)
         // and stay v4-only.
-        let mut handle =
-            serve_proxy_over_sink(sink, local_ip, TUNNEL_PREFIX, TUNNEL_GATEWAY, None, cfg).await?;
+        let mut handle = serve_proxy_over_sink(
+            sink,
+            local_ip,
+            TUNNEL_POOL_PREFIX,
+            TUNNEL_GATEWAY_IP,
+            None,
+            cfg,
+        )
+        .await?;
         // doc 79: gate port forwarding on the selected exit's roster capability.
         // The client only offers the feature where the exit runs NAT-PMP.
         handle.port_forward_supported = exit.supports_port_forward();
@@ -751,7 +758,8 @@ impl<T: HttpTransport> WarrenClient<T> {
         let ipv4 = session.assigned_ipv4();
         // /32 host address on the tunnel; the split-default routes capture the
         // rest. v6 is added only when the exit assigned one.
-        let mtu = u16::try_from(session.max_inner_payload()).unwrap_or(1280);
+        let mtu = u16::try_from(session.max_inner_payload())
+            .unwrap_or(warrenguard_config::TUNNEL_INITIAL_MTU);
         let device = warren_tun::device::open_tun(tun_name).map_err(SdkError::Tun)?;
         // The kernel assigns the interface name on macOS (the requested `tun_name`
         // may be empty), so read it back; on Linux the name is what we asked for.
@@ -1105,7 +1113,7 @@ impl<T: HttpTransport> WarrenClient<T> {
 
 #[cfg(feature = "reqwest-transport")]
 fn warren_api_default_base() -> String {
-    "https://api.warrenbrowse.com".to_owned()
+    warren_contract::product::API_URL.to_owned()
 }
 
 #[cfg(not(feature = "reqwest-transport"))]
