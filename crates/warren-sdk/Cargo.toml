@@ -30,11 +30,10 @@ warren-tun = { path = "../warren-tun", optional = true }
 # (pulls the OS killswitch), so it is gated with the TUN facade and never enters
 # the default userland closure.
 warrenguard-route-split = { workspace = true, optional = true }
-# Safe `if_nametoindex` for the macOS carrier-socket `IP_BOUND_IF` bypass in
-# `start_tun_multihop` (Port Fail fix): the workspace forbids unsafe, so the FFI
-# is delegated to nix rather than an in-crate `libc` call. Feature-gated with the
-# TUN facade, so the default userland build never pulls it.
-nix = { version = "0.30", default-features = false, features = ["net"], optional = true }
+# The OS killswitch the privileged TUN datapath installs so it fails closed (pf
+# sub-anchor on macOS, nft table on Linux). Single home shared with the app-scope
+# system-VPN, replacing the deleted in-tree plan/apply killswitch (doc-94 B1).
+warrenguard-killswitch-os = { workspace = true, optional = true }
 thiserror = { workspace = true }
 # Needed to bind the local SOCKS5 listener and spawn the proxy datapath task.
 tokio = { workspace = true }
@@ -54,8 +53,8 @@ reqwest-transport = ["warren-api/reqwest-transport"]
 # NOT yet validated against a real exit (needs root + a device).
 experimental-tun = [
     "dep:warren-tun",
-    "dep:nix",
     "dep:warrenguard-route-split",
+    "dep:warrenguard-killswitch-os",
     "warren-net/experimental-tun",
 ]
 

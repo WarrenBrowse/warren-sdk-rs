@@ -65,6 +65,8 @@ mod portfollow;
 mod proxy;
 mod store;
 mod supervisor;
+#[cfg(all(unix, feature = "experimental-tun"))]
+mod tun_setup;
 
 #[cfg(all(unix, feature = "experimental-tun"))]
 pub use client::TunDatapathHandle;

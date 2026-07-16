@@ -50,17 +50,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Cross-check the multihop exit against the signed relay list (same as the
-    // other live examples).
+    // other live examples). Prefer a NON-NL exit: NL is wclaude's default egress,
+    // so testing through another exit avoids the same-pubkey downlink collision
+    // with a live wclaude session. Fall back to any cross-checked exit.
     let selector = client.fetch_exits().await?;
     let exits = client.fetch_multihop_directory().await?;
     let exit = exits
-        .into_iter()
+        .iter()
         .find(|e| {
             selector
                 .relays()
                 .iter()
                 .any(|r| r.endpoint_id() == e.exit_ed25519_pubkey)
+                && !e.country.eq_ignore_ascii_case("nl")
+                && !e.city.eq_ignore_ascii_case("amsterdam")
         })
+        .or_else(|| {
+            exits.iter().find(|e| {
+                selector
+                    .relays()
+                    .iter()
+                    .any(|r| r.endpoint_id() == e.exit_ed25519_pubkey)
+            })
+        })
+        .cloned()
         .ok_or("no cross-checked multihop exit")?;
     println!("exit: {} / {}  {}", exit.country, exit.city, exit.endpoint);
 
