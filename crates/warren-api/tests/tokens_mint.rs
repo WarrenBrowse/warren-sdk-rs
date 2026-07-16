@@ -1,5 +1,5 @@
 //! End-to-end minting tests for the anonymous session-token client
-//! (Privacy Pass, doc 64): real blinding, real RSA blind signatures, real
+//! (Privacy Pass): real blinding, real RSA blind signatures, real
 //! finalization/verification, with only the HTTP layer faked (the transport
 //! is the system boundary the shared TDD rules allow mocking).
 //!

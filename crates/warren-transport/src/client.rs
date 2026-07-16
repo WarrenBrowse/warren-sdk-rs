@@ -339,7 +339,7 @@ pub enum TunnelError {
     ExitDraining,
     /// The exit's tunnel IP pool is exhausted. Like [`TunnelError::ExitDraining`]
     /// this reselects a different exit rather than surfacing fatal or hammering
-    /// the full one (aligns with multi-hop `IpExhausted`, audit C3.3).
+    /// the full one (aligns with multi-hop `IpExhausted`).
     #[error("exit ip pool exhausted")]
     PoolExhausted,
     /// Catch-all for a delegated engine transport error that cannot occur on
@@ -900,8 +900,9 @@ mod tests {
     #[test]
     fn map_engine_err_carries_the_reselect_kinds_instead_of_flattening_to_internal() {
         use warrenguard_transport::{FatalCause, Retryability};
-        // Regression (audit A4): these used to flatten to `Internal`, losing the
-        // "re-select another exit" signal the supervisor needs.
+        // These reselect kinds must stay distinct on the SDK error surface:
+        // flattening them to `Internal` would lose the "re-select another exit"
+        // signal the supervisor keys reconnection on.
         assert!(
             matches!(
                 map_engine_err(EngineTunnelError::ExitDrainingRefused),

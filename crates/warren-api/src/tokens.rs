@@ -1,4 +1,4 @@
-//! Anonymous session-token client (Privacy Pass, ADR-0006 / doc 64).
+//! Anonymous session-token client (Privacy Pass, ADR-0006).
 //!
 //! Minting flow: fetch the issuer directory ([`crate::WarrenApiClient::token_keys`],
 //! unsigned), blind a fixed-size batch per epoch against that epoch's
@@ -13,7 +13,7 @@
 //! (`TokenChallenge::for_epoch`). The only local inputs are the current time
 //! and an RNG (an injected system boundary, per the shared TDD rules).
 //!
-//! Anti-correlation guidance (doc 64): mint on unlock or on a timer, never at
+//! Anti-correlation guidance: mint on unlock or on a timer, never at
 //! connect time, so issuance timing does not mirror session timing.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -309,7 +309,7 @@ struct ManagerState {
 /// app presents to the exit (as serialized token bytes; the tunnel layer wraps
 /// each in its wire `SessionToken`).
 ///
-/// Anti-correlation (doc 64): drive [`Self::refresh`] on unlock and on a coarse
+/// Anti-correlation: drive [`Self::refresh`] on unlock and on a coarse
 /// timer, never at connect time, so issuance timing does not mirror session
 /// timing. [`Self::take_current_stack`] never mints (no issuer call at connect);
 /// it only pops. On exhaustion it returns an empty stack, and the tunnel falls
@@ -449,7 +449,7 @@ impl<T: HttpTransport> TokenManager<T> {
     }
 
     /// Exports the current token store as a self-contained, seed-free bundle for
-    /// cross-process persistence (iOS app-group container, doc 64
+    /// cross-process persistence (iOS app-group container,
     /// anti-correlation): the main app mints on unlock/timer and persists this,
     /// the Network Extension loads it and CONSUMES pre-minted tokens WITHOUT
     /// minting at connect from the device's real IP.
@@ -473,7 +473,7 @@ impl<T: HttpTransport> TokenManager<T> {
 ///
 /// The iOS main app persists this into the app-group container so the Network
 /// Extension can consume pre-minted tokens without minting at connect time (the
-/// doc 64 anti-correlation requirement). It holds only anonymous bearer tokens
+/// anti-correlation requirement). It holds only anonymous bearer tokens
 /// (never the wallet seed or pubkey) plus the published epoch length, so the
 /// consumer maps "now" to the current epoch with no issuer-directory fetch and
 /// no network. Double-spend within the prefetch window is the accepted price of

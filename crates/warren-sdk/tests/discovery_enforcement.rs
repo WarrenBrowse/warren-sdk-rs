@@ -1,5 +1,5 @@
 //! Locks in the facade's anti-freeze (`expires_at`) and anti-rollback
-//! (`generation`) enforcement on the live-fetch path (security audit HIGH-1).
+//! (`generation`) enforcement on the live-fetch path.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;

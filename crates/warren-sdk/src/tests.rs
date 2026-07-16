@@ -165,10 +165,10 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
-    // A4 landmine: a policy rejection (unauthorized account) used to loop as
-    // "Reconnecting" forever. The engine verdict is fatal, so the supervisor must
-    // STOP after one attempt and surface the specific cause + a distinct terminal
-    // Failed state.
+    // A policy rejection (unauthorized account) is fatal, not transient: the
+    // engine verdict recurs on every redial, so the supervisor must STOP after
+    // one attempt and surface the specific cause + a distinct terminal Failed
+    // state rather than loop "Reconnecting" forever.
     use std::sync::atomic::{AtomicUsize, Ordering};
     use warren_transport::{FatalCause, MultihopError, SetupError};
 
@@ -526,7 +526,7 @@ fn sdk_error_classifies_only_the_strict_suggestion_refusal_as_conflict() {
 
 #[tokio::test]
 async fn supervise_forward_auto_conflict_degrades_to_a_server_pick() {
-    // C3 (doc 59): a best-effort (auto) rule whose sticky re-suggestion hits a
+    // A best-effort (auto) rule whose sticky re-suggestion hits a
     // conflict on the new exit must retry ONCE with `suggested = 0` (server
     // pick) instead of dying, surface the change, and forget the stale sticky.
     use std::sync::Mutex;
@@ -623,7 +623,7 @@ async fn supervise_forward_auto_conflict_degrades_to_a_server_pick() {
 
 #[tokio::test]
 async fn supervise_forward_pinned_conflict_stays_without_degrading() {
-    // C2 (doc 59): a PINNED rule never silently degrades. A conflict leaves the
+    // A PINNED rule never silently degrades. A conflict leaves the
     // mapping unset for the epoch (ConflictStayed), and the SAME pinned port is
     // requested again on the next epoch; `suggested = 0` is never sent.
     use std::sync::Mutex;
@@ -974,7 +974,7 @@ async fn supervisor_failover_rotates_on_drain() {
     // DRAIN; exit 1 does not. The failover `on_drain` must advance the cursor so
     // the proactive reconnect rotates 0 -> 1 directly, instead of waiting for the
     // draining exit's hard-close to produce the `Err` that the broken-exit path
-    // relies on. This is the ADR 36 audit fix (P1-2).
+    // relies on.
     let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let cursor = Arc::new(AtomicUsize::new(0));

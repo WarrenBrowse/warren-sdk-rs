@@ -685,7 +685,7 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                         // opaque policy refusal) recurs on every redial and no
                         // other exit resolves it: STOP and surface the cause as a
                         // distinct terminal state instead of looping "Reconnecting"
-                        // forever (the A4 landmine).
+                        // forever.
                         let _ = outputs.fatal_tx.send(Some(cause));
                         let _ = outputs.state_tx.send(ConnectionState::Failed);
                         return;
