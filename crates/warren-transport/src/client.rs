@@ -463,7 +463,7 @@ impl ClientTunnel {
             auto_local_ip: false,
             transport_config: None,
             idle_cover: false,
-            tcp_fallback: false,
+            tcp_fallback: true,
         }
     }
 
@@ -550,10 +550,13 @@ impl ClientTunnel {
     }
 
     /// Opts this client into the TLS-over-TCP fallback carrier (anti-censorship
-    /// datapath). Off by default. This is only the deployer's arm switch: the
-    /// fallback still fires only for an exit whose signed roster advertises the
-    /// carrier and carries a cover domain, and only after the UDP handshake
-    /// fails or times out (see [`connect_with_tcp_fallback`](Self::connect_with_tcp_fallback)).
+    /// datapath). ON by default, matching the engine `ClientTunnel` default
+    /// (CORE-FIRST): the carrier is a dormant safety net that fires only for an
+    /// exit whose signed roster advertises it and carries a cover domain, and
+    /// only after the UDP handshake fails or times out, so arming it by default
+    /// costs nothing on an open path (see
+    /// [`connect_with_tcp_fallback`](Self::connect_with_tcp_fallback)). Pass
+    /// `false` to force UDP-only.
     #[must_use]
     pub fn with_tcp_fallback(mut self, enable: bool) -> Self {
         self.tcp_fallback = enable;
@@ -954,6 +957,25 @@ mod tests {
                 Err(QuicDialError::Bind(_))
             ),
             "a wrong-OS bypass variant must be refused (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn tcp_fallback_is_armed_by_default_matching_the_engine() {
+        // CORE-FIRST: the engine `ClientTunnel` defaults the carrier ON, so the
+        // SDK single-hop tunnel must too. The carrier is dormant (fires only for
+        // an advertising exit after the UDP handshake fails), so arming it by
+        // default is free on an open path; a caller forces UDP-only explicitly.
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        assert!(
+            ClientTunnel::new(key.clone()).tcp_fallback(),
+            "a fresh ClientTunnel must arm the TLS-over-TCP carrier by default (engine parity)"
+        );
+        assert!(
+            !ClientTunnel::new(key)
+                .with_tcp_fallback(false)
+                .tcp_fallback(),
+            "with_tcp_fallback(false) must force the UDP-only path"
         );
     }
 
