@@ -895,6 +895,41 @@ mod tests {
     use std::error::Error;
 
     #[test]
+    fn map_engine_err_carries_the_reselect_kinds_instead_of_flattening_to_internal() {
+        use warrenguard_transport::{FatalCause, Retryability};
+        // Regression (audit A4): these used to flatten to `Internal`, losing the
+        // "re-select another exit" signal the supervisor needs.
+        assert!(
+            matches!(
+                map_engine_err(EngineTunnelError::ExitDrainingRefused),
+                TunnelError::ExitDraining
+            ),
+            "ExitDrainingRefused must keep its reselect kind, not become Internal"
+        );
+        assert_eq!(
+            map_engine_err(EngineTunnelError::ExitDrainingRefused).retryability(),
+            Retryability::RetryReselect
+        );
+        assert!(matches!(
+            map_engine_err(EngineTunnelError::PoolExhausted),
+            TunnelError::PoolExhausted
+        ));
+        assert_eq!(
+            map_engine_err(EngineTunnelError::PoolExhausted).retryability(),
+            Retryability::RetryReselect
+        );
+        // The fatal business rejections keep stopping the supervisor.
+        assert_eq!(
+            map_engine_err(EngineTunnelError::AuthRejected).retryability(),
+            Retryability::Fatal(FatalCause::NotAuthorized)
+        );
+        assert_eq!(
+            map_engine_err(EngineTunnelError::DeviceLimitReached).retryability(),
+            Retryability::Fatal(FatalCause::DeviceLimit)
+        );
+    }
+
+    #[test]
     fn bind_endpoint_socket_applies_the_bypass_and_fails_closed_on_a_wrong_os_variant() {
         // The dialer routes the carrier socket through the per-OS bypass before
         // it can send. A bypass this OS cannot honour must fail closed (the

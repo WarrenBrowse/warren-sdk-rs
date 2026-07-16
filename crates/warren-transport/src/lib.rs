@@ -26,12 +26,16 @@ pub use multihop::{
     DrainAdvisory, MultihopClientTunnel, MultihopError, MultihopMetrics, MultihopMetricsSnapshot,
     MultihopSession, RekeyPolicy,
 };
+// The engine setup-failure type carried by `MultihopError::Setup`, re-exported so
+// a consumer can match on / construct the policy verdict (`Rejected`,
+// `IpExhausted`) without reaching into the engine crate directly.
 pub use quinn::TransportConfig;
 pub use reconnect::{
     Backoff, BackoffIter, ConnectionState, JitterBackoff, RetryError, connect_with_retry,
     connect_with_state,
 };
 pub use tls::{WarrenTlsError, default_crypto_provider, make_client_config, make_server_config};
+pub use warren_multihop::SetupError;
 // The engine's reconnect verdict (fatal / retry-same / retry-reselect) and its
 // fatal cause, re-exported so a supervisor consuming a `TunnelError` /
 // `MultihopError` verdict names them without depending on the engine crate.

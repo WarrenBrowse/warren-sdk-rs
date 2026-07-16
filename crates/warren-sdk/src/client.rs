@@ -1067,6 +1067,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
         let (forwarder_tx, forwarder_rx) = tokio::sync::watch::channel(None);
         let (migration_tx, migration_rx) = tokio::sync::watch::channel(None);
+        let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
         let dns_server = cfg.dns_server;
         let task = tokio::spawn(async move {
             supervise_proxy(
@@ -1077,6 +1078,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                     state_tx,
                     forwarder_tx,
                     migration_tx,
+                    fatal_tx,
                 },
                 // Reserve-then-switch is OFF by default: the pre-migrate gate
                 // needs the candidate pre-flight (NAT-PMP reservation over the
@@ -1095,6 +1097,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             state_rx,
             forwarder_rx,
             migration_rx,
+            fatal_rx,
             task,
         })
     }

@@ -113,6 +113,7 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
                     migration_tx: tokio::sync::watch::channel(None).0,
+                    fatal_tx: tokio::sync::watch::channel(None).0,
                 },
                 None,
                 move || {
@@ -163,6 +164,137 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
+    // A4 landmine: a policy rejection (unauthorized account) used to loop as
+    // "Reconnecting" forever. The engine verdict is fatal, so the supervisor must
+    // STOP after one attempt and surface the specific cause + a distinct terminal
+    // Failed state.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use warren_transport::{FatalCause, MultihopError, SetupError};
+
+    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+    let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let task = {
+        let attempts = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            supervise_proxy(
+                socks_listener,
+                None,
+                None,
+                crate::supervisor::SupervisorOutputs {
+                    state_tx,
+                    forwarder_tx: tokio::sync::watch::channel(None).0,
+                    migration_tx: tokio::sync::watch::channel(None).0,
+                    fatal_tx,
+                },
+                None,
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Err::<EstablishedTunnel<ClosableSink>, SdkError>(SdkError::Multihop(
+                            MultihopError::Setup(SetupError::Rejected),
+                        ))
+                    }
+                },
+                || {},
+            )
+            .await;
+        })
+    };
+
+    // A fatal verdict must make the supervisor task RETURN, never loop.
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("a fatal verdict stops the supervisor instead of looping")
+        .expect("the supervisor task joined cleanly");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "a fatal rejection stops after ONE attempt (no silent Reconnecting loop)"
+    );
+    assert_eq!(
+        *state_rx.borrow(),
+        ConnectionState::Failed,
+        "the terminal state is Failed, distinct from a transient Reconnecting"
+    );
+    assert_eq!(
+        *fatal_rx.borrow(),
+        Some(FatalCause::NotAuthorized),
+        "the specific fatal cause is surfaced to the facade"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn supervisor_reselects_on_an_exhaustion_refusal_without_going_fatal() {
+    // A drain / pool-exhaustion refusal is NOT fatal and must NOT redial the same
+    // exit: the supervisor advances the failover cursor (on_drain) so the next
+    // attempt reselects a different exit. A same-target retry would never call
+    // on_drain, so a non-zero count is the reselect proof.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use warren_transport::{MultihopError, SetupError};
+
+    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+    let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+    let reselects = Arc::new(AtomicUsize::new(0));
+
+    let task = {
+        let reselects = Arc::clone(&reselects);
+        tokio::spawn(async move {
+            supervise_proxy(
+                socks_listener,
+                None,
+                None,
+                crate::supervisor::SupervisorOutputs {
+                    state_tx,
+                    forwarder_tx: tokio::sync::watch::channel(None).0,
+                    migration_tx: tokio::sync::watch::channel(None).0,
+                    fatal_tx,
+                },
+                None,
+                || async {
+                    Err::<EstablishedTunnel<ClosableSink>, SdkError>(SdkError::Multihop(
+                        MultihopError::Setup(SetupError::IpExhausted),
+                    ))
+                },
+                move || {
+                    reselects.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await;
+        })
+    };
+
+    // Wait for at least one reselect cycle (backoff base is 250 ms).
+    for _ in 0..80 {
+        if reselects.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        reselects.load(Ordering::SeqCst) >= 1,
+        "an exhaustion refusal must advance the failover cursor (reselect), which a \
+         same-target retry would never do"
+    );
+    assert_eq!(
+        *fatal_rx.borrow(),
+        None,
+        "a reselect verdict is NOT fatal: no fatal cause is latched"
+    );
+    assert_ne!(
+        *state_rx.borrow(),
+        ConnectionState::Failed,
+        "a reselect verdict never reaches the terminal Failed state"
+    );
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death() {
     use crate::supervisor::supervise_proxy;
 
@@ -180,6 +312,7 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
                 state_tx,
                 forwarder_tx,
                 migration_tx: tokio::sync::watch::channel(None).0,
+                fatal_tx: tokio::sync::watch::channel(None).0,
             },
             None,
             move || {
@@ -746,6 +879,7 @@ async fn supervisor_serves_both_socks_and_http_listeners() {
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
                 migration_tx: tokio::sync::watch::channel(None).0,
+                fatal_tx: tokio::sync::watch::channel(None).0,
             },
             None,
             move || {
@@ -793,6 +927,7 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
                 migration_tx: tokio::sync::watch::channel(None).0,
+                fatal_tx: tokio::sync::watch::channel(None).0,
             },
             None,
             move || {
@@ -856,6 +991,7 @@ async fn supervisor_failover_rotates_on_drain() {
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
                 migration_tx: tokio::sync::watch::channel(None).0,
+                fatal_tx: tokio::sync::watch::channel(None).0,
             },
             None,
             move || {
@@ -928,6 +1064,7 @@ async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
                 migration_tx: tokio::sync::watch::channel(None).0,
+                fatal_tx: tokio::sync::watch::channel(None).0,
             },
             None,
             move || {
@@ -1003,6 +1140,7 @@ async fn supervisor_retries_past_failed_attempts_then_connects() {
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
                     migration_tx: tokio::sync::watch::channel(None).0,
+                    fatal_tx: tokio::sync::watch::channel(None).0,
                 },
                 None,
                 move || {
@@ -1074,6 +1212,7 @@ async fn supervisor_emits_structured_migration_events_on_drain() {
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
                 migration_tx,
+                fatal_tx: tokio::sync::watch::channel(None).0,
             },
             None,
             move || {
@@ -1168,6 +1307,7 @@ async fn supervisor_gate_veto_cancels_the_migration_and_keeps_serving() {
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
                     migration_tx,
+                    fatal_tx: tokio::sync::watch::channel(None).0,
                 },
                 Some(Box::new(|_advisory| Box::pin(async { false }))),
                 move || {
@@ -1250,6 +1390,7 @@ async fn supervisor_gate_approval_lets_the_migration_proceed() {
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
                 migration_tx: tokio::sync::watch::channel(None).0,
+                fatal_tx: tokio::sync::watch::channel(None).0,
             },
             Some(Box::new(|_advisory| Box::pin(async { true }))),
             move || {

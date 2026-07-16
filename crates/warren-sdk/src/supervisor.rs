@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use warren_discovery::VerifiedExit;
 use warren_net::{ForwardedPort, MapProto, MultihopPacketSink};
-use warren_transport::{Backoff, ConnectionState, MultihopClientTunnel};
+use warren_transport::{Backoff, ConnectionState, FatalCause, MultihopClientTunnel, Retryability};
 
 use crate::error::SdkError;
 use crate::proxy::{ProxyForwarder, addressing_from_session, build_netstack_config};
@@ -33,6 +33,10 @@ pub struct SupervisedProxyHandle {
     pub(crate) forwarder_rx: tokio::sync::watch::Receiver<Option<ProxyForwarder>>,
     pub(crate) migration_rx:
         tokio::sync::watch::Receiver<Option<crate::portfollow::MigrationEvent>>,
+    /// Set once, to the fatal cause, when the supervisor gives up on a fatal
+    /// engine verdict (and drives `state` to [`ConnectionState::Failed`]). `None`
+    /// while the datapath is healing normally.
+    pub(crate) fatal_rx: tokio::sync::watch::Receiver<Option<FatalCause>>,
     pub(crate) task: tokio::task::JoinHandle<()>,
 }
 
@@ -61,6 +65,23 @@ impl SupervisedProxyHandle {
     #[must_use]
     pub fn watch_state(&self) -> tokio::sync::watch::Receiver<ConnectionState> {
         self.state_rx.clone()
+    }
+
+    /// The fatal cause the supervisor stopped on, or `None` while it is healing
+    /// normally. Set exactly once, alongside the terminal
+    /// [`ConnectionState::Failed`], when a (re)connect failed with a fatal engine
+    /// verdict (unauthorized account, device cap, opaque policy refusal): a
+    /// rejected user then sees WHY instead of an endless `Reconnecting`.
+    #[must_use]
+    pub fn last_fatal(&self) -> Option<FatalCause> {
+        *self.fatal_rx.borrow()
+    }
+
+    /// A watch receiver for the fatal cause, so an app can await the terminal
+    /// failure (`rx.changed().await`) and surface the specific reason.
+    #[must_use]
+    pub fn watch_fatal(&self) -> tokio::sync::watch::Receiver<Option<FatalCause>> {
+        self.fatal_rx.clone()
     }
 
     /// The latest maintenance-migration event
@@ -471,6 +492,12 @@ pub(crate) struct SupervisorOutputs {
     pub(crate) state_tx: tokio::sync::watch::Sender<ConnectionState>,
     pub(crate) forwarder_tx: tokio::sync::watch::Sender<Option<ProxyForwarder>>,
     pub(crate) migration_tx: tokio::sync::watch::Sender<Option<crate::portfollow::MigrationEvent>>,
+    /// Latches the [`FatalCause`] when a (re)connect fails with a fatal engine
+    /// verdict (unauthorized account, device cap, opaque policy refusal): the
+    /// supervisor then stops, so this carries WHY the terminal
+    /// [`ConnectionState::Failed`] was reached, distinct from a transient
+    /// `Reconnecting`.
+    pub(crate) fatal_tx: tokio::sync::watch::Sender<Option<FatalCause>>,
 }
 
 /// Supervises a proxy datapath across tunnel rebuilds, keeping the local
@@ -649,9 +676,34 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                     tokio::time::sleep(backoff.next_delay()).await;
                 }
             }
-            Err(_) => {
-                // No identity material is logged. Back off before the next attempt.
-                tokio::time::sleep(backoff.next_delay()).await;
+            Err(e) => {
+                // The engine classified this failure; the supervisor consumes the
+                // verdict, it never re-decides it. No identity material is logged.
+                match e.retryability() {
+                    Retryability::Fatal(cause) => {
+                        // A business rejection (unauthorized account, device cap,
+                        // opaque policy refusal) recurs on every redial and no
+                        // other exit resolves it: STOP and surface the cause as a
+                        // distinct terminal state instead of looping "Reconnecting"
+                        // forever (the A4 landmine).
+                        let _ = outputs.fatal_tx.send(Some(cause));
+                        let _ = outputs.state_tx.send(ConnectionState::Failed);
+                        return;
+                    }
+                    Retryability::RetryReselect => {
+                        // A drain / pool-exhaustion refusal is not the account's
+                        // fault, but redialing THIS exit re-hits it: advance the
+                        // failover cursor (no-op for a single pinned exit) so the
+                        // next attempt reselects a different exit, then back off.
+                        on_drain();
+                        tokio::time::sleep(backoff.next_delay()).await;
+                    }
+                    // RetrySameTarget, and any future verdict: a transient failure,
+                    // retry the same target after a backoff.
+                    _ => {
+                        tokio::time::sleep(backoff.next_delay()).await;
+                    }
+                }
             }
         }
     }
