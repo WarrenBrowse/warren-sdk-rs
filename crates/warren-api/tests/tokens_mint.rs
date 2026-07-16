@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use data_encoding::BASE64URL_NOPAD;
 use rand010::SeedableRng;
@@ -32,6 +33,16 @@ struct FakeIssuer {
     keys: HashMap<u64, IssuerSecretKey>,
     /// Epochs the fake refuses (simulating quota/subscription rejects).
     refuse: Vec<u64>,
+    /// Machine-readable reject code returned for every epoch in `refuse`
+    /// (default `not_subscribed`; set to `already_issued` to exercise the
+    /// definitive once-per-account-epoch settle).
+    refuse_reason: String,
+    /// When set, the first `/v1/tokens/issue` call answers 503 (a
+    /// transport-class failure) then heals, so a refresh can prove it retries.
+    fail_issue_once: AtomicBool,
+    /// Count of `/v1/tokens/issue` calls, to prove a settled epoch is never
+    /// re-asked.
+    issue_calls: AtomicUsize,
     /// Last issue request seen, for asserting what left the client.
     last_issue: Mutex<Option<(HttpRequest, TokenIssueRequest)>>,
     /// Headers seen on the directory fetch.
@@ -48,6 +59,9 @@ impl FakeIssuer {
         Self {
             keys,
             refuse: Vec::new(),
+            refuse_reason: "not_subscribed".to_owned(),
+            fail_issue_once: AtomicBool::new(false),
+            issue_calls: AtomicUsize::new(0),
             last_issue: Mutex::new(None),
             last_keys_headers: Mutex::new(None),
         }
@@ -93,6 +107,15 @@ impl HttpTransport for FakeIssuer {
             "unexpected URL {}",
             request.url
         );
+        self.issue_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_issue_once.swap(false, Ordering::SeqCst) {
+            // A connected-but-unavailable answer: a transient transport-class
+            // failure the client must retry, not a definitive ledger refusal.
+            return Ok(HttpResponse {
+                status: 503,
+                body: Vec::new(),
+            });
+        }
         let req: TokenIssueRequest = serde_json::from_slice(&request.body).unwrap();
         let mut epochs = Vec::new();
         for e in &req.epochs {
@@ -102,7 +125,7 @@ impl HttpTransport for FakeIssuer {
                     issued: false,
                     blind_signatures: Vec::new(),
                     token_key_id: None,
-                    reject_reason: Some("not_subscribed".to_owned()),
+                    reject_reason: Some(self.refuse_reason.clone()),
                 });
                 continue;
             }
@@ -340,4 +363,74 @@ async fn token_manager_provider_is_empty_before_any_refresh() {
     // so a connect before the first refresh cleanly uses the v6 path.
     let manager = TokenManager::new(Arc::new(client(FakeIssuer::new(&[100]))));
     assert!(manager.take_current_stack(100 * EPOCH_SECS).is_empty());
+}
+
+#[tokio::test]
+async fn a_transient_mint_failure_is_retried_on_the_next_refresh() {
+    use std::sync::Arc;
+    use warren_api::TokenManager;
+
+    // The issue endpoint answers 503 exactly once (a transport-class failure),
+    // then heals.
+    let fake = FakeIssuer::new(&[100]);
+    fake.fail_issue_once.store(true, Ordering::SeqCst);
+    let manager = TokenManager::new(Arc::new(client(fake)));
+    let now = 100 * EPOCH_SECS + 5;
+    let mut rng = StdRng::seed_from_u64(21);
+
+    manager
+        .refresh(now, &mut rng)
+        .await
+        .expect("a per-epoch mint failure is absorbed; refresh itself succeeds");
+    assert_eq!(
+        manager.available(100),
+        0,
+        "the failed mint cannot have stocked the epoch"
+    );
+
+    // The failure was transient, so the next tick must re-ask. Settling the
+    // epoch on a transport error would silently downgrade every session of the
+    // whole epoch to the v6 wallet-signed path after one blip.
+    manager
+        .refresh(now, &mut rng)
+        .await
+        .expect("second refresh");
+    assert_eq!(
+        manager.available(100),
+        QUOTA as usize,
+        "a transient mint failure must be retried on the next refresh tick"
+    );
+}
+
+#[tokio::test]
+async fn a_definitive_already_issued_refusal_settles_the_epoch() {
+    use std::sync::Arc;
+    use warren_api::TokenManager;
+
+    // The issuer's once-per-account-epoch ledger already holds this account for
+    // epoch 100 (a previous run minted it), so every issue answers the
+    // definitive `already_issued` refusal.
+    let mut fake = FakeIssuer::new(&[100]);
+    fake.refuse.push(100);
+    fake.refuse_reason = "already_issued".to_owned();
+    let api = Arc::new(client(fake));
+    let manager = TokenManager::new(Arc::clone(&api));
+    let now = 100 * EPOCH_SECS + 5;
+    let mut rng = StdRng::seed_from_u64(22);
+
+    manager
+        .refresh(now, &mut rng)
+        .await
+        .expect("refused refresh");
+    assert_eq!(manager.available(100), 0, "a refused epoch stocks nothing");
+    let calls_after_refusal = api.transport().issue_calls.load(Ordering::SeqCst);
+    assert_eq!(calls_after_refusal, 1, "the epoch was asked exactly once");
+
+    // already_issued is definitive: the next tick must not re-ask the issuer.
+    manager.refresh(now, &mut rng).await.expect("third refresh");
+    assert_eq!(
+        api.transport().issue_calls.load(Ordering::SeqCst),
+        calls_after_refusal,
+        "an already_issued refusal is definitive; re-asking every tick would hammer the issuer"
+    );
 }

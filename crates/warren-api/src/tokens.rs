@@ -289,13 +289,19 @@ impl TokenStore {
     }
 }
 
+/// The issuer's machine-readable reject code for its once-per-account-epoch
+/// ledger (`warren-api/src/handlers/token.rs::reject_reason`). The only refusal
+/// that is definitive for the rest of the epoch, hence the only one that
+/// settles it client-side.
+const REJECT_ALREADY_ISSUED: &str = "already_issued";
+
 struct ManagerState {
     store: TokenStore,
     directory: Option<TokenIssuerDirectory>,
-    /// Epochs already submitted to `/v1/tokens/issue` this process. The issuer
-    /// signs an account+epoch at most once, so re-minting a spent-then-emptied
-    /// epoch would just get `already_issued`; tracking it lets `refresh` mint
-    /// only genuinely new future epochs.
+    /// Epochs settled this process: minted into the store, or definitively
+    /// refused by the issuer's once-per-account-epoch ledger
+    /// (`already_issued`). Transient failures are deliberately NOT recorded so
+    /// the next refresh tick retries them; a settled epoch is never re-asked.
     minted: BTreeSet<u64>,
 }
 
@@ -330,13 +336,15 @@ impl<T: HttpTransport> TokenManager<T> {
     }
 
     /// Fetches the issuer directory, prunes spent epochs, and mints every
-    /// published epoch from the current one forward that has not been minted
+    /// published epoch from the current one forward that has not been settled
     /// yet. Per-epoch minting is isolated: one refused epoch (e.g. already
-    /// issued by a previous run) does not block the others.
+    /// issued by a previous run) does not block the others, and only a
+    /// definitive `already_issued` refusal settles an epoch; a transient
+    /// failure is left retryable for the next tick.
     ///
     /// # Errors
     /// [`TokenClientError`] only when the directory fetch itself fails; a
-    /// per-epoch mint refusal is swallowed (the epoch is marked attempted).
+    /// per-epoch mint refusal or transport error is swallowed.
     pub async fn refresh<R: CryptoRng + ?Sized>(
         &self,
         now_unix_secs: u64,
@@ -363,16 +371,36 @@ impl<T: HttpTransport> TokenManager<T> {
         };
 
         for epoch in targets {
-            let outcome = mint_tokens(&self.client, &directory, &[epoch], rng).await;
-            let mut st = self.state.lock().expect("token manager mutex poisoned");
-            st.minted.insert(epoch);
-            match outcome {
+            match mint_tokens(&self.client, &directory, &[epoch], rng).await {
                 Ok(mut batches) => {
+                    let mut st = self.state.lock().expect("token manager mutex poisoned");
+                    st.minted.insert(epoch);
                     if let Some(batch) = batches.pop() {
                         st.store.insert(batch);
                     }
                 }
-                Err(_) => { /* attempted-marked above; retried only if it re-enters the window */ }
+                Err(TokenClientError::EpochRefused { reason, .. })
+                    if reason.as_deref() == Some(REJECT_ALREADY_ISSUED) =>
+                {
+                    // The issuer's once-per-account-epoch ledger already holds
+                    // this account (a previous run minted the batch): re-asking
+                    // can never succeed, so settle the epoch and stop asking.
+                    self.state
+                        .lock()
+                        .expect("token manager mutex poisoned")
+                        .minted
+                        .insert(epoch);
+                }
+                Err(_) => {
+                    // Anything else (transport error, 5xx, a refusal that can
+                    // heal like not_subscribed, a malformed response) proves
+                    // nothing about the ledger. Settling the epoch here would
+                    // silently downgrade every session of that epoch to the v6
+                    // wallet-signed path after one transient failure, so leave
+                    // it un-settled and let the next refresh tick retry; if the
+                    // issuer HAD recorded the issuance, that retry is answered
+                    // by the definitive already_issued refusal above.
+                }
             }
         }
         Ok(())
