@@ -498,6 +498,11 @@ pub(crate) struct SupervisorOutputs {
     /// [`ConnectionState::Failed`] was reached, distinct from a transient
     /// `Reconnecting`.
     pub(crate) fatal_tx: tokio::sync::watch::Sender<Option<FatalCause>>,
+    /// Arms the in-tunnel egress-liveness probe for each connected epoch: a
+    /// periodic DNS query through the tunnel catches an exit that ACKs keep-alives
+    /// but forwards nothing, escalating a reselect. Off for the in-process tests
+    /// (whose fake datapaths have no real exit resolver to answer), on in prod.
+    pub(crate) egress_probe: bool,
 }
 
 /// Supervises a proxy datapath across tunnel rebuilds, keeping the local
@@ -563,6 +568,20 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                 // netstack engine. `None` for paths that emit no drain signal.
                 let drain_rx = est.sink.drain_watch();
                 let (connector, alive_rx) = warren_net::spawn_over_sink(Arc::new(est.sink), config);
+                // Arm the in-tunnel egress probe for this epoch: it rides the same
+                // netstack UDP path and, on a debounced dead verdict (the exit ACKs
+                // keep-alives but forwards nothing), fires `egress_dead` so the
+                // serve races below end the epoch and the loop reselects a fresh
+                // exit. Held as an `AbortOnDrop` for the epoch, so the probe is torn
+                // down with the session and never outlives it.
+                let egress_dead = Arc::new(tokio::sync::Notify::new());
+                let _egress_probe = outputs.egress_probe.then(|| {
+                    crate::egress_probe::spawn_egress_probe(
+                        connector.clone(),
+                        gateway,
+                        Arc::clone(&egress_dead),
+                    )
+                });
                 // Publish this epoch's forwarder so self-healing port forwards
                 // can re-map on the fresh connector; cleared to `None` below when
                 // the tunnel dies.
@@ -615,6 +634,14 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                         loop {
                             tokio::select! {
                                 () = &mut serve => break None,
+                                () = egress_dead.notified() => {
+                                    // The exit forwards nothing over a live QUIC
+                                    // session: reselect a fresh exit, exactly as
+                                    // for a dead session. Not a planned drain, so
+                                    // no advisory is carried out of this epoch.
+                                    on_drain();
+                                    break None;
+                                }
                                 advisory = wait_for_drain(&mut rx), if drain_armed => {
                                     if pre_migrate_allows(
                                         pre_migrate.as_mut(), advisory, PRE_MIGRATE_TIMEOUT,
@@ -639,8 +666,17 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                         }
                     }
                     None => {
-                        serve_epoch(&socks_listener, http_listener.as_ref(), connector, alive_rx)
-                            .await;
+                        tokio::select! {
+                            () = serve_epoch(
+                                &socks_listener, http_listener.as_ref(), connector, alive_rx,
+                            ) => {}
+                            () = egress_dead.notified() => {
+                                // The exit forwards nothing over a live QUIC
+                                // session: reselect a fresh exit, exactly as for a
+                                // dead session.
+                                on_drain();
+                            }
+                        }
                         None
                     }
                 };

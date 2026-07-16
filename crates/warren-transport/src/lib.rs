@@ -45,6 +45,10 @@ pub use warren_multihop::SetupError;
 // fatal cause, re-exported so a supervisor consuming a `TunnelError` /
 // `MultihopError` verdict names them without depending on the engine crate.
 pub use warrenguard_transport::{FatalCause, Retryability};
+// The reusable in-tunnel egress-liveness probe scheduler + its IO trait. The SDK
+// proxy supervisor implements `EgressProbeIo` over its userland datapath, so the
+// dead-exit-forwards-nothing verdict is decided once, in the engine.
+pub use warrenguard_transport::egress_probe;
 // The per-OS carrier-socket bypass value a privileged TUN datapath pins on the
 // tunnel (via `MultihopClientTunnel::with_socket_bypass`) so the SDK can name it
 // without depending on the engine crate directly.

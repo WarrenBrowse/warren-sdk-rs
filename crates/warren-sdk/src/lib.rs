@@ -59,6 +59,7 @@ pub use warren_transport::ConnectionState;
 
 mod client;
 pub mod egress;
+mod egress_probe;
 mod error;
 mod portfollow;
 mod proxy;

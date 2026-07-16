@@ -35,6 +35,8 @@ tokio = { workspace = true }
 # Parse the am.i.warren egress-oracle verdict (control-plane leak self-check).
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Frame the in-tunnel egress-probe DNS query into the netstack UDP send path.
+bytes = { workspace = true }
 
 [features]
 # Bundle the reqwest transport so an app can build a working client with one
@@ -57,7 +59,8 @@ name = "live_tun"
 required-features = ["experimental-tun"]
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` enables `start_paused` for the egress-probe scheduler tests.
+tokio = { workspace = true, features = ["test-util"] }
 ed25519-dalek = { workspace = true }
 # Enable the directory/relay-list minting helpers for facade tests (test-only;
 # the feature is off in production builds, which never compile dev-dependencies).

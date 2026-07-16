@@ -1107,6 +1107,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                     forwarder_tx,
                     migration_tx,
                     fatal_tx,
+                    egress_probe: true,
                 },
                 // Reserve-then-switch is OFF by default: the pre-migrate gate
                 // needs the candidate pre-flight (NAT-PMP reservation over the

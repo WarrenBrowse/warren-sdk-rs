@@ -1,0 +1,287 @@
+//! In-tunnel egress-liveness probe for the userland proxy datapath.
+//!
+//! The QUIC transport can look alive (keep-alives ACKed) while the exit forwards
+//! NOTHING (drained or half-swapped during a rollout): the RX-silence guard the
+//! supervisor already has cannot see this, so the UI shows "Connected" with zero
+//! actual internet. This module drives the engine scheduler
+//! [`warren_transport::egress_probe::run_egress_probe`] over the userland
+//! datapath: a periodic DNS query THROUGH the tunnel to the exit resolver (the
+//! tunnel gateway) proves the exit decapsulates and forwards, and on a debounced
+//! dead verdict the probe escalates a reconnect the SAME way a dead session does,
+//! so the supervisor reselects a fresh exit.
+//!
+//! The SDK non-root proxy tier is TUN-less, so the gateway is not OS-routable:
+//! the probe rides the netstack's own UDP path
+//! ([`TunnelConnector::open_udp`](warren_net::TunnelConnector::open_udp)), the
+//! same path the SOCKS UDP association uses, rather than an OS socket.
+
+use std::future::Future;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use tokio::sync::Notify;
+use warren_net::TunnelConnector;
+use warren_transport::egress_probe::{
+    EgressProbeConfig, EgressProbeIo, build_dns_query, is_matching_response, jittered,
+    run_egress_probe,
+};
+
+use crate::supervisor::AbortOnDrop;
+
+/// Name resolved by the probe over the tunnel: Warren infrastructure, queried
+/// against Warren's own exit resolver, so no third party learns anything.
+const PROBE_QNAME: &str = "warrenbrowse.com";
+/// Overall wait for a probe answer through the tunnel.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// One in-tunnel DNS round trip: the gateway-probe seam. Production dials the
+/// netstack UDP path; tests script the verdict, so the supervisor escalation is
+/// testable without a real exit.
+pub(crate) trait GatewayProber: Send {
+    /// One end-to-end probe through the tunnel. `true` = egress alive (a DNS
+    /// answer came back). `false` = no answer within the deadline. A local error
+    /// (the datapath is tearing down) is inconclusive and reports `true`, so a
+    /// host-side hiccup never raises a false dead verdict.
+    fn probe(&mut self) -> impl Future<Output = bool> + Send;
+}
+
+/// Production prober: sends a DNS query over the netstack UDP path to the tunnel
+/// gateway resolver and waits for any matching response.
+pub(crate) struct ConnectorProber {
+    connector: TunnelConnector,
+    gateway_dns: SocketAddr,
+    /// Per-probe query id (wrapping): a stray datagram from a previous probe must
+    /// not be mistaken for this probe's answer. Sequential is fine, the probe is
+    /// not adversarial and QUIC encrypts the wire.
+    next_txid: u16,
+}
+
+impl ConnectorProber {
+    pub(crate) fn new(connector: TunnelConnector, gateway: Ipv4Addr) -> Self {
+        Self {
+            connector,
+            gateway_dns: SocketAddr::new(gateway.into(), 53),
+            next_txid: 0,
+        }
+    }
+}
+
+impl GatewayProber for ConnectorProber {
+    async fn probe(&mut self) -> bool {
+        // A fresh UDP flow per probe (cheap): the netstack routes it into the
+        // tunnel. A local open/send error means the datapath is gone, which is
+        // inconclusive, not an egress-dead verdict.
+        let mut sock = match self.connector.open_udp().await {
+            Ok(s) => s,
+            Err(_) => return true,
+        };
+        self.next_txid = self.next_txid.wrapping_add(1);
+        let txid = self.next_txid;
+        let query = Bytes::from(build_dns_query(txid, PROBE_QNAME));
+        if sock.send_to(query, self.gateway_dns).await.is_err() {
+            return true;
+        }
+        let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+        loop {
+            match tokio::time::timeout_at(deadline, sock.recv_from()).await {
+                Ok(Some((buf, _))) if is_matching_response(&buf, txid) => return true,
+                Ok(Some(_)) => {} // stray datagram from an earlier probe: keep waiting
+                Ok(None) => return true, // the flow closed = teardown, inconclusive
+                Err(_) => return false, // no answer through the tunnel within the deadline
+            }
+        }
+    }
+}
+
+/// Drives the engine egress-probe scheduler over the userland datapath. On the
+/// debounced dead verdict it notifies [`Self::escalate`], which the supervisor
+/// races against `serve` to end the epoch and reselect a fresh exit.
+pub(crate) struct ProxyEgressProbe<P: GatewayProber> {
+    prober: P,
+    cfg: EgressProbeConfig,
+    escalate: Arc<Notify>,
+    /// splitmix64 state for the tick jitter (de-regularization only, so a fleet
+    /// never probes in lockstep; not a security primitive).
+    rng: u64,
+}
+
+impl<P: GatewayProber> ProxyEgressProbe<P> {
+    pub(crate) fn new(prober: P, cfg: EgressProbeConfig, escalate: Arc<Notify>) -> Self {
+        Self {
+            prober,
+            cfg,
+            escalate,
+            rng: 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    /// A well-distributed fraction in `[0, 1)` for the jittered tick interval.
+    fn next_fraction(&mut self) -> f64 {
+        self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        let z = z ^ (z >> 31);
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+impl<P: GatewayProber> EgressProbeIo for ProxyEgressProbe<P> {
+    async fn next_tick(&mut self, settled: bool) -> bool {
+        let base = if settled {
+            self.cfg.interval
+        } else {
+            self.cfg.startup_interval
+        };
+        let frac = self.next_fraction();
+        tokio::time::sleep(jittered(base, frac)).await;
+        true
+    }
+
+    fn session_present(&mut self) -> bool {
+        // The probe task is spawned per epoch and aborted when the epoch ends, so
+        // a live probe always has a published session (single supervised session).
+        true
+    }
+
+    async fn probe(&mut self) -> bool {
+        self.prober.probe().await
+    }
+
+    fn publish(&mut self, _egress_dead: bool) {
+        // The SDK surfaces the outcome through the supervisor's state machine:
+        // a dead verdict escalates a reconnect (Reconnecting), so there is no
+        // separate banner channel to publish here (and no-log forbids logging
+        // datapath state). Kept as the trait's edge-triggered hook for parity.
+    }
+
+    fn drain_active(&mut self) -> bool {
+        // The supervisor owns planned-drain handling on its own advisory signal;
+        // the probe only ever escalates a full reconnect (reselect), never the
+        // gap-free migration path.
+        false
+    }
+
+    async fn try_migrate(&mut self) -> bool {
+        false
+    }
+
+    fn escalate_reconnect(&mut self, _msg: String) {
+        // End the current epoch: the supervisor reselects a fresh exit, exactly
+        // as it does for a dead session. The message carries no identity material,
+        // but the supervisor already logs the transition, so it is dropped here.
+        self.escalate.notify_one();
+    }
+}
+
+/// Spawns the egress probe for one epoch over `connector`, escalating a reconnect
+/// on the dead verdict by notifying `escalate`. The returned [`AbortOnDrop`] is
+/// held by the supervisor for the epoch, so the probe is torn down with it (it
+/// never outlives the session). A no-op task when `WARREN_EGRESS_PROBE=0`.
+pub(crate) fn spawn_egress_probe(
+    connector: TunnelConnector,
+    gateway: Ipv4Addr,
+    escalate: Arc<Notify>,
+) -> AbortOnDrop {
+    let cfg = EgressProbeConfig::from_env();
+    AbortOnDrop(tokio::spawn(async move {
+        if !cfg.enabled {
+            return;
+        }
+        let threshold = cfg.failure_threshold;
+        let mut probe =
+            ProxyEgressProbe::new(ConnectorProber::new(connector, gateway), cfg, escalate);
+        run_egress_probe(&mut probe, threshold).await;
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// A scripted gateway prober: one verdict per probe, `alive` once exhausted.
+    /// The tunnel is a system boundary here, so scripting the probe verdict is the
+    /// right seam to test the SDK escalation without a real exit.
+    struct ScriptedProber {
+        script: Mutex<VecDeque<bool>>,
+    }
+    impl ScriptedProber {
+        fn new(script: impl IntoIterator<Item = bool>) -> Self {
+            Self {
+                script: Mutex::new(script.into_iter().collect()),
+            }
+        }
+    }
+    impl GatewayProber for ScriptedProber {
+        async fn probe(&mut self) -> bool {
+            self.script.lock().unwrap().pop_front().unwrap_or(true)
+        }
+    }
+
+    /// interval + startup 1 s so the paused-time ticks are fast; threshold 3.
+    fn fast_cfg() -> EgressProbeConfig {
+        EgressProbeConfig::resolve(None, Some("1"), Some("1"), Some("3"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_consecutive_dead_probes_escalate_a_reconnect() {
+        // The engine debounce: three consecutive failed in-tunnel probes over a
+        // still-alive QUIC session must escalate a reconnect, so the supervisor
+        // reselects a fresh exit instead of showing Connected over an exit that
+        // forwards nothing.
+        let escalate = Arc::new(Notify::new());
+        let fired = Arc::clone(&escalate);
+        let cfg = fast_cfg();
+        let threshold = cfg.failure_threshold;
+        let mut probe =
+            ProxyEgressProbe::new(ScriptedProber::new([false, false, false]), cfg, escalate);
+
+        let run = tokio::spawn(async move { run_egress_probe(&mut probe, threshold).await });
+        for _ in 0..6 {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            tokio::task::yield_now().await;
+        }
+        run.await.expect("the probe loop returns after escalation");
+
+        tokio::time::timeout(Duration::from_millis(50), fired.notified())
+            .await
+            .expect("a dead egress verdict must escalate exactly one reconnect");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_recovered_probe_resets_and_never_escalates() {
+        // fail, fail, ok, fail, fail: never three consecutive, so the debounce
+        // never fires and no reconnect is escalated (a rollout hot-swap blip must
+        // not flap the datapath).
+        let escalate = Arc::new(Notify::new());
+        let fired = Arc::clone(&escalate);
+        let cfg = fast_cfg();
+        let threshold = cfg.failure_threshold;
+        let mut probe = ProxyEgressProbe::new(
+            ScriptedProber::new([false, false, true, false, false]),
+            cfg,
+            escalate,
+        );
+
+        let run = tokio::spawn(async move { run_egress_probe(&mut probe, threshold).await });
+        for _ in 0..12 {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            tokio::task::yield_now().await;
+        }
+        // The scripted verdicts are exhausted (probe reports alive), so the loop
+        // keeps ticking without ever escalating: abort it and confirm no verdict.
+        run.abort();
+        let _ = run.await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), fired.notified())
+                .await
+                .is_err(),
+            "non-consecutive failures must never escalate a reconnect"
+        );
+    }
+}
