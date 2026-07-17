@@ -6,7 +6,7 @@ use warren_discovery::{ExitId, Location, Relay, VerifiedExit};
 use warren_identity::WarrenIdentity;
 use warren_transport::ConnectionState;
 
-use crate::client::{DefaultClient, WarrenClient};
+use crate::client::{DaitaMode, DefaultClient, WarrenClient, daita_mode};
 use crate::error::SdkError;
 use crate::proxy::TunnelState;
 use crate::supervisor::EstablishedTunnel;
@@ -229,6 +229,19 @@ async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
         *fatal_rx.borrow(),
         Some(FatalCause::NotAuthorized),
         "the specific fatal cause is surfaced to the facade"
+    );
+}
+
+#[test]
+fn daita_defaults_to_the_negotiated_model_with_local_pick_as_explicit_override() {
+    // doc-94 B9: plain `.daita()` advertises support and lets the exit pick
+    // (the production-proven model); only a NAMED machine keeps the
+    // client-side unilateral pick.
+    assert_eq!(daita_mode(false, None), DaitaMode::Off);
+    assert_eq!(daita_mode(true, None), DaitaMode::Negotiated);
+    assert_eq!(
+        daita_mode(true, Some("tamaraw")),
+        DaitaMode::LocalPick("tamaraw".into())
     );
 }
 

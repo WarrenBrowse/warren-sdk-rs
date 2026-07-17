@@ -260,6 +260,12 @@ pub struct MultihopClientTunnel {
     /// ServerIP fix). `None` (default) for the userland proxy (no OS tunnel) and
     /// mobile (`VpnService.protect`). Set via [`Self::with_socket_bypass`].
     socket_bypass: Option<SocketBypass>,
+    /// Advertises DAITA support in the sealed setup (`IpRequest.wants_daita`):
+    /// the exit then samples a machine and returns it in
+    /// `IpAssign.daita_spec` (the negotiated model shared with the app). Off
+    /// by default; when unset the exit MUST NOT grant a spec, keeping its
+    /// downlink unpadded so the session is never misreported as defended.
+    daita_support: bool,
 }
 
 impl MultihopClientTunnel {
@@ -276,7 +282,20 @@ impl MultihopClientTunnel {
             cover_domain: None,
             tcp_fallback: false,
             socket_bypass: None,
+            daita_support: false,
         }
+    }
+
+    /// Advertises DAITA support so the exit samples and returns the machine
+    /// spec (`IpAssign.daita_spec`): the negotiated enablement model. The
+    /// caller reads the grant back via
+    /// [`MultihopSession::assignment`]`().daita_spec` and drives it on the
+    /// uplink; `None` in the reply means the exit declined and the defense is
+    /// NOT running.
+    #[must_use]
+    pub fn with_daita(mut self, enable: bool) -> Self {
+        self.daita_support = enable;
+        self
     }
 
     /// Override the local bind address (defaults to the unspecified address with
@@ -507,12 +526,13 @@ impl MultihopClientTunnel {
             max_age: Duration::MAX,
         });
 
-        // wants_daita stays false: this userland datapath does not drive a
-        // maybenot machine on its uplink yet, and asking the exit to pad its
-        // downlink while the client pads nothing would misreport the session
-        // as defended, the exact lie the /v3 capability echo exists to prevent.
+        // The negotiated DAITA model: `wants_daita` only advertises support;
+        // the exit samples the machine and returns it in the assignment. A
+        // caller that advertises MUST drive the granted spec on its uplink,
+        // otherwise the session would be misreported as defended, the exact
+        // lie the /v3 capability echo exists to prevent.
         let opened = inner
-            .setup_over_stream(Some(&self.signing_key), self.wants_ipv6, false)
+            .setup_over_stream(Some(&self.signing_key), self.wants_ipv6, self.daita_support)
             .await
             .map_err(map_engine_err)?;
 

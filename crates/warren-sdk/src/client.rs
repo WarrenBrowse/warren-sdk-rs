@@ -189,20 +189,23 @@ impl WarrenClientBuilder {
         self
     }
 
-    /// Enables DAITA on multihop tunnels: the client pads its own uplink with
-    /// cover traffic scheduled by a machine picked uniformly from the curated
-    /// [`DaitaPool`](warren_daita::DaitaPool) (the exit pads the downlink
-    /// independently). Off by default. Only affects multihop connects.
+    /// Enables DAITA on multihop tunnels, negotiated with the exit (the
+    /// production model): the client advertises support, the exit samples the
+    /// machine and returns it in the assignment, and the client drives that
+    /// spec on its uplink while the exit pads the downlink. If the exit
+    /// declines, the defense is NOT running (no blind padding). Off by
+    /// default. Only affects multihop connects.
     #[must_use]
     pub fn daita(mut self) -> Self {
         self.daita = true;
         self
     }
 
-    /// Like [`daita`](Self::daita) but pins the uplink defense to a named curated
-    /// machine (`netflow`, `tamaraw`, `front`, `interspace_server`,
-    /// `scrambler_server`) instead of a random pick. Useful for deterministic
-    /// behaviour in tests and ops debugging.
+    /// Explicit override of [`daita`](Self::daita): pins the uplink defense to
+    /// a named curated machine (`netflow`, `tamaraw`, `front`,
+    /// `interspace_server`, `scrambler_server`) picked CLIENT-side, unilateral
+    /// (nothing is negotiated with the exit, whose downlink stays unpadded).
+    /// Useful for deterministic behaviour in tests and ops debugging.
     #[must_use]
     pub fn daita_machine(mut self, name: impl Into<String>) -> Self {
         self.daita = true;
@@ -640,6 +643,9 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// [`SdkError::UnknownDaitaMachine`] if a named machine is not in the pool,
     /// [`SdkError::EmptyDaitaPool`] if the pool is empty, or
     /// [`SdkError::DaitaConfig`] if the maybenot framework rejects the config.
+    /// How the multihop DAITA defense is armed (doc-94 B9): negotiated with
+    /// the exit by default (the production-proven model); a NAMED machine is
+    /// the explicit client-side unilateral override.
     pub async fn connect_multihop(
         &self,
         exit: &VerifiedExit,
@@ -665,7 +671,11 @@ impl<T: HttpTransport> WarrenClient<T> {
         // the app. The SDK's DAITA is builder-driven (`self.daita`), so cover is
         // armed only on the non-DAITA path below.
         let cover = warrenguard_config::knobs::cover_defenses();
+        let daita = daita_mode(self.daita, self.daita_machine.as_deref());
         let mut tunnel = MultihopClientTunnel::new(self.signing.clone());
+        if daita == DaitaMode::Negotiated {
+            tunnel = tunnel.with_daita(true);
+        }
         if self.auto_local_ip {
             tunnel = tunnel.with_auto_local_ip();
         }
@@ -690,7 +700,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         if let Some(bypass) = socket_bypass {
             tunnel = tunnel.with_socket_bypass(bypass);
         }
-        if !self.daita && cover.idle_cover {
+        if daita == DaitaMode::Off && cover.idle_cover {
             // Disable the fixed keep-alive PING; the armed cover driver replaces
             // it with a jittered, size-varied idle footprint. DAITA runs its own
             // cover, so this is the non-DAITA path only.
@@ -708,18 +718,27 @@ impl<T: HttpTransport> WarrenClient<T> {
         // available once the multihop handshake completes. Keyed by the exit's
         // Ed25519 endpoint pubkey, the same key the selector looks up.
         self.record_rtt(exit.exit_ed25519_pubkey, session.path_rtt());
-        if !self.daita {
-            return Ok(MultihopPacketSink::new(session).arm_idle_cover(cover.idle_cover));
-        }
-        // DAITA on: pick the uplink machine, build the driver over a shared
+        // DAITA on: resolve the uplink machine, build the driver over a shared
         // session, and spawn its padding loop. The loop self-terminates when the
         // tunnel closes (a cover send then errors), so no explicit stop is needed.
-        let pool = warren_daita::DaitaPool::default_pool();
-        let cfg = match &self.daita_machine {
-            Some(name) => pool
+        let cfg = match &daita {
+            DaitaMode::Off => {
+                return Ok(MultihopPacketSink::new(session).arm_idle_cover(cover.idle_cover));
+            }
+            // Negotiated (the default): drive exactly what the exit granted.
+            DaitaMode::Negotiated => match session.assignment().daita_spec.clone() {
+                Some(cfg) => cfg,
+                None => {
+                    // The exit declined: the defense is NOT running; return the
+                    // undefended sink instead of padding blindly (the lie the
+                    // /v3 capability echo exists to prevent).
+                    return Ok(MultihopPacketSink::new(session));
+                }
+            },
+            // Explicit override: client-side unilateral pick.
+            DaitaMode::LocalPick(name) => warren_daita::DaitaPool::default_pool()
                 .pick_named_os(name)
                 .ok_or_else(|| SdkError::UnknownDaitaMachine { name: name.clone() })?,
-            None => pool.pick_os().ok_or(SdkError::EmptyDaitaPool)?,
         };
         let state = warren_daita::DaitaState::from_config(&cfg, std::time::Instant::now())
             .map_err(SdkError::DaitaConfig)?;
@@ -1243,6 +1262,28 @@ pub(crate) fn ensure_dns_reachable(
 /// Current Unix time in seconds; `0` if the clock is before the epoch (which
 /// makes `is_expired` conservatively treat the list as not-yet-expired rather
 /// than spuriously rejecting it).
+/// How the multihop DAITA defense is armed (doc-94 B9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DaitaMode {
+    /// No defense requested.
+    Off,
+    /// Default: advertise support, the exit samples and returns the machine
+    /// (the production-proven negotiated model).
+    Negotiated,
+    /// Explicit override: client-side unilateral pick of a named machine.
+    LocalPick(String),
+}
+
+/// Resolves the arming mode from the builder switches. A named machine
+/// implies the override; plain `.daita()` negotiates.
+pub(crate) fn daita_mode(daita: bool, machine: Option<&str>) -> DaitaMode {
+    match (daita, machine) {
+        (false, _) => DaitaMode::Off,
+        (true, None) => DaitaMode::Negotiated,
+        (true, Some(name)) => DaitaMode::LocalPick(name.to_owned()),
+    }
+}
+
 pub(crate) fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

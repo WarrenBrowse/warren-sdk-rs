@@ -418,11 +418,15 @@ pub struct FfiClientOptions {
     /// they survive a restart. `None` keeps them in memory (reset each launch).
     #[uniffi(default = None)]
     pub state_dir: Option<String>,
-    /// Enable the DAITA uplink traffic-analysis defense on multihop tunnels.
+    /// Enable the DAITA traffic-analysis defense on multihop tunnels,
+    /// negotiated with the exit (the exit samples and returns the machine;
+    /// if it declines, the defense is not running).
     #[uniffi(default = false)]
     pub daita: bool,
-    /// Pin the DAITA uplink machine to a named curated-pool entry (for example
-    /// `tamaraw`); `None` lets the SDK pick. Implies `daita`.
+    /// Explicit override: pin the DAITA uplink machine to a named
+    /// curated-pool entry (for example `tamaraw`), picked client-side and
+    /// unilateral (nothing negotiated). `None` = negotiated model. Implies
+    /// `daita`.
     #[uniffi(default = None)]
     pub daita_machine: Option<String>,
     /// Alternative API hostnames (bare DNS names) tried in order when the primary
