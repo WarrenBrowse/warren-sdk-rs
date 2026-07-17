@@ -1866,7 +1866,7 @@ mod tests {
 
     #[test]
     fn fatal_cause_kinds_stay_distinguishable_across_the_ffi() {
-        // The A4 guarantee: the engine's three definitive fatal causes must reach
+        // The fatal-cause guarantee: the engine's three definitive fatal causes must reach
         // the host as distinct kinds, not collapse to one opaque "failed", so a
         // subscription lapse, a device-limit rejection and an opaque policy
         // refusal each drive their own UI instead of an endless "Reconnecting".

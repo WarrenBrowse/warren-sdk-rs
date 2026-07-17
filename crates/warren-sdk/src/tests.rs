@@ -234,7 +234,7 @@ async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
 
 #[test]
 fn daita_defaults_to_the_negotiated_model_with_local_pick_as_explicit_override() {
-    // doc-94 B9: plain `.daita()` advertises support and lets the exit pick
+    // Plain `.daita()` advertises support and lets the exit pick
     // (the production-proven model); only a NAMED machine keeps the
     // client-side unilateral pick.
     assert_eq!(daita_mode(false, None), DaitaMode::Off);

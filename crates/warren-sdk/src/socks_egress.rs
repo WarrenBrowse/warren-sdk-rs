@@ -1,7 +1,7 @@
 //! Egress proof over a local SOCKS5 endpoint: the doc-62 contract, exported.
 //!
 //! Two userland shapes share this single home instead of re-deciding their
-//! constants per client (doc-94 B11):
+//! constants per client:
 //!
 //! - the PERIODIC liveness probe ([`run_socks5_egress_probe`]): an exit that
 //!   is drained or half-swapped keeps ACKing QUIC keep-alives, so RX-silence

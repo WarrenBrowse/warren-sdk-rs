@@ -4,7 +4,7 @@
 //! single-home (`warrenguard-route-split` + `warrenguard-killswitch-os`) does not
 //! cover: bringing up and addressing the freshly opened raw TUN device, and (on
 //! macOS) installing the carrier host-route escape. Ported from the deleted
-//! in-tree `plan`/`apply` glue (doc-94 B1). The app opens and addresses its device
+//! in-tree `plan`/`apply` glue. The app opens and addresses its device
 //! through talpid instead, so this bring-up has no engine home; the routing,
 //! killswitch and DNS policy it composes are all in the shared engine crates.
 

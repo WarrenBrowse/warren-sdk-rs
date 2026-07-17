@@ -643,7 +643,7 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// [`SdkError::UnknownDaitaMachine`] if a named machine is not in the pool,
     /// [`SdkError::EmptyDaitaPool`] if the pool is empty, or
     /// [`SdkError::DaitaConfig`] if the maybenot framework rejects the config.
-    /// How the multihop DAITA defense is armed (doc-94 B9): negotiated with
+    /// How the multihop DAITA defense is armed: negotiated with
     /// the exit by default (the production-proven model); a NAMED machine is
     /// the explicit client-side unilateral override.
     pub async fn connect_multihop(
@@ -763,7 +763,7 @@ impl<T: HttpTransport> WarrenClient<T> {
     ///
     /// The routing (`warrenguard_route_split`), killswitch
     /// (`warrenguard_killswitch_os`) and DNS push are the single, real-exit-proven
-    /// home shared with the app-scope system-VPN (doc-94 B1); this method composes
+    /// home shared with the app-scope system-VPN; this method composes
     /// their RAII guards plus the device bring-up and the per-OS carrier escape.
     /// It also reuses [`Self::connect_multihop`], `warren_tun::device::open_tun`,
     /// `warren_net::tun_channels` and `warren_net::forward_bidirectional`.
@@ -853,7 +853,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         crate::tun_setup::configure_interface(&dev_name, ipv4, ipv6, mtu).map_err(SdkError::Tun)?;
 
         // Bring the datapath up and PROVE it forwards BEFORE arming the killswitch.
-        // Arming fail-closed first (the reverted B1 order) emitted Connected on a
+        // Arming fail-closed first (the earlier arm-before-verify order, since reverted) emitted Connected on a
         // datapath that never came up and stranded the whole host behind the pf
         // anchor with a dead tunnel (2026-07-16 macOS outage). Order now: split
         // capture -> carrier escape -> DNS -> forward -> verify egress -> only then
@@ -1262,7 +1262,7 @@ pub(crate) fn ensure_dns_reachable(
 /// Current Unix time in seconds; `0` if the clock is before the epoch (which
 /// makes `is_expired` conservatively treat the list as not-yet-expired rather
 /// than spuriously rejecting it).
-/// How the multihop DAITA defense is armed (doc-94 B9).
+/// How the multihop DAITA defense is armed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DaitaMode {
     /// No defense requested.
@@ -1293,8 +1293,8 @@ pub(crate) fn now_unix_secs() -> u64 {
 
 /// The Linux carrier-socket bypass given the physical interface index (unused on
 /// Linux: the escape is keyed on the fwmark, not the interface), delegating to the
-/// engine's single picker so the SDK never re-derives the `SO_MARK` mechanism
-/// (doc-94 B2). macOS deliberately uses no socket bypass (the `IP_BOUND_IF` bind
+/// engine's single picker so the SDK never re-derives the `SO_MARK` mechanism.
+/// macOS deliberately uses no socket bypass (the `IP_BOUND_IF` bind
 /// black-holes on multi-interface hosts, the 2026-07-13 incident); its carrier
 /// escapes via a `<exit>/32` host route instead (see [`crate::tun_setup`]).
 #[cfg(all(feature = "experimental-tun", target_os = "linux"))]
@@ -1329,7 +1329,7 @@ fn build_killswitch_opts(
 /// install error, it runs `abort` (tearing down the forwarding tasks) and returns
 /// the error WITHOUT a killswitch, so a datapath that never comes up fails OPEN,
 /// leaving the host as found rather than stranded behind a fail-closed anchor with
-/// a dead tunnel (the reverted B1 order caused exactly that, the 2026-07-16 macOS
+/// a dead tunnel (the earlier arm-before-verify order caused exactly that, the 2026-07-16 macOS
 /// outage). Generic over the killswitch type so this ordering invariant is unit
 /// tested with fakes: `start_tun_multihop` itself needs a real device + privilege.
 #[cfg(all(unix, feature = "experimental-tun"))]
@@ -1482,7 +1482,7 @@ impl Drop for CarrierHostRoute {
 }
 
 /// The OS killswitch backend the datapath installs (pf sub-anchor on macOS, nft
-/// table on Linux). Single-homed in `warrenguard-killswitch-os` (doc-94 B1).
+/// table on Linux). Single-homed in `warrenguard-killswitch-os`.
 #[cfg(all(unix, feature = "experimental-tun", target_os = "macos"))]
 type KsBackend = warrenguard_killswitch_os::MacosKillswitch;
 #[cfg(all(unix, feature = "experimental-tun", target_os = "linux"))]
@@ -1548,7 +1548,7 @@ mod portfail_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn socket_bypass_delegates_to_the_shared_route_split_picker() {
-        // Anti-regrowth pin (doc-94 B2): the SDK must NOT re-derive its own Linux
+        // Anti-regrowth pin: the SDK must NOT re-derive its own Linux
         // carrier bypass; it delegates to the engine's single picker. If a future
         // change re-open-codes a private SDK picker that drifts from the engine's,
         // this equality breaks and this test goes red.
@@ -1565,7 +1565,7 @@ mod portfail_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn killswitch_opts_key_the_carrier_accept_on_the_socket_mark_on_linux() {
-        // The SDK's own opts, rendered by the Home A killswitch (doc-94 B1): the
+        // The SDK's own opts, rendered by the Home A killswitch: the
         // carrier accept must key on the socket mark, never the exit destination.
         // A regression to the destination accept (the Port Fail leak) puts
         // `ip daddr <exit>` back and drops the `meta mark` rule -> red.
@@ -1641,7 +1641,7 @@ mod portfail_tests {
 
     #[tokio::test]
     async fn never_arms_the_killswitch_when_egress_is_not_verified() {
-        // The reverted B1 order armed the killswitch on a datapath that never
+        // The earlier arm-before-verify order armed the killswitch on a datapath that never
         // forwarded, stranding the host fail-closed with a dead tunnel (the
         // 2026-07-16 macOS outage). It must fail OPEN instead: NO killswitch, and
         // the forwarding tasks torn down.
