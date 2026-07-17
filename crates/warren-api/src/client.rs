@@ -329,9 +329,18 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         self.send(http).await.map(|_| ())
     }
 
-    /// Builds an unsigned request (carries only `accept`/`content-type`).
+    /// Builds an unsigned request (carries only `accept`/`content-type` plus
+    /// the product UA).
     fn unsigned_request(&self, method: Method, path: &str, body: Vec<u8>) -> HttpRequest {
-        let mut headers = vec![("accept".to_owned(), "application/json".to_owned())];
+        let mut headers = vec![
+            ("accept".to_owned(), "application/json".to_owned()),
+            // Set in the transport-agnostic builder (not per HTTP backend) so
+            // every transport sends the one product token.
+            (
+                "user-agent".to_owned(),
+                warren_contract::product::USER_AGENT.to_owned(),
+            ),
+        ];
         if !body.is_empty() {
             headers.push(("content-type".to_owned(), "application/json".to_owned()));
         }
@@ -367,6 +376,10 @@ impl<T: HttpTransport> WarrenApiClient<T> {
             .map(|(k, v)| (k.to_owned(), v))
             .collect();
         headers.push(("accept".to_owned(), "application/json".to_owned()));
+        headers.push((
+            "user-agent".to_owned(),
+            warren_contract::product::USER_AGENT.to_owned(),
+        ));
         if !body.is_empty() {
             headers.push(("content-type".to_owned(), "application/json".to_owned()));
         }
@@ -622,6 +635,32 @@ mod tests {
             .verify(canonical.as_bytes(), &Signature::from_bytes(&sig_bytes))
             .expect("signature must verify");
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn every_request_carries_the_product_user_agent() {
+        // The one product UA anchor, on the signed and unsigned paths alike:
+        // the API must see the same token from every Warren client (an SDK
+        // that sends none is the odd one out the server can fingerprint).
+        let c = client(MockTransport::new(200, r#"{"expires_at":1}"#));
+        c.subscription().await.expect("ok");
+        {
+            let guard = c.transport.last.lock().unwrap();
+            let req = guard.as_ref().expect("request captured");
+            assert_eq!(
+                header(req, "user-agent"),
+                Some(warren_contract::product::USER_AGENT),
+                "signed requests must carry the product UA"
+            );
+        }
+        c.list_exits().await.expect("ok");
+        let guard = c.transport.last.lock().unwrap();
+        let req = guard.as_ref().expect("request captured");
+        assert_eq!(
+            header(req, "user-agent"),
+            Some(warren_contract::product::USER_AGENT),
+            "unsigned requests must carry the product UA"
+        );
     }
 
     #[tokio::test]
