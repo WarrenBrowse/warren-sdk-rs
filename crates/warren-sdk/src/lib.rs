@@ -63,6 +63,7 @@ mod egress_probe;
 mod error;
 mod portfollow;
 mod proxy;
+pub mod socks_egress;
 mod store;
 mod supervisor;
 #[cfg(all(unix, feature = "experimental-tun"))]
