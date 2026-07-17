@@ -56,6 +56,10 @@ pub use warrenguard_transport::drain_policy;
 // session verdict) is engine-owned; supervisors draw delays from it instead
 // of re-declaring a local schedule.
 pub use warrenguard_transport::redial_policy;
+// The "host moved to another network" detection (preferred-path probe +
+// change watcher) is engine-owned; supervisors arm it and react with their own
+// redial machinery.
+pub use warrenguard_transport::network_monitor;
 // The per-OS carrier-socket bypass value a privileged TUN datapath pins on the
 // tunnel (via `MultihopClientTunnel::with_socket_bypass`) so the SDK can name it
 // without depending on the engine crate directly.

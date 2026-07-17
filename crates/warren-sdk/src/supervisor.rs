@@ -484,6 +484,56 @@ async fn pre_migrate_allows(
     (tokio::time::timeout(timeout, gate(advisory)).await).unwrap_or(false)
 }
 
+/// Local network-path watcher armed for each connected epoch: when the host's
+/// preferred route toward the exit moves to a live new path (Wi-Fi to Ethernet
+/// handover, DHCP renumbering, connectivity recovery), the epoch ends and the
+/// supervisor redials immediately from the new path instead of waiting for
+/// idle-timeout/dead-path detection. Detection is the engine's
+/// `network_monitor` home; this is only its arming seam (injectable for
+/// tests).
+pub(crate) struct NetworkWatch {
+    pub(crate) probe: Box<dyn FnMut() -> Option<std::net::IpAddr> + Send>,
+    pub(crate) interval: std::time::Duration,
+}
+
+impl NetworkWatch {
+    /// The production watcher: the kernel's own route decision toward the
+    /// engine probe anchor, at the engine poll cadence.
+    pub(crate) fn system() -> Self {
+        Self {
+            probe: Box::new(|| {
+                warren_transport::network_monitor::preferred_source_ip(
+                    warren_transport::network_monitor::PROBE_ANCHOR,
+                )
+            }),
+            interval: warren_transport::network_monitor::POLL_INTERVAL,
+        }
+    }
+
+    /// Resolves when the preferred path moves (never, when unarmed).
+    async fn moved(watch: Option<&mut Self>) {
+        match watch {
+            Some(watch) => {
+                warren_transport::network_monitor::wait_for_path_change(
+                    &mut *watch.probe,
+                    watch.interval,
+                )
+                .await;
+            }
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// Optional guards the supervisor arms around each connected epoch: the
+/// reserve-then-switch pre-migrate gate and the network-path watcher. Grouped
+/// so the supervisor signature stays readable as the seams grow.
+#[derive(Default)]
+pub(crate) struct EpochGuards {
+    pub(crate) pre_migrate: Option<PreMigrateGate>,
+    pub(crate) network_watch: Option<NetworkWatch>,
+}
+
 /// The watch senders a supervisor publishes on: connection state, the
 /// per-epoch forwarder driving self-healing port forwards, and the structured
 /// maintenance-migration events. Grouped so the supervisor signature stays
@@ -517,7 +567,7 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
     http_listener: Option<tokio::net::TcpListener>,
     dns_server: Option<std::net::Ipv4Addr>,
     outputs: SupervisorOutputs,
-    mut pre_migrate: Option<PreMigrateGate>,
+    guards: EpochGuards,
     mut connect: F,
     on_drain: D,
 ) where
@@ -530,6 +580,10 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
     // single-exit datapath passes a no-op (one pinned exit, nothing to rotate).
     D: Fn(),
 {
+    let EpochGuards {
+        mut pre_migrate,
+        mut network_watch,
+    } = guards;
     // The engine redial policy: the shared full-jitter schedule (so many
     // clients losing the same exit at once do not reconnect in a synchronized
     // wave) plus the healthy-vs-flapping session verdict, both single-homed in
@@ -610,6 +664,13 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                 // the migration and the current session keeps serving; the exit
                 // is left to hard-close at its drain deadline, and the port
                 // survives its swap server-side.
+                // The network watcher races the whole epoch: a moved preferred
+                // path ends it so the redial rebinds on the new network at
+                // once, instead of riding the dead session into idle timeout.
+                // Same exit, so no rotation: the network moved, the exit is
+                // fine.
+                let path_moved = NetworkWatch::moved(network_watch.as_mut());
+                tokio::pin!(path_moved);
                 let drained = match drain_rx {
                     Some(mut rx) => {
                         // The serve future is pinned OUTSIDE the drain loop so a
@@ -627,6 +688,7 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                         loop {
                             tokio::select! {
                                 () = &mut serve => break None,
+                                () = &mut path_moved => break None,
                                 () = egress_dead.notified() => {
                                     // The exit forwards nothing over a live QUIC
                                     // session: reselect a fresh exit, exactly as
@@ -663,6 +725,7 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                             () = serve_epoch(
                                 &socks_listener, http_listener.as_ref(), connector, alive_rx,
                             ) => {}
+                            () = &mut path_moved => {}
                             () = egress_dead.notified() => {
                                 // The exit forwards nothing over a live QUIC
                                 // session: reselect a fresh exit, exactly as for a

@@ -118,7 +118,10 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
                     migration_tx: tokio::sync::watch::channel(None).0,
                     fatal_tx: tokio::sync::watch::channel(None).0,
                 },
-                None,
+                crate::supervisor::EpochGuards {
+                    pre_migrate: None,
+                    network_watch: None,
+                },
                 move || {
                     let kill_tx = kill_tx.clone();
                     let cycles = Arc::clone(&cycles);
@@ -167,6 +170,94 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn network_path_change_redials_immediately_without_rotating() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // A handover (the preferred local source moves to a live new path) must
+    // end the serving epoch and redial at once, instead of riding the dead
+    // session into idle-timeout/dead-path detection minutes later. It must
+    // NOT rotate the failover cursor: the exit is healthy, the network moved.
+    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+    let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
+    let rotations = Arc::new(AtomicUsize::new(0));
+    let source = Arc::new(std::sync::Mutex::new(Some(
+        "192.0.2.10".parse::<std::net::IpAddr>().unwrap(),
+    )));
+
+    let task = {
+        let rotations = Arc::clone(&rotations);
+        let probe_source = Arc::clone(&source);
+        tokio::spawn(async move {
+            supervise_proxy(
+                socks_listener,
+                None,
+                None,
+                crate::supervisor::SupervisorOutputs {
+                    egress_probe: false,
+                    state_tx,
+                    forwarder_tx: tokio::sync::watch::channel(None).0,
+                    migration_tx: tokio::sync::watch::channel(None).0,
+                    fatal_tx: tokio::sync::watch::channel(None).0,
+                },
+                crate::supervisor::EpochGuards {
+                    pre_migrate: None,
+                    network_watch: Some(crate::supervisor::NetworkWatch {
+                        probe: Box::new(move || *probe_source.lock().unwrap()),
+                        interval: std::time::Duration::from_millis(20),
+                    }),
+                },
+                move || {
+                    let kill_tx = kill_tx.clone();
+                    async move {
+                        let close = Arc::new(tokio::sync::Notify::new());
+                        let _ = kill_tx.send(Arc::clone(&close));
+                        Ok::<_, SdkError>(EstablishedTunnel {
+                            sink: ClosableSink { close },
+                            local_ip: "10.66.0.2".parse().unwrap(),
+                            prefix: 24,
+                            gateway: "10.66.0.1".parse().unwrap(),
+                            ipv6: None,
+                        })
+                    }
+                },
+                move || {
+                    rotations.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await;
+        })
+    };
+
+    // Epoch 1 is up (the tunnel is healthy and never closed by the sink).
+    let kill1 = tokio::time::timeout(std::time::Duration::from_secs(5), kill_rx.recv())
+        .await
+        .expect("first connect happened")
+        .expect("kill handle");
+    // Let the epoch's watcher take its baseline (several poll intervals): the
+    // watcher baselines on the network the epoch dialed from, so a flip before
+    // its first poll would just look like the starting point.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Simulated handover: the preferred source moves (Wi-Fi -> Ethernet).
+    *source.lock().unwrap() = Some("198.51.100.20".parse().unwrap());
+
+    let kill2 = tokio::time::timeout(std::time::Duration::from_secs(5), kill_rx.recv())
+        .await
+        .expect("the supervisor redialed on the network move without waiting for session death")
+        .expect("kill handle");
+    assert_eq!(
+        rotations.load(Ordering::SeqCst),
+        0,
+        "a network move keeps the same exit: the failover cursor must not rotate"
+    );
+
+    kill1.notify_one();
+    kill2.notify_one();
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
     // A policy rejection (unauthorized account) is fatal, not transient: the
     // engine verdict recurs on every redial, so the supervisor must STOP after
@@ -194,7 +285,10 @@ async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
                     migration_tx: tokio::sync::watch::channel(None).0,
                     fatal_tx,
                 },
-                None,
+                crate::supervisor::EpochGuards {
+                    pre_migrate: None,
+                    network_watch: None,
+                },
                 move || {
                     let attempts = Arc::clone(&attempts);
                     async move {
@@ -273,7 +367,10 @@ async fn supervisor_reselects_on_an_exhaustion_refusal_without_going_fatal() {
                     migration_tx: tokio::sync::watch::channel(None).0,
                     fatal_tx,
                 },
-                None,
+                crate::supervisor::EpochGuards {
+                    pre_migrate: None,
+                    network_watch: None,
+                },
                 || async {
                     Err::<EstablishedTunnel<ClosableSink>, SdkError>(SdkError::Multihop(
                         MultihopError::Setup(SetupError::IpExhausted),
@@ -334,7 +431,10 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
                 migration_tx: tokio::sync::watch::channel(None).0,
                 fatal_tx: tokio::sync::watch::channel(None).0,
             },
-            None,
+            crate::supervisor::EpochGuards {
+                pre_migrate: None,
+                network_watch: None,
+            },
             move || {
                 let kill_tx = kill_tx.clone();
                 async move {
@@ -902,7 +1002,10 @@ async fn supervisor_serves_both_socks_and_http_listeners() {
                 migration_tx: tokio::sync::watch::channel(None).0,
                 fatal_tx: tokio::sync::watch::channel(None).0,
             },
-            None,
+            crate::supervisor::EpochGuards {
+                pre_migrate: None,
+                network_watch: None,
+            },
             move || {
                 let keep_open = Arc::clone(&keep_open);
                 async move {
@@ -951,7 +1054,10 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
                 migration_tx: tokio::sync::watch::channel(None).0,
                 fatal_tx: tokio::sync::watch::channel(None).0,
             },
-            None,
+            crate::supervisor::EpochGuards {
+                pre_migrate: None,
+                network_watch: None,
+            },
             move || {
                 let cursor = Arc::clone(&cursor);
                 let ok_tx = ok_tx.clone();
@@ -1016,7 +1122,10 @@ async fn supervisor_failover_rotates_on_drain() {
                 migration_tx: tokio::sync::watch::channel(None).0,
                 fatal_tx: tokio::sync::watch::channel(None).0,
             },
-            None,
+            crate::supervisor::EpochGuards {
+                pre_migrate: None,
+                network_watch: None,
+            },
             move || {
                 let cursor = Arc::clone(&cursor);
                 let used_tx = used_tx.clone();
@@ -1090,7 +1199,10 @@ async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
                 migration_tx: tokio::sync::watch::channel(None).0,
                 fatal_tx: tokio::sync::watch::channel(None).0,
             },
-            None,
+            crate::supervisor::EpochGuards {
+                pre_migrate: None,
+                network_watch: None,
+            },
             move || {
                 let cursor = Arc::clone(&cursor);
                 let used_tx = used_tx.clone();
@@ -1167,7 +1279,10 @@ async fn supervisor_retries_past_failed_attempts_then_connects() {
                     migration_tx: tokio::sync::watch::channel(None).0,
                     fatal_tx: tokio::sync::watch::channel(None).0,
                 },
-                None,
+                crate::supervisor::EpochGuards {
+                    pre_migrate: None,
+                    network_watch: None,
+                },
                 move || {
                     let attempts = Arc::clone(&attempts);
                     let keep_open = Arc::clone(&keep_open);
@@ -1240,7 +1355,10 @@ async fn supervisor_emits_structured_migration_events_on_drain() {
                 migration_tx,
                 fatal_tx: tokio::sync::watch::channel(None).0,
             },
-            None,
+            crate::supervisor::EpochGuards {
+                pre_migrate: None,
+                network_watch: None,
+            },
             move || {
                 let cursor = Arc::clone(&cursor);
                 let keep_open = Arc::clone(&keep_open);
@@ -1336,7 +1454,10 @@ async fn supervisor_gate_veto_cancels_the_migration_and_keeps_serving() {
                     migration_tx,
                     fatal_tx: tokio::sync::watch::channel(None).0,
                 },
-                Some(Box::new(|_advisory| Box::pin(async { false }))),
+                crate::supervisor::EpochGuards {
+                    pre_migrate: Some(Box::new(|_advisory| Box::pin(async { false }))),
+                    network_watch: None,
+                },
                 move || {
                     let connects = Arc::clone(&connects);
                     let keep_open = Arc::clone(&keep_open);
@@ -1420,7 +1541,10 @@ async fn supervisor_gate_approval_lets_the_migration_proceed() {
                 migration_tx: tokio::sync::watch::channel(None).0,
                 fatal_tx: tokio::sync::watch::channel(None).0,
             },
-            Some(Box::new(|_advisory| Box::pin(async { true }))),
+            crate::supervisor::EpochGuards {
+                pre_migrate: Some(Box::new(|_advisory| Box::pin(async { true }))),
+                network_watch: None,
+            },
             move || {
                 let cursor = Arc::clone(&cursor);
                 let used_tx = used_tx.clone();

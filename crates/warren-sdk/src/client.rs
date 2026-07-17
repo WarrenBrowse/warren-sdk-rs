@@ -1195,11 +1195,18 @@ impl<T: HttpTransport> WarrenClient<T> {
                     fatal_tx,
                     egress_probe: true,
                 },
-                // Reserve-then-switch is OFF by default: the pre-migrate gate
-                // needs the candidate pre-flight (NAT-PMP reservation over the
-                // target exit) that activates with the transactional-migration
-                // rollout; until then a drain migrates unconditionally.
-                None,
+                crate::supervisor::EpochGuards {
+                    // Reserve-then-switch is OFF by default: the pre-migrate
+                    // gate needs the candidate pre-flight (NAT-PMP reservation
+                    // over the target exit) that activates with the
+                    // transactional-migration rollout; until then a drain
+                    // migrates unconditionally.
+                    pre_migrate: None,
+                    // Network-change migration: a moved default path
+                    // (handover, renumbering) redials immediately instead of
+                    // riding the dead session into idle timeout.
+                    network_watch: Some(crate::supervisor::NetworkWatch::system()),
+                },
                 connect,
                 on_drain,
             )
