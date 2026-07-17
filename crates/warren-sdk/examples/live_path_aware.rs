@@ -92,6 +92,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "EGRESS CONFIRMED via the path-aware circuit (SYN-ACK through the \
                  sealed tunnel, attempt {attempt})"
             );
+            // Optional hold so the relay leg spans heartbeat ticks (lets an
+            // operator watch the fleet's path-quality advisory populate).
+            if let Some(secs) = std::env::var("WARREN_HOLD_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                println!("holding the circuit open for {secs}s...");
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            }
             handle.shutdown();
             return Ok(());
         }
