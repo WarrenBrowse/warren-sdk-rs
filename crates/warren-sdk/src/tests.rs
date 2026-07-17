@@ -287,7 +287,8 @@ async fn supervisor_reselects_on_an_exhaustion_refusal_without_going_fatal() {
         })
     };
 
-    // Wait for at least one reselect cycle (backoff base is 250 ms).
+    // Wait for at least one reselect cycle (the engine redial schedule's
+    // first draws stay well under this budget).
     for _ in 0..80 {
         if reselects.load(Ordering::SeqCst) >= 1 {
             break;

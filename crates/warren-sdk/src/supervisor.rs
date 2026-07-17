@@ -530,18 +530,11 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
     // single-exit datapath passes a no-op (one pinned exit, nothing to rotate).
     D: Fn(),
 {
-    // A session that stayed up at least this long is treated as healthy, so its
-    // next reconnect starts fresh. A shorter one is "flapping" (the exit accepts
-    // the handshake then drops immediately): apply backoff so we do not tight-loop
-    // full cryptographic handshakes and hammer the exit.
-    const MIN_HEALTHY_UPTIME: std::time::Duration = std::time::Duration::from_secs(5);
-    // Full-jitter backoff (base 250 ms, ceiling 20 s) so many clients losing the
-    // same exit at once do not reconnect in a synchronized wave (thundering herd).
-    let mut backoff = Backoff {
-        base: std::time::Duration::from_millis(250),
-        max: std::time::Duration::from_secs(20),
-    }
-    .forever();
+    // The engine redial policy: the shared full-jitter schedule (so many
+    // clients losing the same exit at once do not reconnect in a synchronized
+    // wave) plus the healthy-vs-flapping session verdict, both single-homed in
+    // `warren_transport::redial_policy`.
+    let mut backoff = warren_transport::redial_policy::REDIAL_BACKOFF.forever();
     let mut first = true;
     // The advisory of an in-flight drain migration; consumed by the next
     // successful connect to emit the `Completed` migration event.
@@ -704,12 +697,15 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                     // (deadline-aware jitter) spreads the herd exactly like the
                     // app reactor, never a local backoff schedule.
                     tokio::time::sleep(drain_spread(&advisory)).await;
-                } else if up_since.elapsed() >= MIN_HEALTHY_UPTIME {
-                    // The tunnel died after a healthy run: reconnect at once.
-                    backoff.reset();
                 } else {
-                    // Flapped (died almost immediately): back off first.
-                    tokio::time::sleep(backoff.next_delay()).await;
+                    // The engine redial verdict: a healthy run resets the
+                    // schedule and reconnects at once; a flap (died almost
+                    // immediately) backs off first.
+                    tokio::time::sleep(warren_transport::redial_policy::delay_after_session(
+                        up_since.elapsed(),
+                        &mut backoff,
+                    ))
+                    .await;
                 }
             }
             Err(e) => {

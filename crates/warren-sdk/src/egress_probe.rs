@@ -18,23 +18,16 @@
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::Notify;
 use warren_net::TunnelConnector;
 use warren_transport::egress_probe::{
-    EgressProbeConfig, EgressProbeIo, build_dns_query, is_matching_response, jittered,
-    run_egress_probe,
+    EgressProbeConfig, EgressProbeIo, PROBE_QNAME, PROBE_TIMEOUT, build_dns_query,
+    is_matching_response, jittered, run_egress_probe,
 };
 
 use crate::supervisor::AbortOnDrop;
-
-/// Name resolved by the probe over the tunnel: Warren infrastructure, queried
-/// against Warren's own exit resolver, so no third party learns anything.
-const PROBE_QNAME: &str = "warrenbrowse.com";
-/// Overall wait for a probe answer through the tunnel.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// One in-tunnel DNS round trip: the gateway-probe seam. Production dials the
 /// netstack UDP path; tests script the verdict, so the supervisor escalation is
@@ -201,6 +194,7 @@ pub(crate) fn spawn_egress_probe(
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use super::*;
 
