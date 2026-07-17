@@ -811,9 +811,9 @@ impl<T: HttpTransport> WarrenClient<T> {
         // (Port Fail / TunnelCrack ServerIP fix); the split installs the matching
         // `fwmark lookup main` rule so only the marked socket escapes.
         //
-        // macOS: do NOT bind the carrier (`IP_BOUND_IF` black-holes on
-        // multi-interface hosts, the 2026-07-13 carrier-blackhole incident); the
-        // unbound carrier escapes via a `<exit>/32` physical host route instead,
+        // macOS: do NOT bind the carrier (`IP_BOUND_IF` black-holes egress on
+        // multi-interface hosts); the unbound carrier escapes via a
+        // `<exit>/32` physical host route instead,
         // matching the app's proven macOS model. The bind-preferred + egress-guard
         // revert (a live QUIC socket rebind) belongs to a separate datapath change:
         // it needs an engine endpoint-rebind seam and its own connection-migration
@@ -853,9 +853,9 @@ impl<T: HttpTransport> WarrenClient<T> {
         crate::tun_setup::configure_interface(&dev_name, ipv4, ipv6, mtu).map_err(SdkError::Tun)?;
 
         // Bring the datapath up and PROVE it forwards BEFORE arming the killswitch.
-        // Arming fail-closed first (the earlier arm-before-verify order, since reverted) emitted Connected on a
-        // datapath that never came up and stranded the whole host behind the pf
-        // anchor with a dead tunnel (2026-07-16 macOS outage). Order now: split
+        // Arming fail-closed before the datapath is proven emits Connected on a
+        // datapath that never came up and strands the whole host behind the pf
+        // anchor with a dead tunnel. Order: split
         // capture -> carrier escape -> DNS -> forward -> verify egress -> only then
         // the killswitch. Every guard here is RAII: on any failure before the
         // killswitch, the guards installed so far revert on their drops and no
@@ -872,7 +872,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         // AFTER the split: the engine route-split is built for the socket-keyed
         // (IP_BOUND_IF) bypass and its install deletes any `<exit>` host route as a
         // stale destination-keyed leftover. This macOS path deliberately does not
-        // bind the carrier (the 2026-07-13 IP_BOUND_IF multi-interface blackhole),
+        // bind the carrier (`IP_BOUND_IF` black-holes egress on multi-interface hosts),
         // so it needs the `<exit>/32` escape instead; adding it after the split lets
         // the more-specific host route win and keeps the QUIC carrier off the tunnel
         // (before the split deleted it, the carrier looped into its own tunnel and
@@ -1295,7 +1295,7 @@ pub(crate) fn now_unix_secs() -> u64 {
 /// Linux: the escape is keyed on the fwmark, not the interface), delegating to the
 /// engine's single picker so the SDK never re-derives the `SO_MARK` mechanism.
 /// macOS deliberately uses no socket bypass (the `IP_BOUND_IF` bind
-/// black-holes on multi-interface hosts, the 2026-07-13 incident); its carrier
+/// black-holes egress on multi-interface hosts); its carrier
 /// escapes via a `<exit>/32` host route instead (see [`crate::tun_setup`]).
 #[cfg(all(feature = "experimental-tun", target_os = "linux"))]
 fn socket_bypass_from_ifindex(ifindex: u32) -> SocketBypass {
@@ -1329,8 +1329,8 @@ fn build_killswitch_opts(
 /// install error, it runs `abort` (tearing down the forwarding tasks) and returns
 /// the error WITHOUT a killswitch, so a datapath that never comes up fails OPEN,
 /// leaving the host as found rather than stranded behind a fail-closed anchor with
-/// a dead tunnel (the earlier arm-before-verify order caused exactly that, the 2026-07-16 macOS
-/// outage). Generic over the killswitch type so this ordering invariant is unit
+/// a dead tunnel (arming before egress is verified strands the host exactly that
+/// way). Generic over the killswitch type so this ordering invariant is unit
 /// tested with fakes: `start_tun_multihop` itself needs a real device + privilege.
 #[cfg(all(unix, feature = "experimental-tun"))]
 async fn arm_killswitch_on_verified_egress<K, VFut, AFut>(
@@ -1641,10 +1641,9 @@ mod portfail_tests {
 
     #[tokio::test]
     async fn never_arms_the_killswitch_when_egress_is_not_verified() {
-        // The earlier arm-before-verify order armed the killswitch on a datapath that never
-        // forwarded, stranding the host fail-closed with a dead tunnel (the
-        // 2026-07-16 macOS outage). It must fail OPEN instead: NO killswitch, and
-        // the forwarding tasks torn down.
+        // Arming the killswitch on a datapath that never forwarded would strand
+        // the host fail-closed with a dead tunnel. It must fail OPEN instead: NO
+        // killswitch, and the forwarding tasks torn down.
         let armed = std::cell::Cell::new(false);
         let aborted = std::cell::Cell::new(false);
         let err = arm_killswitch_on_verified_egress::<FakeKs, _, _>(
