@@ -27,7 +27,8 @@ pub use dto::{
     TokenIssuerDirectory, TokenIssuerKey,
 };
 pub use tokens::{
-    MintedEpoch, TokenClientError, TokenManager, TokenStore, current_epoch, mint_tokens,
+    MintedEpoch, PersistedTokens, TokenClientError, TokenManager, TokenStore, current_epoch,
+    mint_tokens,
 };
 pub use transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 

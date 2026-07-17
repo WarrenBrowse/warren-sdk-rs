@@ -434,3 +434,120 @@ async fn a_definitive_already_issued_refusal_settles_the_epoch() {
         "an already_issued refusal is definitive; re-asking every tick would hammer the issuer"
     );
 }
+
+/// A well-formed serialized token for persistence-path tests: the codec never
+/// verifies, only the byte layout matters. `marker` distinguishes tokens.
+fn fake_token_bytes(marker: u8) -> [u8; warrenguard_token::TOKEN_LEN] {
+    let mut bytes = [0u8; warrenguard_token::TOKEN_LEN];
+    bytes[0..2].copy_from_slice(&0x0002u16.to_be_bytes());
+    bytes[2] = marker;
+    bytes
+}
+
+fn bundle_json(epoch: u64, tokens: &[[u8; warrenguard_token::TOKEN_LEN]]) -> String {
+    let encoded: Vec<String> = tokens.iter().map(|t| BASE64URL_NOPAD.encode(t)).collect();
+    serde_json::json!({
+        "epoch_secs": EPOCH_SECS,
+        "epochs": { epoch.to_string(): encoded },
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_mint_horizon_narrows_refresh_to_current_plus_horizon() {
+    use std::sync::Arc;
+    use warren_api::TokenManager;
+
+    // Five epochs published; a horizon of 2 must mint only current..=current+2.
+    let api = Arc::new(client(FakeIssuer::new(&[100, 101, 102, 103, 104])));
+    let manager = TokenManager::new(Arc::clone(&api)).with_mint_horizon(2);
+    let mut rng = StdRng::seed_from_u64(31);
+    manager
+        .refresh(100 * EPOCH_SECS + 5, &mut rng)
+        .await
+        .expect("refresh");
+
+    assert_eq!(manager.available(100), QUOTA as usize);
+    assert_eq!(manager.available(102), QUOTA as usize);
+    assert_eq!(
+        manager.available(103),
+        0,
+        "epochs beyond the horizon must not be minted"
+    );
+    assert_eq!(
+        api.transport().issue_calls.load(Ordering::SeqCst),
+        3,
+        "one issue call per epoch inside the horizon only"
+    );
+
+    // The horizon slides with the clock: one epoch later, exactly the newly
+    // in-horizon epoch is minted (settled ones are never re-asked).
+    manager
+        .refresh(101 * EPOCH_SECS + 5, &mut rng)
+        .await
+        .expect("second refresh");
+    assert_eq!(manager.available(103), QUOTA as usize);
+    assert_eq!(manager.available(104), 0);
+    assert_eq!(api.transport().issue_calls.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn a_restored_bundle_vends_tokens_before_any_refresh() {
+    use std::sync::Arc;
+    use warren_api::{PersistedTokens, TokenManager};
+
+    // A replacement process restores the persisted bundle: the store must vend
+    // v7 tokens immediately, with no directory fetch and no mint (the whole
+    // point of persistence is surviving process death while offline).
+    let api = Arc::new(client(FakeIssuer::new(&[])));
+    let manager = TokenManager::new(Arc::clone(&api));
+    let token = fake_token_bytes(7);
+    let bundle = PersistedTokens::from_json(&bundle_json(100, &[token])).expect("parse");
+    assert_eq!(manager.restore_persisted(&bundle), 1, "one token restored");
+
+    let stack = manager.take_current_stack(100 * EPOCH_SECS + 5);
+    assert_eq!(stack, vec![token], "the restored token is vended as-is");
+    assert!(
+        manager.take_current_stack(100 * EPOCH_SECS + 6).is_empty(),
+        "restored stock drains like minted stock"
+    );
+    assert_eq!(
+        api.transport().issue_calls.load(Ordering::SeqCst),
+        0,
+        "restore must never touch the network"
+    );
+    assert!(
+        manager.export_persistable().is_some(),
+        "the epoch length restored from the bundle makes the store re-exportable"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_after_restore_keeps_the_restored_stock_on_already_issued() {
+    use std::sync::Arc;
+    use warren_api::{PersistedTokens, TokenManager};
+
+    // The issuer's ledger already holds this account for epoch 100 (the
+    // previous process minted the batch now being restored): the refresh must
+    // settle the epoch without clearing the restored tokens.
+    let mut fake = FakeIssuer::new(&[100]);
+    fake.refuse.push(100);
+    fake.refuse_reason = "already_issued".to_owned();
+    let api = Arc::new(client(fake));
+    let manager = TokenManager::new(Arc::clone(&api));
+    let bundle =
+        PersistedTokens::from_json(&bundle_json(100, &[fake_token_bytes(9)])).expect("parse");
+    manager.restore_persisted(&bundle);
+
+    let mut rng = StdRng::seed_from_u64(41);
+    manager
+        .refresh(100 * EPOCH_SECS + 5, &mut rng)
+        .await
+        .expect("refresh");
+    assert_eq!(
+        manager.available(100),
+        1,
+        "an already_issued settle must keep the restored stock"
+    );
+    assert_eq!(manager.take_current_stack(100 * EPOCH_SECS + 6).len(), 1);
+}

@@ -214,9 +214,11 @@ pub async fn mint_tokens<T: HttpTransport, R: CryptoRng + ?Sized>(
 /// RAM-only by default: tokens are bearer credentials with a bounded
 /// lifetime (the prefetch window), and a lost store is recovered by minting
 /// at the next epoch, so persisting them adds a disk-theft surface for no
-/// availability win. The single documented exception is the seed-free iOS
-/// app-group export ([`PersistedTokens`]), where cross-process handoff to
-/// the Network Extension requires it.
+/// availability win. The documented exception is the seed-free
+/// [`PersistedTokens`] bundle, for hosts where the process dies routinely
+/// (Android VpnService, iOS app-group handoff): without it every process
+/// death strands the already-issued epochs and downgrades sessions to the
+/// wallet-identified v6 path.
 #[derive(Default)]
 pub struct TokenStore {
     per_epoch: BTreeMap<u64, Vec<Token>>,
@@ -297,7 +299,10 @@ const REJECT_ALREADY_ISSUED: &str = "already_issued";
 
 struct ManagerState {
     store: TokenStore,
-    directory: Option<TokenIssuerDirectory>,
+    /// The published epoch length, learned from the issuer directory or from a
+    /// restored bundle. Keeping it independent of the directory lets a
+    /// restored store vend tokens before the first (possibly offline) refresh.
+    epoch_secs: Option<u64>,
     /// Epochs settled this process: minted into the store, or definitively
     /// refused by the issuer's once-per-account-epoch ledger
     /// (`already_issued`). Transient failures are deliberately NOT recorded so
@@ -318,6 +323,10 @@ struct ManagerState {
 pub struct TokenManager<T> {
     client: Arc<WarrenApiClient<T>>,
     state: Arc<Mutex<ManagerState>>,
+    /// When set, [`Self::refresh`] mints only `current..=current + horizon`
+    /// instead of the whole published window. `None` keeps the full-window
+    /// prefetch.
+    mint_horizon: Option<u64>,
 }
 
 impl<T: HttpTransport> TokenManager<T> {
@@ -329,10 +338,24 @@ impl<T: HttpTransport> TokenManager<T> {
             client,
             state: Arc::new(Mutex::new(ManagerState {
                 store: TokenStore::new(),
-                directory: None,
+                epoch_secs: None,
                 minted: BTreeSet::new(),
             })),
+            mint_horizon: None,
         }
+    }
+
+    /// Caps [`Self::refresh`] at `current + epochs` instead of the whole
+    /// published window. For hosts whose process (and store) dies routinely: a
+    /// lost narrow batch strands only `epochs + 1` already-issued epochs at the
+    /// issuer (~hours of v6 fallback) where a lost full-window batch strands
+    /// the entire prefetch window (~2 days). The issuer evaluates each
+    /// requested epoch independently, so a narrowed request needs no
+    /// server-side change.
+    #[must_use]
+    pub fn with_mint_horizon(mut self, epochs: u64) -> Self {
+        self.mint_horizon = Some(epochs);
+        self
     }
 
     /// Fetches the issuer directory, prunes spent epochs, and mints every
@@ -357,16 +380,19 @@ impl<T: HttpTransport> TokenManager<T> {
 
         // Snapshot which epochs still need minting under the lock, then mint
         // WITHOUT holding it (mint_tokens awaits the network).
+        let horizon_end = self
+            .mint_horizon
+            .map_or(u64::MAX, |h| current.saturating_add(h));
         let targets: Vec<u64> = {
             let mut st = self.state.lock().expect("token manager mutex poisoned");
             st.store.prune_before(current);
             st.minted.retain(|&e| e >= current);
-            st.directory = Some(directory.clone());
+            st.epoch_secs = Some(directory.epoch_secs);
             directory
                 .keys
                 .iter()
                 .map(|k| k.epoch)
-                .filter(|&e| e >= current && !st.minted.contains(&e))
+                .filter(|&e| e >= current && e <= horizon_end && !st.minted.contains(&e))
                 .collect()
         };
 
@@ -435,11 +461,7 @@ impl<T: HttpTransport> TokenManager<T> {
     #[must_use]
     pub fn take_current_stack(&self, now_unix_secs: u64) -> Vec<[u8; TOKEN_LEN]> {
         let mut st = self.state.lock().expect("token manager mutex poisoned");
-        let Some(epoch) = st
-            .directory
-            .as_ref()
-            .and_then(|d| current_epoch(d, now_unix_secs))
-        else {
+        let Some(epoch) = st.epoch_secs.filter(|&s| s > 0).map(|s| now_unix_secs / s) else {
             return Vec::new();
         };
         match st.store.take(epoch) {
@@ -448,20 +470,49 @@ impl<T: HttpTransport> TokenManager<T> {
         }
     }
 
+    /// Loads a previously exported bundle ([`Self::export_persistable`]) back
+    /// into the store, so a replacement process vends its predecessor's
+    /// unspent tokens instead of riding the v6 wallet-signed fallback until a
+    /// fresh epoch opens (issuance is once per account and epoch). Malformed
+    /// entries are skipped; epochs are NOT settled here, so the next refresh
+    /// re-asks and lets the issuer's definitive `already_issued` answer settle
+    /// them (correct even if the bundle came from another account's mint).
+    /// Returns the number of tokens restored (observability; safe to ignore,
+    /// hence no `#[must_use]`).
+    #[allow(clippy::must_use_candidate)]
+    pub fn restore_persisted(&self, bundle: &PersistedTokens) -> usize {
+        let mut st = self.state.lock().expect("token manager mutex poisoned");
+        if st.epoch_secs.is_none() && bundle.epoch_secs > 0 {
+            st.epoch_secs = Some(bundle.epoch_secs);
+        }
+        let mut restored = 0;
+        for (&epoch, encoded) in &bundle.epochs {
+            let tokens: Vec<Token> = encoded
+                .iter()
+                .filter_map(|e| BASE64URL_NOPAD.decode(e.as_bytes()).ok())
+                .filter_map(|bytes| Token::parse(&bytes).ok())
+                .collect();
+            restored += tokens.len();
+            st.store.insert(MintedEpoch { epoch, tokens });
+        }
+        restored
+    }
+
     /// Exports the current token store as a self-contained, seed-free bundle for
     /// cross-process persistence (iOS app-group container,
     /// anti-correlation): the main app mints on unlock/timer and persists this,
     /// the Network Extension loads it and CONSUMES pre-minted tokens WITHOUT
     /// minting at connect from the device's real IP.
     ///
-    /// Returns `None` until the first [`Self::refresh`] has fetched the issuer
-    /// directory (the bundle carries the epoch length so the consumer needs no
-    /// directory of its own). The bundle holds only anonymous bearer tokens,
-    /// never the wallet seed or pubkey.
+    /// Returns `None` until the epoch length is known, i.e. after the first
+    /// [`Self::refresh`] or a [`Self::restore_persisted`] (the bundle carries
+    /// the epoch length so the consumer needs no directory of its own). The
+    /// bundle holds only anonymous bearer tokens, never the wallet seed or
+    /// pubkey.
     #[must_use]
     pub fn export_persistable(&self) -> Option<PersistedTokens> {
         let st = self.state.lock().expect("token manager mutex poisoned");
-        let epoch_secs = st.directory.as_ref().map(|d| d.epoch_secs)?;
+        let epoch_secs = st.epoch_secs?;
         Some(PersistedTokens::from_snapshot(
             epoch_secs,
             st.store.snapshot_serialized(),
@@ -471,13 +522,15 @@ impl<T: HttpTransport> TokenManager<T> {
 
 /// A self-contained, seed-free bundle of pre-minted anonymous tokens.
 ///
-/// The iOS main app persists this into the app-group container so the Network
-/// Extension can consume pre-minted tokens without minting at connect time (the
-/// anti-correlation requirement). It holds only anonymous bearer tokens
-/// (never the wallet seed or pubkey) plus the published epoch length, so the
-/// consumer maps "now" to the current epoch with no issuer-directory fetch and
-/// no network. Double-spend within the prefetch window is the accepted price of
-/// unlinkability (ADR-0006), bounded by the issuance quota.
+/// Two consumers: the iOS app-group handoff (main app mints, the Network
+/// Extension consumes pre-minted tokens without minting at connect time, the
+/// anti-correlation requirement), and Android app-private persistence across
+/// VpnService process death ([`TokenManager::restore_persisted`]). It holds
+/// only anonymous bearer tokens (never the wallet seed or pubkey) plus the
+/// published epoch length, so the consumer maps "now" to the current epoch
+/// with no issuer-directory fetch and no network. Double-spend within the
+/// prefetch window is the accepted price of unlinkability (ADR-0006), bounded
+/// by the issuance quota.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PersistedTokens {
     /// Published epoch length in seconds; the current epoch is `now / epoch_secs`.
@@ -655,6 +708,20 @@ mod persistence_tests {
         // Only epoch -> count is shown, never the base64 token payload.
         assert!(rendered.contains("epoch_secs"));
         assert!(!rendered.contains(&BASE64URL_NOPAD.encode(&fake_token(0xAB).serialize())));
+    }
+
+    #[test]
+    fn persisted_bundle_at_rest_carries_only_epoch_secs_and_epochs() {
+        // The at-rest schema is pinned seed-free: any new field (a wallet
+        // hint, a device id, key material) would extend what a disk-theft or
+        // backup exfiltration learns, so its addition must be a deliberate,
+        // reviewed break of this test.
+        let bundle = PersistedTokens::from_snapshot(60, vec![(2, vec![fake_token(1).serialize()])]);
+        let value: serde_json::Value =
+            serde_json::from_str(&bundle.to_json().expect("serialize")).expect("json");
+        let mut keys: Vec<&String> = value.as_object().expect("object").keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["epoch_secs", "epochs"]);
     }
 
     #[test]
