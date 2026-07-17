@@ -13,18 +13,12 @@
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
 use warren_tun_core::{Framing, RawTunDevice};
-use warrenguard_config::{TUNNEL_GATEWAY_IP, TUNNEL_GATEWAY_IPV6};
-use warrenguard_transport_core::{build_frag_needed, clamp_syn_mss, is_tcp_syn};
+use warrenguard_transport_core::{
+    clamp_downlink_syn, clamp_uplink_syn, is_tcp_syn, uplink_frag_needed,
+};
 
 use crate::error::NetError;
 use crate::sink::PacketSink;
-
-/// Subtracted from the tunnel's own (exactly-known) transmit budget when
-/// clamping an OUTBOUND SYN/SYN-ACK (device -> tunnel direction): the option
-/// governs segments the EXIT will later send back on ITS OWN budget, which
-/// this client cannot read. Mirrors the engine's client uplink pumps; see
-/// `93-REDUCED-MTU-ADAPTATION.md`.
-const UPLINK_ASYMMETRY_MARGIN: u16 = 48;
 
 /// Channel depth for each direction (bounds memory under a burst; backpressure
 /// is `try_send`-drop on egress, matching the netstack's TX behavior).
@@ -83,24 +77,20 @@ pub fn tun_channels<D: RawTunDevice>(
 }
 
 /// Forwards device -> tunnel (the uplink: the local OS is the sender of
-/// everything on this leg). Mirrors the engine's client uplink pump
-/// (`93-REDUCED-MTU-ADAPTATION.md`): an outbound SYN/SYN-ACK has its MSS
-/// option clamped to the tunnel's current budget minus
-/// [`UPLINK_ASYMMETRY_MARGIN`] (that option governs segments the EXIT will
-/// send back on ITS OWN budget, which this client cannot read), and a packet
-/// that the tunnel's CURRENT budget cannot carry is turned back into an ICMP
-/// Fragmentation-Needed / Packet-Too-Big written into the device instead of
-/// being sent (and silently dropped): the local OS's own PMTUD then converges
-/// on later packets rather than the flow black-holing.
+/// everything on this leg). Rides the single-homed clamp/PTB policy in
+/// [`warrenguard_transport_core::inner_mtu`], shared with the engine's
+/// supervised pump: an outbound SYN/SYN-ACK has its MSS option clamped to
+/// the tunnel's current budget minus the shared uplink proxy-budget margin,
+/// and a packet the tunnel's CURRENT budget cannot carry is turned back into
+/// an ICMP Fragmentation-Needed / Packet-Too-Big written into the device
+/// instead of being sent (and silently dropped): the local OS's own PMTUD
+/// then converges on later packets rather than the flow black-holing.
 async fn pump_uplink<D: PacketSink, T: PacketSink>(device: &D, tunnel: &T) -> Result<(), NetError> {
     loop {
         let packet = device.recv_packet().await?;
-        let budget = tunnel.max_payload();
-        if packet.len() > budget {
-            let effective = u16::try_from(budget).unwrap_or(u16::MAX);
-            if let Some(ptb) =
-                build_frag_needed(&packet, effective, TUNNEL_GATEWAY_IP, TUNNEL_GATEWAY_IPV6)
-            {
+        let budget = u16::try_from(tunnel.max_payload()).unwrap_or(u16::MAX);
+        if packet.len() > usize::from(budget) {
+            if let Some(ptb) = uplink_frag_needed(&packet, budget) {
                 // Best-effort: a failure to write the PTB back just leaves the
                 // sender waiting for its own retransmit/timeout, no worse than
                 // before this fix existed.
@@ -109,11 +99,8 @@ async fn pump_uplink<D: PacketSink, T: PacketSink>(device: &D, tunnel: &T) -> Re
             continue;
         }
         if is_tcp_syn(&packet) {
-            let clamp_to = u16::try_from(budget)
-                .unwrap_or(u16::MAX)
-                .saturating_sub(UPLINK_ASYMMETRY_MARGIN);
             let mut owned = packet.to_vec();
-            let _ = clamp_syn_mss(&mut owned, clamp_to);
+            let _ = clamp_uplink_syn(&mut owned, budget);
             tunnel.send_packet(&owned).await?;
         } else {
             tunnel.send_packet(&packet).await?;
@@ -121,12 +108,12 @@ async fn pump_uplink<D: PacketSink, T: PacketSink>(device: &D, tunnel: &T) -> Re
     }
 }
 
-/// Forwards tunnel -> device (the downlink). Mirrors the engine's client
-/// downlink pump: an inbound SYN/SYN-ACK has its MSS option clamped to the
-/// tunnel's current budget EXACTLY (this node's own transmit budget, known
-/// precisely, unlike the uplink leg's), so a locally-initiated flow's peer
-/// never learns an MSS larger than this client's own tunnel-bound segments
-/// can later carry.
+/// Forwards tunnel -> device (the downlink). Rides the single-homed clamp
+/// policy: an inbound SYN/SYN-ACK has its MSS option clamped to the tunnel's
+/// current budget EXACTLY (this node's own transmit budget, known precisely,
+/// unlike the uplink leg's), so a locally-initiated flow's peer never learns
+/// an MSS larger than this client's own tunnel-bound segments can later
+/// carry.
 async fn pump_downlink<T: PacketSink, D: PacketSink>(
     tunnel: &T,
     device: &D,
@@ -134,9 +121,9 @@ async fn pump_downlink<T: PacketSink, D: PacketSink>(
     loop {
         let packet = tunnel.recv_packet().await?;
         if is_tcp_syn(&packet) {
-            let clamp_to = u16::try_from(tunnel.max_payload()).unwrap_or(u16::MAX);
+            let budget = u16::try_from(tunnel.max_payload()).unwrap_or(u16::MAX);
             let mut owned = packet.to_vec();
-            let _ = clamp_syn_mss(&mut owned, clamp_to);
+            let _ = clamp_downlink_syn(&mut owned, budget);
             device.send_packet(&owned).await?;
         } else {
             device.send_packet(&packet).await?;
@@ -574,8 +561,8 @@ mod tests {
         let forwarded = tun_out_rx.try_recv().expect("the SYN reached the tunnel");
         assert_eq!(
             syn_mss(&forwarded),
-            1000 - UPLINK_ASYMMETRY_MARGIN - 40,
-            "clamped to the tunnel's budget minus the asymmetry margin, minus the v4 header overhead"
+            1000 - warrenguard_transport_core::PROXY_BUDGET_MARGIN - 40,
+            "clamped to the tunnel's budget minus the shared uplink margin, minus the v4 header overhead"
         );
     }
 

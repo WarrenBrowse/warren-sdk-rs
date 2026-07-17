@@ -3590,7 +3590,6 @@ dependencies = [
  "warren-tun",
  "warren-tun-core",
  "warren-wire",
- "warrenguard-config",
  "warrenguard-pump",
  "warrenguard-transport-core",
 ]
