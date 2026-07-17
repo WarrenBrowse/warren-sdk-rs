@@ -7,8 +7,9 @@
 //! This crate stays `unsafe_code = forbid`: the bridge is safe and works over any
 //! `RawTunDevice`, including an in-memory mock (so the framing/channel logic is
 //! unit-tested here). The real kernel device is opened by `warren-tun` behind its
-//! `experimental-tun` feature, and the full privileged datapath has NOT YET been
-//! validated against a real exit (per CLAUDE.md, that needs root + a device).
+//! `experimental-tun` feature. On macOS the full privileged datapath riding this
+//! bridge is real-exit validated (egress via the exit, DNS through the tunnel,
+//! clean restore); on Linux and Windows it is not yet.
 
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
