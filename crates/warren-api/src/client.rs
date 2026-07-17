@@ -135,6 +135,26 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         }
     }
 
+    /// Public `GET /v1/multihop/path-quality`. Returns the raw UNSIGNED
+    /// path-quality advisory JSON, or `None` on `404` (an older API without
+    /// the endpoint, or no advisory yet). Advisory-only data: the caller
+    /// parses it with `warren_discovery::PathQualityAdvisory` and treats any
+    /// failure as "no advisory".
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on transport failure or a non-200/404 status.
+    pub async fn fetch_path_quality(&self) -> Result<Option<String>, ClientError> {
+        let req = self.unsigned_request(Method::Get, "/v1/multihop/path-quality", Vec::new());
+        match self.send(req).await {
+            Ok(resp) => String::from_utf8(resp.body)
+                .map(Some)
+                .map_err(ClientError::ResponseEncoding),
+            Err(ClientError::ServerStatus { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Unsigned `POST /v1/register`. Redeems a voucher to bind a subscription to
     /// the account pubkey.
     ///
@@ -703,6 +723,34 @@ mod tests {
             .fetch_multihop_directory()
             .await
             .expect("404 must be Ok(None), not an error");
+        assert_eq!(body, None);
+    }
+
+    #[tokio::test]
+    async fn path_quality_returns_body_on_200_and_is_unsigned() {
+        let c = client(MockTransport::new(200, "{\"version\":1}"));
+        let body = c.fetch_path_quality().await.expect("ok");
+        assert_eq!(body.as_deref(), Some("{\"version\":1}"));
+        let guard = c.transport.last.lock().unwrap();
+        let req = guard.as_ref().unwrap();
+        assert!(
+            req.url.ends_with("/v1/multihop/path-quality"),
+            "wrong path: {}",
+            req.url
+        );
+        assert!(
+            header(req, HEADER_PUBKEY).is_none(),
+            "fetch_path_quality must be unsigned"
+        );
+    }
+
+    #[tokio::test]
+    async fn path_quality_maps_404_to_none() {
+        let c = client(MockTransport::new(404, "not found"));
+        let body = c
+            .fetch_path_quality()
+            .await
+            .expect("404 must be Ok(None): an older API simply has no advisory");
         assert_eq!(body, None);
     }
 

@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use warren_api::{HttpTransport, WarrenApiClient};
 use warren_discovery::{
-    ExitQuery, ExitSelector, Relay, RttCache, SelectorError, VerifiedExit,
+    DEFAULT_RTT_TTL_SECS, ExitQuery, ExitSelector, PATH_QUALITY_VERSION, PathAwareParams,
+    PathQualityAdvisory, Relay, RttCache, SelectorError, VerifiedExit, select_entry_path_aware,
     verify_multihop_directory, verify_signed_relay_list,
 };
 use warren_identity::WarrenIdentity;
@@ -630,6 +631,56 @@ impl<T: HttpTransport> WarrenClient<T> {
         self.multihop_generation_store
             .store_floor(verified.generation);
         Ok(verified)
+    }
+
+    /// Best-effort fetch of the UNSIGNED path-quality advisory
+    /// (`GET /v1/multihop/path-quality`). `None` on ANY failure: a missing
+    /// endpoint (older API), a transport error, a garbage body, or an
+    /// unknown advisory version all mean "no advisory", and selection then
+    /// keeps today's weight-ordered behavior. The advisory can only bias
+    /// ordering among directory-verified circuits, never admit a node, so
+    /// nothing here is trusted.
+    pub async fn fetch_path_quality(&self) -> Option<PathQualityAdvisory> {
+        let body = self.api.fetch_path_quality().await.ok().flatten()?;
+        let advisory: PathQualityAdvisory = serde_json::from_str(&body).ok()?;
+        (advisory.version == PATH_QUALITY_VERSION).then_some(advisory)
+    }
+
+    /// Path-aware ENTRY pick for `exit` over a verified `dir`: prefers
+    /// measured-healthy, low-RTT entries (client-measured RTT from this
+    /// client's own connection history plus the advisory's relay->exit leg)
+    /// over any advertised location, with switch hysteresis so a transient
+    /// blip cannot flap circuits. Every candidate is gated by the shared
+    /// [`warren_discovery::CircuitPolicy`], and the returned circuit view
+    /// comes from [`VerifiedExit::via_entry`], so no signal can produce a
+    /// topology the diversity rule forbids.
+    ///
+    /// With `advisory: None` and no RTT history this reduces to the
+    /// deterministic highest-weight pick (today's behavior).
+    /// `prev_entry_node_id` is the currently-flying entry's node id (its
+    /// `exit_id` field), for hysteresis. `None` when no policy-legal entry
+    /// exists for this exit.
+    #[must_use]
+    pub fn select_multihop_entry(
+        &self,
+        dir: &warren_discovery::VerifiedDirectory,
+        exit: &VerifiedExit,
+        advisory: Option<&PathQualityAdvisory>,
+        prev_entry_node_id: Option<&[u8; 16]>,
+    ) -> Option<VerifiedExit> {
+        let now = now_unix_secs();
+        let cache = self.rtt_cache_snapshot();
+        let entry = select_entry_path_aware(
+            &dir.entries,
+            exit,
+            &dir.policy,
+            advisory,
+            |e| cache.fresh_rtt_ms(e.relay_ed25519_pubkey, now, DEFAULT_RTT_TTL_SECS),
+            now,
+            prev_entry_node_id,
+            &PathAwareParams::default(),
+        )?;
+        exit.via_entry(entry, &dir.policy)
     }
 
     /// Establishes a multihop tunnel to `exit` (the handshake real exits require:
