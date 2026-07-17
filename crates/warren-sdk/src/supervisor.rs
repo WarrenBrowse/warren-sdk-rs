@@ -700,10 +700,10 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                             outcome: crate::portfollow::MigrationOutcome::Migrating,
                         }));
                     let _ = outputs.state_tx.send(ConnectionState::Draining);
-                    // Proactive drain reconnect: ALWAYS jitter-delay (never
-                    // reset) so a pinned single-exit does not tight-loop on the
-                    // still-draining exit, and the herd spreads (anti-stampede).
-                    tokio::time::sleep(backoff.next_delay()).await;
+                    // Proactive drain reconnect: the engine drain policy
+                    // (deadline-aware jitter) spreads the herd exactly like the
+                    // app reactor, never a local backoff schedule.
+                    tokio::time::sleep(drain_spread(&advisory)).await;
                 } else if up_since.elapsed() >= MIN_HEALTHY_UPTIME {
                     // The tunnel died after a healthy run: reconnect at once.
                     backoff.reset();
@@ -743,6 +743,21 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
             }
         }
     }
+}
+
+/// Anti-stampede spread before the proactive drain reconnect: the engine
+/// drain policy (deadline-aware jitter bounded by the hard-close), so SDK
+/// clients spread exactly like the app's drain reactor.
+fn drain_spread(advisory: &warren_transport::DrainAdvisory) -> std::time::Duration {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    warren_transport::drain_policy::jitter_delay(
+        advisory.deadline_unix_secs,
+        now_unix,
+        warren_transport::drain_policy::stampede_fraction(),
+    )
 }
 
 /// Resolves with the advisory when the exit publishes a maintenance drain on
@@ -823,6 +838,27 @@ mod drain_tests {
             deadline_unix_secs: 1_700_000_000,
             reason_code: 0,
         }
+    }
+
+    #[test]
+    fn drain_spread_rides_the_engine_policy() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Deadline inside the engine safety margin: react immediately, never
+        // a blind backoff (the pre-policy behavior slept regardless).
+        let imminent = DrainAdvisory {
+            deadline_unix_secs: now + 3,
+            reason_code: 0,
+        };
+        assert_eq!(drain_spread(&imminent), Duration::ZERO);
+        // Soft drain: the spread must stay under the engine jitter cap.
+        let soft = DrainAdvisory {
+            deadline_unix_secs: u64::MAX,
+            reason_code: 0,
+        };
+        assert!(drain_spread(&soft) <= warren_transport::drain_policy::MAX_JITTER);
     }
 
     #[tokio::test]

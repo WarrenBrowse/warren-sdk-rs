@@ -10,9 +10,9 @@
 
 use std::time::{Duration, Instant};
 
-/// How long a conflicted candidate exit stays out of rotation (aligned with the
-/// warren-app avoid-set).
-pub const DEFAULT_AVOID_TTL: Duration = Duration::from_secs(300);
+/// How long a conflicted candidate exit stays out of rotation: the engine
+/// drain policy's avoid TTL (one home, shared with the warren-app avoid-set).
+pub const DEFAULT_AVOID_TTL: Duration = warren_transport::drain_policy::DRAINED_EXIT_AVOID_TTL;
 
 /// Upper bound on one candidate pre-flight probe. Past it the candidate is
 /// treated as CONFLICTED (fail-safe: an unreachable NAT-PMP gateway must not

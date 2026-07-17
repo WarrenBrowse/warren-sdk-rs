@@ -690,31 +690,17 @@ impl Default for RekeyPolicy {
 /// [`MultihopSession::recv_packet`] decodes it and republishes it on the
 /// session's drain watch so an upper layer (the SDK supervisor / FFI host)
 /// can migrate off the draining exit before its hard-close deadline.
-/// `Copy + Eq` so a `watch` can dedupe identical re-emits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DrainAdvisory {
-    /// Absolute Unix-epoch seconds after which the exit hard-closes any
-    /// straggler. `u64::MAX` = soft drain (no hard deadline).
-    pub deadline_unix_secs: u64,
-    /// Opaque operator reason code (0 = maintenance).
-    pub reason_code: u8,
-}
+/// `Copy + Eq` so a `watch` can dedupe identical re-emits. The type is the
+/// engine's (single advisory home, next to the drain-reaction policy).
+pub use warrenguard_transport::drain_policy::ExitDrainAdvisory as DrainAdvisory;
 
-impl DrainAdvisory {
-    /// Extract a drain advisory from a decoded control plaintext, or `None`
-    /// if it is not an `ExitDraining` frame (DAITA dummy, other control
-    /// variant, or a malformed frame).
-    fn from_control(plaintext: &[u8]) -> Option<Self> {
-        match try_decode_control(plaintext) {
-            Ok(Some(WarrenControlMessage::ExitDraining {
-                deadline_unix_secs,
-                reason_code,
-            })) => Some(Self {
-                deadline_unix_secs,
-                reason_code,
-            }),
-            _ => None,
-        }
+/// Extract a drain advisory from a decoded control plaintext, or `None`
+/// if it is not an `ExitDraining` frame (DAITA dummy, other control
+/// variant, or a malformed frame).
+fn drain_advisory_from_plaintext(plaintext: &[u8]) -> Option<DrainAdvisory> {
+    match try_decode_control(plaintext) {
+        Ok(Some(msg)) => DrainAdvisory::from_control(&msg),
+        _ => None,
     }
 }
 
@@ -926,7 +912,7 @@ impl MultihopSession {
                     // setup control exchange is already complete): surface it
                     // on the drain watch so the upper layer can migrate off
                     // the draining exit before its hard-close deadline.
-                    if let Some(adv) = DrainAdvisory::from_control(&plaintext) {
+                    if let Some(adv) = drain_advisory_from_plaintext(&plaintext) {
                         // Dedupe: the exit re-emits the same advisory every few
                         // seconds until the deadline. Publish only on a real
                         // change so a `changed()`-based consumer is not woken by
@@ -1539,7 +1525,7 @@ mod policy_tests {
         })
         .expect("encode ExitDraining");
         let adv =
-            DrainAdvisory::from_control(&plaintext).expect("ExitDraining must yield an advisory");
+            drain_advisory_from_plaintext(&plaintext).expect("ExitDraining must yield an advisory");
         assert_eq!(adv.deadline_unix_secs, 1_700_000_000);
         assert_eq!(adv.reason_code, 7);
     }
@@ -1549,9 +1535,9 @@ mod policy_tests {
         // A non-draining control frame (Rejected) is not an advisory...
         let rejected = warren_wire::control::encode_control(&WarrenControlMessage::Rejected)
             .expect("encode Rejected");
-        assert!(DrainAdvisory::from_control(&rejected).is_none());
+        assert!(drain_advisory_from_plaintext(&rejected).is_none());
         // ...and a raw IPv4 packet (first nibble 4) is not even a control frame.
-        assert!(DrainAdvisory::from_control(&[0x45, 0x00, 0x00, 0x14]).is_none());
+        assert!(drain_advisory_from_plaintext(&[0x45, 0x00, 0x00, 0x14]).is_none());
     }
 
     #[test]

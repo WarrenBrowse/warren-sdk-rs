@@ -49,6 +49,9 @@ pub use warrenguard_transport::{FatalCause, Retryability};
 // proxy supervisor implements `EgressProbeIo` over its userland datapath, so the
 // dead-exit-forwards-nothing verdict is decided once, in the engine.
 pub use warrenguard_transport::egress_probe;
+// The drain-reaction anti-stampede policy (jitter, cooldown, avoid TTL) is
+// engine-owned; consumers spread reconnects with it instead of re-deciding.
+pub use warrenguard_transport::drain_policy;
 // The per-OS carrier-socket bypass value a privileged TUN datapath pins on the
 // tunnel (via `MultihopClientTunnel::with_socket_bypass`) so the SDK can name it
 // without depending on the engine crate directly.

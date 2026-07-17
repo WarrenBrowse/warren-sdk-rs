@@ -67,11 +67,13 @@ impl warren_net::PacketSink for DrainingSink {
 /// A drain watch receiver: `draining` => pre-seeded with an advisory that fires
 /// immediately; otherwise a receiver whose sender is dropped, so the watch holds
 /// `None` forever and the drain arm never fires (the session just serves).
+/// The seeded deadline is already past so the engine drain policy yields a
+/// zero anti-stampede spread (no test-time sleep).
 fn make_drain_rx(
     draining: bool,
 ) -> tokio::sync::watch::Receiver<Option<warren_transport::DrainAdvisory>> {
     let seed = draining.then_some(warren_transport::DrainAdvisory {
-        deadline_unix_secs: u64::MAX,
+        deadline_unix_secs: 1,
         reason_code: 0,
     });
     tokio::sync::watch::channel(seed).1
@@ -1260,7 +1262,7 @@ async fn supervisor_emits_structured_migration_events_on_drain() {
     assert_eq!(
         migrating,
         MigrationEvent {
-            deadline_unix_secs: u64::MAX,
+            deadline_unix_secs: 1,
             reason_code: 0,
             outcome: MigrationOutcome::Migrating,
         },
