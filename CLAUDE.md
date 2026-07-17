@@ -3,7 +3,7 @@
 Standalone Rust client SDK for the Warren VPN. This repo is the reference
 implementation of the Warren client protocol; the same SDK is reimplemented in
 TypeScript, Dart, Python, Kotlin, Swift and Java. Read `ARCHITECTURE.md` for the
-layering and `ROADMAP.md` for the phase plan.
+layering.
 
 > Shared Warren rules (single source of truth: WarrenBrowse/warren-workspace).
 > They resolve when this repo is checked out inside the workspace (mani sync);

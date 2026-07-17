@@ -22,8 +22,7 @@ production API. The same SDK is being reimplemented in TypeScript, Dart, Python,
 Kotlin, Swift and Java; this Rust crate is the reference and the source of the
 shared golden vectors.
 
-See `ARCHITECTURE.md` for the design, `ROADMAP.md` for the plan, and `CLAUDE.md`
-for the engineering rules.
+See `ARCHITECTURE.md` for the design and `CLAUDE.md` for the engineering rules.
 
 ## Status
 
@@ -33,8 +32,7 @@ multihop tunnel is **live-validated against a production exit**. The **non-root
 proxy datapath is feature-complete** on Linux, macOS and Windows: SOCKS5 and HTTP
 CONNECT, DNS-over-tunnel (no host-resolver leak), SOCKS5 UDP associate, dual-stack
 IPv6, and the port-forwarding primitives. Applications depend on a single crate,
-`warren-sdk`. `ROADMAP.md` is the source of truth for fine-grained status; see
-`AUDIT.md` for the audit trail.
+`warren-sdk`.
 
 | Capability | Crate | Status |
 |---|---|---|
