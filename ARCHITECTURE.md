@@ -84,6 +84,29 @@ offering two backends behind one `PacketSink` seam:
 The mode is selected at runtime (`ConnectMode::Proxy` vs `ConnectMode::Tun`),
 defaulting to `Proxy`. Both backends share the QUIC core in `warren-transport`.
 
+## Circuit: single-hop and multi-hop over one datapath
+
+There is a single client datapath, the HPKE-sealed multihop transport, driven by
+the `start_proxy*` family (`start_proxy`, `start_proxy_supervised`,
+`start_proxy_supervised_failover`, `start_proxy_bonded`). What varies is the
+`Circuit` handed to it, a dial target labeled by hop count:
+
+- **`Circuit::SingleHop(exit)`** dials the exit directly: the client and the exit
+  are the only nodes. This is the single-hop mode (what a launcher like `wclaude`
+  uses).
+- **`Circuit::MultiHop(exit)`** dials an entry-composed exit built with
+  `WarrenClient::select_multihop_entry`, which folds the entry edge over the
+  exit's HPKE anchor. That composition lives there alone, so `Circuit` never
+  reimplements it.
+
+Both variants run the exact same supervised datapath; the label is the named home
+of the single-hop vs multi-hop distinction. There is no separate single-hop code
+path: the earlier `connect_tunnel` / `start_proxy(exit)` datapath (v4-only,
+unsupervised, its SetupAck carrying no subnet or v6 gateway) was removed. A
+single-hop session is now just a one-exit multihop circuit, so it inherits IPv6,
+the exit-supplied subnet and the self-healing supervision that the dedicated
+single-hop path lacked.
+
 ## Frozen wire contracts (ported from warren-core)
 
 These are reproduced exactly and pinned by `vectors/`. A change is a wire-format
