@@ -42,20 +42,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dir.dropped
     );
 
-    let advisory = client.fetch_path_quality().await;
-    match &advisory {
-        Some(a) => println!(
-            "advisory: {} entries (generated_at {})",
-            a.entries.len(),
-            a.generated_at
-        ),
-        None => println!("advisory: none (older API or unavailable) -> weight-order fallback"),
-    }
+    // A/B knob: force the no-advisory fallback path for comparison runs.
+    let advisory = if std::env::var("WARREN_NO_ADVISORY").is_ok() {
+        println!("advisory: DISABLED by WARREN_NO_ADVISORY -> weight-order fallback");
+        None
+    } else {
+        let a = client.fetch_path_quality().await;
+        match &a {
+            Some(a) => println!(
+                "advisory: {} entries (generated_at {})",
+                a.entries.len(),
+                a.generated_at
+            ),
+            None => println!("advisory: none (older API or unavailable) -> weight-order fallback"),
+        }
+        a
+    };
 
+    let wanted = std::env::var("WARREN_EXIT_COUNTRY").unwrap_or_else(|_| "NL".into());
     let exit = dir
         .exits
         .iter()
-        .find(|e| e.country == "NL")
+        .find(|e| e.country == wanted)
         .or_else(|| dir.exits.first())
         .ok_or("empty directory")?
         .clone();
