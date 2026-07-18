@@ -5,7 +5,7 @@
 //!
 //! What it validates against real exits:
 //!   1. A real multihop handshake yields a real, sane path RTT
-//!      (`ClientSession`/`MultihopSession::path_rtt`), recorded into the
+//!      (`MultihopSession::path_rtt`), recorded into the
 //!      client's [`RttCache`] keyed by the exit's Ed25519 endpoint pubkey.
 //!   2. `select_exit_by_proximity` biases weighted selection toward the
 //!      lower-RTT exit at comparable weight (doc 52 §6.2 client: selection

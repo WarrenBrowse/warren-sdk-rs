@@ -6,17 +6,18 @@
 //! The obfuscation lives at the QUIC Initial layer, before any authentication,
 //! so this needs no exit, no wallet/secret and no privilege: a plain UDP "tap"
 //! that never speaks QUIC captures the client's first flight via the public
-//! `ClientTunnel::connect` path (which applies `warren_transport_config` by
-//! default). A default upstream client would emit a single ~1200-byte Initial;
-//! the obfuscated default emits a padded (>= 1280) first datagram and splits
-//! the ClientHello across >= 2 datagrams, so both assertions are real guards.
+//! `MultihopClientTunnel::connect` path (which applies `warren_transport_config`
+//! by default, shared by every Warren datapath). A default upstream client would
+//! emit a single ~1200-byte Initial; the obfuscated default emits a padded
+//! (>= 1280) first datagram and splits the ClientHello across >= 2 datagrams, so
+//! both assertions are real guards.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use tokio::net::UdpSocket;
-use warren_transport::ClientTunnel;
+use warren_transport::MultihopClientTunnel;
 
 /// The fork pads the obfuscated client Initial to `initial_datagram_min_size`
 /// (1280). The default upstream Initial is the RFC 9000 floor (1200).
@@ -33,11 +34,14 @@ async fn sdk_default_client_initial_is_padded_and_split() {
     let tap_addr: SocketAddr = tap.local_addr().expect("tap addr");
 
     // Public default path: no `with_transport_config`, so the connect applies
-    // `warren_transport_config()` (the obfuscated default).
-    let tunnel = ClientTunnel::new(SigningKey::from_bytes(&[1u8; 32]));
+    // `warren_transport_config()` (the obfuscated default). The x25519 / exit_id
+    // are dummies: the tap never speaks QUIC, so only the first flight is emitted.
+    let tunnel = MultihopClientTunnel::new(SigningKey::from_bytes(&[1u8; 32]));
     let driver = tokio::spawn(async move {
         // Never resolves (the tap is silent); we want the Initial emission only.
-        let _ = tunnel.connect([0x11u8; 32], tap_addr).await;
+        let _ = tunnel
+            .connect([0x11u8; 32], [0x22u8; 32], [0x33u8; 16], tap_addr)
+            .await;
     });
 
     let mut buf = [0u8; 4096];

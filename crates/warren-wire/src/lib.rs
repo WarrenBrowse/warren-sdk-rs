@@ -1,8 +1,8 @@
 //! Pure Warren wire codecs.
 //!
 //! Implemented:
-//! - the tunnel handshake frames ([`handshake::Setup`] / [`handshake::SetupAck`],
-//!   postcard, wire-compatible with warren-core);
+//! - the shared handshake primitives ([`handshake`]: identity, DAITA config and
+//!   protocol version, wire-compatible with warren-core);
 //! - the NAT-PMP codec ([`natpmp`], RFC 6886 plus the Warren rate-limit trailer);
 //! - the multihop dispatch frame wire codec ([`multihop::WarrenMultihopFrame`]):
 //!   the first frame every connection sends. HPKE sealing/opening and the exit
@@ -22,8 +22,7 @@ pub use control::{
 };
 pub use handshake::{
     AUTH_SIG_LEN, AuthSig, CLIENT_PUBKEY_LEN, DEVICE_ID_LEN, DaitaConfig, MAX_SETUP_FRAME_BYTES,
-    PROTOCOL_VERSION, ProtocolError, Setup, SetupAck, decode_setup, decode_setup_ack, encode_setup,
-    encode_setup_ack, features,
+    PROTOCOL_VERSION, ProtocolError, features,
 };
 pub use multihop::{
     MULTIHOP_FRAME_MAX_OVERHEAD, MultihopError, WARREN_HPKE_AAD_V1, WARREN_HPKE_VERSION_V1,

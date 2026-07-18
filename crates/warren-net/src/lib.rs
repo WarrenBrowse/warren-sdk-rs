@@ -18,8 +18,8 @@
 //!    (`CAP_NET_ADMIN` or a pre-owned device); macOS and Windows require
 //!    privilege, which is exactly why the proxy datapath is the default.
 //!
-//! What is implemented and tested today: the [`PacketSink`] seam and its QUIC
-//! implementation ([`QuicPacketSink`]), the SOCKS5 codec and proxy server, the
+//! What is implemented and tested today: the [`PacketSink`] seam and its
+//! multihop implementation ([`MultihopPacketSink`]), the SOCKS5 codec and proxy server, the
 //! smoltcp userspace netstack and its tunnel connector ([`TunnelConnector`]),
 //! the leak-level model ([`KillSwitchLevel`]), and the proxy datapath config
 //! ([`ProxyConfig`]). The per-OS TUN devices, routing/DNS plumbing and OS
@@ -58,9 +58,7 @@ pub use portforward::{
 };
 #[cfg(feature = "proxy")]
 pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy, UdpConnector, UdpFlow};
-pub use sink::{
-    BondedPacketSink, CloseRttObserver, MultihopPacketSink, PacketSink, QuicPacketSink,
-};
+pub use sink::{BondedPacketSink, CloseRttObserver, MultihopPacketSink, PacketSink};
 pub use tun_sink::{TunBridge, TunPacketSink, forward_bidirectional, tun_channels};
 /// The NAT-PMP mapping protocol selector (TCP or UDP) and the gateway result
 /// code, re-exported from the wire codec so callers can name them (notably to

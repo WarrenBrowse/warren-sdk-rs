@@ -1,9 +1,9 @@
 //! Warren QUIC transport.
 //!
-//! [`ClientTunnel`] dials an exit over QUIC with a TLS 1.3 raw-public-key
-//! handshake ([`tls`]), exchanges the Setup/SetupAck frames, and yields a
-//! [`ClientSession`] that carries IP packets as RFC 9221 datagrams. The session
-//! is the data-plane seam the `warren-net` backends drive.
+//! [`MultihopClientTunnel`] dials an exit over QUIC with a TLS 1.3 handshake
+//! ([`tls`]), completes the HPKE-sealed multihop setup exchange, and yields a
+//! [`MultihopSession`] that carries IP packets as RFC 9221 datagrams. The
+//! session is the data-plane seam the `warren-net` backends drive.
 //!
 //! Pure protocol logic: no TUN, routing, DNS or OS coupling here.
 
@@ -14,11 +14,11 @@ pub mod reconnect;
 pub(crate) mod tcp_fallback;
 pub mod tls;
 
-pub use client::{ClientSession, ClientTunnel, TunnelError, local_ip_for_endpoint};
+pub use client::{TunnelError, local_ip_for_endpoint};
 // ADR-0006 idle cover: the scheduler + driver live in the engine
 // (`warrenguard_pump::idle_cover`), the single home. Re-exported here so SDK
 // consumers keep the `warren_transport::{CoverSink, IdleCoverDriver, ..}` path;
-// the SDK's `ClientSession`/`MultihopSession` implement the engine `CoverSink`.
+// the SDK's `MultihopSession` implements the engine `CoverSink`.
 pub use warrenguard_pump::idle_cover::{
     CoverSink, IdleCover, IdleCoverDriver, IdleCoverDriverHandle,
 };

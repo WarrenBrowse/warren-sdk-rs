@@ -3,15 +3,15 @@
 //! A [`PacketSink`] moves inner IP packets between a datapath (a TUN device, or
 //! a userspace netstack) and the QUIC tunnel. The TUN backend reads packets from
 //! the OS and writes them to the sink; the netstack/proxy backend synthesizes
-//! packets from terminated L4 flows and does the same. [`QuicPacketSink`] is the
-//! tunnel-side implementation over a [`warren_transport::ClientSession`].
+//! packets from terminated L4 flows and does the same. [`MultihopPacketSink`] is
+//! the tunnel-side implementation over a [`warren_transport::MultihopSession`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
-use warren_transport::{ClientSession, DaitaDriverHandle, MultihopSession};
+use warren_transport::{DaitaDriverHandle, MultihopSession};
 use warrenguard_pump::idle_cover::{CoverSink, CoverStop, run_idle_cover};
 
 use crate::error::NetError;
@@ -116,103 +116,6 @@ pub type CloseRttObserver = Box<dyn Fn(u32) + Send + Sync>;
 /// Clamped whole-millisecond reading of a session's smoothed path RTT.
 fn rtt_millis(rtt: std::time::Duration) -> u32 {
     u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX)
-}
-
-/// A [`PacketSink`] backed by a QUIC tunnel session (RFC 9221 datagrams).
-pub struct QuicPacketSink {
-    session: Arc<ClientSession>,
-    /// Drop-to-stop guard for the idle-cover loop, when armed (see
-    /// [`Self::arm_idle_cover`]). Held here so cover is torn down with the sink
-    /// (the connection lifecycle) and never outlives the tunnel.
-    cover: Option<CoverStop>,
-    /// Fired with the final path RTT on drop, when wired (see
-    /// [`Self::with_close_rtt_observer`]).
-    close_rtt: Option<CloseRttObserver>,
-}
-
-impl Drop for QuicPacketSink {
-    fn drop(&mut self) {
-        if let Some(observer) = self.close_rtt.take() {
-            observer(rtt_millis(self.session.path_rtt()));
-        }
-    }
-}
-
-// Manual Debug: `CoverStop` is not Debug, and the guard has no observable state
-// worth rendering, so it is omitted.
-impl std::fmt::Debug for QuicPacketSink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QuicPacketSink")
-            .field("session", &self.session)
-            .finish_non_exhaustive()
-    }
-}
-
-impl QuicPacketSink {
-    /// Wraps an established session (idle cover not yet armed).
-    #[must_use]
-    pub fn new(session: ClientSession) -> Self {
-        Self {
-            session: Arc::new(session),
-            cover: None,
-            close_rtt: None,
-        }
-    }
-
-    /// Arms `observer` to receive the session's final smoothed path RTT when
-    /// this sink is dropped, complementing the post-handshake sample the SDK
-    /// records at connect so a long session's parting measurement also
-    /// reaches the client RTT store.
-    #[must_use]
-    pub fn with_close_rtt_observer(mut self, observer: CloseRttObserver) -> Self {
-        self.close_rtt = Some(observer);
-        self
-    }
-
-    /// Arms teardown-safe idle cover over the session when `idle_cover` is set,
-    /// so the userland datapath emits the jittered, size-varied idle footprint
-    /// instead of the fixed keep-alive PING. The stop guard is owned by this
-    /// sink, so cover is torn down when the sink (the datapath) is dropped.
-    #[must_use]
-    pub fn arm_idle_cover(mut self, idle_cover: bool) -> Self {
-        self.cover = arm_idle_cover_over(&self.session, idle_cover);
-        self
-    }
-
-    /// The underlying session.
-    #[must_use]
-    pub fn session(&self) -> &ClientSession {
-        &self.session
-    }
-
-    /// True while the idle-cover loop is armed for this sink (the datapath is
-    /// emitting the jittered cover footprint instead of the keep-alive PING).
-    #[must_use]
-    pub fn cover_is_armed(&self) -> bool {
-        self.cover.is_some()
-    }
-}
-
-impl PacketSink for QuicPacketSink {
-    async fn send_packet(&self, packet: &[u8]) -> Result<(), NetError> {
-        // One copy into the refcounted Bytes quinn needs; no intermediate Vec.
-        self.session
-            .send_datagram(Bytes::copy_from_slice(packet))
-            .map_err(NetError::Tunnel)
-    }
-
-    async fn recv_packet(&self) -> Result<Bytes, NetError> {
-        self.session.read_datagram().await.map_err(NetError::Tunnel)
-    }
-
-    fn max_payload(&self) -> usize {
-        // Honor both the path MTU (once probed) and the exit's policy MTU from
-        // the handshake; before the first PMTU probe, fall back to the policy.
-        let policy = usize::from(self.session.assigned_max_mtu());
-        self.session
-            .max_datagram_size()
-            .map_or(policy, |path| path.min(policy))
-    }
 }
 
 /// A [`PacketSink`] backed by a multihop tunnel session: every inner IP packet

@@ -1,6 +1,6 @@
-//! ADR-0006 idle-cover end-to-end (SDK): the cover driver emits jittered,
-//! size-varied dummies over a real loopback tunnel while idle, with the
-//! keep-alive PING disabled (`with_idle_cover(true)` sets
+//! ADR-0006 idle-cover end-to-end (SDK, multihop datapath): the cover driver
+//! emits jittered, size-varied dummies over a real loopback multihop tunnel while
+//! idle, with the keep-alive PING disabled (`with_idle_cover(true)` sets
 //! `keep_alive_interval(None)`), so cover REPLACES the beacon rather than adding
 //! to it.
 //!
@@ -16,22 +16,28 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use tokio::sync::Notify;
-use warren_test_support::spawn_fake_exit;
-use warren_transport::{ClientTunnel, IdleCoverDriver};
+use warren_test_support::spawn_fake_multihop_exit;
+use warren_transport::{IdleCoverDriver, MultihopClientTunnel};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "ADR-0006 idle cover ~35s idle; run with --ignored --nocapture"]
 async fn idle_cover_emits_and_keeps_connection_alive() {
     let exit_key = SigningKey::from_bytes(&[9u8; 32]);
-    let (exit_addr, exit_pubkey) = spawn_fake_exit(exit_key).await;
+    let (exit_addr, keys) = spawn_fake_multihop_exit(exit_key).await;
 
     // with_idle_cover(true) disables the keep-alive PING (keep_alive_interval None).
-    let tunnel = ClientTunnel::new(SigningKey::from_bytes(&[1u8; 32])).with_idle_cover(true);
+    let tunnel =
+        MultihopClientTunnel::new(SigningKey::from_bytes(&[1u8; 32])).with_idle_cover(true);
     let session = Arc::new(
         tunnel
-            .connect(exit_pubkey, exit_addr)
+            .connect(
+                keys.ed25519_pubkey,
+                keys.x25519_pubkey,
+                keys.exit_id,
+                exit_addr,
+            )
             .await
-            .expect("handshake must succeed"),
+            .expect("multihop setup must succeed"),
     );
 
     // Baseline after the handshake/MTU-probe settles.
