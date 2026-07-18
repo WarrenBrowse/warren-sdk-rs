@@ -17,6 +17,9 @@ pub mod transport;
 #[cfg(feature = "reqwest-transport")]
 pub mod reqwest_transport;
 
+#[cfg(feature = "marked-transport")]
+pub mod marked_transport;
+
 pub use client::{ClientError, WarrenApiClient};
 pub use dto::{
     CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
@@ -34,3 +37,6 @@ pub use transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportE
 
 #[cfg(feature = "reqwest-transport")]
 pub use reqwest_transport::ReqwestTransport;
+
+#[cfg(feature = "marked-transport")]
+pub use marked_transport::MarkedTransport;

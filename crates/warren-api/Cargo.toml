@@ -28,9 +28,41 @@ thiserror = { workspace = true }
 # builder stays cheap to compile and test; the SDK facade enables it.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"], optional = true }
 
+# Optional socket-marked control-plane transport (feature `marked-transport`).
+# reqwest cannot set SO_MARK on its sockets, so the privileged daemon path uses
+# this self-contained hyper + rustls HTTPS/1.1 client whose TCP sockets carry the
+# Warren tunnel fwmark via the engine's socket-bypass. Off by default.
+hyper = { version = "1", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+http = { version = "1", optional = true }
+bytes = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+rustls = { workspace = true, optional = true }
+webpki-roots = { version = "1", optional = true }
+# `all` exposes the safe `Socket::mark()` getter the SO_MARK proof test reads back.
+socket2 = { version = "0.6", features = ["all"], optional = true }
+warrenguard-socket-bypass = { workspace = true, optional = true }
+warrenguard-tun-core = { workspace = true, optional = true }
+
 [features]
 default = []
 reqwest-transport = ["dep:reqwest"]
+marked-transport = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:http",
+    "dep:bytes",
+    "dep:tokio",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:webpki-roots",
+    "dep:socket2",
+    "dep:warrenguard-socket-bypass",
+    "dep:warrenguard-tun-core",
+]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

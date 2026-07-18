@@ -48,6 +48,10 @@ bytes = { workspace = true }
 # dependency. Apps that bring their own HttpTransport can disable it.
 default = ["reqwest-transport"]
 reqwest-transport = ["warren-api/reqwest-transport"]
+# Socket-marked control-plane transport for the privileged daemon (warrend): its
+# control-plane fetch carries the Warren tunnel fwmark so a `meta mark` lockdown
+# guard permits it. Off by default (only the daemon needs it).
+marked-transport = ["warren-api/marked-transport"]
 # The experimental privileged TUN datapath facade (`start_tun_multihop`). Pulls
 # warren-tun's device open + warren-net's TUN datapath. EXPERIMENTAL, Unix-only,
 # NOT yet validated against a real exit (needs root + a device).

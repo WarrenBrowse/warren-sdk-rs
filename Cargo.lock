@@ -3471,20 +3471,31 @@ dependencies = [
 name = "warren-api"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "data-encoding",
  "ed25519-dalek",
  "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "rand 0.10.1",
  "rand 0.8.6",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "warren-contract",
  "warren-identity",
+ "warrenguard-socket-bypass",
  "warrenguard-token",
+ "warrenguard-tun-core",
+ "webpki-roots",
 ]
 
 [[package]]
