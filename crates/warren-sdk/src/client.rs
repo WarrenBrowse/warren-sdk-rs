@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use warren_api::{HttpTransport, WarrenApiClient};
 use warren_discovery::{
-    DEFAULT_RTT_TTL_SECS, ExitQuery, ExitSelector, PATH_QUALITY_VERSION, PathAwareParams,
-    PathQualityAdvisory, Relay, RttCache, SelectorError, VerifiedExit, select_entry_path_aware,
-    verify_multihop_directory, verify_signed_relay_list,
+    CircuitPolicy, DEFAULT_RTT_TTL_SECS, ExitQuery, ExitSelector, PATH_QUALITY_VERSION,
+    PathAwareParams, PathQualityAdvisory, Relay, RttCache, SelectorError, VerifiedEntry,
+    VerifiedExit, entry_rtt_from, select_entry_path_aware, verify_multihop_directory,
+    verify_signed_relay_list,
 };
 use warren_identity::WarrenIdentity;
 use warren_net::{MultihopPacketSink, QuicPacketSink};
@@ -479,7 +480,9 @@ impl<T: HttpTransport> WarrenClient<T> {
         // available post-handshake. Record it keyed by exit before wrapping
         // the session, so later selections can prefer nearer exits.
         self.record_rtt(exit.endpoint_id(), session.path_rtt());
-        Ok(QuicPacketSink::new(session).arm_idle_cover(cover.idle_cover))
+        Ok(QuicPacketSink::new(session)
+            .arm_idle_cover(cover.idle_cover)
+            .with_close_rtt_observer(self.close_rtt_recorder(exit.endpoint_id())))
     }
 
     /// Record a measured path RTT for the exit identified by its Ed25519
@@ -491,6 +494,18 @@ impl<T: HttpTransport> WarrenClient<T> {
         if let Ok(mut cache) = self.rtt_cache.lock() {
             cache.record(endpoint_id, rtt_ms, now_unix_secs());
         }
+    }
+
+    /// Sink observer recording the session's parting RTT under
+    /// `endpoint_id` when the datapath drops, so a long session's final
+    /// measurement reaches the store, not just the connect-time one.
+    fn close_rtt_recorder(&self, endpoint_id: [u8; 32]) -> warren_net::CloseRttObserver {
+        let cache = Arc::clone(&self.rtt_cache);
+        Box::new(move |rtt_ms| {
+            if let Ok(mut cache) = cache.lock() {
+                cache.record(endpoint_id, rtt_ms, now_unix_secs());
+            }
+        })
     }
 
     /// Selects an exit from `selector` weighted by `weight * f(rtt)` using
@@ -668,19 +683,42 @@ impl<T: HttpTransport> WarrenClient<T> {
         advisory: Option<&PathQualityAdvisory>,
         prev_entry_node_id: Option<&[u8; 16]>,
     ) -> Option<VerifiedExit> {
-        let now = now_unix_secs();
-        let cache = self.rtt_cache_snapshot();
-        let entry = select_entry_path_aware(
+        self.select_multihop_entry_among(
             &dir.entries,
             exit,
             &dir.policy,
             advisory,
-            |e| cache.fresh_rtt_ms(e.relay_ed25519_pubkey, now, DEFAULT_RTT_TTL_SECS),
+            prev_entry_node_id,
+        )
+    }
+
+    /// [`Self::select_multihop_entry`] over a caller-filtered subset of the
+    /// directory's entries (e.g. a geographic pre-filter): the ONE wiring of
+    /// the shared path-aware entry selection to this client's own RTT
+    /// history, so no embedding (bindings included) re-implements the pick.
+    /// `entries` and `policy` must come from the same verified directory.
+    #[must_use]
+    pub fn select_multihop_entry_among(
+        &self,
+        entries: &[VerifiedEntry],
+        exit: &VerifiedExit,
+        policy: &CircuitPolicy,
+        advisory: Option<&PathQualityAdvisory>,
+        prev_entry_node_id: Option<&[u8; 16]>,
+    ) -> Option<VerifiedExit> {
+        let now = now_unix_secs();
+        let cache = self.rtt_cache_snapshot();
+        let entry = select_entry_path_aware(
+            entries,
+            exit,
+            policy,
+            advisory,
+            entry_rtt_from(&cache, now, DEFAULT_RTT_TTL_SECS),
             now,
             prev_entry_node_id,
             &PathAwareParams::default(),
         )?;
-        exit.via_entry(entry, &dir.policy)
+        exit.via_entry(entry, policy)
     }
 
     /// Establishes a multihop tunnel to `exit` (the handshake real exits require:
@@ -774,7 +812,9 @@ impl<T: HttpTransport> WarrenClient<T> {
         // tunnel closes (a cover send then errors), so no explicit stop is needed.
         let cfg = match &daita {
             DaitaMode::Off => {
-                return Ok(MultihopPacketSink::new(session).arm_idle_cover(cover.idle_cover));
+                return Ok(MultihopPacketSink::new(session)
+                    .arm_idle_cover(cover.idle_cover)
+                    .with_close_rtt_observer(self.close_rtt_recorder(exit.exit_ed25519_pubkey)));
             }
             // Negotiated (the default): drive exactly what the exit granted.
             DaitaMode::Negotiated => match session.assignment().daita_spec.clone() {
@@ -783,7 +823,9 @@ impl<T: HttpTransport> WarrenClient<T> {
                     // The exit declined: the defense is NOT running; return the
                     // undefended sink instead of padding blindly (the lie the
                     // /v3 capability echo exists to prevent).
-                    return Ok(MultihopPacketSink::new(session));
+                    return Ok(MultihopPacketSink::new(session).with_close_rtt_observer(
+                        self.close_rtt_recorder(exit.exit_ed25519_pubkey),
+                    ));
                 }
             },
             // Explicit override: client-side unilateral pick.
@@ -803,7 +845,8 @@ impl<T: HttpTransport> WarrenClient<T> {
         // explicit-stop path is for callers that hold their own handle).
         let stop = Arc::new(tokio::sync::Notify::new());
         tokio::spawn(driver.run(stop));
-        Ok(MultihopPacketSink::from_arc(session, Some(handle)))
+        Ok(MultihopPacketSink::from_arc(session, Some(handle))
+            .with_close_rtt_observer(self.close_rtt_recorder(exit.exit_ed25519_pubkey)))
     }
 
     /// Starts the PRIVILEGED TUN datapath over a multihop tunnel to `exit`: opens

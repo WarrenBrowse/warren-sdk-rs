@@ -143,6 +143,49 @@ async fn select_multihop_entry_composes_a_policy_legal_circuit() {
 }
 
 #[tokio::test]
+async fn select_multihop_entry_among_honors_the_caller_subset_and_the_policy() {
+    // The subset surface is what bindings feed a geo pre-filter into: the
+    // pick must never leave the subset, and the shared diversity policy
+    // still gates every candidate (a subset holding only the exit's own
+    // node composes nothing rather than a forbidden circuit).
+    let (client, _) = client_with(404, "");
+    let dir = client
+        .fetch_multihop_directory_full()
+        .await
+        .expect("directory verifies");
+    let exit = dir
+        .exits
+        .iter()
+        .find(|x| x.exit_id == [10; 16])
+        .expect("RO exit present")
+        .clone();
+
+    let only_legal: Vec<_> = dir
+        .entries
+        .iter()
+        .filter(|e| e.exit_id == [20; 16])
+        .cloned()
+        .collect();
+    let circuit = client
+        .select_multihop_entry_among(&only_legal, &exit, &dir.policy, None, None)
+        .expect("the legal subset composes a circuit");
+    assert_eq!(circuit.endpoint, "198.51.100.20:443".parse().unwrap());
+
+    let only_self: Vec<_> = dir
+        .entries
+        .iter()
+        .filter(|e| e.exit_id == [10; 16])
+        .cloned()
+        .collect();
+    assert!(
+        client
+            .select_multihop_entry_among(&only_self, &exit, &dir.policy, None, None)
+            .is_none(),
+        "a subset with no policy-legal entry must compose nothing"
+    );
+}
+
+#[tokio::test]
 async fn a_degraded_only_candidate_is_still_selected_never_fail_closed() {
     let now = now_secs();
     let body = format!(

@@ -1,13 +1,13 @@
 //! Client-side RTT proximity scoring (doc 52 §6.2 client).
 //!
-//! The signed relay list already carries a server-computed `weight`. This
-//! module lets the client bias selection toward *nearer* exits at equal
-//! weight, using the round-trip time it measured on a prior QUIC
-//! handshake to each exit (`connection().stats().path.rtt`, fed in by the
-//! tunnel layer). The measured RTTs live in an [`RttCache`] with a TTL;
-//! [`crate::selector::ExitSelector::select_weighted_by_proximity`] turns
-//! them into an effective score `weight * f(rtt)` and weighted-picks over
-//! that.
+//! The measurement STORE is single-homed in `warren-discovery-core`
+//! ([`RttCache`], re-exported here): the same store, staleness rule and
+//! endpoint keying feed the shared path-aware multihop selection and this
+//! module's single-hop scoring, so the client-measured RTT has exactly one
+//! source. This module keeps only the SDK's exit-proximity scoring:
+//! [`crate::selector::ExitSelector::select_weighted_by_proximity`] turns a
+//! fresh measured RTT into an effective score `weight * f(rtt)` and
+//! weighted-picks over that.
 //!
 //! Design invariants:
 //! - **Zero data == today.** An exit with no fresh RTT sample is scored at
@@ -21,17 +21,7 @@
 //!   `now_unix_secs`, so the cache and scoring are deterministically
 //!   testable (the SDK portability + TDD rules).
 
-use std::collections::HashMap;
-
-/// The stable exit identity used to key measurements: the exit's Ed25519
-/// endpoint pubkey (`Relay::endpoint_id`, also the multihop directory's
-/// `exit_ed25519_pubkey`), so a measurement taken on any dial path keys
-/// the same exit and survives an endpoint-address change.
-pub type EndpointId = [u8; 32];
-
-/// Default freshness window for a measured RTT (24 h), matching the doc's
-/// per-exit local cache TTL of 24 h.
-pub const DEFAULT_RTT_TTL_SECS: u64 = 24 * 60 * 60;
+pub use warren_discovery_core::{DEFAULT_RTT_TTL_SECS, EndpointId, RttCache};
 
 /// Reference RTT (ms) shaping the proximity curve `f(rtt) = K / (K + rtt)`.
 /// At `rtt == K` the factor is 0.5. 50 ms is a sensible mid-latency knee;
@@ -44,66 +34,6 @@ const RTT_REFERENCE_MS: f64 = 50.0;
 /// probed exit falls below it; an all-unprobed fleet collapses to the
 /// weight-only distribution (every candidate shares this factor).
 const NEUTRAL_RTT_MS: u32 = 60;
-
-/// One measured round-trip time to an exit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RttSample {
-    rtt_ms: u32,
-    measured_at_unix: u64,
-}
-
-/// Per-exit cache of the most recent measured RTT, with TTL expiry.
-///
-/// Populated by the tunnel after a handshake completes; read by the
-/// selector. Keyed by [`EndpointId`] so it survives an endpoint-address
-/// change for the same logical exit.
-#[derive(Debug, Clone, Default)]
-pub struct RttCache {
-    samples: HashMap<EndpointId, RttSample>,
-}
-
-impl RttCache {
-    /// Empty cache.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record (or overwrite) the RTT measured to `endpoint_id` at
-    /// `now_unix_secs`. The latest measurement always wins.
-    pub fn record(&mut self, endpoint_id: EndpointId, rtt_ms: u32, now_unix_secs: u64) {
-        self.samples.insert(
-            endpoint_id,
-            RttSample {
-                rtt_ms,
-                measured_at_unix: now_unix_secs,
-            },
-        );
-    }
-
-    /// Fresh RTT for `endpoint_id`: the sample if it was measured within
-    /// `ttl_secs` of `now_unix_secs`, else `None` (stale or never
-    /// measured). Does not mutate; expiry is evaluated at read time.
-    #[must_use]
-    pub fn fresh_rtt_ms(
-        &self,
-        endpoint_id: EndpointId,
-        now_unix_secs: u64,
-        ttl_secs: u64,
-    ) -> Option<u32> {
-        self.samples.get(&endpoint_id).and_then(|s| {
-            let age = now_unix_secs.saturating_sub(s.measured_at_unix);
-            (age < ttl_secs).then_some(s.rtt_ms)
-        })
-    }
-
-    /// Drop samples older than `ttl_secs` relative to `now_unix_secs`.
-    /// Optional housekeeping; `fresh_rtt_ms` already ignores stale ones.
-    pub fn prune(&mut self, now_unix_secs: u64, ttl_secs: u64) {
-        self.samples
-            .retain(|_, s| now_unix_secs.saturating_sub(s.measured_at_unix) < ttl_secs);
-    }
-}
 
 /// Proximity factor in `(0, 1]` for an RTT in ms: `K / (K + rtt)`,
 /// monotonically decreasing, 1.0 at 0 ms.
@@ -158,58 +88,6 @@ mod tests {
     }
 
     #[test]
-    fn cache_returns_fresh_sample_and_expires_stale_one() {
-        let mut cache = RttCache::new();
-        cache.record(eid(1), 42, 1_000);
-        // Within TTL: returned.
-        assert_eq!(
-            cache.fresh_rtt_ms(
-                eid(1),
-                1_000 + DEFAULT_RTT_TTL_SECS - 1,
-                DEFAULT_RTT_TTL_SECS
-            ),
-            Some(42)
-        );
-        // Past TTL: gone (treated as unprobed).
-        assert_eq!(
-            cache.fresh_rtt_ms(eid(1), 1_000 + DEFAULT_RTT_TTL_SECS, DEFAULT_RTT_TTL_SECS),
-            None
-        );
-        // Unknown exit: None.
-        assert_eq!(
-            cache.fresh_rtt_ms(eid(9), 1_000, DEFAULT_RTT_TTL_SECS),
-            None
-        );
-    }
-
-    #[test]
-    fn latest_measurement_overwrites() {
-        let mut cache = RttCache::new();
-        cache.record(eid(1), 100, 1_000);
-        cache.record(eid(1), 20, 1_050);
-        assert_eq!(
-            cache.fresh_rtt_ms(eid(1), 1_060, DEFAULT_RTT_TTL_SECS),
-            Some(20)
-        );
-    }
-
-    #[test]
-    fn prune_drops_only_stale_samples() {
-        let mut cache = RttCache::new();
-        cache.record(eid(1), 10, 1_000); // will be stale
-        cache.record(eid(2), 10, 5_000); // fresh
-        cache.prune(1_000 + DEFAULT_RTT_TTL_SECS, DEFAULT_RTT_TTL_SECS);
-        assert_eq!(
-            cache.fresh_rtt_ms(eid(1), 5_000, DEFAULT_RTT_TTL_SECS),
-            None
-        );
-        assert_eq!(
-            cache.fresh_rtt_ms(eid(2), 5_000, DEFAULT_RTT_TTL_SECS),
-            Some(10)
-        );
-    }
-
-    #[test]
     fn proximity_factor_is_monotonically_decreasing() {
         assert!(proximity_factor(0) > proximity_factor(25));
         assert!(proximity_factor(25) > proximity_factor(50));
@@ -256,6 +134,8 @@ mod tests {
 
     #[test]
     fn a_probed_near_exit_beats_the_unprobed_baseline_and_a_probed_far_one_loses() {
+        // Exercises the SHARED store through this crate's re-export: the
+        // scoring must read exactly what the single-homed cache serves.
         let mut cache = RttCache::new();
         cache.record(eid(1), 10, 1_000); // near
         cache.record(eid(2), 200, 1_000); // far

@@ -39,5 +39,5 @@ pub use signed::{
 pub use warren_discovery_core::warren_types;
 pub use warren_discovery_core::{
     EntryPathQuality, LegQuality, PATH_QUALITY_DEGRADED_RTT_MS, PATH_QUALITY_VERSION,
-    PathAwareParams, PathQualityAdvisory, select_entry_path_aware,
+    PathAwareParams, PathQualityAdvisory, entry_rtt_from, select_entry_path_aware,
 };

@@ -107,6 +107,17 @@ pub trait PacketSink: Send + Sync {
     }
 }
 
+/// Observer of the session's final smoothed path RTT (ms), fired once when
+/// the owning sink is dropped (the datapath teardown, the natural pre-close
+/// lifecycle point). The sink stays discovery-agnostic: the SDK client
+/// wires this to its RTT store, keyed by the identity it dialed.
+pub type CloseRttObserver = Box<dyn Fn(u32) + Send + Sync>;
+
+/// Clamped whole-millisecond reading of a session's smoothed path RTT.
+fn rtt_millis(rtt: std::time::Duration) -> u32 {
+    u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX)
+}
+
 /// A [`PacketSink`] backed by a QUIC tunnel session (RFC 9221 datagrams).
 pub struct QuicPacketSink {
     session: Arc<ClientSession>,
@@ -114,6 +125,17 @@ pub struct QuicPacketSink {
     /// [`Self::arm_idle_cover`]). Held here so cover is torn down with the sink
     /// (the connection lifecycle) and never outlives the tunnel.
     cover: Option<CoverStop>,
+    /// Fired with the final path RTT on drop, when wired (see
+    /// [`Self::with_close_rtt_observer`]).
+    close_rtt: Option<CloseRttObserver>,
+}
+
+impl Drop for QuicPacketSink {
+    fn drop(&mut self) {
+        if let Some(observer) = self.close_rtt.take() {
+            observer(rtt_millis(self.session.path_rtt()));
+        }
+    }
 }
 
 // Manual Debug: `CoverStop` is not Debug, and the guard has no observable state
@@ -133,7 +155,18 @@ impl QuicPacketSink {
         Self {
             session: Arc::new(session),
             cover: None,
+            close_rtt: None,
         }
+    }
+
+    /// Arms `observer` to receive the session's final smoothed path RTT when
+    /// this sink is dropped, complementing the post-handshake sample the SDK
+    /// records at connect so a long session's parting measurement also
+    /// reaches the client RTT store.
+    #[must_use]
+    pub fn with_close_rtt_observer(mut self, observer: CloseRttObserver) -> Self {
+        self.close_rtt = Some(observer);
+        self
     }
 
     /// Arms teardown-safe idle cover over the session when `idle_cover` is set,
@@ -194,6 +227,17 @@ pub struct MultihopPacketSink {
     /// [`Self::arm_idle_cover`]). Held here so cover is torn down with the sink
     /// (the connection lifecycle) and never outlives the tunnel.
     cover: Option<CoverStop>,
+    /// Fired with the first hop's final path RTT on drop, when wired (see
+    /// [`Self::with_close_rtt_observer`]).
+    close_rtt: Option<CloseRttObserver>,
+}
+
+impl Drop for MultihopPacketSink {
+    fn drop(&mut self) {
+        if let Some(observer) = self.close_rtt.take() {
+            observer(rtt_millis(self.session.path_rtt()));
+        }
+    }
 }
 
 impl MultihopPacketSink {
@@ -212,7 +256,18 @@ impl MultihopPacketSink {
             session,
             daita,
             cover: None,
+            close_rtt: None,
         }
+    }
+
+    /// Arms `observer` to receive the first hop's final smoothed path RTT
+    /// when this sink is dropped, complementing the post-handshake sample the
+    /// SDK records at connect so a long session's parting measurement also
+    /// reaches the client RTT store.
+    #[must_use]
+    pub fn with_close_rtt_observer(mut self, observer: CloseRttObserver) -> Self {
+        self.close_rtt = Some(observer);
+        self
     }
 
     /// Arms teardown-safe idle cover over the session when `idle_cover` is set
@@ -561,6 +616,34 @@ mod tests {
             )
             .await
             .expect("loopback multihop connect")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_the_sink_fires_the_close_rtt_observer_once() {
+        // The drop-time sample is the datapath's parting RTT measurement:
+        // it must fire exactly once, with a plausible clamped-milliseconds
+        // value, or long sessions never refresh the client RTT store.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sink = MultihopPacketSink::new(loopback_multihop_session().await)
+            .with_close_rtt_observer(Box::new(move |rtt_ms| {
+                sink_seen.lock().unwrap().push(rtt_ms);
+            }));
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the observer must not fire while the datapath is alive"
+        );
+        drop(sink);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "sink drop must fire the close-RTT observer exactly once"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unwired_sink_drops_silently() {
+        drop(MultihopPacketSink::new(loopback_multihop_session().await));
     }
 
     #[tokio::test(flavor = "multi_thread")]

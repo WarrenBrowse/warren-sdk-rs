@@ -58,7 +58,9 @@ pub use portforward::{
 };
 #[cfg(feature = "proxy")]
 pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy, UdpConnector, UdpFlow};
-pub use sink::{BondedPacketSink, MultihopPacketSink, PacketSink, QuicPacketSink};
+pub use sink::{
+    BondedPacketSink, CloseRttObserver, MultihopPacketSink, PacketSink, QuicPacketSink,
+};
 pub use tun_sink::{TunBridge, TunPacketSink, forward_bidirectional, tun_channels};
 /// The NAT-PMP mapping protocol selector (TCP or UDP) and the gateway result
 /// code, re-exported from the wire codec so callers can name them (notably to

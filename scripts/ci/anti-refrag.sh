@@ -102,6 +102,15 @@ forbid_rs "doc94 A9" \
   'fn[[:space:]]+resolve_fallback_policy' \
   "crates"
 
+# Task 79: the client entry-RTT store (EWMA cache + endpoint keying) is
+# single-homed in warren-discovery-core next to the path-aware selector; the
+# SDK re-exports it (`warren_discovery::RttCache`) and must never re-declare
+# its own store.
+forbid_rs "doc49 t79" \
+  "SDK re-defines the client RTT store (home: warren-discovery-core::RttCache)" \
+  'struct[[:space:]]+RttCache' \
+  "crates"
+
 # Dependency direction: the client SDK never depends on the private backend
 # (warren-core) or the app (warren-app / mullvad-*). warrenguard + warren-contract
 # siblings are allowed.
