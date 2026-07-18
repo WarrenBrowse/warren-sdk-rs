@@ -1,3 +1,4 @@
+#[cfg(all(unix, feature = "experimental-tun"))]
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,13 +11,14 @@ use warren_discovery::{
     verify_signed_relay_list,
 };
 use warren_identity::WarrenIdentity;
-use warren_net::{MultihopPacketSink, QuicPacketSink};
-use warren_transport::{ClientTunnel, ConnectionState, MultihopClientTunnel, SocketBypass};
+use warren_net::MultihopPacketSink;
+use warren_transport::{ConnectionState, MultihopClientTunnel, SocketBypass};
 
 #[cfg(feature = "reqwest-transport")]
 use warren_api::ReqwestTransport;
 
-use warrenguard_config::{TUNNEL_GATEWAY_IP, TUNNEL_POOL_PREFIX};
+#[cfg(all(unix, feature = "experimental-tun"))]
+use warrenguard_config::TUNNEL_GATEWAY_IP;
 
 use crate::error::{BuildError, SdkError};
 use crate::proxy::{ProxyHandle, addressing_from_session, serve_proxy_over_sink};
@@ -441,50 +443,6 @@ impl<T: HttpTransport> WarrenClient<T> {
         Ok(ExitSelector::new(verified.relays))
     }
 
-    /// Establishes the QUIC tunnel to `exit` and returns the packet plane.
-    ///
-    /// # Errors
-    ///
-    /// [`SdkError::NoExitAddress`] if the exit lists no address,
-    /// [`SdkError::Tunnel`] if the handshake fails.
-    pub async fn connect_tunnel(
-        &self,
-        exit: &warren_discovery::Relay,
-    ) -> Result<QuicPacketSink, SdkError> {
-        // wg-0005 lockstep: an exit advertising a cover domain runs in v6
-        // X.509 mode, which this SDK transport does not implement (RPK only).
-        // Refuse rather than silently mis-dial in RPK mode, which cannot
-        // interoperate and would fail the handshake with an opaque error.
-        if exit.cover_domain().is_some() {
-            return Err(SdkError::CoverDomainUnsupported);
-        }
-        let addr: SocketAddr = *exit.addrs().first().ok_or(SdkError::NoExitAddress)?;
-        // Resolve the coupled cover-defense switch from the engine knobs (idle
-        // cover default ON, DAITA mutual exclusion), the single home shared with
-        // the app, so the SDK never runs cover off while the fleet assumes it on.
-        let cover = warrenguard_config::knobs::cover_defenses();
-        let mut tunnel = ClientTunnel::new(self.signing.clone());
-        if self.auto_local_ip {
-            tunnel = tunnel.with_auto_local_ip();
-        }
-        if let Some(cfg) = &self.transport_config {
-            tunnel = tunnel.with_transport_config(cfg.clone());
-        }
-        if cover.idle_cover {
-            // Disable the fixed keep-alive PING; the armed cover driver replaces
-            // it with a jittered, size-varied idle footprint.
-            tunnel = tunnel.with_idle_cover(true);
-        }
-        let session = tunnel.connect(exit.endpoint_id(), addr).await?;
-        // Feed the RTT proximity cache (doc 52 §6.2 client): the smoothed path RTT is
-        // available post-handshake. Record it keyed by exit before wrapping
-        // the session, so later selections can prefer nearer exits.
-        self.record_rtt(exit.endpoint_id(), session.path_rtt());
-        Ok(QuicPacketSink::new(session)
-            .arm_idle_cover(cover.idle_cover)
-            .with_close_rtt_observer(self.close_rtt_recorder(exit.endpoint_id())))
-    }
-
     /// Record a measured path RTT for the exit identified by its Ed25519
     /// endpoint pubkey into the proximity cache. Best effort: a poisoned
     /// lock is silently skipped (proximity is an optimisation, never
@@ -501,7 +459,7 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// the RTT measurements gathered on prior connects (doc 52 §6.2 client).
     /// At equal weight a nearer exit is preferred; before any measurement it
     /// is exactly [`ExitSelector::select_weighted`]. Returns an owned
-    /// [`Relay`] (ready to pass to [`Self::connect_tunnel`]).
+    /// [`Relay`].
     ///
     /// # Errors
     ///
@@ -528,43 +486,6 @@ impl<T: HttpTransport> WarrenClient<T> {
     #[must_use]
     pub fn rtt_cache_snapshot(&self) -> RttCache {
         self.rtt_cache.lock().map(|c| c.clone()).unwrap_or_default()
-    }
-
-    /// Starts the non-root proxy datapath against `exit`: connects the tunnel,
-    /// runs a userspace netstack over it, and serves a local SOCKS5 proxy on
-    /// `cfg.socks5`. Application traffic sent through the proxy egresses at the
-    /// exit. Returns a handle whose drop stops the proxy.
-    ///
-    /// This is the feature-complete non-root mode on every OS. Validate against a
-    /// real exit before relying on it (per the engineering rules).
-    ///
-    /// # Errors
-    ///
-    /// [`SdkError::NoExitAddress`]/[`SdkError::Tunnel`] from the tunnel, or
-    /// [`SdkError::Proxy`] if the local listener cannot bind.
-    pub async fn start_proxy(
-        &self,
-        exit: &warren_discovery::Relay,
-        cfg: &warren_net::ProxyConfig,
-    ) -> Result<ProxyHandle, SdkError> {
-        let sink = self.connect_tunnel(exit).await?;
-        let local_ip = sink.session().assigned_ipv4();
-        // Single-hop SetupAck carries no subnet (and no v6 gateway/prefix), so
-        // fall back to the frozen v4 tunnel defaults (10.66.0.0/16, gw 10.66.0.1)
-        // and stay v4-only.
-        let mut handle = serve_proxy_over_sink(
-            sink,
-            local_ip,
-            TUNNEL_POOL_PREFIX,
-            TUNNEL_GATEWAY_IP,
-            None,
-            cfg,
-        )
-        .await?;
-        // doc 79: gate port forwarding on the selected exit's roster capability.
-        // The client only offers the feature where the exit runs NAT-PMP.
-        handle.port_forward_supported = exit.supports_port_forward();
-        Ok(handle)
     }
 
     /// Fetches and verifies the signed multihop directory, returning the trusted

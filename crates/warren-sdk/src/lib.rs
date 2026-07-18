@@ -32,9 +32,7 @@
 //! ```
 //!
 //! Account, payment and incident operations are reached through
-//! [`WarrenClient::api`]. The single-hop [`WarrenClient::connect_tunnel`] returns
-//! a raw [`warren_net::QuicPacketSink`] for tests and bespoke datapaths; real
-//! exits require the multihop path above.
+//! [`WarrenClient::api`].
 //!
 //! Beyond the one-shot [`WarrenClient::start_proxy_multihop`]:
 //! - [`WarrenClient::start_proxy_multihop_supervised`] returns a
