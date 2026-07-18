@@ -1,5 +1,5 @@
 //! Full non-root datapath through the facade over a MULTIHOP tunnel:
-//! `WarrenClient::start_proxy_multihop` completes the HPKE-sealed setup exchange
+//! `WarrenClient::start_proxy` completes the HPKE-sealed setup exchange
 //! against an in-process netstack-terminating multihop exit, runs the userspace
 //! netstack over the sealed packet plane, and serves a local SOCKS5 proxy. A
 //! SOCKS5 client reaches the exit's echo service through the whole chain, every
@@ -12,14 +12,14 @@
 use ed25519_dalek::SigningKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use warren_sdk::WarrenClient;
 use warren_sdk::discovery::VerifiedExit;
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::net::ProxyConfig;
+use warren_sdk::{Circuit, WarrenClient};
 use warren_test_support::{NETSTACK_EXIT_IP, NETSTACK_EXIT_PORT, spawn_netstack_multihop_exit};
 
 #[tokio::test(flavor = "multi_thread")]
-async fn start_proxy_multihop_routes_socks5_through_a_sealed_tunnel() {
+async fn start_proxy_routes_socks5_through_a_sealed_tunnel() {
     let (exit_addr, keys) = spawn_netstack_multihop_exit(SigningKey::from_bytes(&[9u8; 32])).await;
 
     let (identity, _m) = WarrenIdentity::generate();
@@ -52,7 +52,7 @@ async fn start_proxy_multihop_routes_socks5_through_a_sealed_tunnel() {
         ..ProxyConfig::default()
     };
     let handle = client
-        .start_proxy_multihop(&exit, &cfg)
+        .start_proxy(&Circuit::SingleHop(exit), &cfg)
         .await
         .expect("multihop proxy starts");
 

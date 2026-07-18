@@ -11,8 +11,8 @@
 //! assignment and re-establishes the sealed tunnel from scratch).
 //!
 //! This is the app-driven reconnect pattern: observe `ProxyHandle::state`, and on
-//! `TunnelState::Disconnected` drop the handle and call `start_proxy_multihop`
-//! again. For a hands-off equivalent, `start_proxy_multihop_supervised` keeps the
+//! `TunnelState::Disconnected` drop the handle and call `start_proxy`
+//! again. For a hands-off equivalent, `start_proxy_supervised` keeps the
 //! tunnel up automatically behind a stable proxy address. It needs a subscribed
 //! wallet (the exit gates the `IpAssign`).
 
@@ -20,9 +20,9 @@ use std::net::SocketAddr;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use warren_sdk::WarrenClient;
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::net::ProxyConfig;
+use warren_sdk::{Circuit, WarrenClient};
 
 const API_BASE: &str = "https://api.warrenbrowse.com";
 const SERVER_PUBKEY_PIN: &str = "4c2c9253c426ae4db4cc88703f9ac802a020420c7fea6479c87af530ada72c3e";
@@ -60,7 +60,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             http: None,
             ..ProxyConfig::default()
         };
-        let handle = client.start_proxy_multihop(&exit, &cfg).await?;
+        let handle = client
+            .start_proxy(&Circuit::SingleHop(exit.clone()), &cfg)
+            .await?;
         println!(
             "tunnel up on {} (state: {:?}) via {} / {}",
             handle.local_addr(),

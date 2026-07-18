@@ -22,9 +22,9 @@ use std::net::SocketAddr;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use warren_sdk::WarrenClient;
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::net::{MapProto, ProxyConfig};
+use warren_sdk::{Circuit, WarrenClient};
 
 const API_BASE: &str = "https://api.warrenbrowse.com";
 const SERVER_PUBKEY_PIN: &str = "4c2c9253c426ae4db4cc88703f9ac802a020420c7fea6479c87af530ada72c3e";
@@ -62,7 +62,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http: None,
         ..ProxyConfig::default()
     };
-    let handle = client.start_proxy_multihop(&exit, &cfg).await?;
+    let handle = client
+        .start_proxy(&Circuit::SingleHop(exit.clone()), &cfg)
+        .await?;
     println!("tunnel up (state: {:?})", handle.state());
 
     // A local server the forwarded port would relay inbound connections to.

@@ -26,6 +26,30 @@ use crate::supervisor::{
     EstablishedTunnel, SupervisedProxyHandle, establish_multihop, supervise_proxy,
 };
 
+/// A dial target, labeled by hop count. Both variants run the same supervised
+/// datapath (the HPKE multihop transport); the label records how many nodes the
+/// traffic crosses, and is the named home of the single-hop vs multi-hop
+/// distinction. Single-hop dials the exit directly; multi-hop dials an
+/// entry-composed exit built with [`WarrenClient::select_multihop_entry`], whose
+/// result already folds the entry edge over the exit's HPKE anchor (so the
+/// composition lives in exactly one place, not here).
+pub enum Circuit {
+    /// One exit, dialed directly: the client and the exit are the only nodes.
+    SingleHop(VerifiedExit),
+    /// An entry relay then the exit: the dialed descriptor carries the entry
+    /// edge (endpoint and identity) over the exit's HPKE anchor.
+    MultiHop(VerifiedExit),
+}
+
+impl Circuit {
+    /// The exit descriptor to dial for this circuit.
+    fn dialed_exit(&self) -> &VerifiedExit {
+        match self {
+            Circuit::SingleHop(exit) | Circuit::MultiHop(exit) => exit,
+        }
+    }
+}
+
 /// Persists the highest trusted signed-list `generation`, the anti-rollback
 /// floor.
 ///
@@ -763,7 +787,7 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// a kernel TUN device named `tun_name`, installs the split-default routing,
     /// the OS killswitch and the DNS push, and forwards raw IP packets between the
     /// device and the sealed tunnel. This is the one-call entry for full-OS
-    /// capture, the privileged analogue of [`Self::start_proxy_multihop`].
+    /// capture, the privileged analogue of [`Self::start_proxy`].
     ///
     /// The routing (`warrenguard_route_split`), killswitch
     /// (`warrenguard_killswitch_os`) and DNS push are the single, real-exit-proven
@@ -939,11 +963,12 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// [`SdkError::ExitDnsDisabled`] if the exit runs no DNS forwarder and no
     /// resolver override is set, [`SdkError::Multihop`] from the tunnel, or
     /// [`SdkError::Proxy`] if the local listener cannot bind.
-    pub async fn start_proxy_multihop(
+    pub async fn start_proxy(
         &self,
-        exit: &VerifiedExit,
+        circuit: &Circuit,
         cfg: &warren_net::ProxyConfig,
     ) -> Result<ProxyHandle, SdkError> {
+        let exit = circuit.dialed_exit();
         ensure_dns_reachable(exit.dns_disabled, cfg)?;
         let sink = self.connect_multihop(exit).await?;
         // Capture the session's counters before the sink moves into the engine, so
@@ -979,18 +1004,19 @@ impl<T: HttpTransport> WarrenClient<T> {
 
     /// Starts the non-root proxy datapath over a bonded set of `n` multihop
     /// sessions to `exit` (see [`Self::connect_multihop_bonded`]). Same shape as
-    /// [`Self::start_proxy_multihop`] but traffic is striped across `n` tunnels.
+    /// [`Self::start_proxy`] but traffic is striped across `n` tunnels.
     ///
     /// # Errors
     ///
     /// [`SdkError::Multihop`] from establishing a member, [`SdkError::ExitDnsDisabled`]
-    /// per [`Self::start_proxy_multihop`], or [`SdkError::Proxy`] on a bind failure.
-    pub async fn start_proxy_multihop_bonded(
+    /// per [`Self::start_proxy`], or [`SdkError::Proxy`] on a bind failure.
+    pub async fn start_proxy_bonded(
         &self,
-        exit: &VerifiedExit,
+        circuit: &Circuit,
         n: usize,
         cfg: &warren_net::ProxyConfig,
     ) -> Result<ProxyHandle, SdkError> {
+        let exit = circuit.dialed_exit();
         ensure_dns_reachable(exit.dns_disabled, cfg)?;
         let n = n.max(1);
         let mut sinks = Vec::with_capacity(n);
@@ -1013,13 +1039,13 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// fetched `IpAssign` on each reconnect while the app-facing proxy address
     /// stays stable. Observe progress via [`SupervisedProxyHandle::watch_state`].
     ///
-    /// Unlike [`Self::start_proxy_multihop`], the returned handle stays valid
+    /// Unlike [`Self::start_proxy`], the returned handle stays valid
     /// across reconnects: the app keeps pointing at the same proxy address and the
     /// datapath transparently re-establishes. Reconnection targets the same
     /// `exit`; the first attempt's failure is surfaced (the handle reports
     /// [`ConnectionState::Reconnecting`]) but does not error the call. For
     /// resilience to a permanently-unreachable exit, see
-    /// [`Self::start_proxy_multihop_supervised_failover`].
+    /// [`Self::start_proxy_supervised_failover`].
     ///
     /// # Errors
     ///
@@ -1027,14 +1053,14 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// resolver override is set, or [`SdkError::Proxy`] if a local listener cannot
     /// bind. Tunnel establishment happens in the background, so connect failures
     /// surface as state, not here.
-    pub async fn start_proxy_multihop_supervised(
+    pub async fn start_proxy_supervised(
         &self,
-        exit: &VerifiedExit,
+        circuit: &Circuit,
         cfg: &warren_net::ProxyConfig,
     ) -> Result<SupervisedProxyHandle, SdkError> {
+        let exit = circuit.dialed_exit().clone();
         ensure_dns_reachable(exit.dns_disabled, cfg)?;
         let signing = self.signing.clone();
-        let exit = exit.clone();
         let auto_local_ip = self.auto_local_ip;
         let wants_ipv6 = self.wants_ipv6;
         let transport_config = self.transport_config.clone();
@@ -1066,7 +1092,7 @@ impl<T: HttpTransport> WarrenClient<T> {
     }
 
     /// Self-healing multihop proxy with exit FAILOVER: same stable-listener,
-    /// self-rebuilding datapath as [`Self::start_proxy_multihop_supervised`], but
+    /// self-rebuilding datapath as [`Self::start_proxy_supervised`], but
     /// over a prioritized list of candidate `exits`. It sticks with the first exit
     /// that connects (stable egress), and only rotates to the next candidate when
     /// the current one fails to (re)establish, wrapping around the list. The app
@@ -1078,19 +1104,20 @@ impl<T: HttpTransport> WarrenClient<T> {
     ///
     /// [`SdkError::NoMultihopExit`] if `exits` is empty; [`SdkError::Proxy`] if a
     /// local listener cannot bind. Connect failures surface as state, not here.
-    pub async fn start_proxy_multihop_supervised_failover(
+    pub async fn start_proxy_supervised_failover(
         &self,
-        exits: &[VerifiedExit],
+        circuits: &[Circuit],
         cfg: &warren_net::ProxyConfig,
     ) -> Result<SupervisedProxyHandle, SdkError> {
-        if exits.is_empty() {
+        if circuits.is_empty() {
             return Err(SdkError::NoMultihopExit);
         }
+        let exits: Vec<VerifiedExit> = circuits.iter().map(|c| c.dialed_exit().clone()).collect();
         // Without a DNS override, an exit that runs no in-tunnel forwarder
         // (`dns_disabled`) cannot resolve names, so drop such exits from the
         // rotation: otherwise failover could silently land on one and break name
         // resolution. With an override every exit can resolve, so keep them all.
-        let exits = dns_capable_candidates(exits, cfg.dns_server.is_some());
+        let exits = dns_capable_candidates(&exits, cfg.dns_server.is_some());
         if exits.is_empty() {
             return Err(SdkError::ExitDnsDisabled);
         }

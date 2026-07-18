@@ -6,7 +6,7 @@ use warren_discovery::VerifiedExit;
 use warren_identity::WarrenIdentity;
 use warren_transport::ConnectionState;
 
-use crate::client::{DaitaMode, DefaultClient, WarrenClient, daita_mode};
+use crate::client::{Circuit, DaitaMode, DefaultClient, WarrenClient, daita_mode};
 use crate::error::SdkError;
 use crate::proxy::TunnelState;
 use crate::supervisor::EstablishedTunnel;
@@ -1034,7 +1034,7 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
 
     // Two candidate "exits": index 0 always fails to connect (a broken exit
     // like prod SG), index 1 connects. This mirrors the rotating closure of
-    // start_proxy_multihop_supervised_failover: the cursor advances only on
+    // start_proxy_supervised_failover: the cursor advances only on
     // failure, so the supervisor must rotate past 0 and succeed on 1.
     let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
@@ -1741,7 +1741,7 @@ async fn start_proxy_reports_a_listener_bind_failure() {
     };
 
     match test_client()
-        .start_proxy_multihop_supervised(&exit, &cfg)
+        .start_proxy_supervised(&Circuit::SingleHop(exit.clone()), &cfg)
         .await
     {
         Err(SdkError::Proxy(_)) => {}
@@ -1764,7 +1764,7 @@ async fn supervised_proxy_reaches_connected_against_a_fake_exit() {
         dns_server: None,
     };
     let handle = test_client()
-        .start_proxy_multihop_supervised(&exit, &cfg)
+        .start_proxy_supervised(&Circuit::SingleHop(exit.clone()), &cfg)
         .await
         .expect("supervised proxy binds");
 
@@ -1788,7 +1788,7 @@ async fn supervised_proxy_reaches_connected_against_a_fake_exit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn start_proxy_multihop_against_a_fake_exit_is_connected() {
+async fn start_proxy_against_a_fake_exit_is_connected() {
     // The non-supervised datapath sets up over the fake exit and reports a
     // live tunnel (the proxy listener is bound and the state is Connected).
     let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
@@ -1800,7 +1800,7 @@ async fn start_proxy_multihop_against_a_fake_exit_is_connected() {
         dns_server: None,
     };
     let handle = test_client()
-        .start_proxy_multihop(&exit, &cfg)
+        .start_proxy(&Circuit::SingleHop(exit.clone()), &cfg)
         .await
         .expect("proxy datapath starts over the fake exit");
     assert_eq!(handle.state(), TunnelState::Connected);
@@ -1810,7 +1810,7 @@ async fn start_proxy_multihop_against_a_fake_exit_is_connected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn start_proxy_multihop_bonded_with_one_member_connects() {
+async fn start_proxy_bonded_with_one_member_connects() {
     // The bundle-of-one is a transparent wrapper (warren-core's n=1 case): the
     // bonded datapath sets up over the fake exit and reports a live tunnel. The
     // n>=2 striping/merge logic is covered by the BondedPacketSink unit test.
@@ -1823,7 +1823,7 @@ async fn start_proxy_multihop_bonded_with_one_member_connects() {
         dns_server: None,
     };
     let handle = test_client()
-        .start_proxy_multihop_bonded(&exit, 1, &cfg)
+        .start_proxy_bonded(&Circuit::SingleHop(exit.clone()), 1, &cfg)
         .await
         .expect("bonded proxy datapath starts over the fake exit");
     assert_eq!(handle.state(), TunnelState::Connected);
@@ -1847,7 +1847,7 @@ async fn connect_multihop_bonded_treats_zero_members_as_one() {
 }
 
 #[tokio::test]
-async fn start_proxy_multihop_refuses_a_dns_disabled_exit_without_a_resolver() {
+async fn start_proxy_refuses_a_dns_disabled_exit_without_a_resolver() {
     // The guard must fire before any connect attempt, so an unroutable address
     // never matters: a dns_disabled exit with no override resolver is rejected.
     let exit = VerifiedExit {
@@ -1872,7 +1872,7 @@ async fn start_proxy_multihop_refuses_a_dns_disabled_exit_without_a_resolver() {
     };
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        test_client().start_proxy_multihop(&exit, &cfg),
+        test_client().start_proxy(&Circuit::SingleHop(exit.clone()), &cfg),
     )
     .await
     .expect("the guard returns immediately, well before any connect timeout");
@@ -2034,8 +2034,9 @@ async fn failover_refuses_an_all_dns_disabled_list_without_an_override() {
         http: None,
         dns_server: None,
     };
+    let circuits: Vec<Circuit> = exits.iter().cloned().map(Circuit::SingleHop).collect();
     let result = client
-        .start_proxy_multihop_supervised_failover(&exits, &cfg)
+        .start_proxy_supervised_failover(&circuits, &cfg)
         .await;
     assert!(matches!(result, Err(SdkError::ExitDnsDisabled)));
 }

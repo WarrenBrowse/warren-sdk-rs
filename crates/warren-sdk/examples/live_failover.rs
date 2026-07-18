@@ -5,7 +5,7 @@
 //!
 //! Builds a candidate list with a KNOWN-BROKEN exit first (Singapore, which
 //! consistently fails the multihop setup in prod) followed by the others, then
-//! calls `start_proxy_multihop_supervised_failover`. The supervisor must rotate
+//! calls `start_proxy_supervised_failover`. The supervisor must rotate
 //! past the broken exit, reach `Connected` on a working one, and egress through
 //! the stable address. This proves failover routes around a real broken exit.
 //! If prod has no broken exit (Singapore was fixed), it still validates that
@@ -15,11 +15,11 @@ use std::net::SocketAddr;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use warren_sdk::WarrenClient;
 use warren_sdk::discovery::VerifiedExit;
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::net::ProxyConfig;
 use warren_sdk::transport::ConnectionState;
+use warren_sdk::{Circuit, WarrenClient};
 
 const API_BASE: &str = "https://api.warrenbrowse.com";
 const SERVER_PUBKEY_PIN: &str = "4c2c9253c426ae4db4cc88703f9ac802a020420c7fea6479c87af530ada72c3e";
@@ -65,8 +65,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http: None,
         ..ProxyConfig::default()
     };
+    let circuits: Vec<Circuit> = candidates.iter().cloned().map(Circuit::SingleHop).collect();
     let handle = client
-        .start_proxy_multihop_supervised_failover(&candidates, &cfg)
+        .start_proxy_supervised_failover(&circuits, &cfg)
         .await?;
     let proxy = handle.local_addr();
     println!(

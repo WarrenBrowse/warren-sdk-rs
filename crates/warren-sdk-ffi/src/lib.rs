@@ -37,8 +37,8 @@ use warren_sdk::identity::{WarrenIdentity, ss58};
 use warren_sdk::net::{ForwardedPort, MapProto, ProxyConfig};
 use warren_sdk::transport::{Backoff, ConnectionState, FatalCause, RetryError, connect_with_state};
 use warren_sdk::{
-    DefaultClient, FileGenerationStore, FileServerKeyStore, ProxyForwarder, ProxyHandle, SdkError,
-    SupervisedProxyHandle, WarrenClient,
+    Circuit, DefaultClient, FileGenerationStore, FileServerKeyStore, ProxyForwarder, ProxyHandle,
+    SdkError, SupervisedProxyHandle, WarrenClient,
 };
 use zeroize::Zeroizing;
 
@@ -831,7 +831,9 @@ impl WarrenFfiClient {
                 .into_iter()
                 .find(|e| e.exit_id == want)
                 .ok_or(SdkError::NoMultihopExit)?;
-            self.inner.start_proxy_multihop(&exit, &cfg).await
+            self.inner
+                .start_proxy(&Circuit::SingleHop(exit), &cfg)
+                .await
         };
 
         let handle = connect_with_state(Backoff::HANDSHAKE, 3, notify, attempt)
@@ -892,7 +894,7 @@ impl WarrenFfiClient {
 
         let handle = self
             .inner
-            .start_proxy_multihop_supervised(&exit, &cfg)
+            .start_proxy_supervised(&Circuit::SingleHop(exit), &cfg)
             .await
             .map_err(map_sdk_error)?;
         Ok(wrap_supervised(handle, observer))
@@ -938,10 +940,10 @@ impl WarrenFfiClient {
         if exits.is_empty() {
             return Err(map_sdk_error(SdkError::NoMultihopExit));
         }
-
+        let circuits: Vec<Circuit> = exits.into_iter().map(Circuit::SingleHop).collect();
         let handle = self
             .inner
-            .start_proxy_multihop_supervised_failover(&exits, &cfg)
+            .start_proxy_supervised_failover(&circuits, &cfg)
             .await
             .map_err(map_sdk_error)?;
         Ok(wrap_supervised(handle, observer))

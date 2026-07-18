@@ -4,7 +4,7 @@
 //! live_proxy`
 //!
 //! 1. Opens a real multihop tunnel to a production exit and starts the non-root
-//!    SOCKS5 proxy datapath (`start_proxy_multihop`).
+//!    SOCKS5 proxy datapath (`start_proxy`).
 //! 2. PROOF: a SOCKS5 CONNECT to a public host (`1.1.1.1:443`) completes through
 //!    the sealed tunnel, i.e. a SYN-ACK came back from the internet via the exit.
 //!    That is conclusive: traffic egresses at the exit, not this host.
@@ -22,9 +22,9 @@ use std::net::ToSocketAddrs;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use warren_sdk::WarrenClient;
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::net::ProxyConfig;
+use warren_sdk::{Circuit, WarrenClient};
 
 const API_BASE: &str = "https://api.warrenbrowse.com";
 const SERVER_PUBKEY_PIN: &str = "4c2c9253c426ae4db4cc88703f9ac802a020420c7fea6479c87af530ada72c3e";
@@ -74,7 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http: None,
         ..ProxyConfig::default()
     };
-    let handle = client.start_proxy_multihop(&exit, &cfg).await?;
+    let handle = client
+        .start_proxy(&Circuit::SingleHop(exit.clone()), &cfg)
+        .await?;
     println!(
         "SOCKS5 proxy up on {} (state: {:?})",
         handle.local_addr(),
