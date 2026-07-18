@@ -490,22 +490,11 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// lock is silently skipped (proximity is an optimisation, never
     /// load-bearing).
     fn record_rtt(&self, endpoint_id: [u8; 32], rtt: std::time::Duration) {
-        let rtt_ms = u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX);
-        if let Ok(mut cache) = self.rtt_cache.lock() {
-            cache.record(endpoint_id, rtt_ms, now_unix_secs());
-        }
+        record_rtt_in(&self.rtt_cache, endpoint_id, rtt);
     }
 
-    /// Sink observer recording the session's parting RTT under
-    /// `endpoint_id` when the datapath drops, so a long session's final
-    /// measurement reaches the store, not just the connect-time one.
     fn close_rtt_recorder(&self, endpoint_id: [u8; 32]) -> warren_net::CloseRttObserver {
-        let cache = Arc::clone(&self.rtt_cache);
-        Box::new(move |rtt_ms| {
-            if let Ok(mut cache) = cache.lock() {
-                cache.record(endpoint_id, rtt_ms, now_unix_secs());
-            }
-        })
+        close_rtt_recorder_for(&self.rtt_cache, endpoint_id)
     }
 
     /// Selects an exit from `selector` weighted by `weight * f(rtt)` using
@@ -1128,15 +1117,24 @@ impl<T: HttpTransport> WarrenClient<T> {
         let auto_local_ip = self.auto_local_ip;
         let wants_ipv6 = self.wants_ipv6;
         let transport_config = self.transport_config.clone();
+        let rtt_cache = Arc::clone(&self.rtt_cache);
         self.spawn_supervised(
             cfg,
             move || {
                 let signing = signing.clone();
                 let exit = exit.clone();
                 let transport_config = transport_config.clone();
+                let rtt_cache = Arc::clone(&rtt_cache);
                 async move {
-                    establish_multihop(signing, &exit, auto_local_ip, wants_ipv6, transport_config)
-                        .await
+                    establish_multihop(
+                        signing,
+                        &exit,
+                        auto_local_ip,
+                        wants_ipv6,
+                        transport_config,
+                        rtt_cache,
+                    )
+                    .await
                 }
             },
             // Single pinned exit: a drain has nowhere to rotate, the proactive
@@ -1193,6 +1191,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             // Keyed by the raw exit id bytes (`VerifiedExit::exit_id`).
             crate::portfollow::AvoidSet::<[u8; 16]>::default(),
         ));
+        let rtt_cache = Arc::clone(&self.rtt_cache);
         self.spawn_supervised(
             cfg,
             move || {
@@ -1201,6 +1200,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                 let cursor = Arc::clone(&cursor);
                 let avoid = Arc::clone(&avoid);
                 let transport_config = transport_config.clone();
+                let rtt_cache = Arc::clone(&rtt_cache);
                 async move {
                     let idx = {
                         let avoid = avoid.lock().expect("avoid-set lock poisoned");
@@ -1217,6 +1217,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                         auto_local_ip,
                         wants_ipv6,
                         transport_config,
+                        rtt_cache,
                     )
                     .await
                     {
@@ -1390,6 +1391,36 @@ pub(crate) fn now_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// The ONE wiring of a measured path RTT into the client store, shared by
+/// every datapath (client connects and the supervised reconnect loop).
+/// Best effort: a poisoned lock is silently skipped (the store is an
+/// optimisation, never load-bearing).
+pub(crate) fn record_rtt_in(
+    cache: &Arc<Mutex<RttCache>>,
+    endpoint_id: [u8; 32],
+    rtt: std::time::Duration,
+) {
+    let rtt_ms = u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX);
+    if let Ok(mut cache) = cache.lock() {
+        cache.record(endpoint_id, rtt_ms, now_unix_secs());
+    }
+}
+
+/// Sink observer recording the session's parting RTT under `endpoint_id`
+/// when the datapath drops, so a long session's final measurement reaches
+/// the store, not just the connect-time one.
+pub(crate) fn close_rtt_recorder_for(
+    cache: &Arc<Mutex<RttCache>>,
+    endpoint_id: [u8; 32],
+) -> warren_net::CloseRttObserver {
+    let cache = Arc::clone(cache);
+    Box::new(move |rtt_ms| {
+        if let Ok(mut cache) = cache.lock() {
+            cache.record(endpoint_id, rtt_ms, now_unix_secs());
+        }
+    })
 }
 
 /// The Linux carrier-socket bypass given the physical interface index (unused on

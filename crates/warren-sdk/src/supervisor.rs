@@ -844,6 +844,7 @@ pub(crate) async fn establish_multihop(
     auto_local_ip: bool,
     wants_ipv6: bool,
     transport_config: Option<std::sync::Arc<warren_transport::TransportConfig>>,
+    rtt_cache: std::sync::Arc<std::sync::Mutex<warren_discovery::RttCache>>,
 ) -> Result<EstablishedTunnel<MultihopPacketSink>, SdkError> {
     let mut tunnel = MultihopClientTunnel::new(signing);
     if auto_local_ip {
@@ -875,7 +876,13 @@ pub(crate) async fn establish_multihop(
             exit.endpoint,
         )
         .await?;
-    let sink = MultihopPacketSink::new(session);
+    // Feed the client RTT store on BOTH lifecycle points of every
+    // supervised (re)connect: the first hop's post-handshake sample now,
+    // and its parting sample when the sink drops on teardown/reconnect.
+    crate::client::record_rtt_in(&rtt_cache, exit.exit_ed25519_pubkey, session.path_rtt());
+    let sink = MultihopPacketSink::new(session).with_close_rtt_observer(
+        crate::client::close_rtt_recorder_for(&rtt_cache, exit.exit_ed25519_pubkey),
+    );
     let (local_ip, prefix, gateway, ipv6) = addressing_from_session(sink.session());
     Ok(EstablishedTunnel {
         sink,
