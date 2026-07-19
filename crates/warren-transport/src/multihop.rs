@@ -128,6 +128,13 @@ pub enum MultihopError {
     /// address). Only reachable in cover-domain mode with the carrier armed.
     #[error("tcp fallback carrier failed")]
     TcpFallback(#[source] warrenguard_tcp_fallback::FallbackError),
+    /// The setup reply authenticated as an `IpAssign` but the engine did not
+    /// surface the decoded assignment (`MultiHopClient::assignment` was `None`).
+    /// A correct engine always captures it (both the `/v1` and `/v2` setup paths
+    /// do), so this is unreachable in practice; it exists so a future engine edge
+    /// case returns a typed error here instead of panicking the process.
+    #[error("missing IP assignment in setup reply")]
+    MissingAssignment,
 }
 
 impl From<QuicDialError> for MultihopError {
@@ -585,9 +592,9 @@ impl MultihopClientTunnel {
         // reconstructing it here (`IpAssignment` is `#[non_exhaustive]` outside
         // its defining crate, so this wrapper cannot build one itself).
         let assignment = match try_decode_control(&opened) {
-            Ok(Some(WarrenControlMessage::IpAssign { .. })) => inner.assignment().expect(
-                "MultiHopClient::setup_over_stream captures the assignment for every IpAssign reply",
-            ),
+            Ok(Some(WarrenControlMessage::IpAssign { .. })) => {
+                inner.assignment().ok_or(MultihopError::MissingAssignment)?
+            }
             Ok(Some(WarrenControlMessage::Rejected)) => {
                 return Err(MultihopError::Setup(SetupError::Rejected));
             }
@@ -1572,6 +1579,19 @@ mod policy_tests {
         );
         // The static context label is fine (it is a step name, not identity).
         assert!(setup_io.to_string().contains("open setup stream"));
+    }
+
+    #[test]
+    fn missing_assignment_is_a_typed_error_not_a_panic() {
+        // The `IpAssign`-reply arm used to `.expect()` the decoded assignment,
+        // panicking the whole process if the engine ever authenticated the reply
+        // without surfacing it. The defensive replacement returns this typed
+        // variant instead: a static, address-free label and a same-target retry
+        // verdict (an engine self-inconsistency, not a policy/pool signal).
+        use warrenguard_transport::Retryability;
+        let err = MultihopError::MissingAssignment;
+        assert_eq!(err.to_string(), "missing IP assignment in setup reply");
+        assert!(matches!(err.retryability(), Retryability::RetrySameTarget));
     }
 
     #[test]
