@@ -52,7 +52,7 @@ portable in concept.
 | `warren-discovery` | core | Verify the signed relay list (v7) + weighted selection; verify the multihop directory PKI chain | done |
 | `warren-multihop` | core | Client HPKE session (X25519 / HKDF-SHA256 / ChaCha20Poly1305), sealed `IpRequest`/`IpAssign`, epoch/seq replay window | done |
 | `warren-daita` | core | DAITA uplink traffic-analysis defense: curated machine pool, scheduler state, padding/cover-traffic config | done |
-| `warren-transport` | net | QUIC handshake (quinn + rustls raw public keys), single-hop + multihop `ClientSession` datagram plane, reconnect/backoff supervisor | done |
+| `warren-transport` | net | QUIC handshake (quinn + rustls raw public keys), multihop `MultihopSession` datagram plane, reconnect/backoff supervisor | done |
 | `warren-net` | net | `PacketSink` seam + QUIC plane + smoltcp userspace netstack (TCP/UDP, dual-stack IPv6) + SOCKS5/HTTP CONNECT proxy + DNS-over-tunnel + NAT-PMP port-forwarding (client + inbound listen/relay) + killswitch levels; per-OS privileged TUN backend feature-gated (todo) | done (proxy); TUN todo |
 | `warren-tun` | net | OS TUN datapath behind `experimental-tun`: device seam + framing, route/killswitch plan and apply, physical-gateway discovery (macOS), fail-safe revert | experimental |
 | `warren-sdk` | facade | `WarrenClient` composing identity/api/discovery/multihop/transport/net | done |
@@ -204,8 +204,8 @@ Consequence, stated plainly:
   native binding (`warren_napi`) all pin this crate and therefore the fork.
 
 The connect path still takes a caller-supplied transport config:
-`WarrenClient::transport_config` (and the `with_transport_config` builders on
-`ClientTunnel` / `MultihopClientTunnel`) accept an `Arc<TransportConfig>` that
+`WarrenClient::transport_config` (and the `with_transport_config` builder on
+`MultihopClientTunnel`) accept an `Arc<TransportConfig>` that
 overrides the default, so a deployment can tune or disable obfuscation as a
 per-deployment threat-model decision. The fork is a git-dep, so the SDK builds
 `--all-features` clean for embedders with no vendored tree or local setup.

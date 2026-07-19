@@ -74,15 +74,14 @@ warrenguard-socket-bypass = { git = "https://github.com/WarrenBrowse/warrenguard
 # Client-side tunnel transport: the multihop protocol logic (HPKE seal/open,
 # rekey/epoch, setup-over-stream, sync datagram send/recv) lives once in
 # `warrenguard_transport::multihop::MultiHopClient`; `warren-transport`'s
-# MultihopSession/MultihopClientTunnel are thin wrappers around it. Same for
-# the single-hop `client` module: ClientSession/ClientTunnel wrap
-# `warrenguard_transport::client::{ClientSession, ClientTunnel}`.
+# MultihopSession/MultihopClientTunnel are thin wrappers around it.
 warrenguard-transport = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "3ebb788e732deb71169d92fcbff24727720c1931" }
-# Sealed error type `warrenguard_transport::client`'s Result is built on;
-# needed directly so `warren-transport` can name and map its variants.
+# Shared engine transport core: the client transport profile
+# (`warren_transport_config_client`) `warren-transport` dials with, and the
+# inner-MTU budget (`inner_mtu`) `warren-net` sizes the proxy datapath from.
 warrenguard-transport-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "3ebb788e732deb71169d92fcbff24727720c1931" }
 # Central knob registry: `CoverDefenses` + `cover_defenses()` resolve the coupled
-# DAITA / idle-cover client switch that `warren-transport::ClientTunnel` threads.
+# DAITA / idle-cover client switch that `warren-sdk`'s client builder threads.
 warrenguard-config = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "3ebb788e732deb71169d92fcbff24727720c1931" }
 # Single home of the idle-cover scheduler + driver (ADR-0006): the SDK sessions
 # implement its `CoverSink` and drive its `IdleCoverDriver`, replacing the former

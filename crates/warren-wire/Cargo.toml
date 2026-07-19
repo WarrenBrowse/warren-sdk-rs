@@ -1,6 +1,6 @@
 [package]
 name = "warren-wire"
-description = "Pure Warren wire codecs: Setup/SetupAck handshake frames (postcard). NAT-PMP and the multihop HPKE frame land with their consuming phases. No I/O."
+description = "Pure Warren wire codecs (postcard): the identity/DAITA/version handshake primitives, the NAT-PMP codec, and the multihop dispatch frame with its sealed control messages. Wire-compatible with warren-core. No I/O."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

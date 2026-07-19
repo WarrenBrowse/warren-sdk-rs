@@ -1,6 +1,6 @@
 [package]
 name = "warren-transport"
-description = "Warren QUIC transport: TLS 1.3 raw-public-key handshake (quinn + rustls), identity-bound Setup/SetupAck exchange, ClientSession with RFC 9221 datagrams. Wire-compatible with warren-core."
+description = "Warren QUIC transport: TLS 1.3 raw-public-key handshake (quinn + rustls), the HPKE-sealed multihop setup exchange, and a MultihopSession carrying RFC 9221 datagrams. Wire-compatible with warren-core."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -28,14 +28,11 @@ warrenguard-multihop = { workspace = true }
 # datagram send/recv): MultihopSession/MultihopClientTunnel below own a
 # `warrenguard_transport::multihop::MultiHopClient` and delegate to it, so the
 # protocol logic lives once, shared with warren-core via the same engine crate.
-# `client` (single-hop) mirrors this: ClientSession/ClientTunnel own a
-# `warrenguard_transport::client::{ClientSession, ClientTunnel}`.
 warrenguard-transport = { workspace = true }
-# Sealed error type of `warrenguard_transport::client`'s Result, needed to name
-# and map its variants in `client::map_engine_err`.
+# The shared engine client transport profile (`warren_transport_config_client`,
+# plus its idle-cover variant) the dialer builds every QUIC connection from.
 warrenguard-transport-core = { workspace = true }
-# `CoverDefenses` + `cover_defenses()`: the resolved DAITA / idle-cover knob
-# switch the client builder threads (`ClientTunnel::with_cover_defenses`).
+# `ALPN_H3`: the single home of the client ALPN the RPK/WebPKI dial configs pin.
 warrenguard-config = { workspace = true }
 # Single home of the idle-cover scheduler + driver (CoverSink / IdleCoverDriver);
 # the SDK sessions implement the trait and re-export the driver.
