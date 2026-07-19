@@ -47,7 +47,7 @@ portable in concept.
 | Crate | Layer | Role | Status |
 |---|---|---|---|
 | `warren-identity` | core | BIP39 mnemonic to Ed25519, SS58 `wb…` address, canonical API request signing | done |
-| `warren-wire` | core | Re-exports the engine's (`warrenguard-wire`) canonical codecs: Setup/SetupAck handshake, NAT-PMP, multihop HPKE frame, control `/v2`, PoP | done |
+| `warren-wire` | core | Re-exports the engine's (`warrenguard-wire`) canonical codecs: NAT-PMP, multihop HPKE frame, control `/v3`, PoP | done |
 | `warren-api` | core | Signed HTTP client for the `/v1/*` account API (incl. payments, support, incidents) with anti-censorship host fallback; transport-agnostic core + optional reqwest | done |
 | `warren-discovery` | core | Verify the signed relay list (v7) + weighted selection; verify the multihop directory PKI chain | done |
 | `warren-multihop` | core | Client HPKE session (X25519 / HKDF-SHA256 / ChaCha20Poly1305), sealed `IpRequest`/`IpAssign`, epoch/seq replay window | done |
@@ -117,7 +117,7 @@ break and requires a schema version bump.
 | Identity | BIP39 (12 words) -> seed (64 bytes, empty passphrase) -> first 32 bytes -> HKDF-SHA256 (salt `warren/identity/v1`, info `vpn-node-key`) -> Ed25519 |
 | Address | SS58 prefix 13295 (`wb…`), Blake2b-512 checksum, base58 |
 | API auth | canonical `METHOD\npath\ntimestamp\nnonce_hex\nsha256_hex(body)`, Ed25519 signature, headers `X-Warren-PubKey` (SS58), `X-Warren-Sig`, `X-Warren-Timestamp`, `X-Warren-Nonce` |
-| Handshake | Setup/SetupAck (postcard), protocol version 5, 16-byte device id, feature bitmask, in-band client auth (client signs the TLS channel binding in `Setup`; no mutual-TLS client certificate) |
+| Handshake | HPKE-sealed multihop session: sealed control `IpRequest` / `IpAssign` (control `/v3`, marker `0xC0 0x03`, DAITA capability echo); admission by proof-of-possession (`pop`); relay-leg auth signs the exported TLS channel binding (`sign_relay_auth`), no mutual-TLS client certificate |
 | Discovery | Signed relay list (v7), canonical JSON, Ed25519 over a pinned server pubkey, generation anti-rollback, expiry anti-freeze |
 | TLS | Raw public keys (RFC 7250), ALPN `h3`, TLS 1.3 only, 0-RTT off |
 | NAT-PMP | RFC 6886 plus Warren rate-limit extensions |
@@ -197,7 +197,7 @@ Consequence, stated plainly:
   so a censor doing QUIC DPI sees the obfuscated handshake, not a distinct one.
 - The steady-state traffic-analysis defense (DAITA cover traffic) is also present
   in this SDK (`daita_driver`), and the golden vectors freeze the **frame** wire
-  format (Setup/SetupAck, multihop HPKE, NAT-PMP), so "wire-compatible" holds at
+  format (multihop HPKE frame v1/v2, control `/v3`), so "wire-compatible" holds at
   both the protocol layer and the QUIC-Initial obfuscation layer.
 - Every consumer inherits the obfuscated default: the desktop system-VPN daemon
   (`warrend`), the Dart/Flutter proxy mode (`warren_sdk_frb`), and the Node
