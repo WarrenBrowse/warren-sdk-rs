@@ -47,7 +47,10 @@ warrenguard-backoff = { workspace = true }
 # userland proxy simply configures no bypass, so it stays in that closure too.
 warrenguard-socket-bypass = { workspace = true }
 warren-wire = { path = "../warren-wire" }
-warren-multihop = { path = "../warren-multihop" }
+# default-features off so the engine PQ seal is pulled ONLY through this crate's
+# own `pq-hpke` feature: a `--no-default-features` transport build is then a
+# genuine classical-only build (no ML-KEM crypto compiled).
+warren-multihop = { path = "../warren-multihop", default-features = false }
 warren-daita = { path = "../warren-daita" }
 ed25519-dalek = { workspace = true }
 quinn = { workspace = true }
@@ -57,6 +60,15 @@ thiserror = { workspace = true }
 # rand_core 0.9 OsRng for the per-session HPKE ephemeral keypair (hpke 0.13
 # expects the 0.9 trait surface, matching warren-multihop).
 rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }
+
+[features]
+default = ["pq-hpke"]
+# Prefer the engine's hybrid post-quantum multihop seal (X-Wing) when the dialed
+# exit advertises a signed ML-KEM-768 key, classical /v1 otherwise. On by default
+# but inert on the wire: the dial passes require_pq = false, so a no-PQ exit
+# builds the byte-identical classical session and PQ stays dormant until exits
+# publish signed ML-KEM descriptors.
+pq-hpke = ["warrenguard-transport/pq-hpke", "warren-multihop/pq-hpke"]
 
 [dev-dependencies]
 # test-util enables `tokio::time` pause/auto-advance so the reconnect backoff

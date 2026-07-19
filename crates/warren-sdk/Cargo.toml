@@ -46,8 +46,12 @@ bytes = { workspace = true }
 [features]
 # Bundle the reqwest transport so an app can build a working client with one
 # dependency. Apps that bring their own HttpTransport can disable it.
-default = ["reqwest-transport"]
+# `pq-hpke` is on by default so the multihop dial prefers the post-quantum
+# X-Wing seal (inert until an exit advertises a signed ML-KEM key).
+default = ["reqwest-transport", "pq-hpke"]
 reqwest-transport = ["warren-api/reqwest-transport"]
+# Forwards the post-quantum X-Wing multihop seal preference to the transport.
+pq-hpke = ["warren-transport/pq-hpke"]
 # Socket-marked control-plane transport for the privileged daemon (warrend): its
 # control-plane fetch carries the Warren tunnel fwmark so a `meta mark` lockdown
 # guard permits it. Off by default (only the daemon needs it).

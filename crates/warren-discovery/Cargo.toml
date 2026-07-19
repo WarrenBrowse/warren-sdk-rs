@@ -31,6 +31,9 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+# Builds the root/operational/server signing keys the mint fixture consumes in
+# the PQ-selection facade test.
+ed25519-dalek = { workspace = true }
 
 [lints]
 workspace = true

@@ -868,6 +868,13 @@ pub(crate) async fn establish_multihop(
     if exit.tcp_fallback {
         tunnel = tunnel.with_tcp_fallback(true);
     }
+    // Prefer the post-quantum X-Wing seal when the verified directory bound a
+    // signed ML-KEM key to this exit; `None` keeps the classical seal
+    // (byte-identical) and the dial never fails over a missing PQ key.
+    #[cfg(feature = "pq-hpke")]
+    {
+        tunnel = tunnel.with_exit_mlkem768(exit.exit_mlkem768_pubkey.clone());
+    }
     let session = tunnel
         .connect(
             exit.exit_ed25519_pubkey,

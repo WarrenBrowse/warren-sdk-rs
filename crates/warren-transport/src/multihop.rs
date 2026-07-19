@@ -266,6 +266,14 @@ pub struct MultihopClientTunnel {
     /// by default; when unset the exit MUST NOT grant a spec, keeping its
     /// downlink unpadded so the session is never misreported as defended.
     daita_support: bool,
+    /// The dialed exit's signed ML-KEM-768 recipient key from the verified
+    /// directory (the X-Wing hybrid-seal half), when the exit published one.
+    /// `None`/empty selects the classical `/v1` seal. Threaded to
+    /// [`MultiHopClient::from_established_connection_pq`] with `require_pq =
+    /// false`, so the dial is byte-identical to the classical path until an
+    /// exit advertises PQ. Set via [`Self::with_exit_mlkem768`].
+    #[cfg(feature = "pq-hpke")]
+    exit_mlkem768: Option<Vec<u8>>,
 }
 
 impl MultihopClientTunnel {
@@ -283,6 +291,8 @@ impl MultihopClientTunnel {
             tcp_fallback: false,
             socket_bypass: None,
             daita_support: false,
+            #[cfg(feature = "pq-hpke")]
+            exit_mlkem768: None,
         }
     }
 
@@ -371,6 +381,20 @@ impl MultihopClientTunnel {
     #[must_use]
     pub fn with_tcp_fallback(mut self, enabled: bool) -> Self {
         self.tcp_fallback = enabled;
+        self
+    }
+
+    /// Carry the dialed exit's signed ML-KEM-768 recipient key (the X-Wing
+    /// hybrid-seal half) from the verified directory, so the multihop setup
+    /// prefers the post-quantum `/v2` seal. Pass the value the SDK surfaced in
+    /// `VerifiedExit::exit_mlkem768_pubkey`: `Some` only when the exit's PQ
+    /// operational signature bound the key, `None` otherwise. `None` or an empty
+    /// slice keeps the classical `/v1` seal, byte-identical to a build without
+    /// this call, since [`Self::connect`] threads it with `require_pq = false`.
+    #[cfg(feature = "pq-hpke")]
+    #[must_use]
+    pub fn with_exit_mlkem768(mut self, exit_mlkem768: Option<Vec<u8>>) -> Self {
+        self.exit_mlkem768 = exit_mlkem768;
         self
     }
 
@@ -508,6 +532,22 @@ impl MultihopClientTunnel {
             .is_some()
             .then(|| tls::WarrenPubkey::from_bytes(exit_pubkey));
 
+        // Prefer the post-quantum X-Wing seal when the exit advertised a signed
+        // ML-KEM key; `require_pq = false` and an absent/empty key both fall back
+        // to the byte-identical classical `/v1` session inside the engine, so the
+        // wire is unchanged until exits publish PQ descriptors.
+        #[cfg(feature = "pq-hpke")]
+        let mut inner = MultiHopClient::from_established_connection_pq(
+            endpoint,
+            conn.clone(),
+            ExitId::from_bytes(exit_id),
+            &exit_x25519,
+            self.exit_mlkem768.as_deref().unwrap_or(&[]),
+            false,
+            relay_auth_pubkey,
+        )
+        .map_err(map_engine_err)?;
+        #[cfg(not(feature = "pq-hpke"))]
         let mut inner = MultiHopClient::from_established_connection(
             endpoint,
             conn.clone(),

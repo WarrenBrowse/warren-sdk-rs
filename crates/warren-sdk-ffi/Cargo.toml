@@ -31,6 +31,12 @@ uniffi = { version = "0.31", features = ["cli", "tokio"] }
 # the foreign observer; async exports run on the host app's tokio runtime.
 tokio = { workspace = true }
 
+[features]
+# PQ-by-default across the FFI: forwards the post-quantum X-Wing multihop seal
+# preference to the SDK (inert until an exit advertises a signed ML-KEM key).
+default = ["pq-hpke"]
+pq-hpke = ["warren-sdk/pq-hpke"]
+
 [dev-dependencies]
 # Drives the async FFI methods in tests (#[tokio::test]).
 tokio = { workspace = true }
