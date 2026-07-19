@@ -2,7 +2,7 @@
 //! HPKE-sealed setup exchange (inner `IpRequest`/`IpAssign`) against a fake exit
 //! that re-derives the per-frame crypto independently, then exchanges a sealed
 //! data datagram. This validates the handshake real exits require (a sealed
-//! `WarrenMultihopFrame` first, not a bare `Setup`) without any real network.
+//! `WarrenMultihopFrame` first) without any real network.
 
 use std::net::Ipv4Addr;
 

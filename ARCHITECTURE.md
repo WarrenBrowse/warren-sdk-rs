@@ -100,12 +100,9 @@ the `start_proxy*` family (`start_proxy`, `start_proxy_supervised`,
   reimplements it.
 
 Both variants run the exact same supervised datapath; the label is the named home
-of the single-hop vs multi-hop distinction. There is no separate single-hop code
-path: the earlier `connect_tunnel` / `start_proxy(exit)` datapath (v4-only,
-unsupervised, its SetupAck carrying no subnet or v6 gateway) was removed. A
-single-hop session is now just a one-exit multihop circuit, so it inherits IPv6,
-the exit-supplied subnet and the self-healing supervision that the dedicated
-single-hop path lacked.
+of the single-hop vs multi-hop distinction. A single-hop session is a one-exit
+multihop circuit, so it has IPv6, the exit-supplied subnet, and self-healing
+supervision.
 
 ## Frozen wire contracts (ported from warren-core)
 

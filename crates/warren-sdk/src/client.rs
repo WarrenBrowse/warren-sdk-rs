@@ -655,8 +655,8 @@ impl<T: HttpTransport> WarrenClient<T> {
         exit.via_entry(entry, policy)
     }
 
-    /// Establishes a multihop tunnel to `exit` (the handshake real exits require:
-    /// an HPKE-sealed setup frame, not a bare `Setup`) and returns the sealed
+    /// Establishes a multihop tunnel to `exit` (the handshake real exits require
+    /// an HPKE-sealed setup frame) and returns the sealed
     /// packet plane.
     ///
     /// # Errors

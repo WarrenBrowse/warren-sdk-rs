@@ -11,8 +11,8 @@
 //!   3. each directory exit's Ed25519 identity also appears in the pinned relay
 //!      list (binds the directory to the pinned trust root).
 //!
-//! Then it opens a real MULTIHOP tunnel (the handshake real exits require: an
-//! HPKE-sealed setup frame, not a bare `Setup`). Routing requires a SUBSCRIBED
+//! Then it opens a real MULTIHOP tunnel (the handshake real exits require an
+//! HPKE-sealed setup frame). Routing requires a SUBSCRIBED
 //! wallet (the exit gates the `IpAssign` on its allowlist + proof of
 //! possession), so without `WARREN_MNEMONIC` the exit answers `Rejected`: that
 //! still proves the sealed handshake reached the exit's policy gate.

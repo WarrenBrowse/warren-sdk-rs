@@ -228,7 +228,7 @@ pub(crate) fn build_netstack_config<S: warren_net::PacketSink>(
 }
 
 /// Runs the userspace netstack over `sink` and serves the local SOCKS5 (and
-/// optional HTTP CONNECT) proxy. Shared by the single-hop and multihop datapaths.
+/// optional HTTP CONNECT) proxy. Shared by the single-hop and multihop circuit modes.
 pub(crate) async fn serve_proxy_over_sink<S>(
     sink: S,
     local_ip: std::net::Ipv4Addr,

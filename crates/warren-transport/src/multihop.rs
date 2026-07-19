@@ -1,9 +1,9 @@
 //! Multihop QUIC client tunnel (the handshake real exits actually require).
 //!
 //! Production exits read an HPKE-sealed [`WarrenMultihopFrame`](warren_wire::multihop::WarrenMultihopFrame) as the first
-//! frame on every connection (single-hop included), not a bare
-//! `Setup`: a raw Setup is rejected with `malformed setup
-//! frame`. This module implements that path:
+//! frame on every connection (single-hop included); an unsealed or malformed
+//! first frame is rejected with `malformed setup frame`. This module
+//! implements that path:
 //!
 //! 1. QUIC + TLS handshake against the dialed peer. In X.509 cover-domain mode
 //!    (see [`MultihopClientTunnel::with_cover_domain`]), the client validates the
