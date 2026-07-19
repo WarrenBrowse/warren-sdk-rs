@@ -6,6 +6,6 @@
 //! engine crate's round-trip tests.
 
 pub use warrenguard_wire::{
-    AUTH_SIG_LEN, AuthSig, CLIENT_PUBKEY_LEN, DEVICE_ID_LEN, DaitaConfig, MAX_SETUP_FRAME_BYTES,
-    PROTOCOL_VERSION, ProtocolError, features,
+    CLIENT_PUBKEY_LEN, DEVICE_ID_LEN, DaitaConfig, MAX_SETUP_FRAME_BYTES, PROTOCOL_VERSION,
+    ProtocolError, features,
 };
