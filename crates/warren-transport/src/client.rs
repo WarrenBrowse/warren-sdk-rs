@@ -492,8 +492,10 @@ mod tests {
             "the ClientHello-split obfuscation knob must be set, got: {rendered}"
         );
         assert!(
-            rendered.contains("initial_datagram_min_size: 1280"),
-            "the first-Initial padding obfuscation knob must be set to 1280, got: {rendered}"
+            rendered.contains("initial_datagram_min_size: 1200"),
+            "the first-Initial padding obfuscation knob must be set to the engine's \
+             reduced-MTU-safe 1200 (a larger padded Initial black-holes on nested/reduced-MTU \
+             paths), got: {rendered}"
         );
     }
 

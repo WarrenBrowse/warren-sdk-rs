@@ -133,7 +133,7 @@ rand = "0.8"
 # obfuscated-Initial padding/fragmentation knobs, which `warren_transport_config`
 # enables by default, so a Dart proxy via warren_sdk_frb presents the same QUIC
 # Initial fingerprint and network quality as warren-app with zero configuration.
-quinn = { git = "ssh://git@github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.16-fork.10", package = "warren-quinn" }
+quinn = { git = "ssh://git@github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.16-fork.11", package = "warren-quinn" }
 # No `logging` feature: rustls can emit handshake diagnostics (including the
 # SNI, which encodes the exit pubkey) through the `log` facade, which would leak
 # into an embedder's log sink and break Warren's no-log posture.

@@ -7,10 +7,12 @@
 //! so this needs no exit, no wallet/secret and no privilege: a plain UDP "tap"
 //! that never speaks QUIC captures the client's first flight via the public
 //! `MultihopClientTunnel::connect` path (which applies `warren_transport_config`
-//! by default, shared by every Warren datapath). A default upstream client would
-//! emit a single ~1200-byte Initial; the obfuscated default emits a padded
-//! (>= 1280) first datagram and splits the ClientHello across >= 2 datagrams, so
-//! both assertions are real guards.
+//! by default, shared by every Warren datapath). The padded Initial sits at the
+//! RFC 9000 floor (1200) so the datapath survives nested/reduced-MTU paths; at the
+//! floor the size alone no longer distinguishes the obfuscated Initial from a plain
+//! one, so the size check below is only a floor sanity check and the real,
+//! size-independent obfuscation guard is the ClientHello split across >= 2 Initial
+//! datagrams.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -19,9 +21,10 @@ use ed25519_dalek::SigningKey;
 use tokio::net::UdpSocket;
 use warren_transport::MultihopClientTunnel;
 
-/// The fork pads the obfuscated client Initial to `initial_datagram_min_size`
-/// (1280). The default upstream Initial is the RFC 9000 floor (1200).
-const OBFUSCATED_MIN_FIRST_DATAGRAM: usize = 1280;
+/// The engine pads the obfuscated client Initial to `initial_datagram_min_size`,
+/// the RFC 9000 floor (1200) for reduced-MTU survival. This is a floor sanity
+/// check; the ClientHello split is what proves obfuscation.
+const OBFUSCATED_MIN_FIRST_DATAGRAM: usize = 1200;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sdk_default_client_initial_is_padded_and_split() {

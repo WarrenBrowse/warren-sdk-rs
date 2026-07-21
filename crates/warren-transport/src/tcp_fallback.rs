@@ -158,6 +158,7 @@ mod tests {
             let policy = FallbackPolicy {
                 tcp_fallback_enabled: true,
                 udp_handshake_timeout: Duration::from_millis(800),
+                ..FallbackPolicy::default()
             };
             let cover = CoverTls {
                 addr: SocketAddr::new(exit_ip, super::super::COVER_TCP_PORT),
