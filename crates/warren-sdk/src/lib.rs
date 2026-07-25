@@ -53,11 +53,6 @@ pub use warren_identity as identity;
 pub use warren_net as net;
 pub use warren_transport as transport;
 
-/// Product/deployment anchors (API base URL, pinned server keys, canonical
-/// override env names) from the neutral contract crate, re-exported so
-/// downstream consumers read one source of truth instead of local literals.
-pub use warren_contract::product;
-
 /// Lifecycle state of a supervised connection (`Connecting`, `Connected`,
 /// `Reconnecting`, `Failed`), re-exported for [`SupervisedProxyHandle`].
 pub use warren_transport::ConnectionState;
@@ -67,6 +62,10 @@ pub mod egress;
 mod egress_probe;
 mod error;
 mod portfollow;
+/// Product/deployment anchors (API base URL, pinned server keys, canonical
+/// override env names), resolved for this build's release channel, so
+/// downstream consumers read one source of truth instead of local literals.
+pub mod product;
 mod proxy;
 pub mod socks_egress;
 mod store;

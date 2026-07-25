@@ -20,7 +20,7 @@ use warren_sdk::WarrenClient;
 use warren_sdk::discovery::{DEFAULT_RTT_TTL_SECS, ExitQuery, ExitSelector, VerifiedExit};
 use warren_sdk::identity::WarrenIdentity;
 
-const API_BASE: &str = "https://api.warrenbrowse.com";
+const API_BASE: &str = warren_sdk::product::API_URL;
 const SERVER_PUBKEY_PIN: &str = "4c2c9253c426ae4db4cc88703f9ac802a020420c7fea6479c87af530ada72c3e";
 /// How many distinct real exits to probe (each costs one handshake).
 const MAX_PROBES: usize = 3;

@@ -99,6 +99,19 @@ Applications depend only on `warren-sdk`:
 | `warren-api` | `reqwest-transport` | on | Backs the above; the same opt-out applies. |
 | `warren-discovery` | `test-helpers` | off | Exposes server-side signing helpers for tests in other crates. Never enable in production; it is wired only as a dev-dependency. |
 
+## Release channel (build-time)
+
+`WARREN_PRODUCT_ENV` picks the channel a build targets, `prod` (the default when
+unset) or `beta`, and `warren_sdk::product::API_URL` resolves to that channel's
+API base (`https://api.warrenbrowse.com` or `https://api.beta.warrenbrowse.com`).
+Any other value fails the build, and the runtime overrides (`WARREN_API_URL`,
+`WarrenClient::builder().api_base(..)`) still win over the compiled default.
+
+```bash
+cargo build                             # prod
+WARREN_PRODUCT_ENV=beta cargo build     # beta
+```
+
 ## Build and test
 
 The golden vectors live in `vectors/`, which is a **git submodule** of the

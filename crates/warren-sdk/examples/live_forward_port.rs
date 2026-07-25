@@ -26,7 +26,7 @@ use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::net::{MapProto, ProxyConfig};
 use warren_sdk::{Circuit, WarrenClient};
 
-const API_BASE: &str = "https://api.warrenbrowse.com";
+const API_BASE: &str = warren_sdk::product::API_URL;
 const SERVER_PUBKEY_PIN: &str = "4c2c9253c426ae4db4cc88703f9ac802a020420c7fea6479c87af530ada72c3e";
 /// Tunnel-side internal port to request a mapping for (arbitrary).
 const INTERNAL_PORT: u16 = 8080;

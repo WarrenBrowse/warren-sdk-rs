@@ -1277,7 +1277,7 @@ impl<T: HttpTransport> WarrenClient<T> {
 
 #[cfg(feature = "reqwest-transport")]
 fn warren_api_default_base() -> String {
-    warren_contract::product::API_URL.to_owned()
+    crate::product::API_URL.to_owned()
 }
 
 #[cfg(not(feature = "reqwest-transport"))]
