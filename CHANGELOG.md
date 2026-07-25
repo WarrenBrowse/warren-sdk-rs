@@ -9,6 +9,26 @@ the pre-release `0.0.x` line.
 
 ### Added
 
+- Live datapath observability reachable from the SUPERVISED datapath, which is
+  the one every real app holds. `ProxyHandle::metrics` already existed but only
+  on the unsupervised handle, so any app needing reconnection could not read the
+  counters the engine was already keeping. New:
+  `SupervisedProxyHandle::metrics()` and `metrics_reader()` (a cheap cloneable
+  `MetricsReader` for a background task, following reconnects), plus
+  `MultihopSession::path_quality()` / `carrier()`.
+  `MultihopMetricsSnapshot` gains `path: Option<PathQuality>` carrying the outer
+  `Carrier` (native QUIC vs the TLS-over-TCP fallback, recorded at the dial
+  race), smoothed RTT, the settled PMTU and max inner payload, and quinn's own
+  `black_holes`, `lost_packets`, `congestion_events` and PLPMTUD probe counts.
+  These are the variables datapath incidents turn on, and none was observable
+  from a client before.
+  The probe observes WITHOUT owning: quinn closes a connection when its last
+  handle drops, so a strong reference in an observability path would extend the
+  datapath's lifetime. It holds a weak reference and reports `None` once the
+  epoch ends. No change to the shared `warrenguard` engine was needed: the
+  carrier race is generic over the connection type, so each leg tags its own
+  value and the winner carries the tag.
+
 - ADR-0006 idle cover traffic ("B2-lite"), opt-in via `with_idle_cover(true)` on
   `ClientTunnel` and `MultihopClientTunnel` (off by default). When enabled the
   keep-alive PING is disabled and a caller-spawned `IdleCoverDriver` emits a

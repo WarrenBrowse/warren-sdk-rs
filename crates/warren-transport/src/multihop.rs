@@ -769,8 +769,9 @@ impl Default for PathQuality {
     }
 }
 
-/// A serializable point-in-time view of a session's counters. Plain scalars so it
-/// maps cleanly across the FFI boundary to the sibling-language SDKs.
+/// A serializable point-in-time view of a session's counters. Scalars plus one
+/// optional flat record ([`PathQuality`]), so it maps cleanly across the FFI
+/// boundary to the sibling-language SDKs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MultihopMetricsSnapshot {
