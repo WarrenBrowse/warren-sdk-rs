@@ -28,8 +28,8 @@ pub use warrenguard_pump::idle_cover::{
 // fork-agnostic: identical whether the workspace patches quinn or not.
 pub use daita_driver::{DaitaDriver, DaitaDriverHandle};
 pub use multihop::{
-    DrainAdvisory, MultihopClientTunnel, MultihopError, MultihopMetrics, MultihopMetricsSnapshot,
-    MultihopSession, RekeyPolicy,
+    Carrier, DrainAdvisory, MultihopClientTunnel, MultihopError, MultihopMetrics,
+    MultihopMetricsSnapshot, MultihopSession, PathQuality, RekeyPolicy,
 };
 // The engine setup-failure type carried by `MultihopError::Setup`, re-exported so
 // a consumer can match on / construct the policy verdict (`Rejected`,

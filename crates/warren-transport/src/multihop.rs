@@ -469,7 +469,7 @@ impl MultihopClientTunnel {
         // sent (cover-domain mode, inside `setup_over_stream` below) or at the
         // TLS layer (RPK mode).
         let bind = effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr);
-        let (endpoint, conn) = if let Some(ref domain) = self.cover_domain {
+        let (endpoint, conn, carrier) = if let Some(ref domain) = self.cover_domain {
             if self.tcp_fallback {
                 // Carrier armed (roster v10): race the UDP/QUIC handshake against
                 // the cover-domain TLS-over-TCP carrier on the entry's :443/tcp, so
@@ -509,24 +509,26 @@ impl MultihopClientTunnel {
                 )
                 .await?
             } else {
-                dial_quic_webpki(
+                let (endpoint, conn) = dial_quic_webpki(
                     domain,
                     exit_addr,
                     bind,
                     transport_config,
                     self.socket_bypass,
                 )
-                .await?
+                .await?;
+                (endpoint, conn, Carrier::Udp)
             }
         } else {
-            dial_quic(
+            let (endpoint, conn) = dial_quic(
                 exit_pubkey,
                 exit_addr,
                 bind,
                 transport_config,
                 self.socket_bypass,
             )
-            .await?
+            .await?;
+            (endpoint, conn, Carrier::Udp)
         };
 
         // X.509 cover-domain mode (ADR-0004): `exit_pubkey` doubles as the
@@ -601,8 +603,11 @@ impl MultihopClientTunnel {
             // Kept distinct from `Rejected`: a suspended account must surface a
             // suspension rather than a renew prompt, which is the whole reason
             // the engine has a separate wire variant for it.
-            Ok(Some(WarrenControlMessage::RejectedBanned)) => {
-                return Err(MultihopError::Setup(SetupError::Banned));
+            // The product-defined reason code rides through untouched, exactly as
+            // the engine's own setup path carries it: the deployer's control
+            // plane assigns its meaning and the client maps it to a message.
+            Ok(Some(WarrenControlMessage::RejectedBanned { reason_code })) => {
+                return Err(MultihopError::Setup(SetupError::Banned(reason_code)));
             }
             Ok(Some(WarrenControlMessage::IpExhausted)) => {
                 return Err(MultihopError::Setup(SetupError::IpExhausted));
@@ -623,6 +628,7 @@ impl MultihopClientTunnel {
         Ok(MultihopSession {
             inner,
             conn,
+            carrier,
             assignment,
             metrics: Arc::new(MultihopMetrics::new(0)),
             drain_tx: tokio::sync::watch::channel(None).0,
@@ -643,6 +649,14 @@ pub struct MultihopMetrics {
     connected_since: Instant,
 }
 
+impl Default for MultihopMetrics {
+    /// Zeroed counters at epoch 0, for a caller that needs a metrics handle
+    /// without a session (a fake datapath in a test).
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
 impl MultihopMetrics {
     fn new(epoch: u32) -> Self {
         Self {
@@ -657,6 +671,10 @@ impl MultihopMetrics {
     }
 
     /// A point-in-time snapshot of the counters.
+    ///
+    /// Read from a detached handle, so it carries no [`PathQuality`]: only a live
+    /// session can answer for the path it runs on. Use
+    /// [`MultihopSession::metrics_snapshot`] for the complete view.
     #[must_use]
     pub fn snapshot(&self) -> MultihopMetricsSnapshot {
         MultihopMetricsSnapshot {
@@ -667,6 +685,86 @@ impl MultihopMetrics {
             cover_packets_sent: self.cover_packets_sent.load(Ordering::Relaxed),
             epoch: self.epoch.load(Ordering::Relaxed),
             uptime_secs: self.connected_since.elapsed().as_secs(),
+            path: None,
+        }
+    }
+}
+
+/// Which outer carrier the QUIC session actually runs on.
+///
+/// The engine races native QUIC over UDP against the anti-censorship
+/// TLS-over-TCP carrier, and a UDP-blocked or reduced-MTU path silently ends up
+/// on the slower one. The two differ enough in throughput, latency and MTU that
+/// a report which does not name the carrier cannot be interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carrier {
+    /// Native QUIC over UDP.
+    Udp,
+    /// The TLS-over-TCP carrier on the entry's `:443/tcp` (roster v10).
+    TlsTcp,
+}
+
+impl Carrier {
+    /// A stable lowercase tag for logs and the FFI boundary.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::TlsTcp => "tls-tcp",
+        }
+    }
+}
+
+/// Live quality of the QUIC path under a session, read at snapshot time.
+///
+/// Every one of these is a variable a datapath incident turns on, and none of
+/// them was reachable from outside the transport before: a client could report
+/// that traffic stalled, never which path shape stalled. `black_holes` in
+/// particular is quinn's own count of detected black holes, the exact phenomenon
+/// the reduced-MTU and nested-VPN incidents are about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PathQuality {
+    /// Which outer carrier the session runs on.
+    pub carrier: Carrier,
+    /// Smoothed round-trip time to the first hop, milliseconds.
+    pub rtt_ms: u32,
+    /// Largest UDP payload the path currently supports (the PMTU quinn settled
+    /// on, which the black-hole window is defined in terms of).
+    pub path_mtu: u16,
+    /// Largest inner IP packet this session can carry, after frame overhead.
+    pub max_inner_payload: u32,
+    /// Black holes quinn detected on this path since connect.
+    pub black_holes: u64,
+    /// Packets lost on this path.
+    pub lost_packets: u64,
+    /// Congestion events on this path.
+    pub congestion_events: u64,
+    /// PLPMTUD probes sent, and how many were lost: a rising loss count is an
+    /// MTU ceiling being discovered the hard way.
+    pub plpmtud_probes_sent: u64,
+    /// See [`Self::plpmtud_probes_sent`].
+    pub plpmtud_probes_lost: u64,
+}
+
+impl Default for PathQuality {
+    /// A quiet native-QUIC path with nothing measured yet.
+    ///
+    /// The type is `#[non_exhaustive]` so it can gain fields without breaking
+    /// consumers, which also means no consumer can build one by literal. This is
+    /// how a caller (a test shaping a report, an FFI binding) gets a value to
+    /// fill in.
+    fn default() -> Self {
+        Self {
+            carrier: Carrier::Udp,
+            rtt_ms: 0,
+            path_mtu: 0,
+            max_inner_payload: 0,
+            black_holes: 0,
+            lost_packets: 0,
+            congestion_events: 0,
+            plpmtud_probes_sent: 0,
+            plpmtud_probes_lost: 0,
         }
     }
 }
@@ -690,6 +788,9 @@ pub struct MultihopMetricsSnapshot {
     pub epoch: u32,
     /// Seconds since the session was established.
     pub uptime_secs: u64,
+    /// Live path quality, present only when the snapshot was taken from the live
+    /// session rather than a detached counters handle.
+    pub path: Option<PathQuality>,
 }
 
 /// The session rekey doctrine (warren-core doc 19 § 11.6): rotate the HPKE
@@ -792,6 +893,11 @@ pub struct MultihopSession {
     // handle), for `Self::connection`'s `&self -> &Connection` borrow contract:
     // the engine only exposes to-be-cloned or higher-level accessors.
     conn: quinn::Connection,
+    /// Which leg of the UDP/TCP dial race produced `conn`. Fixed for the session:
+    /// a carrier change means a fresh dial, so it is recorded once here rather
+    /// than re-derived (quinn cannot tell the two apart, the carrier presents a
+    /// synthetic UDP socket).
+    carrier: Carrier,
     assignment: IpAssignment,
     metrics: Arc<MultihopMetrics>,
     /// ADR 36: republishes a mid-session `ExitDraining` advisory to the upper
@@ -943,10 +1049,36 @@ impl MultihopSession {
         Arc::clone(&self.metrics)
     }
 
-    /// A point-in-time snapshot of this session's counters.
+    /// A point-in-time snapshot of this session's counters, complete with the
+    /// live [`PathQuality`] only a session can answer for.
     #[must_use]
     pub fn metrics_snapshot(&self) -> MultihopMetricsSnapshot {
-        self.metrics.snapshot()
+        let mut snapshot = self.metrics.snapshot();
+        snapshot.path = Some(self.path_quality());
+        snapshot
+    }
+
+    /// The live quality of the QUIC path under this session.
+    #[must_use]
+    pub fn path_quality(&self) -> PathQuality {
+        let stats = self.conn.stats().path;
+        PathQuality {
+            carrier: self.carrier,
+            rtt_ms: u32::try_from(stats.rtt.as_millis()).unwrap_or(u32::MAX),
+            path_mtu: stats.current_mtu,
+            max_inner_payload: u32::try_from(self.max_inner_payload()).unwrap_or(u32::MAX),
+            black_holes: stats.black_holes_detected,
+            lost_packets: stats.lost_packets,
+            congestion_events: stats.congestion_events,
+            plpmtud_probes_sent: stats.sent_plpmtud_probes,
+            plpmtud_probes_lost: stats.lost_plpmtud_probes,
+        }
+    }
+
+    /// Which outer carrier this session runs on.
+    #[must_use]
+    pub fn carrier(&self) -> Carrier {
+        self.carrier
     }
 
     /// Await the next inbound IP packet, opening sealed datagrams and skipping
@@ -1063,6 +1195,8 @@ impl MultihopSession {
         Self {
             inner,
             conn,
+            // The test constructor dials plain UDP QUIC, never the carrier.
+            carrier: Carrier::Udp,
             assignment: IpAssignment::placeholder_for_test(),
             metrics: Arc::new(MultihopMetrics::new(0)),
             drain_tx: tokio::sync::watch::channel(None).0,
@@ -1536,6 +1670,77 @@ mod real_exit_tests {
         );
 
         session.disconnect();
+    }
+}
+
+#[cfg(test)]
+mod path_quality_tests {
+    use super::*;
+
+    async fn loopback_session() -> MultihopSession {
+        use warren_test_support::spawn_fake_multihop_exit;
+
+        let exit_key = SigningKey::from_bytes(&[9u8; 32]);
+        let (exit_addr, keys) = spawn_fake_multihop_exit(exit_key).await;
+        MultihopClientTunnel::new(SigningKey::from_bytes(&[4u8; 32]))
+            .connect(
+                keys.ed25519_pubkey,
+                keys.x25519_pubkey,
+                keys.exit_id,
+                exit_addr,
+            )
+            .await
+            .expect("loopback multihop connect")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_session_reports_its_path_quality() {
+        let session = loopback_session().await;
+        let path = session.path_quality();
+
+        assert_eq!(path.carrier, Carrier::Udp, "a plain dial is native QUIC");
+        // The QUIC base MTU is 1200; anything below it means the value is not
+        // really coming from the path.
+        assert!(path.path_mtu >= 1200, "path_mtu was {}", path.path_mtu);
+        assert!(
+            path.max_inner_payload > 0
+                && u64::from(path.max_inner_payload) < u64::from(path.path_mtu),
+            "the inner payload must fit inside the path MTU, after frame overhead"
+        );
+        // A loopback path has nothing to lose and no black hole to detect.
+        assert_eq!(path.black_holes, 0);
+        assert_eq!(path.plpmtud_probes_lost, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_session_snapshot_carries_the_path_and_a_detached_one_does_not() {
+        // The distinction is the whole contract: only a live session can answer
+        // for the path, and a detached counters handle must say so rather than
+        // invent a value.
+        let session = loopback_session().await;
+        assert!(
+            session.metrics_snapshot().path.is_some(),
+            "a live session must report its path"
+        );
+        assert!(
+            session.metrics().snapshot().path.is_none(),
+            "a detached counters handle cannot know the path"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_counters_are_the_same_on_both_snapshot_paths() {
+        let session = loopback_session().await;
+        session
+            .send_packet(&[
+                0x45, 0, 0, 20, 0, 0, 0, 0, 64, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+            ])
+            .expect("loopback send");
+        let live = session.metrics_snapshot();
+        let detached = session.metrics().snapshot();
+        assert_eq!(live.packets_sent, 1);
+        assert_eq!(live.packets_sent, detached.packets_sent);
+        assert_eq!(live.epoch, detached.epoch);
     }
 }
 

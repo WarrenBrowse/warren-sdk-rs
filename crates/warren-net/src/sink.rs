@@ -67,6 +67,17 @@ pub trait PacketSink: Send + Sync {
         None
     }
 
+    /// This datapath's live counters and path quality, when it is backed by a
+    /// multihop session. The default returns `None` (a sink with no sealed
+    /// session has nothing to report); the multi-hop sink overrides it.
+    ///
+    /// Read through the sink rather than from a detached counters handle so the
+    /// live [`PathQuality`](warren_transport::PathQuality) comes with it, and so
+    /// the value can never outlive the datapath it describes.
+    fn metrics_snapshot(&self) -> Option<warren_transport::MultihopMetricsSnapshot> {
+        None
+    }
+
     /// Sends a batch of packets. The default forwards them one by one; a
     /// GSO-aware implementation can override this to coalesce the syscall.
     ///
@@ -242,6 +253,10 @@ impl PacketSink for MultihopPacketSink {
     ) -> Option<tokio::sync::watch::Receiver<Option<warren_transport::DrainAdvisory>>> {
         Some(self.session.watch_drain())
     }
+
+    fn metrics_snapshot(&self) -> Option<warren_transport::MultihopMetricsSnapshot> {
+        Some(self.session.metrics_snapshot())
+    }
 }
 
 /// Channel depth for the merged inbound stream of a [`BondedPacketSink`].
@@ -355,6 +370,14 @@ impl<S: PacketSink + 'static> PacketSink for BondedPacketSink<S> {
         // Every member bonds to the SAME exit, so any member's drain advisory
         // speaks for the whole bundle; the first member's watch suffices.
         self.members.first().and_then(|m| m.drain_watch())
+    }
+
+    fn metrics_snapshot(&self) -> Option<warren_transport::MultihopMetricsSnapshot> {
+        // Counters are per-member and the bundle stripes across them, so the
+        // first member speaks only for its own share of the traffic. Its PATH
+        // quality does describe the bundle (same exit, same carrier), which is
+        // what a diagnosis reads this for.
+        self.members.first().and_then(|m| m.metrics_snapshot())
     }
 }
 

@@ -25,6 +25,8 @@ use warrenguard_tcp_fallback::{
     FallbackPolicy, TcpCarrierSocket, build_carrier_client_endpoint, connect_with_fallback,
 };
 
+use crate::multihop::Carrier;
+
 // The fallback-carrier arming rule and its cover-domain fingerprint constants
 // have a single home in `warrenguard-tcp-fallback`, shared with the privileged
 // system-VPN transport so neither the policy nor the on-wire fingerprint can skew
@@ -59,19 +61,24 @@ pub(crate) async fn dial_quic_webpki_with_fallback(
     socket_bypass: Option<warrenguard_socket_bypass::SocketBypass>,
     policy: &FallbackPolicy,
     cover: Option<CoverTls<'_>>,
-) -> Result<(quinn::Endpoint, quinn::Connection), QuicDialError> {
+) -> Result<(quinn::Endpoint, quinn::Connection, Carrier), QuicDialError> {
     let cover = cover.filter(|_| policy.tcp_fallback_enabled);
     let Some(cover) = cover else {
-        return dial_quic_webpki(
+        let (endpoint, conn) = dial_quic_webpki(
             server_name,
             exit_addr,
             bind_local_ip,
             transport_config,
             socket_bypass,
         )
-        .await;
+        .await?;
+        return Ok((endpoint, conn, Carrier::Udp));
     };
 
+    // Each leg tags the connection it produces, and the race returns whichever
+    // one won, tag included. That is why the engine's `connect_with_fallback` is
+    // generic over the connection type: the winner is knowable without the
+    // engine having to report it, so nothing in warrenguard changes.
     let udp_transport_config = transport_config.clone();
     let udp = async move {
         dial_quic_webpki(
@@ -82,9 +89,14 @@ pub(crate) async fn dial_quic_webpki_with_fallback(
             socket_bypass,
         )
         .await
+        .map(|(endpoint, conn)| (endpoint, conn, Carrier::Udp))
         .map_err(|_| io::Error::other("udp quic handshake failed"))
     };
-    let tcp = || dial_tcp_carrier_webpki(server_name, exit_addr, cover, transport_config);
+    let tcp = || async move {
+        dial_tcp_carrier_webpki(server_name, exit_addr, cover, transport_config)
+            .await
+            .map(|(endpoint, conn)| (endpoint, conn, Carrier::TlsTcp))
+    };
 
     connect_with_fallback(policy, udp, tcp)
         .await
@@ -170,7 +182,7 @@ mod tests {
             // handshake times out and the dial must fall back to the carrier.
             let exit_addr = SocketAddr::new(exit_ip, 9);
 
-            let (_endpoint, conn) = tokio::time::timeout(
+            let (_endpoint, conn, carrier) = tokio::time::timeout(
                 Duration::from_secs(20),
                 dial_quic_webpki_with_fallback(
                     &cover_domain,
@@ -190,6 +202,77 @@ mod tests {
                 conn.close_reason().is_none(),
                 "the QUIC connection established over the carrier must be live"
             );
+            // The reported carrier must be the leg that actually won, otherwise a
+            // report blames the wrong path shape for a session's behaviour.
+            assert_eq!(
+                carrier,
+                super::super::Carrier::TlsTcp,
+                "a session forced onto the carrier must report itself as such"
+            );
+        }
+    }
+
+    mod race_tagging {
+        //! The dial reports which leg won by tagging each arm's value, which only
+        //! works because the engine's race is generic over the connection type.
+        //! These pin that contract without a network.
+
+        use std::io;
+        use std::time::Duration;
+
+        use warrenguard_tcp_fallback::{FallbackPolicy, connect_with_fallback};
+
+        use crate::multihop::Carrier;
+
+        fn racing_policy() -> FallbackPolicy {
+            FallbackPolicy {
+                tcp_fallback_enabled: true,
+                udp_handshake_timeout: Duration::from_millis(200),
+                tcp_race_delay: Duration::from_millis(10),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_winning_udp_leg_reports_udp() {
+            let udp = async { Ok::<_, io::Error>(Carrier::Udp) };
+            let tcp = || async { Ok::<_, io::Error>(Carrier::TlsTcp) };
+            let won = connect_with_fallback(&racing_policy(), udp, tcp)
+                .await
+                .expect("the udp leg succeeds");
+            assert_eq!(won, Carrier::Udp);
+        }
+
+        #[tokio::test]
+        async fn a_udp_leg_that_fails_hands_the_tag_to_the_carrier() {
+            let udp = async { Err::<Carrier, _>(io::Error::other("udp blocked")) };
+            let tcp = || async { Ok::<_, io::Error>(Carrier::TlsTcp) };
+            let won = connect_with_fallback(&racing_policy(), udp, tcp)
+                .await
+                .expect("the carrier takes over");
+            assert_eq!(won, Carrier::TlsTcp);
+        }
+
+        #[tokio::test]
+        async fn a_stalled_udp_leg_hands_the_tag_to_the_carrier() {
+            // The shape the anti-censorship carrier exists for: UDP neither
+            // succeeds nor fails, it just never answers.
+            let udp = async {
+                std::future::pending::<()>().await;
+                unreachable!()
+            };
+            let tcp = || async { Ok::<_, io::Error>(Carrier::TlsTcp) };
+            let won = connect_with_fallback(&racing_policy(), udp, tcp)
+                .await
+                .expect("the carrier takes over from a stalled udp leg");
+            assert_eq!(won, Carrier::TlsTcp);
+        }
+
+        #[test]
+        fn the_carrier_tags_are_stable_and_distinct() {
+            // They reach logs and the FFI boundary; a rename silently breaks a
+            // fleet query that filters on them.
+            assert_eq!(Carrier::Udp.as_str(), "udp");
+            assert_eq!(Carrier::TlsTcp.as_str(), "tls-tcp");
         }
     }
 }

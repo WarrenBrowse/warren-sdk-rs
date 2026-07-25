@@ -31,6 +31,13 @@ impl warren_net::PacketSink for ClosableSink {
     fn max_payload(&self) -> usize {
         1280
     }
+
+    /// Reports counters so the supervisor's metrics republication is observable
+    /// without a real multihop session. The default `None` would make a live
+    /// epoch indistinguishable from a dead one.
+    fn metrics_snapshot(&self) -> Option<warren_transport::MultihopMetricsSnapshot> {
+        Some(warren_transport::MultihopMetrics::default().snapshot())
+    }
 }
 
 /// A sink that models a tunnel whose exit signals a maintenance DRAIN (ADR 36):
@@ -115,6 +122,7 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
                     egress_probe: false,
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
+                    metrics_tx: tokio::sync::watch::channel(None).0,
                     migration_tx: tokio::sync::watch::channel(None).0,
                     fatal_tx: tokio::sync::watch::channel(None).0,
                 },
@@ -197,6 +205,7 @@ async fn network_path_change_redials_immediately_without_rotating() {
                     egress_probe: false,
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
+                    metrics_tx: tokio::sync::watch::channel(None).0,
                     migration_tx: tokio::sync::watch::channel(None).0,
                     fatal_tx: tokio::sync::watch::channel(None).0,
                 },
@@ -282,6 +291,7 @@ async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
                     egress_probe: false,
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
+                    metrics_tx: tokio::sync::watch::channel(None).0,
                     migration_tx: tokio::sync::watch::channel(None).0,
                     fatal_tx,
                 },
@@ -364,6 +374,7 @@ async fn supervisor_reselects_on_an_exhaustion_refusal_without_going_fatal() {
                     egress_probe: false,
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
+                    metrics_tx: tokio::sync::watch::channel(None).0,
                     migration_tx: tokio::sync::watch::channel(None).0,
                     fatal_tx,
                 },
@@ -411,6 +422,94 @@ async fn supervisor_reselects_on_an_exhaustion_refusal_without_going_fatal() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn supervisor_metrics_probe_reads_the_live_epoch_and_never_outlives_it() {
+    use crate::supervisor::supervise_proxy;
+
+    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+    let (metrics_tx, mut metrics_rx) = tokio::sync::watch::channel(None);
+    let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let task = tokio::spawn(async move {
+        supervise_proxy(
+            socks_listener,
+            None,
+            None,
+            crate::supervisor::SupervisorOutputs {
+                egress_probe: false,
+                state_tx,
+                forwarder_tx: tokio::sync::watch::channel(None).0,
+                metrics_tx,
+                migration_tx: tokio::sync::watch::channel(None).0,
+                fatal_tx: tokio::sync::watch::channel(None).0,
+            },
+            crate::supervisor::EpochGuards {
+                pre_migrate: None,
+                network_watch: None,
+            },
+            move || {
+                let kill_tx = kill_tx.clone();
+                async move {
+                    let close = Arc::new(tokio::sync::Notify::new());
+                    let _ = kill_tx.send(Arc::clone(&close));
+                    Ok::<_, SdkError>(EstablishedTunnel {
+                        sink: ClosableSink { close },
+                        local_ip: "10.66.0.2".parse().unwrap(),
+                        prefix: 24,
+                        gateway: "10.66.0.1".parse().unwrap(),
+                        ipv6: None,
+                    })
+                }
+            },
+            || {},
+        )
+        .await;
+    });
+
+    let kill = tokio::time::timeout(std::time::Duration::from_secs(5), kill_rx.recv())
+        .await
+        .expect("first connect")
+        .expect("kill handle");
+    metrics_rx.changed().await.unwrap();
+    // Hold the probe past the epoch on purpose: this is the exact shape that
+    // would leak the datapath if the probe owned it.
+    let probe = metrics_rx
+        .borrow_and_update()
+        .clone()
+        .expect("a probe is published while connected");
+    assert!(
+        probe().is_some(),
+        "the probe reads the live epoch's counters"
+    );
+
+    // Kill the epoch and wait for the supervisor to withdraw the probe.
+    kill.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), metrics_rx.changed())
+        .await
+        .expect("the supervisor withdraws the probe")
+        .unwrap();
+    assert!(
+        metrics_rx.borrow_and_update().is_none(),
+        "no probe is published while the tunnel is down"
+    );
+
+    // The probe we kept must now answer None: it holds a weak reference, so the
+    // datapath was free to be torn down. A strong one would keep the QUIC
+    // connection alive and this would still return Some.
+    let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while probe().is_some() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        released.is_ok(),
+        "a retained probe must not keep the datapath alive"
+    );
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death() {
     use crate::supervisor::supervise_proxy;
 
@@ -428,6 +527,7 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
                 egress_probe: false,
                 state_tx,
                 forwarder_tx,
+                metrics_tx: tokio::sync::watch::channel(None).0,
                 migration_tx: tokio::sync::watch::channel(None).0,
                 fatal_tx: tokio::sync::watch::channel(None).0,
             },
@@ -999,6 +1099,7 @@ async fn supervisor_serves_both_socks_and_http_listeners() {
                 egress_probe: false,
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
+                metrics_tx: tokio::sync::watch::channel(None).0,
                 migration_tx: tokio::sync::watch::channel(None).0,
                 fatal_tx: tokio::sync::watch::channel(None).0,
             },
@@ -1051,6 +1152,7 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
                 egress_probe: false,
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
+                metrics_tx: tokio::sync::watch::channel(None).0,
                 migration_tx: tokio::sync::watch::channel(None).0,
                 fatal_tx: tokio::sync::watch::channel(None).0,
             },
@@ -1119,6 +1221,7 @@ async fn supervisor_failover_rotates_on_drain() {
                 egress_probe: false,
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
+                metrics_tx: tokio::sync::watch::channel(None).0,
                 migration_tx: tokio::sync::watch::channel(None).0,
                 fatal_tx: tokio::sync::watch::channel(None).0,
             },
@@ -1196,6 +1299,7 @@ async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
                 egress_probe: false,
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
+                metrics_tx: tokio::sync::watch::channel(None).0,
                 migration_tx: tokio::sync::watch::channel(None).0,
                 fatal_tx: tokio::sync::watch::channel(None).0,
             },
@@ -1276,6 +1380,7 @@ async fn supervisor_retries_past_failed_attempts_then_connects() {
                     egress_probe: false,
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
+                    metrics_tx: tokio::sync::watch::channel(None).0,
                     migration_tx: tokio::sync::watch::channel(None).0,
                     fatal_tx: tokio::sync::watch::channel(None).0,
                 },
@@ -1352,6 +1457,7 @@ async fn supervisor_emits_structured_migration_events_on_drain() {
                 egress_probe: false,
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
+                metrics_tx: tokio::sync::watch::channel(None).0,
                 migration_tx,
                 fatal_tx: tokio::sync::watch::channel(None).0,
             },
@@ -1451,6 +1557,7 @@ async fn supervisor_gate_veto_cancels_the_migration_and_keeps_serving() {
                     egress_probe: false,
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
+                    metrics_tx: tokio::sync::watch::channel(None).0,
                     migration_tx,
                     fatal_tx: tokio::sync::watch::channel(None).0,
                 },
@@ -1538,6 +1645,7 @@ async fn supervisor_gate_approval_lets_the_migration_proceed() {
                 egress_probe: false,
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
+                metrics_tx: tokio::sync::watch::channel(None).0,
                 migration_tx: tokio::sync::watch::channel(None).0,
                 fatal_tx: tokio::sync::watch::channel(None).0,
             },

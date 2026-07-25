@@ -1230,6 +1230,7 @@ impl<T: HttpTransport> WarrenClient<T> {
 
         let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
         let (forwarder_tx, forwarder_rx) = tokio::sync::watch::channel(None);
+        let (metrics_tx, metrics_rx) = tokio::sync::watch::channel(None);
         let (migration_tx, migration_rx) = tokio::sync::watch::channel(None);
         let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
         let dns_server = cfg.dns_server;
@@ -1241,6 +1242,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                 crate::supervisor::SupervisorOutputs {
                     state_tx,
                     forwarder_tx,
+                    metrics_tx,
                     migration_tx,
                     fatal_tx,
                     egress_probe: true,
@@ -1268,6 +1270,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             http_addr,
             state_rx,
             forwarder_rx,
+            metrics_rx,
             migration_rx,
             fatal_rx,
             task,

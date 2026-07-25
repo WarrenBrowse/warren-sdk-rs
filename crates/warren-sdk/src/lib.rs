@@ -57,6 +57,11 @@ pub use warren_transport as transport;
 /// `Reconnecting`, `Failed`), re-exported for [`SupervisedProxyHandle`].
 pub use warren_transport::ConnectionState;
 
+/// What [`SupervisedProxyHandle::metrics`] and [`MetricsReader::read`] return:
+/// the datapath's counters plus the live quality of the path they ran on.
+/// Re-exported at the root so an app reading them needs no second dependency.
+pub use warren_transport::{Carrier, MultihopMetrics, MultihopMetricsSnapshot, PathQuality};
+
 mod client;
 pub mod egress;
 mod egress_probe;
@@ -86,7 +91,7 @@ pub use portfollow::{
 };
 pub use proxy::{ProxyForwarder, ProxyHandle, TunnelState};
 pub use store::{FileGenerationStore, FileServerKeyStore};
-pub use supervisor::{SupervisedForwardedPort, SupervisedProxyHandle};
+pub use supervisor::{MetricsReader, SupervisedForwardedPort, SupervisedProxyHandle};
 
 #[cfg(test)]
 mod tests;

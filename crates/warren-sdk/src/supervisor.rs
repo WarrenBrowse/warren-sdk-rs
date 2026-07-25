@@ -18,6 +18,46 @@ pub(crate) struct EstablishedTunnel<S> {
     pub(crate) ipv6: Option<warren_net::Ipv6Addressing>,
 }
 
+/// Reads the current epoch's datapath counters on demand.
+///
+/// Type-erased so the non-generic handle can hold it, and it captures a `Weak`
+/// to the datapath rather than the datapath itself: a strong reference would
+/// keep the QUIC connection alive past the epoch that owns it (quinn closes a
+/// connection when its last handle drops), so an observability feature would
+/// silently change the tunnel's lifetime. It returns `None` once the epoch is
+/// gone, which is the truthful answer.
+pub(crate) type MetricsProbe =
+    Arc<dyn Fn() -> Option<warren_transport::MultihopMetricsSnapshot> + Send + Sync>;
+
+/// A cheap, cloneable reader of a supervised datapath's live metrics.
+///
+/// [`SupervisedProxyHandle::metrics`] needs the handle in scope, which a
+/// background task (a health probe, a support-report collector) does not have.
+/// This detaches the read: clone it into the task and poll it for the life of
+/// the session, across reconnects. Like the handle's accessor it observes
+/// without owning, so a reader kept forever never extends a datapath's life.
+#[derive(Clone)]
+pub struct MetricsReader {
+    rx: tokio::sync::watch::Receiver<Option<MetricsProbe>>,
+}
+
+impl MetricsReader {
+    /// The current epoch's counters and path quality, or `None` while the tunnel
+    /// is down (or once the session it came from has ended).
+    #[must_use]
+    pub fn read(&self) -> Option<warren_transport::MultihopMetricsSnapshot> {
+        self.rx.borrow().as_ref().and_then(|probe| probe())
+    }
+}
+
+impl std::fmt::Debug for MetricsReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsReader")
+            .field("live", &self.rx.borrow().is_some())
+            .finish()
+    }
+}
+
 /// A self-healing proxy datapath (see
 /// [`WarrenClient::start_proxy_supervised`](crate::WarrenClient::start_proxy_supervised)).
 /// The local proxy
@@ -31,6 +71,9 @@ pub struct SupervisedProxyHandle {
     /// every (re)connect and cleared (`None`) while the tunnel is down. Drives
     /// the self-healing port forwards.
     pub(crate) forwarder_rx: tokio::sync::watch::Receiver<Option<ProxyForwarder>>,
+    /// Reads the current epoch's datapath counters, republished on every
+    /// (re)connect and cleared while the tunnel is down.
+    pub(crate) metrics_rx: tokio::sync::watch::Receiver<Option<MetricsProbe>>,
     pub(crate) migration_rx:
         tokio::sync::watch::Receiver<Option<crate::portfollow::MigrationEvent>>,
     /// Set once, to the fatal cause, when the supervisor gives up on a fatal
@@ -82,6 +125,28 @@ impl SupervisedProxyHandle {
     #[must_use]
     pub fn watch_fatal(&self) -> tokio::sync::watch::Receiver<Option<FatalCause>> {
         self.fatal_rx.clone()
+    }
+
+    /// A snapshot of the current epoch's datapath counters and live path quality
+    /// (carrier, RTT, PMTU, black holes), or `None` while the tunnel is down.
+    ///
+    /// The unsupervised [`ProxyHandle::metrics`](crate::ProxyHandle::metrics) is
+    /// unreachable for any app that needs reconnection, which is every real one,
+    /// so this is the accessor that actually gets used. Read it fresh rather than
+    /// caching it: the value belongs to one epoch, and a reconnect replaces the
+    /// session it describes.
+    #[must_use]
+    pub fn metrics(&self) -> Option<warren_transport::MultihopMetricsSnapshot> {
+        self.metrics_rx.borrow().as_ref().and_then(|probe| probe())
+    }
+
+    /// A detached [`MetricsReader`] for a background task that cannot hold this
+    /// handle. Follows reconnects: it always reads the current epoch.
+    #[must_use]
+    pub fn metrics_reader(&self) -> MetricsReader {
+        MetricsReader {
+            rx: self.metrics_rx.clone(),
+        }
     }
 
     /// The latest maintenance-migration event
@@ -541,6 +606,9 @@ pub(crate) struct EpochGuards {
 pub(crate) struct SupervisorOutputs {
     pub(crate) state_tx: tokio::sync::watch::Sender<ConnectionState>,
     pub(crate) forwarder_tx: tokio::sync::watch::Sender<Option<ProxyForwarder>>,
+    /// Reads the current epoch's datapath counters without owning the datapath,
+    /// republished per epoch like `forwarder_tx` and cleared when it ends.
+    pub(crate) metrics_tx: tokio::sync::watch::Sender<Option<MetricsProbe>>,
     pub(crate) migration_tx: tokio::sync::watch::Sender<Option<crate::portfollow::MigrationEvent>>,
     /// Latches the [`FatalCause`] when a (re)connect fails with a fatal engine
     /// verdict (unauthorized account, device cap, opaque policy refusal): the
@@ -614,7 +682,16 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                 // ADR 36: grab the drain watch before the sink is moved into the
                 // netstack engine. `None` for paths that emit no drain signal.
                 let drain_rx = est.sink.drain_watch();
-                let (connector, alive_rx) = warren_net::spawn_over_sink(Arc::new(est.sink), config);
+                let sink = Arc::new(est.sink);
+                // Publish a NON-owning reader of this epoch's counters. The weak
+                // reference is load-bearing: the netstack owns the datapath for
+                // the epoch, and a strong clone here would hold the QUIC
+                // connection open past its teardown.
+                let weak_sink = Arc::downgrade(&sink);
+                let _ = outputs.metrics_tx.send(Some(Arc::new(move || {
+                    weak_sink.upgrade().and_then(|s| s.metrics_snapshot())
+                })));
+                let (connector, alive_rx) = warren_net::spawn_over_sink(sink, config);
                 // Arm the in-tunnel egress probe for this epoch: it rides the same
                 // netstack UDP path and, on a debounced dead verdict (the exit ACKs
                 // keep-alives but forwards nothing), fires `egress_dead` so the
@@ -737,6 +814,7 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                     }
                 };
                 let _ = outputs.forwarder_tx.send(None);
+                let _ = outputs.metrics_tx.send(None);
                 if let Some(advisory) = drained {
                     // Rotate the failover cursor PAST the draining exit so the
                     // reconnect lands on a different one (no-op for single-exit).
