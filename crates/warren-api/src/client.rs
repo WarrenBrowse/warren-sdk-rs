@@ -906,7 +906,7 @@ mod tests {
         let c = client(MockTransport::new(200, r#"{"expires_at":123}"#));
         let req = RegisterAccountRequest {
             pubkey_ss58: a_ss58(),
-            voucher_secret: "voucher".to_owned(),
+            voucher_secret: Some("voucher".to_owned()),
             referral_code: None,
         };
         let resp = c.register(&req).await.expect("ok");

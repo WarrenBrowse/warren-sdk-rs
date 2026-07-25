@@ -598,6 +598,12 @@ impl MultihopClientTunnel {
             Ok(Some(WarrenControlMessage::Rejected)) => {
                 return Err(MultihopError::Setup(SetupError::Rejected));
             }
+            // Kept distinct from `Rejected`: a suspended account must surface a
+            // suspension rather than a renew prompt, which is the whole reason
+            // the engine has a separate wire variant for it.
+            Ok(Some(WarrenControlMessage::RejectedBanned)) => {
+                return Err(MultihopError::Setup(SetupError::Banned));
+            }
             Ok(Some(WarrenControlMessage::IpExhausted)) => {
                 return Err(MultihopError::Setup(SetupError::IpExhausted));
             }

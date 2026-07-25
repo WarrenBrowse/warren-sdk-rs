@@ -720,7 +720,7 @@ impl WarrenFfiClient {
         let req = RegisterAccountRequest {
             pubkey_ss58: PubkeySs58::try_from(self.inner.api().address())
                 .expect("client identity address is a valid Warren SS58 by construction"),
-            voucher_secret,
+            voucher_secret: Some(voucher_secret),
             referral_code: None,
         };
         let resp = self
