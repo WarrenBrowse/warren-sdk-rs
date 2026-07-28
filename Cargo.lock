@@ -3724,6 +3724,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
  "warren-api",
  "warren-contract",
  "warren-daita",

@@ -110,6 +110,11 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 # Errors. thiserror for libraries; never a stringly-typed error.
 thiserror = "2"
 
+# Observability. The SDK emits tracing events at its own migration decision
+# points (escape refused, rebind failed, epoch ended) and never installs a
+# subscriber: where the events go is the consumer's choice.
+tracing = "0.1"
+
 # Serialization. serde for public DTOs and golden-vector replay; postcard is
 # the exact wire codec warren-core uses for the handshake frames, so the SDK
 # must use it too to stay byte-compatible.

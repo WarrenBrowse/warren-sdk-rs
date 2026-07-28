@@ -35,6 +35,9 @@ warrenguard-route-split = { workspace = true, optional = true }
 # system-VPN, replacing the deleted in-tree plan/apply killswitch (doc-94 B1).
 warrenguard-killswitch-os = { workspace = true, optional = true }
 thiserror = { workspace = true }
+# Emit the SDK-side migration watchdog decisions (escape refused, rebind
+# failed, epoch ended); the engine loop traces the nominal chain itself.
+tracing = { workspace = true }
 # Needed to bind the local SOCKS5 listener and spawn the proxy datapath task.
 tokio = { workspace = true }
 # Parse the am.i.warren egress-oracle verdict (control-plane leak self-check).

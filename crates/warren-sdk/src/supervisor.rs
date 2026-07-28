@@ -701,7 +701,15 @@ impl warren_transport::migration_watchdog::MigrationIo for EpochMigrationIo<'_> 
         // straight away instead of spending the probe window on a datapath
         // that has no QUIC path to move. That is the pre-watchdog behavior,
         // which is the fallback this whole binding is built to preserve.
-        self.session().is_some_and(|s| !s.is_over_carrier())
+        match self.session() {
+            // Distinguished from the over-carrier case the engine reports: a
+            // gone session is not a TCP-carried one.
+            None => {
+                tracing::debug!("no live session to migrate; the cycle redials");
+                false
+            }
+            Some(s) => !s.is_over_carrier(),
+        }
     }
 
     async fn ensure_route_escape(&mut self) -> bool {
@@ -717,7 +725,18 @@ impl warren_transport::migration_watchdog::MigrationIo for EpochMigrationIo<'_> 
             // destination-keyed route is the only thing left keeping the
             // carrier off the tunnel it carries. Install it BEFORE the rebind
             // and report whether it took: no escape, no rebind.
-            crate::tun_setup::add_carrier_host_route_macos(exit_ip, &gateway).is_ok()
+            match crate::tun_setup::add_carrier_host_route_macos(exit_ip, &gateway) {
+                Ok(()) => true,
+                Err(error) => {
+                    // The install error is an errno; the route's addresses
+                    // never enter the trace.
+                    tracing::info!(
+                        %error,
+                        "carrier escape install failed; refusing the rebind, the cycle redials"
+                    );
+                    false
+                }
+            }
         }
         #[cfg(not(all(target_os = "macos", feature = "experimental-tun")))]
         {
@@ -726,6 +745,10 @@ impl warren_transport::migration_watchdog::MigrationIo for EpochMigrationIo<'_> 
             // A policy asking for one elsewhere cannot be honoured, and
             // fail-closed means refusing the rebind (the cycle redials) rather
             // than handing quinn a socket with no escape at all.
+            tracing::info!(
+                "no destination-keyed escape on this datapath; refusing the rebind, the cycle \
+                 redials"
+            );
             false
         }
     }
@@ -734,8 +757,13 @@ impl warren_transport::migration_watchdog::MigrationIo for EpochMigrationIo<'_> 
         if let Some(session) = self.session() {
             // A failed rebind leaves the session on its current socket, so the
             // probe window simply proves the old path dead and the cycle
-            // redials. Nothing to do but let it run.
-            let _ = session.rebind_wildcard(self.policy.rebind_policy());
+            // redials. The engine logs "rebound socket" unconditionally, so
+            // without this line a failed rebind is indistinguishable from a
+            // successful one. The error is an errno or the carrier kind,
+            // never an address.
+            if let Err(error) = session.rebind_wildcard(self.policy.rebind_policy()) {
+                tracing::info!(%error, "endpoint rebind failed; the session stays on its socket");
+            }
         }
     }
 
@@ -765,14 +793,22 @@ impl warren_transport::migration_watchdog::MigrationIo for EpochMigrationIo<'_> 
             }
             None => false,
         };
+        // The engine logs WHY it forced the reconnect at each call site; this
+        // line records that the SDK acted on the verdict and ended the epoch.
+        tracing::debug!(
+            had_session,
+            "watchdog verdict applied: epoch ends, supervisor redials"
+        );
         self.rebuild.notify_one();
         had_session
     }
 
-    fn escalate(&mut self, _msg: String) {
-        // The SDK ships no log sink (no-log discipline), so the reaction IS the
-        // report: the epoch ends, the supervisor republishes `Reconnecting`,
-        // and the host sees it on the state watch.
+    fn escalate(&mut self, msg: String) {
+        // The engine's escalation reasons are static, address-free strings.
+        // Beyond the trace, the reaction is the report: the epoch ends, the
+        // supervisor republishes `Reconnecting`, and the host sees it on the
+        // state watch.
+        tracing::warn!(reason = %msg, "watchdog escalated; ending the epoch");
         self.rebuild.notify_one();
     }
 }
@@ -1221,6 +1257,86 @@ pub(crate) async fn establish_multihop(
         gateway,
         ipv6,
     })
+}
+
+// The refusal branch under test only compiles where the platform carries no
+// destination-keyed escape; the macOS TUN build takes the install branch
+// against the real `route` binary, which a unit test cannot drive.
+#[cfg(all(test, not(all(target_os = "macos", feature = "experimental-tun"))))]
+mod migration_io_tests {
+    use super::*;
+    use warren_transport::migration_watchdog::MigrationIo;
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<String>>);
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            self.0.lock().expect("capture lock").clone()
+        }
+    }
+
+    impl tracing::Subscriber for LogCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Line<'a>(&'a mut String);
+            impl tracing::field::Visit for Line<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                }
+            }
+            let mut line = String::new();
+            event.record(&mut Line(&mut line));
+            let mut buf = self.0.lock().expect("capture lock");
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn refused_escape_emits_one_address_free_trace() {
+        let exit_ip: std::net::IpAddr = "192.0.2.77".parse().expect("test-net IP");
+        let gateway = "198.51.100.1".to_string();
+        let mut io = EpochMigrationIo {
+            watch: None,
+            session: std::sync::Weak::new(),
+            rebuild: Arc::new(tokio::sync::Notify::new()),
+            policy: MigrationPolicy {
+                bypass: None,
+                carrier_host_route: Some((exit_ip, gateway.clone())),
+            },
+        };
+        let capture = LogCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let allowed = io.ensure_route_escape().await;
+        let logs = capture.contents();
+        assert!(
+            !allowed,
+            "no escape mechanism here: the rebind must be refused"
+        );
+        assert!(
+            !logs.is_empty(),
+            "the refusal must be observable: one trace line expected"
+        );
+        assert!(
+            !logs.contains("192.0.2.77") && !logs.contains(&gateway),
+            "a migration trace must never carry the exit IP or the gateway: {logs}"
+        );
+    }
 }
 
 #[cfg(test)]
