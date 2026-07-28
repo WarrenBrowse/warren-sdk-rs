@@ -591,16 +591,20 @@ pub(crate) struct MigrationPolicy {
     /// `None` when the host carries the escape by route instead.
     pub(crate) bypass: Option<warren_transport::SocketBypass>,
     /// The `<exit>/32` escape to (re)install before a rebind, as the exit IP
-    /// and the PHYSICAL gateway to pin it to (macOS privileged TUN); `None`
-    /// when nothing captures the host's routes.
+    /// and the PHYSICAL gateway resolved at connect time (macOS privileged
+    /// TUN); `None` when nothing captures the host's routes.
     ///
-    /// The gateway is the one resolved at dial time, deliberately: once the
-    /// split capture is installed, `route -n get default` names the tunnel
-    /// (the engine says as much on
-    /// `warrenguard_route_split::default_route_split_macos::parse_scutil_router`),
-    /// so re-resolving it there would risk pinning the carrier's escape to the
-    /// tunnel it carries. A gateway that no longer exists makes the install
-    /// fail, which refuses the rebind and redials: fail-closed, never nested.
+    /// The connect-time gateway is the fallback, not a frozen pin:
+    /// `ensure_route_escape` re-resolves the current physical default through
+    /// the engine's tunnel-resistant discovery
+    /// (`warrenguard_route_split::default_route_split_macos::discover_physical_default`),
+    /// which refuses a tunnel source rather than guessing and falls back to
+    /// `scutil` when the split capture shadows `route get default`, so
+    /// re-resolving after the capture is safe and a genuine interface
+    /// hand-off migrates. When the re-resolution fails, this value still
+    /// recovers a flap on the same interface; when neither yields an
+    /// installable route the rebind is refused and the cycle redials:
+    /// fail-closed, never nested.
     pub(crate) carrier_host_route: Option<(std::net::IpAddr, String)>,
 }
 
@@ -657,6 +661,15 @@ impl EpochMigrationIo<'_> {
 /// (armeabi-v7a, x86), which the compiler rejects outright.
 fn sample_identity(session_addr: usize, port: u16) -> usize {
     session_addr ^ usize::from(port).rotate_left(17)
+}
+
+/// Which gateway the migration escape pins to, in preference order: the
+/// freshly re-resolved physical default when the engine discovery could name
+/// one, else the connect-time value (which still recovers a flap on the same
+/// interface), else nothing installable and the rebind is refused.
+#[cfg(any(test, all(target_os = "macos", feature = "experimental-tun")))]
+fn escape_gateway(fresh: Option<String>, connect_time: Option<String>) -> Option<String> {
+    fresh.or(connect_time)
 }
 
 impl warren_transport::migration_watchdog::MigrationIo for EpochMigrationIo<'_> {
@@ -725,14 +738,45 @@ impl warren_transport::migration_watchdog::MigrationIo for EpochMigrationIo<'_> 
             // destination-keyed route is the only thing left keeping the
             // carrier off the tunnel it carries. Install it BEFORE the rebind
             // and report whether it took: no escape, no rebind.
-            match crate::tun_setup::add_carrier_host_route_macos(exit_ip, &gateway) {
-                Ok(()) => true,
-                Err(error) => {
-                    // The install error is an errno; the route's addresses
-                    // never enter the trace.
+            //
+            // Re-resolve the physical default first: the engine discovery
+            // refuses a tunnel source rather than guessing (and falls back to
+            // scutil when the split capture shadows `route get default`), so
+            // a genuine interface hand-off pins the escape to the CURRENT
+            // gateway instead of the one the host had at connect time.
+            let fresh =
+                match warrenguard_route_split::default_route_split_macos::discover_physical_default(
+                )
+                .await
+                {
+                    Ok((_iface, gateway)) => gateway,
+                    Err(_) => {
+                        // The discovery's anyhow chain can carry raw `route`
+                        // output (addresses), so it is never rendered.
+                        tracing::debug!(
+                            "physical-default re-resolution failed; falling back to the connect-time \
+                         gateway"
+                        );
+                        None
+                    }
+                };
+            match escape_gateway(fresh, Some(gateway)) {
+                Some(gw) => match crate::tun_setup::add_carrier_host_route_macos(exit_ip, &gw) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        // The install error is an errno; the route's addresses
+                        // never enter the trace.
+                        tracing::info!(
+                            %error,
+                            "carrier escape install failed; refusing the rebind, the cycle redials"
+                        );
+                        false
+                    }
+                },
+                None => {
                     tracing::info!(
-                        %error,
-                        "carrier escape install failed; refusing the rebind, the cycle redials"
+                        "no gateway to pin the carrier escape to; refusing the rebind, the cycle \
+                         redials"
                     );
                     false
                 }
@@ -1350,6 +1394,38 @@ mod sample_identity_tests {
         // the ephemeral port.
         let addr = 0x7f00_beef_usize;
         assert_ne!(sample_identity(addr, 443), sample_identity(addr, 8443));
+    }
+}
+
+#[cfg(test)]
+mod escape_gateway_tests {
+    use super::escape_gateway;
+
+    #[test]
+    fn a_re_resolved_gateway_wins() {
+        assert_eq!(
+            escape_gateway(Some("gw-fresh".into()), Some("gw-connect".into())),
+            Some("gw-fresh".into()),
+            "a genuine interface hand-off must pin the escape to the current gateway"
+        );
+    }
+
+    #[test]
+    fn a_failed_re_resolution_falls_back_to_the_connect_time_gateway() {
+        assert_eq!(
+            escape_gateway(None, Some("gw-connect".into())),
+            Some("gw-connect".into()),
+            "the connect-time value still recovers a flap on the same interface"
+        );
+    }
+
+    #[test]
+    fn no_gateway_at_all_refuses_the_escape() {
+        assert_eq!(
+            escape_gateway(None, None),
+            None,
+            "nothing installable must refuse the rebind, never guess"
+        );
     }
 }
 

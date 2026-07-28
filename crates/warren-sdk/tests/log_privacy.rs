@@ -126,6 +126,34 @@ fn log_call_args(body: &str) -> Vec<String> {
     out
 }
 
+/// Blanks the CONTENT of string literals (quotes kept), so the in-log-args
+/// pass only matches interpolated identifiers: a word inside a static message
+/// leaks no value. Format captures inside literals (`{gateway}`) stay covered
+/// by the global-substring pass, which runs on the raw text.
+fn strip_string_literals(args: &str) -> String {
+    let mut out = String::with_capacity(args.len());
+    let mut in_str = false;
+    let mut escaped = false;
+    for c in args.chars() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+                out.push(c);
+            }
+        } else {
+            if c == '"' {
+                in_str = true;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn strip_line_comments(body: &str) -> String {
     body.lines()
         .map(|l| match l.find("//") {
@@ -150,8 +178,9 @@ fn violations_in(rel: &str, body: &str) -> Vec<String> {
     }
 
     for args in log_call_args(&code) {
+        let interpolated = strip_string_literals(&args);
         for token in FORBIDDEN_IN_LOG_ARGS {
-            if args.contains(token) {
+            if interpolated.contains(token) {
                 out.push(format!(
                     "{rel}: tracing macro interpolates {token:?} (leaks the user's network \
                      or identity).\n      {}",
@@ -236,6 +265,17 @@ fn scanner_ignores_errno_display_and_booleans() {
     assert!(
         violations_in("t.rs", benign).is_empty(),
         "an errno Display and a boolean must not be flagged"
+    );
+}
+
+#[test]
+fn scanner_ignores_the_word_gateway_inside_a_static_message() {
+    // A word in a static literal leaks no value; only an interpolated
+    // identifier does.
+    let benign = r#"tracing::debug!("falling back to the connect-time gateway");"#;
+    assert!(
+        violations_in("t.rs", benign).is_empty(),
+        "a static message naming the concept must not be flagged"
     );
 }
 

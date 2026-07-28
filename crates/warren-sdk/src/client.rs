@@ -936,10 +936,11 @@ impl<T: HttpTransport> WarrenClient<T> {
         #[cfg(target_os = "macos")]
         let migration_policy = crate::supervisor::MigrationPolicy {
             // The carrier is deliberately left unbound on macOS, so its escape
-            // is the `<exit>/32` host route. It is pinned to the gateway
-            // resolved ABOVE, before the split capture made `route get default`
-            // name the tunnel: re-resolving it after the capture would risk
-            // pinning the carrier's escape to the tunnel it carries.
+            // is the `<exit>/32` host route. The gateway resolved ABOVE is the
+            // migration-time fallback: `ensure_route_escape` re-resolves the
+            // current physical default through the engine's tunnel-resistant
+            // discovery first, so a genuine interface hand-off migrates
+            // instead of failing on a gateway that no longer exists.
             bypass: None,
             carrier_host_route: Some((exit_ip, phys_gateway.clone())),
         };
