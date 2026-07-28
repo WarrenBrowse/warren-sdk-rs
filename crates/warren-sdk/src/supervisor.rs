@@ -648,6 +648,17 @@ impl EpochMigrationIo<'_> {
     }
 }
 
+/// Sample identity for the watchdog's RX progress probe: the session's `Arc`
+/// address with the local port mixed in, because the allocator can reuse a
+/// freed `Arc` address for the very next session (ABA) while the wildcard
+/// bind's ephemeral port cannot within any realistic window. The port is
+/// rotated in, not shifted: a shift wide enough to clear a 64-bit pointer's
+/// low bits overflows `usize` on the 32-bit ABIs the Dart SDK builds
+/// (armeabi-v7a, x86), which the compiler rejects outright.
+fn sample_identity(session_addr: usize, port: u16) -> usize {
+    session_addr ^ usize::from(port).rotate_left(17)
+}
+
 impl warren_transport::migration_watchdog::MigrationIo for EpochMigrationIo<'_> {
     async fn next_route_event(&mut self) -> bool {
         match self.watch.as_deref_mut() {
@@ -736,12 +747,9 @@ impl warren_transport::migration_watchdog::MigrationIo for EpochMigrationIo<'_> 
 
     fn rx_sample(&mut self) -> Option<warren_transport::migration_watchdog::RxSample> {
         let session = self.session()?;
-        // Mix the local port into the identity: the allocator can reuse a freed
-        // `Arc` address for the very next session (ABA), the wildcard bind's
-        // ephemeral port cannot within any realistic window.
         let port = session.local_addr().map(|a| a.port()).unwrap_or(0);
         Some(warren_transport::migration_watchdog::RxSample {
-            id: (Arc::as_ptr(&session) as usize) ^ (usize::from(port) << 47),
+            id: sample_identity(Arc::as_ptr(&session) as usize, port),
             rx_datagrams: session.connection().stats().udp_rx.datagrams,
         })
     }
@@ -1213,6 +1221,20 @@ pub(crate) async fn establish_multihop(
         gateway,
         ipv6,
     })
+}
+
+#[cfg(test)]
+mod sample_identity_tests {
+    use super::sample_identity;
+
+    #[test]
+    fn distinct_ports_distinguish_a_reused_arc_address() {
+        // ABA guard: a freed `Arc` address reused by the next session must not
+        // alias the old sample identity, because the fresh wildcard bind moved
+        // the ephemeral port.
+        let addr = 0x7f00_beef_usize;
+        assert_ne!(sample_identity(addr, 443), sample_identity(addr, 8443));
+    }
 }
 
 #[cfg(test)]
