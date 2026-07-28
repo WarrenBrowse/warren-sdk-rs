@@ -6,6 +6,8 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
@@ -202,85 +204,7 @@ pub async fn spawn_fake_multihop_exit(exit_key: SigningKey) -> (SocketAddr, Mult
             .expect("incoming")
             .await
             .expect("conn");
-        let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
-        let request_bytes = recv.read_to_end(65536).await.expect("read setup request");
-        let request = WarrenMultihopFrame::decode(&request_bytes).expect("decode request frame");
-        assert_eq!(
-            request.exit_id.as_bytes(),
-            &exit_id,
-            "setup frame exit_id must match"
-        );
-
-        let encapped =
-            <ExitKem as KemTrait>::EncappedKey::from_bytes(&request.encapsulated_key).unwrap();
-        let ctx = setup_receiver::<ExitAead, ExitKdf, ExitKem>(
-            &OpModeR::Base,
-            &recipient_priv,
-            &encapped,
-            WARREN_HPKE_INFO_V1,
-        )
-        .expect("setup_receiver");
-
-        let plaintext = exit_open(&ctx, &exit_id, &request).expect("open setup request");
-        match try_decode_control(&plaintext)
-            .expect("decode control")
-            .expect("control present")
-        {
-            WarrenControlMessage::IpRequest { .. } => {}
-            other => panic!("expected an IpRequest, got {other:?}"),
-        }
-
-        let assign = WarrenControlMessage::IpAssign {
-            ipv4: [10, 66, 0, 2],
-            prefix_len: 24,
-            gateway_ipv4: [10, 66, 0, 1],
-            ipv6: None,
-            prefix_len_v6: 0,
-            gateway_ipv6: None,
-            daita_spec: None,
-        };
-        let reply_plaintext = encode_control(&assign).expect("encode IpAssign");
-        // Reverse seq starts at 0 for the setup reply; data replies use 1, 2, ...
-        let reply_frame = exit_seal(
-            &ctx,
-            &exit_id,
-            request.encapsulated_key,
-            &reply_plaintext,
-            request.epoch,
-            0,
-        );
-        send.write_all(&reply_frame.encode().expect("encode reply"))
-            .await
-            .expect("write reply");
-        send.finish().expect("finish reply");
-
-        let mut reverse_seq: u64 = 1;
-        while let Ok(dg) = conn.read_datagram().await {
-            let Ok(frame) = WarrenMultihopFrame::decode(&dg) else {
-                continue;
-            };
-            if frame.exit_id.as_bytes() != &exit_id {
-                continue;
-            }
-            let Some(ip_packet) = exit_open(&ctx, &exit_id, &frame) else {
-                continue;
-            };
-            let echo = exit_seal(
-                &ctx,
-                &exit_id,
-                request.encapsulated_key,
-                &ip_packet,
-                frame.epoch,
-                reverse_seq,
-            );
-            reverse_seq += 1;
-            if conn
-                .send_datagram(echo.encode().expect("encode echo").into())
-                .is_err()
-            {
-                break;
-            }
-        }
+        serve_echo_connection(conn, &recipient_priv, exit_id, None).await;
         drop(endpoint);
     });
 
@@ -291,6 +215,193 @@ pub async fn spawn_fake_multihop_exit(exit_key: SigningKey) -> (SocketAddr, Mult
             x25519_pubkey,
             exit_id,
         },
+    )
+}
+
+/// Serves ONE accepted multihop connection: reads the HPKE-sealed setup frame
+/// (inner `IpRequest`), replies with a sealed `IpAssign`, then echoes every
+/// sealed data datagram back.
+///
+/// `seen_addrs`, when wired, records the client source address quinn currently
+/// attributes to this connection on each datagram, so a test can observe a QUIC
+/// path MIGRATION (the address moves under one connection) as something
+/// distinct from a redial (a second accept).
+///
+/// # Panics
+///
+/// Panics on any handshake failure (test helper).
+async fn serve_echo_connection(
+    conn: quinn::Connection,
+    recipient_priv: &<ExitKem as KemTrait>::PrivateKey,
+    exit_id: [u8; EXIT_ID_LEN],
+    seen_addrs: Option<Arc<std::sync::Mutex<Vec<SocketAddr>>>>,
+) {
+    let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
+    let request_bytes = recv.read_to_end(65536).await.expect("read setup request");
+    let request = WarrenMultihopFrame::decode(&request_bytes).expect("decode request frame");
+    assert_eq!(
+        request.exit_id.as_bytes(),
+        &exit_id,
+        "setup frame exit_id must match"
+    );
+
+    let encapped =
+        <ExitKem as KemTrait>::EncappedKey::from_bytes(&request.encapsulated_key).unwrap();
+    let ctx = setup_receiver::<ExitAead, ExitKdf, ExitKem>(
+        &OpModeR::Base,
+        recipient_priv,
+        &encapped,
+        WARREN_HPKE_INFO_V1,
+    )
+    .expect("setup_receiver");
+
+    let plaintext = exit_open(&ctx, &exit_id, &request).expect("open setup request");
+    match try_decode_control(&plaintext)
+        .expect("decode control")
+        .expect("control present")
+    {
+        WarrenControlMessage::IpRequest { .. } => {}
+        other => panic!("expected an IpRequest, got {other:?}"),
+    }
+
+    let assign = WarrenControlMessage::IpAssign {
+        ipv4: [10, 66, 0, 2],
+        prefix_len: 24,
+        gateway_ipv4: [10, 66, 0, 1],
+        ipv6: None,
+        prefix_len_v6: 0,
+        gateway_ipv6: None,
+        daita_spec: None,
+    };
+    let reply_plaintext = encode_control(&assign).expect("encode IpAssign");
+    // Reverse seq starts at 0 for the setup reply; data replies use 1, 2, ...
+    let reply_frame = exit_seal(
+        &ctx,
+        &exit_id,
+        request.encapsulated_key,
+        &reply_plaintext,
+        request.epoch,
+        0,
+    );
+    send.write_all(&reply_frame.encode().expect("encode reply"))
+        .await
+        .expect("write reply");
+    send.finish().expect("finish reply");
+
+    let mut reverse_seq: u64 = 1;
+    while let Ok(dg) = conn.read_datagram().await {
+        if let Some(seen) = seen_addrs.as_ref() {
+            let remote = conn.remote_address();
+            let mut seen = seen.lock().expect("seen-address lock");
+            if seen.last() != Some(&remote) {
+                seen.push(remote);
+            }
+        }
+        let Ok(frame) = WarrenMultihopFrame::decode(&dg) else {
+            continue;
+        };
+        if frame.exit_id.as_bytes() != &exit_id {
+            continue;
+        }
+        let Some(ip_packet) = exit_open(&ctx, &exit_id, &frame) else {
+            continue;
+        };
+        let echo = exit_seal(
+            &ctx,
+            &exit_id,
+            request.encapsulated_key,
+            &ip_packet,
+            frame.epoch,
+            reverse_seq,
+        );
+        reverse_seq += 1;
+        if conn
+            .send_datagram(echo.encode().expect("encode echo").into())
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+/// What a [`spawn_migratable_multihop_exit`] exit observed, shared with the
+/// test that spawned it.
+#[derive(Clone, Default)]
+pub struct ExitObserver {
+    accepts: Arc<AtomicUsize>,
+    client_addrs: Arc<std::sync::Mutex<Vec<SocketAddr>>>,
+}
+
+impl ExitObserver {
+    /// How many QUIC handshakes the exit has accepted. A client that migrated
+    /// its path shows ONE; a client that redialed shows one per dial.
+    #[must_use]
+    pub fn accepts(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
+    }
+
+    /// The successive client source addresses seen on the accepted
+    /// connection(s), in order and without immediate repeats. Two entries with
+    /// a single accept is a QUIC path migration.
+    #[must_use]
+    pub fn client_addrs(&self) -> Vec<SocketAddr> {
+        self.client_addrs.lock().expect("seen-address lock").clone()
+    }
+}
+
+/// Spawns a loopback multihop exit that serves EVERY incoming connection (not
+/// only the first, unlike [`spawn_fake_multihop_exit`]) and reports what it saw
+/// through an [`ExitObserver`]: accept count and client source addresses.
+///
+/// `migration` mirrors the relay's `quinn::ServerConfig::migration`. With
+/// `false`, quinn drops datagrams arriving from a moved client, which is how a
+/// test models a migration that dead-ends and must fall back to a redial.
+///
+/// # Panics
+///
+/// Panics on any setup failure (test helper).
+pub async fn spawn_migratable_multihop_exit(
+    exit_key: SigningKey,
+    migration: bool,
+) -> (SocketAddr, MultihopExitKeys, ExitObserver) {
+    let ed25519_pubkey = exit_key.verifying_key().to_bytes();
+    let (recipient_priv, recipient_pub) =
+        ExitKem::gen_keypair(&mut rand_core::UnwrapErr(rand_core::OsRng));
+    let x25519_pubkey: [u8; 32] = recipient_pub.to_bytes().into();
+    let exit_id = [0x11u8; EXIT_ID_LEN];
+
+    let mut cfg = make_server_config(&exit_key, default_crypto_provider(), &[ALPN_H3])
+        .expect("server config");
+    cfg.migration(migration);
+    let endpoint = quinn::Endpoint::server(cfg, "127.0.0.1:0".parse().unwrap())
+        .expect("server endpoint binds");
+    let addr = endpoint.local_addr().expect("local addr");
+
+    let observer = ExitObserver::default();
+    let spawned = observer.clone();
+    tokio::spawn(async move {
+        let recipient_priv = Arc::new(recipient_priv);
+        while let Some(incoming) = endpoint.accept().await {
+            let Ok(conn) = incoming.await else {
+                continue;
+            };
+            spawned.accepts.fetch_add(1, Ordering::SeqCst);
+            let recipient_priv = Arc::clone(&recipient_priv);
+            let addrs = Arc::clone(&spawned.client_addrs);
+            tokio::spawn(async move {
+                serve_echo_connection(conn, &recipient_priv, exit_id, Some(addrs)).await;
+            });
+        }
+    });
+
+    (
+        addr,
+        MultihopExitKeys {
+            ed25519_pubkey,
+            x25519_pubkey,
+            exit_id,
+        },
+        observer,
     )
 }
 

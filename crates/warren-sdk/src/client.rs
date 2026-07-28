@@ -1255,9 +1255,14 @@ impl<T: HttpTransport> WarrenClient<T> {
                     // migrates unconditionally.
                     pre_migrate: None,
                     // Network-change migration: a moved default path
-                    // (handover, renumbering) redials immediately instead of
-                    // riding the dead session into idle timeout.
+                    // (handover, renumbering) migrates the live QUIC session
+                    // and, failing that, redials immediately instead of riding
+                    // the dead session into idle timeout.
                     network_watch: Some(crate::supervisor::NetworkWatch::system()),
+                    // The userland proxy captures no host route, so the fresh
+                    // migration socket needs no escape: it is an ordinary
+                    // application socket following the system routing table.
+                    migration: crate::supervisor::MigrationPolicy::default(),
                 },
                 connect,
                 on_drain,

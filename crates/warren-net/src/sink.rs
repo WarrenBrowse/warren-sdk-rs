@@ -78,6 +78,18 @@ pub trait PacketSink: Send + Sync {
         None
     }
 
+    /// The live multihop session behind this datapath, when it has one. The
+    /// default returns `None` (a sink with no sealed session has nothing to
+    /// migrate); the multi-hop sink overrides it.
+    ///
+    /// This is what lets a supervisor hand the migration watchdog the QUIC
+    /// path it must rebind and probe on a network change. Hold the result for
+    /// no longer than the epoch that published it: it is a strong reference, so
+    /// keeping one alive keeps the QUIC connection alive with it.
+    fn multihop_session(&self) -> Option<Arc<MultihopSession>> {
+        None
+    }
+
     /// Sends a batch of packets. The default forwards them one by one; a
     /// GSO-aware implementation can override this to coalesce the syscall.
     ///
@@ -256,6 +268,10 @@ impl PacketSink for MultihopPacketSink {
 
     fn metrics_snapshot(&self) -> Option<warren_transport::MultihopMetricsSnapshot> {
         Some(self.session.metrics_snapshot())
+    }
+
+    fn multihop_session(&self) -> Option<Arc<MultihopSession>> {
+        Some(Arc::clone(&self.session))
     }
 }
 

@@ -129,6 +129,7 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
                 crate::supervisor::EpochGuards {
                     pre_migrate: None,
                     network_watch: None,
+                    ..Default::default()
                 },
                 move || {
                     let kill_tx = kill_tx.clone();
@@ -215,6 +216,7 @@ async fn network_path_change_redials_immediately_without_rotating() {
                         probe: Box::new(move || *probe_source.lock().unwrap()),
                         interval: std::time::Duration::from_millis(20),
                     }),
+                    ..Default::default()
                 },
                 move || {
                     let kill_tx = kill_tx.clone();
@@ -266,6 +268,202 @@ async fn network_path_change_redials_immediately_without_rotating() {
     task.abort();
 }
 
+/// A supervised epoch over a REAL loopback multihop session, driven by a
+/// scripted preferred-path probe. Returns the running supervisor task, the
+/// scripted source cell the test flips to simulate a handover, how many times
+/// the datapath was (re)established, and the state watch.
+///
+/// Shared by the two network-change datapath tests so they differ only in the
+/// exit's migration posture.
+struct MigrationHarness {
+    task: tokio::task::JoinHandle<()>,
+    source: Arc<std::sync::Mutex<Option<std::net::IpAddr>>>,
+    connects: Arc<std::sync::atomic::AtomicUsize>,
+    state_rx: tokio::sync::watch::Receiver<ConnectionState>,
+}
+
+async fn spawn_migration_harness(exit: VerifiedExit) -> MigrationHarness {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (identity, _mnemonic) = WarrenIdentity::generate();
+    let signing = identity.signing_key();
+    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+    let connects = Arc::new(AtomicUsize::new(0));
+    let source = Arc::new(std::sync::Mutex::new(Some(
+        "192.0.2.10".parse::<std::net::IpAddr>().unwrap(),
+    )));
+    let rtt_cache = Arc::new(std::sync::Mutex::new(warren_discovery::RttCache::new()));
+
+    let task = {
+        let connects = Arc::clone(&connects);
+        let probe_source = Arc::clone(&source);
+        tokio::spawn(async move {
+            supervise_proxy(
+                socks_listener,
+                None,
+                None,
+                crate::supervisor::SupervisorOutputs {
+                    // The fake exit runs no resolver, so the in-tunnel egress
+                    // probe would report a dead path it cannot answer for.
+                    egress_probe: false,
+                    state_tx,
+                    forwarder_tx: tokio::sync::watch::channel(None).0,
+                    metrics_tx: tokio::sync::watch::channel(None).0,
+                    migration_tx: tokio::sync::watch::channel(None).0,
+                    fatal_tx: tokio::sync::watch::channel(None).0,
+                },
+                crate::supervisor::EpochGuards {
+                    pre_migrate: None,
+                    network_watch: Some(crate::supervisor::NetworkWatch {
+                        probe: Box::new(move || *probe_source.lock().unwrap()),
+                        interval: std::time::Duration::from_millis(50),
+                    }),
+                    ..Default::default()
+                },
+                move || {
+                    let signing = signing.clone();
+                    let exit = exit.clone();
+                    let rtt_cache = Arc::clone(&rtt_cache);
+                    let connects = Arc::clone(&connects);
+                    async move {
+                        let est = crate::supervisor::establish_multihop(
+                            signing, &exit, false, false, None, rtt_cache,
+                        )
+                        .await?;
+                        connects.fetch_add(1, Ordering::SeqCst);
+                        // One datagram right after the handshake so the exit
+                        // records the source address THIS epoch dialed from:
+                        // the migration proof is that the same connection later
+                        // arrives from a different one.
+                        let _ = est.sink.session().send_cover_traffic(16);
+                        Ok::<_, SdkError>(est)
+                    }
+                },
+                || {},
+            )
+            .await;
+        })
+    };
+
+    MigrationHarness {
+        task,
+        source,
+        connects,
+        state_rx,
+    }
+}
+
+/// Waits (up to `budget`) for the supervised datapath to report `Connected`.
+async fn await_connected(
+    state_rx: &mut tokio::sync::watch::Receiver<ConnectionState>,
+    budget: std::time::Duration,
+) {
+    tokio::time::timeout(budget, async {
+        while *state_rx.borrow_and_update() != ConnectionState::Connected {
+            if state_rx.changed().await.is_err() {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the supervised datapath must connect to the loopback exit");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn network_change_migrates_before_it_redials() {
+    use std::sync::atomic::Ordering;
+
+    // A moved default path must MIGRATE the live QUIC session (rebind onto a
+    // fresh socket, let the relay revalidate the path) instead of ending the
+    // epoch: the exit keeps ONE connection and sees it arrive from a new source
+    // address, with no second handshake. The watchdog only concludes "migrated"
+    // once the tunnel is receiving again, so a single establish after the
+    // change is also the proof that the path is alive.
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let (addr, keys, observed) =
+        warren_test_support::spawn_migratable_multihop_exit(exit_key, true).await;
+    let mut harness = spawn_migration_harness(fake_verified_exit(addr, &keys)).await;
+
+    await_connected(&mut harness.state_rx, std::time::Duration::from_secs(10)).await;
+    // Let the epoch's watcher baseline on the network it dialed from.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    *harness.source.lock().unwrap() = Some("198.51.100.20".parse().unwrap());
+    // Settle window + the whole migration probe window + slack: past this a
+    // failed migration would already have fallen back to a redial.
+    tokio::time::sleep(
+        warren_transport::migration_watchdog::MIGRATION_TIMEOUT + std::time::Duration::from_secs(2),
+    )
+    .await;
+
+    assert_eq!(
+        observed.accepts(),
+        1,
+        "the network change must migrate the live session, not re-handshake"
+    );
+    assert_eq!(
+        harness.connects.load(Ordering::SeqCst),
+        1,
+        "a migrated path must not rebuild the datapath"
+    );
+    let addrs = observed.client_addrs();
+    assert!(
+        addrs.len() >= 2,
+        "the exit must have seen the SAME connection arrive from a new source \
+         address (a QUIC path migration), saw {addrs:?}"
+    );
+    harness.task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn network_change_falls_back_to_redial_when_migration_dies() {
+    use std::sync::atomic::Ordering;
+
+    // Same handover against an exit that REFUSES migration (quinn drops the
+    // datagrams of a moved client): the rebind dead-ends, so the watchdog must
+    // fall back to the redial that works today. Exactly two handshakes, and the
+    // second one only AFTER the migration window elapsed, which is what proves
+    // the redial is the fallback of an attempted migration rather than the
+    // reflex it used to be.
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let (addr, keys, observed) =
+        warren_test_support::spawn_migratable_multihop_exit(exit_key, false).await;
+    let mut harness = spawn_migration_harness(fake_verified_exit(addr, &keys)).await;
+
+    await_connected(&mut harness.state_rx, std::time::Duration::from_secs(10)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let moved_at = std::time::Instant::now();
+    *harness.source.lock().unwrap() = Some("198.51.100.20".parse().unwrap());
+    let mut redialed = false;
+    for _ in 0..300 {
+        if observed.accepts() >= 2 {
+            redialed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let elapsed = moved_at.elapsed();
+
+    assert!(
+        redialed,
+        "a migration that dead-ends must fall back to the redial that works today"
+    );
+    assert!(
+        elapsed >= warren_transport::migration_watchdog::MIGRATION_TIMEOUT,
+        "the redial must be the verdict of an attempted migration, not a reflex: \
+         it landed {elapsed:?} after the network change"
+    );
+    assert_eq!(
+        observed.accepts(),
+        2,
+        "exactly one recovery handshake, no reconnect storm"
+    );
+    assert_eq!(harness.connects.load(Ordering::SeqCst), 2);
+    harness.task.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
     // A policy rejection (unauthorized account) is fatal, not transient: the
@@ -298,6 +496,7 @@ async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
                 crate::supervisor::EpochGuards {
                     pre_migrate: None,
                     network_watch: None,
+                    ..Default::default()
                 },
                 move || {
                     let attempts = Arc::clone(&attempts);
@@ -381,6 +580,7 @@ async fn supervisor_reselects_on_an_exhaustion_refusal_without_going_fatal() {
                 crate::supervisor::EpochGuards {
                     pre_migrate: None,
                     network_watch: None,
+                    ..Default::default()
                 },
                 || async {
                     Err::<EstablishedTunnel<ClosableSink>, SdkError>(SdkError::Multihop(
@@ -446,6 +646,7 @@ async fn supervisor_metrics_probe_reads_the_live_epoch_and_never_outlives_it() {
             crate::supervisor::EpochGuards {
                 pre_migrate: None,
                 network_watch: None,
+                ..Default::default()
             },
             move || {
                 let kill_tx = kill_tx.clone();
@@ -534,6 +735,7 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
             crate::supervisor::EpochGuards {
                 pre_migrate: None,
                 network_watch: None,
+                ..Default::default()
             },
             move || {
                 let kill_tx = kill_tx.clone();
@@ -1106,6 +1308,7 @@ async fn supervisor_serves_both_socks_and_http_listeners() {
             crate::supervisor::EpochGuards {
                 pre_migrate: None,
                 network_watch: None,
+                ..Default::default()
             },
             move || {
                 let keep_open = Arc::clone(&keep_open);
@@ -1159,6 +1362,7 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
             crate::supervisor::EpochGuards {
                 pre_migrate: None,
                 network_watch: None,
+                ..Default::default()
             },
             move || {
                 let cursor = Arc::clone(&cursor);
@@ -1228,6 +1432,7 @@ async fn supervisor_failover_rotates_on_drain() {
             crate::supervisor::EpochGuards {
                 pre_migrate: None,
                 network_watch: None,
+                ..Default::default()
             },
             move || {
                 let cursor = Arc::clone(&cursor);
@@ -1306,6 +1511,7 @@ async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
             crate::supervisor::EpochGuards {
                 pre_migrate: None,
                 network_watch: None,
+                ..Default::default()
             },
             move || {
                 let cursor = Arc::clone(&cursor);
@@ -1387,6 +1593,7 @@ async fn supervisor_retries_past_failed_attempts_then_connects() {
                 crate::supervisor::EpochGuards {
                     pre_migrate: None,
                     network_watch: None,
+                    ..Default::default()
                 },
                 move || {
                     let attempts = Arc::clone(&attempts);
@@ -1464,6 +1671,7 @@ async fn supervisor_emits_structured_migration_events_on_drain() {
             crate::supervisor::EpochGuards {
                 pre_migrate: None,
                 network_watch: None,
+                ..Default::default()
             },
             move || {
                 let cursor = Arc::clone(&cursor);
@@ -1564,6 +1772,7 @@ async fn supervisor_gate_veto_cancels_the_migration_and_keeps_serving() {
                 crate::supervisor::EpochGuards {
                     pre_migrate: Some(Box::new(|_advisory| Box::pin(async { false }))),
                     network_watch: None,
+                    ..Default::default()
                 },
                 move || {
                     let connects = Arc::clone(&connects);
@@ -1652,6 +1861,7 @@ async fn supervisor_gate_approval_lets_the_migration_proceed() {
             crate::supervisor::EpochGuards {
                 pre_migrate: Some(Box::new(|_advisory| Box::pin(async { true }))),
                 network_watch: None,
+                ..Default::default()
             },
             move || {
                 let cursor = Arc::clone(&cursor);

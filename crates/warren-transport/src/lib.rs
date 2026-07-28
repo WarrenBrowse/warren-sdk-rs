@@ -29,7 +29,7 @@ pub use warrenguard_pump::idle_cover::{
 pub use daita_driver::{DaitaDriver, DaitaDriverHandle};
 pub use multihop::{
     Carrier, DrainAdvisory, MultihopClientTunnel, MultihopError, MultihopMetrics,
-    MultihopMetricsSnapshot, MultihopSession, PathQuality, RekeyPolicy,
+    MultihopMetricsSnapshot, MultihopSession, PathQuality, RebindError, RebindPolicy, RekeyPolicy,
 };
 // The engine setup-failure type carried by `MultihopError::Setup`, re-exported so
 // a consumer can match on / construct the policy verdict (`Rejected`,
@@ -60,6 +60,10 @@ pub use warrenguard_transport::redial_policy;
 // change watcher) is engine-owned; supervisors arm it and react with their own
 // redial machinery.
 pub use warrenguard_transport::network_monitor;
+// The migration watchdog's decision loop, timings and IO trait are engine-owned
+// (one home for every client surface); a consumer supplies only the platform
+// bindings of `MigrationIo` over its own route-event source and session.
+pub use warrenguard_transport::migration_watchdog;
 // The per-OS carrier-socket bypass value a privileged TUN datapath pins on the
 // tunnel (via `MultihopClientTunnel::with_socket_bypass`) so the SDK can name it
 // without depending on the engine crate directly.

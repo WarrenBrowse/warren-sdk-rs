@@ -60,6 +60,10 @@ use warren_wire::multihop::EXIT_ID_LEN;
 use warrenguard_transport::multihop::{
     MultiHopClient, MultiHopError as EngineMultihopError, RekeyPolicy as EngineRekeyPolicy,
 };
+// The rebind escape contract is engine-owned (the dial builds the socket, so it
+// owns how a migration socket must be escaped); re-exported so a consumer names
+// the policy without depending on the engine crate.
+pub use warrenguard_transport::multihop::{RebindError, RebindPolicy};
 
 use crate::client::{QuicDialError, dial_quic, dial_quic_webpki, effective_bind};
 use crate::tls;
@@ -1082,6 +1086,70 @@ impl MultihopSession {
         self.carrier
     }
 
+    /// The local address this session's QUIC endpoint is bound to.
+    ///
+    /// The migration watchdog mixes its port into the session identity it
+    /// samples: an `Arc` address alone can be reused by the very next session,
+    /// the wildcard bind's ephemeral port cannot.
+    ///
+    /// # Errors
+    ///
+    /// The `getsockname` error from the underlying socket.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    /// `true` when this session rides the TLS-over-TCP fallback carrier, whose
+    /// synthetic socket cannot be swapped: it can never migrate, so its only
+    /// recovery from a network change is a full redial.
+    #[must_use]
+    pub fn is_over_carrier(&self) -> bool {
+        self.inner.is_over_carrier()
+    }
+
+    /// Rebinds this session's QUIC endpoint onto a fresh wildcard socket built
+    /// the way the dial builds its own, applying `policy` before quinn can send
+    /// anything on it. The relay revalidates the new 4-tuple in about one RTT
+    /// and the connection survives, with the connection-ID rotation quinn does
+    /// on a local-address change.
+    ///
+    /// # Errors
+    ///
+    /// [`RebindError::OverCarrier`] when the session rides the TLS-over-TCP
+    /// carrier, or [`RebindError::Io`] when the bind, the escape policy or the
+    /// endpoint rebind failed. On any error the session keeps its socket.
+    pub fn rebind_wildcard(&self, policy: RebindPolicy) -> Result<(), RebindError> {
+        self.inner.rebind_wildcard(policy)
+    }
+
+    /// Closes the relay connection with the forced-reconnect application code,
+    /// so the datapath above redials from a fresh socket. Used by the migration
+    /// watchdog when a network change left the QUIC path dead and the rebind
+    /// did not recover it; the close reads as a transient loss, never as a
+    /// policy rejection.
+    pub fn force_close_for_reconnect(&self) {
+        self.inner.force_close_for_reconnect();
+    }
+
+    /// Sends one path-MTU-sized DAITA padding datagram: the migration
+    /// watchdog's in-tunnel liveness probe (any answer bumps the session's
+    /// received-datagram counter).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`send_packet`](Self::send_packet).
+    pub async fn send_daita_padding(&self) -> Result<usize, MultihopError> {
+        let sent = self
+            .inner
+            .send_daita_padding()
+            .await
+            .map_err(map_engine_err)?;
+        self.metrics
+            .cover_packets_sent
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(sent)
+    }
+
     /// Await the next inbound IP packet, opening sealed datagrams and skipping
     /// DAITA dummies, control messages, and frames that fail the exit-id pin,
     /// the anti-replay window, or the AEAD open.
@@ -1846,5 +1914,107 @@ mod policy_tests {
         assert!(!p.is_due(Duration::from_secs(99)));
         assert!(p.is_due(Duration::from_secs(100)));
         assert!(p.is_due(Duration::from_secs(101)));
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    /// A live session against a loopback exit that ACCEPTS migration, the way
+    /// every client-facing production endpoint does. The generic engine server
+    /// config disables it (`warrenguard_tls::make_server_config`), and each
+    /// production endpoint overrides that, so a fake exit built on the generic
+    /// default would model no real relay.
+    async fn migratable_loopback_session() -> MultihopSession {
+        use warren_test_support::spawn_migratable_multihop_exit;
+
+        let exit_key = SigningKey::from_bytes(&[9u8; 32]);
+        let (exit_addr, keys, _observed) = spawn_migratable_multihop_exit(exit_key, true).await;
+        MultihopClientTunnel::new(SigningKey::from_bytes(&[4u8; 32]))
+            .connect(
+                keys.ed25519_pubkey,
+                keys.x25519_pubkey,
+                keys.exit_id,
+                exit_addr,
+            )
+            .await
+            .expect("loopback multihop connect")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_native_session_migrates_onto_a_fresh_socket_and_keeps_serving() {
+        // What the migration watchdog does on a network change: the session
+        // moves to a brand-new socket and the SAME connection keeps carrying
+        // traffic, because the relay revalidates the new 4-tuple instead of
+        // requiring a handshake.
+        let session = migratable_loopback_session().await;
+        assert!(
+            !session.is_over_carrier(),
+            "a plain UDP dial is migratable; only the TCP carrier is not"
+        );
+        // Prove the path carries traffic BEFORE the rebind, so a failure after
+        // it can only be the migration.
+        let warmup = [
+            0x45u8, 0, 0, 20, 0, 0, 0, 0, 64, 0, 0, 0, 1, 1, 1, 1, 3, 3, 3, 3,
+        ];
+        session
+            .send_packet(&warmup)
+            .expect("send before the rebind");
+        let echoed = tokio::time::timeout(Duration::from_secs(5), session.recv_packet())
+            .await
+            .expect("the dialed path must answer")
+            .expect("the exit echoes on the dialed path");
+        assert_eq!(echoed, warmup);
+        let before = session.local_addr().expect("bound before the rebind");
+
+        session
+            .rebind_wildcard(RebindPolicy::Plain)
+            .expect("the userland datapath rebinds with no per-socket escape");
+
+        let after = session.local_addr().expect("bound after the rebind");
+        assert_ne!(
+            before, after,
+            "a rebind must put the session on a fresh socket, or the migration \
+             leaves the dead path in place"
+        );
+        // The watchdog's own liveness probe rides this path first.
+        session
+            .send_daita_padding()
+            .await
+            .expect("liveness probe on the migrated path");
+        let packet = [
+            0x45u8, 0, 0, 20, 0, 0, 0, 0, 64, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+        ];
+        session.send_packet(&packet).expect("send after the rebind");
+        let echoed = tokio::time::timeout(Duration::from_secs(5), session.recv_packet())
+            .await
+            .expect("the migrated path must answer")
+            .expect("the exit echoes the packet on the migrated path");
+        assert_eq!(
+            echoed, packet,
+            "the migrated session must carry traffic end to end"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forced_reconnect_close_ends_the_session_locally() {
+        // The watchdog's fallback: close so the datapath above redials. A
+        // LOCAL close is the point, since a locally-closed connection is never
+        // mapped to a policy rejection and so reads as a transient loss.
+        let session = migratable_loopback_session().await;
+        session.force_close_for_reconnect();
+
+        assert!(
+            session.recv_packet().await.is_err(),
+            "a forced-reconnect close must end the session"
+        );
+        assert!(
+            matches!(
+                session.connection().close_reason(),
+                Some(quinn::ConnectionError::LocallyClosed)
+            ),
+            "the close must be local, so the redial path treats it as transient"
+        );
     }
 }

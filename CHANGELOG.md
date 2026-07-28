@@ -9,6 +9,24 @@ the pre-release `0.0.x` line.
 
 ### Added
 
+- Network changes now MIGRATE the live QUIC session instead of always redialing
+  it. The supervised proxy datapath arms the engine migration watchdog
+  (`warrenguard_transport::migration_watchdog`, re-exported as
+  `warren_transport::migration_watchdog`) for each connected epoch: on a moved
+  default path it rebinds the session onto a fresh wildcard socket, probes the
+  tunnel with DAITA padding, and keeps the epoch when the relay revalidates the
+  path (about one RTT, no re-handshake, with the connection-ID rotation quinn
+  performs on a local-address change). The redial is now the FALLBACK: when the
+  migration does not take within the engine's probe window, the watchdog ends
+  the epoch exactly as a network change did before, so nothing regresses when a
+  path cannot be migrated. A session riding the TLS-over-TCP carrier is never
+  rebound (it has no UDP socket to swap) and redials straight away.
+  New session surface: `MultihopSession::rebind_wildcard()`, `local_addr()`,
+  `is_over_carrier()`, `force_close_for_reconnect()`, `send_daita_padding()`,
+  plus the re-exported `RebindPolicy` / `RebindError`, and
+  `PacketSink::multihop_session()` so a supervisor can reach the QUIC path
+  behind a datapath.
+
 - Live datapath observability reachable from the SUPERVISED datapath, which is
   the one every real app holds. `ProxyHandle::metrics` already existed but only
   on the unsupervised handle, so any app needing reconnection could not read the
