@@ -926,6 +926,35 @@ impl<T: HttpTransport> WarrenClient<T> {
             .await
             .map_err(|e| SdkError::Tun(std::io::Error::other(format!("dns push: {e}"))))?;
 
+        // Reach the QUIC path before the sink moves into the pump: the migration
+        // watchdog rebinds and probes it on a network change. Weakly, so it can
+        // never keep a torn-down tunnel alive.
+        let migration_session = warren_net::PacketSink::multihop_session(&sink)
+            .as_ref()
+            .map(Arc::downgrade)
+            .unwrap_or_default();
+        #[cfg(target_os = "macos")]
+        let migration_policy = crate::supervisor::MigrationPolicy {
+            // The carrier is deliberately left unbound on macOS, so its escape
+            // is the `<exit>/32` host route. It is pinned to the gateway
+            // resolved ABOVE, before the split capture made `route get default`
+            // name the tunnel: re-resolving it after the capture would risk
+            // pinning the carrier's escape to the tunnel it carries.
+            bypass: None,
+            carrier_host_route: Some((exit_ip, phys_gateway.clone())),
+        };
+        #[cfg(target_os = "linux")]
+        let migration_policy = crate::supervisor::MigrationPolicy {
+            // The fwmark rule follows the main table's updated default on its
+            // own, so the fresh socket only has to carry the same mark.
+            bypass: socket_bypass,
+            carrier_host_route: None,
+        };
+        // Unreachable (the bypass resolution above already returned Err on any
+        // other target), but it keeps this datapath type-checking there.
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let migration_policy = crate::supervisor::MigrationPolicy::default();
+
         // Start forwarding so the device actually carries traffic, then verify.
         let (tun_sink, bridge) =
             warren_net::tun_channels(device, warren_tun::Framing::for_target_os(), mtu);
@@ -950,9 +979,24 @@ impl<T: HttpTransport> WarrenClient<T> {
         )
         .await?;
 
+        // Arm the migration watchdog on the live datapath: a moved default path
+        // now migrates this session (escape, rebind, probe) instead of leaving
+        // it on a 4-tuple that no longer exists until the idle timeout notices.
+        // Unlike the supervised proxy there is nothing here to redial, so a
+        // migration that does not take ends with the session closed and the
+        // caller rebuilding the datapath, which is what any tunnel loss already
+        // asks of it. Armed after the killswitch so the host is fail-closed for
+        // the whole window the watchdog can act in.
+        let migration = tokio::spawn(crate::supervisor::watch_datapath_migration(
+            crate::supervisor::NetworkWatch::system(),
+            migration_session,
+            migration_policy,
+        ));
+
         Ok(TunDatapathHandle {
             driver,
             pump,
+            migration,
             route_guard,
             dns_guard,
             #[cfg(target_os = "macos")]
@@ -1598,6 +1642,9 @@ type KsBackend = warrenguard_killswitch_os::LinuxKillswitch;
 pub struct TunDatapathHandle {
     driver: tokio::task::JoinHandle<std::io::Result<()>>,
     pump: tokio::task::JoinHandle<Result<(), warren_net::NetError>>,
+    // Migrates the QUIC path across network changes; aborted with the datapath
+    // so it can never act on a session the caller has already torn down.
+    migration: tokio::task::JoinHandle<()>,
     // Reverts the split-default `/1` capture on drop (physical default resumes).
     route_guard: Option<warrenguard_route_split::platform_net::RouteSplitGuard>,
     // Restores the system resolvers on drop.
@@ -1626,6 +1673,7 @@ impl Drop for TunDatapathHandle {
         // (declaration order), leaving the host as found. Best-effort throughout.
         self.driver.abort();
         self.pump.abort();
+        self.migration.abort();
     }
 }
 

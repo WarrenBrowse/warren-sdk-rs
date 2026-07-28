@@ -27,6 +27,17 @@ the pre-release `0.0.x` line.
   `PacketSink::multihop_session()` so a supervisor can reach the QUIC path
   behind a datapath.
 
+- The experimental privileged TUN datapath (`start_tun_multihop`) gets the same
+  watchdog, which it had no equivalent of at all: a network change used to leave
+  it on a 4-tuple that no longer existed until quinn's idle timeout noticed.
+  It now migrates the session, with the per-OS escape the datapath already
+  installs (the Linux fwmark bypass reapplied to the fresh socket, the macOS
+  `<exit>/32` host route reinstalled ahead of the rebind and pinned to the
+  gateway resolved at dial time, before the split capture makes `route get
+  default` name the tunnel). Having no supervisor to redial it, its fallback
+  stops at closing the session, so the caller rebuilds the datapath exactly as
+  it already does on any tunnel loss.
+
 - Live datapath observability reachable from the SUPERVISED datapath, which is
   the one every real app holds. `ProxyHandle::metrics` already existed but only
   on the unsupervised handle, so any app needing reconnection could not read the

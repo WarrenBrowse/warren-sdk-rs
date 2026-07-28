@@ -585,21 +585,29 @@ impl NetworkWatch {
 /// deliberately leaves the carrier unbound and escapes it with a
 /// destination-keyed `<exit>/32` host route, because binding it black-holes
 /// egress on multi-interface hosts.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct MigrationPolicy {
     /// Bypass to reapply to the fresh socket before quinn can send on it;
     /// `None` when the host carries the escape by route instead.
     pub(crate) bypass: Option<warren_transport::SocketBypass>,
-    /// Exit IP whose host route is the carrier's only escape from the
-    /// split-default capture (macOS privileged TUN); `None` when nothing
-    /// captures the host's routes.
-    pub(crate) carrier_host_route_exit: Option<std::net::IpAddr>,
+    /// The `<exit>/32` escape to (re)install before a rebind, as the exit IP
+    /// and the PHYSICAL gateway to pin it to (macOS privileged TUN); `None`
+    /// when nothing captures the host's routes.
+    ///
+    /// The gateway is the one resolved at dial time, deliberately: once the
+    /// split capture is installed, `route -n get default` names the tunnel
+    /// (the engine says as much on
+    /// `warrenguard_route_split::default_route_split_macos::parse_scutil_router`),
+    /// so re-resolving it there would risk pinning the carrier's escape to the
+    /// tunnel it carries. A gateway that no longer exists makes the install
+    /// fail, which refuses the rebind and redials: fail-closed, never nested.
+    pub(crate) carrier_host_route: Option<(std::net::IpAddr, String)>,
 }
 
 impl MigrationPolicy {
     /// The rebind policy this datapath hands the engine: a per-socket bypass
     /// when the platform escapes by socket, the plain wildcard bind otherwise.
-    fn rebind_policy(self) -> warren_transport::RebindPolicy {
+    pub(crate) fn rebind_policy(&self) -> warren_transport::RebindPolicy {
         match self.bypass {
             Some(bypass) => warren_transport::RebindPolicy::Bypass(bypass),
             None => warren_transport::RebindPolicy::Plain,
@@ -620,29 +628,27 @@ impl MigrationPolicy {
 /// `escalate` both end the epoch, which is exactly what a network change did
 /// before the watchdog existed. A migration that does not take therefore
 /// degrades to today's redial, never to a stuck session.
-struct EpochMigrationIo<'a, S> {
+struct EpochMigrationIo<'a> {
     watch: Option<&'a mut NetworkWatch>,
     /// Weak, like the metrics probe: the watchdog observes the datapath, it
-    /// must never keep a torn-down QUIC connection alive.
-    sink: std::sync::Weak<S>,
+    /// must never keep a torn-down QUIC connection alive. An empty `Weak` (a
+    /// datapath with no sealed session, as the in-process fakes have) simply
+    /// never upgrades.
+    session: std::sync::Weak<warren_transport::MultihopSession>,
     /// Fired when the watchdog decides the session must be rebuilt; the
     /// supervisor's epoch race consumes it and redials.
     rebuild: Arc<tokio::sync::Notify>,
     policy: MigrationPolicy,
 }
 
-impl<S: warren_net::PacketSink> EpochMigrationIo<'_, S> {
-    /// The epoch's live multihop session, or `None` once the datapath is gone
-    /// (or when this sink carries no sealed session, as the in-process fakes
-    /// do).
+impl EpochMigrationIo<'_> {
+    /// The epoch's live multihop session, or `None` once the datapath is gone.
     fn session(&self) -> Option<Arc<warren_transport::MultihopSession>> {
-        self.sink.upgrade().and_then(|sink| sink.multihop_session())
+        self.session.upgrade()
     }
 }
 
-impl<S: warren_net::PacketSink + 'static> warren_transport::migration_watchdog::MigrationIo
-    for EpochMigrationIo<'_, S>
-{
+impl warren_transport::migration_watchdog::MigrationIo for EpochMigrationIo<'_> {
     async fn next_route_event(&mut self) -> bool {
         match self.watch.as_deref_mut() {
             Some(watch) => {
@@ -688,7 +694,7 @@ impl<S: warren_net::PacketSink + 'static> warren_transport::migration_watchdog::
     }
 
     async fn ensure_route_escape(&mut self) -> bool {
-        let Some(exit_ip) = self.policy.carrier_host_route_exit else {
+        let Some((exit_ip, gateway)) = self.policy.carrier_host_route.clone() else {
             // Either nothing captures the host's routes (userland proxy) or the
             // escape rides the socket itself (Linux fwmark, reapplied by the
             // rebind policy): there is no destination-keyed route to establish.
@@ -696,18 +702,15 @@ impl<S: warren_net::PacketSink + 'static> warren_transport::migration_watchdog::
         };
         #[cfg(all(target_os = "macos", feature = "experimental-tun"))]
         {
-            // Re-resolve the gateway of the network we just moved ONTO: the
-            // connect-time one belongs to the link that is gone. The split
-            // capture is still installed, so this must be the physical gateway
-            // the route-split parser reads, not `route get default`'s tunnel.
-            let Ok(gateway) = crate::tun_setup::discover_physical_gateway_macos() else {
-                return false;
-            };
+            // The rebind hands quinn a socket with no bind of its own, so this
+            // destination-keyed route is the only thing left keeping the
+            // carrier off the tunnel it carries. Install it BEFORE the rebind
+            // and report whether it took: no escape, no rebind.
             crate::tun_setup::add_carrier_host_route_macos(exit_ip, &gateway).is_ok()
         }
         #[cfg(not(all(target_os = "macos", feature = "experimental-tun")))]
         {
-            let _ = exit_ip;
+            let _ = (exit_ip, gateway);
             // Only the macOS TUN datapath keys its escape on the destination.
             // A policy asking for one elsewhere cannot be honoured, and
             // fail-closed means refusing the rebind (the cycle redials) rather
@@ -766,13 +769,37 @@ impl<S: warren_net::PacketSink + 'static> warren_transport::migration_watchdog::
     }
 }
 
-/// Runs the migration watchdog for one connected epoch and resolves when it
-/// decides the session must be rebuilt. The SDK supervisor owns the redial, so
-/// the watchdog's verdict is the epoch's end, not a reconnect of its own.
-async fn migration_epoch<S: warren_net::PacketSink + 'static>(
-    io: &mut EpochMigrationIo<'_, S>,
-    rebuild: &tokio::sync::Notify,
+/// Runs the migration watchdog over a datapath that has NO supervisor of its
+/// own: the privileged TUN facade, which owns a device, routing, DNS and a
+/// killswitch that only its caller may rebuild.
+///
+/// Same engine loop and same escape contract as the supervised proxy, but the
+/// fallback stops at the session close the watchdog asks for: the caller sees
+/// its datapath die (as it already does on any tunnel loss) and decides whether
+/// to rebuild. Resolves once the watchdog has given its verdict, so the caller
+/// can drop the task with the datapath.
+// Present in test builds on every platform (the loopback datapath tests need no
+// TUN device), and in the privileged builds that actually own such a datapath.
+#[cfg(any(test, all(unix, feature = "experimental-tun")))]
+pub(crate) async fn watch_datapath_migration(
+    mut watch: NetworkWatch,
+    session: std::sync::Weak<warren_transport::MultihopSession>,
+    policy: MigrationPolicy,
 ) {
+    let rebuild = Arc::new(tokio::sync::Notify::new());
+    let mut io = EpochMigrationIo {
+        watch: Some(&mut watch),
+        session,
+        rebuild: Arc::clone(&rebuild),
+        policy,
+    };
+    migration_epoch(&mut io, &rebuild).await;
+}
+
+/// Runs the migration watchdog and resolves when it decides the session must be
+/// rebuilt: the engine loop itself only returns on an escalation, so the
+/// verdict channel is what turns it into "this datapath is finished".
+async fn migration_epoch(io: &mut EpochMigrationIo<'_>, rebuild: &tokio::sync::Notify) {
     tokio::select! {
         // Returns only on an escalation or a closed event source; both mean the
         // epoch cannot be kept.
@@ -882,7 +909,13 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                 // the epoch, and a strong clone here would hold the QUIC
                 // connection open past its teardown.
                 let weak_sink = Arc::downgrade(&sink);
-                let watchdog_sink = Arc::downgrade(&sink);
+                // Taken before the sink moves into the netstack engine, and
+                // held weakly: the session it points at dies with the epoch.
+                let watchdog_session = sink
+                    .multihop_session()
+                    .as_ref()
+                    .map(Arc::downgrade)
+                    .unwrap_or_default();
                 let _ = outputs.metrics_tx.send(Some(Arc::new(move || {
                     weak_sink.upgrade().and_then(|s| s.metrics_snapshot())
                 })));
@@ -946,9 +979,9 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                 let rebuild = Arc::new(tokio::sync::Notify::new());
                 let mut migration_io = EpochMigrationIo {
                     watch: network_watch.as_mut(),
-                    sink: watchdog_sink,
+                    session: watchdog_session,
                     rebuild: Arc::clone(&rebuild),
-                    policy: migration,
+                    policy: migration.clone(),
                 };
                 let path_moved = migration_epoch(&mut migration_io, &rebuild);
                 tokio::pin!(path_moved);

@@ -464,6 +464,136 @@ async fn network_change_falls_back_to_redial_when_migration_dies() {
     harness.task.abort();
 }
 
+/// A live loopback session plus the scripted preferred-path cell, for the
+/// datapaths that have no supervisor of their own (the privileged TUN facade).
+async fn unsupervised_datapath(
+    migration: bool,
+) -> (
+    Arc<warren_transport::MultihopSession>,
+    Arc<std::sync::Mutex<Option<std::net::IpAddr>>>,
+    warren_test_support::ExitObserver,
+) {
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let (addr, keys, observed) =
+        warren_test_support::spawn_migratable_multihop_exit(exit_key, migration).await;
+    let session = warren_transport::MultihopClientTunnel::new(
+        ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]),
+    )
+    .connect(keys.ed25519_pubkey, keys.x25519_pubkey, keys.exit_id, addr)
+    .await
+    .expect("loopback multihop connect");
+    // One datagram so the exit records the source address this session dialed
+    // from, the baseline a migration has to move away from.
+    session.send_cover_traffic(16).expect("prime the path");
+    let source = Arc::new(std::sync::Mutex::new(Some(
+        "192.0.2.10".parse::<std::net::IpAddr>().unwrap(),
+    )));
+    (Arc::new(session), source, observed)
+}
+
+/// The scripted network watch the datapath tests arm the watchdog with.
+fn scripted_watch(
+    source: &Arc<std::sync::Mutex<Option<std::net::IpAddr>>>,
+) -> crate::supervisor::NetworkWatch {
+    let probe_source = Arc::clone(source);
+    crate::supervisor::NetworkWatch {
+        probe: Box::new(move || *probe_source.lock().unwrap()),
+        interval: std::time::Duration::from_millis(50),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsupervised_datapath_migrates_its_session_on_a_network_change() {
+    // The privileged TUN datapath has no supervisor to redial it, so the
+    // watchdog is all it gets. A network change must move the QUIC path under
+    // it and leave the session serving: rebuilding a device, its routing and
+    // its killswitch is the caller's decision, never this loop's.
+    let (session, source, observed) = unsupervised_datapath(true).await;
+    let watchdog = tokio::spawn(crate::supervisor::watch_datapath_migration(
+        scripted_watch(&source),
+        Arc::downgrade(&session),
+        crate::supervisor::MigrationPolicy::default(),
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    *source.lock().unwrap() = Some("198.51.100.20".parse().unwrap());
+    tokio::time::sleep(
+        warren_transport::migration_watchdog::MIGRATION_TIMEOUT + std::time::Duration::from_secs(2),
+    )
+    .await;
+
+    assert!(
+        session.connection().close_reason().is_none(),
+        "a migrated path must leave the datapath alive"
+    );
+    assert_eq!(observed.accepts(), 1, "no re-handshake");
+    let addrs = observed.client_addrs();
+    assert!(
+        addrs.len() >= 2,
+        "the exit must have seen the session arrive from a new source address, saw {addrs:?}"
+    );
+    watchdog.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsupervised_datapath_closes_its_session_when_migration_dies() {
+    // Against an exit that refuses migration the rebind dead-ends. With no
+    // supervisor to redial, the watchdog's fallback is to close the session, so
+    // the caller learns its datapath is dead instead of holding a tunnel that
+    // silently carries nothing until the idle timeout.
+    let (session, source, _observed) = unsupervised_datapath(false).await;
+    let watchdog = tokio::spawn(crate::supervisor::watch_datapath_migration(
+        scripted_watch(&source),
+        Arc::downgrade(&session),
+        crate::supervisor::MigrationPolicy::default(),
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let moved_at = std::time::Instant::now();
+    *source.lock().unwrap() = Some("198.51.100.20".parse().unwrap());
+    let mut closed = false;
+    for _ in 0..300 {
+        if session.connection().close_reason().is_some() {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let elapsed = moved_at.elapsed();
+
+    assert!(
+        closed,
+        "a dead-ended migration must close the session so the caller rebuilds"
+    );
+    assert!(
+        elapsed >= warren_transport::migration_watchdog::MIGRATION_TIMEOUT,
+        "the close must be the verdict of an attempted migration: it landed {elapsed:?} \
+         after the network change"
+    );
+    watchdog.abort();
+}
+
+#[test]
+fn the_escape_policy_decides_how_the_migration_socket_is_bound() {
+    // A datapath whose carrier escapes by socket must hand the engine that
+    // bypass, or the fresh socket rides the plain routing table and the
+    // split-default capture swallows the carrier.
+    use crate::supervisor::MigrationPolicy;
+    assert!(matches!(
+        MigrationPolicy::default().rebind_policy(),
+        warren_transport::RebindPolicy::Plain
+    ));
+    let bypass = warren_transport::SocketBypass::Fwmark(0x7761_7272);
+    assert!(matches!(
+        MigrationPolicy {
+            bypass: Some(bypass),
+            carrier_host_route: None,
+        }
+        .rebind_policy(),
+        warren_transport::RebindPolicy::Bypass(_)
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
     // A policy rejection (unauthorized account) is fatal, not transient: the
