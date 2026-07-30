@@ -229,7 +229,22 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     /// [`ClientError::ServerStatus`] when issuance is not configured
     /// server-side.
     pub async fn token_keys(&self) -> Result<TokenIssuerDirectory, ClientError> {
-        let http = self.unsigned_request(Method::Get, "/v1/tokens/keys", Vec::new());
+        self.token_keys_for(crate::tokens::CredentialClass::Session)
+            .await
+    }
+
+    /// [`Self::token_keys`] for any credential class. Each class holds its own
+    /// per-epoch issuer keys, so a client that blinds against the wrong
+    /// directory mints credentials the server refuses.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::token_keys`].
+    pub async fn token_keys_for(
+        &self,
+        class: crate::tokens::CredentialClass,
+    ) -> Result<TokenIssuerDirectory, ClientError> {
+        let http = self.unsigned_request(Method::Get, class.keys_path(), Vec::new());
         self.send_json(http).await
     }
 
@@ -246,8 +261,22 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         &self,
         req: &TokenIssueRequest,
     ) -> Result<TokenIssueResponse, ClientError> {
+        self.issue_tokens_for(crate::tokens::CredentialClass::Session, req)
+            .await
+    }
+
+    /// [`Self::issue_tokens`] for any credential class.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::issue_tokens`].
+    pub async fn issue_tokens_for(
+        &self,
+        class: crate::tokens::CredentialClass,
+        req: &TokenIssueRequest,
+    ) -> Result<TokenIssueResponse, ClientError> {
         let body = serialize(req)?;
-        let http = self.signed_request(Method::Post, "/v1/tokens/issue", body)?;
+        let http = self.signed_request(Method::Post, class.issue_path(), body)?;
         self.send_json(http).await
     }
 

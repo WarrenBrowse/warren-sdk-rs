@@ -30,8 +30,8 @@ pub use dto::{
     TokenIssuerDirectory, TokenIssuerKey,
 };
 pub use tokens::{
-    MintedEpoch, PersistedTokens, TokenClientError, TokenManager, TokenStore, current_epoch,
-    mint_tokens,
+    CredentialClass, MintedEpoch, PersistedTokens, PortEntitlementManager, TokenClientError,
+    TokenManager, TokenStore, current_epoch, mint_tokens, mint_tokens_for,
 };
 pub use transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 

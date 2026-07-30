@@ -145,6 +145,20 @@ pub async fn mint_tokens<T: HttpTransport, R: CryptoRng + ?Sized>(
     epochs: &[u64],
     rng: &mut R,
 ) -> Result<Vec<MintedEpoch>, TokenClientError> {
+    mint_tokens_for(CredentialClass::Session, client, directory, epochs, rng).await
+}
+
+/// [`mint_tokens`] for any credential class.
+///
+/// # Errors
+/// [`TokenClientError`]; see each variant.
+pub async fn mint_tokens_for<T: HttpTransport, R: CryptoRng + ?Sized>(
+    class: CredentialClass,
+    client: &WarrenApiClient<T>,
+    directory: &TokenIssuerDirectory,
+    epochs: &[u64],
+    rng: &mut R,
+) -> Result<Vec<MintedEpoch>, TokenClientError> {
     let quota = directory.quota_per_epoch as usize;
     if quota == 0 || directory.epoch_secs == 0 {
         return Err(TokenClientError::BadDirectoryPolicy);
@@ -169,9 +183,12 @@ pub async fn mint_tokens<T: HttpTransport, R: CryptoRng + ?Sized>(
     }
 
     let response = client
-        .issue_tokens(&TokenIssueRequest {
-            epochs: request_epochs,
-        })
+        .issue_tokens_for(
+            class,
+            &TokenIssueRequest {
+                epochs: request_epochs,
+            },
+        )
         .await?;
 
     // Finalize, matching response epochs by value (never by position).
@@ -291,6 +308,43 @@ impl TokenStore {
     }
 }
 
+/// Which credential the issuer endpoints refer to.
+///
+/// The two classes share the whole minting flow and differ only in their
+/// endpoints, which hold different per-epoch keys: a session token admits a
+/// tunnel session, a port entitlement buys one forwarded port (warren-core
+/// doc 99). Blinding against the wrong directory mints credentials the server
+/// refuses, so the class travels with the client call rather than being
+/// implied by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CredentialClass {
+    /// Admits a tunnel session.
+    #[default]
+    Session,
+    /// Buys one forwarded port.
+    PortEntitlement,
+}
+
+impl CredentialClass {
+    /// Public issuer directory for this class.
+    #[must_use]
+    pub const fn keys_path(self) -> &'static str {
+        match self {
+            Self::Session => "/v1/tokens/keys",
+            Self::PortEntitlement => "/v1/port-entitlements/keys",
+        }
+    }
+
+    /// Wallet-signed issuance endpoint for this class.
+    #[must_use]
+    pub const fn issue_path(self) -> &'static str {
+        match self {
+            Self::Session => "/v1/tokens/issue",
+            Self::PortEntitlement => "/v1/port-entitlements/issue",
+        }
+    }
+}
+
 /// The issuer's machine-readable reject code for its once-per-account-epoch
 /// ledger (`warren-api/src/handlers/token.rs::reject_reason`). The only refusal
 /// that is definitive for the rest of the epoch, hence the only one that
@@ -322,6 +376,7 @@ struct ManagerState {
 /// downgrade; the per-epoch quota bounds concurrent sessions anyway).
 pub struct TokenManager<T> {
     client: Arc<WarrenApiClient<T>>,
+    class: CredentialClass,
     state: Arc<Mutex<ManagerState>>,
     /// When set, [`Self::refresh`] mints only `current..=current + horizon`
     /// instead of the whole published window. `None` keeps the full-window
@@ -334,8 +389,16 @@ impl<T: HttpTransport> TokenManager<T> {
     /// [`Self::refresh`].
     #[must_use]
     pub fn new(client: Arc<WarrenApiClient<T>>) -> Self {
+        Self::for_class(client, CredentialClass::Session)
+    }
+
+    /// [`Self::new`] for any credential class. Same minting flow, same
+    /// once-per-epoch bookkeeping, this class's endpoints and batch size.
+    #[must_use]
+    pub fn for_class(client: Arc<WarrenApiClient<T>>, class: CredentialClass) -> Self {
         Self {
             client,
+            class,
             state: Arc::new(Mutex::new(ManagerState {
                 store: TokenStore::new(),
                 epoch_secs: None,
@@ -343,6 +406,19 @@ impl<T: HttpTransport> TokenManager<T> {
             })),
             mint_horizon: None,
         }
+    }
+
+    /// The epoch `now` falls in, once a refresh (or a restored bundle) has
+    /// taught the manager the published epoch length. `None` before that: a
+    /// manager that has never seen the issuer cannot place a timestamp.
+    #[must_use]
+    pub fn epoch_at(&self, now_unix_secs: u64) -> Option<u64> {
+        self.state
+            .lock()
+            .expect("token manager mutex poisoned")
+            .epoch_secs
+            .filter(|&s| s > 0)
+            .map(|s| now_unix_secs / s)
     }
 
     /// Caps [`Self::refresh`] at `current + epochs` instead of the whole
@@ -373,7 +449,7 @@ impl<T: HttpTransport> TokenManager<T> {
         now_unix_secs: u64,
         rng: &mut R,
     ) -> Result<(), TokenClientError> {
-        let directory = self.client.token_keys().await?;
+        let directory = self.client.token_keys_for(self.class).await?;
         let Some(current) = current_epoch(&directory, now_unix_secs) else {
             return Err(TokenClientError::BadDirectoryPolicy);
         };
@@ -397,7 +473,7 @@ impl<T: HttpTransport> TokenManager<T> {
         };
 
         for epoch in targets {
-            match mint_tokens(&self.client, &directory, &[epoch], rng).await {
+            match mint_tokens_for(self.class, &self.client, &directory, &[epoch], rng).await {
                 Ok(mut batches) => {
                     let mut st = self.state.lock().expect("token manager mutex poisoned");
                     st.minted.insert(epoch);
@@ -730,5 +806,75 @@ mod persistence_tests {
             PersistedTokens::from_json("not json"),
             Err(TokenClientError::BadPersistedBundle)
         ));
+    }
+}
+
+/// Hands each port-forwarding rule the entitlement it presents (warren-core
+/// doc 99).
+///
+/// A wrapper over [`TokenManager`] rather than a second minting flow: what an
+/// entitlement needs on top is an ASSIGNMENT. The exit spends a credential the
+/// first time it sees it and renews the spend afterwards, so a rule that
+/// presented a different credential on each mapping refresh would spend the
+/// subscriber's whole batch on one port. Slot `n` therefore keeps its
+/// credential for the whole epoch, and moves to the next epoch's batch when
+/// the current one stops being spendable anywhere.
+pub struct PortEntitlementManager<T> {
+    inner: TokenManager<T>,
+    assigned: Mutex<Assigned>,
+}
+
+#[derive(Default)]
+struct Assigned {
+    /// The epoch `slots` was filled for. A credential verifies against its own
+    /// epoch's issuer key and no other, so the whole map is dead at a boundary.
+    epoch: Option<u64>,
+    slots: BTreeMap<usize, Vec<u8>>,
+}
+
+impl<T: HttpTransport> PortEntitlementManager<T> {
+    /// Builds a manager over a wallet-signed API client. Empty until the first
+    /// [`Self::refresh_auto`].
+    #[must_use]
+    pub fn new(client: Arc<WarrenApiClient<T>>) -> Self {
+        Self {
+            inner: TokenManager::for_class(client, CredentialClass::PortEntitlement),
+            assigned: Mutex::new(Assigned::default()),
+        }
+    }
+
+    /// Tops the batch up, on the same coarse timer as session tokens.
+    ///
+    /// # Errors
+    /// [`TokenClientError`] when the directory fetch fails.
+    pub async fn refresh_auto(&self, now_unix_secs: u64) -> Result<(), TokenClientError> {
+        self.inner.refresh_auto(now_unix_secs).await
+    }
+
+    /// The credential rule `slot` presents right now, or `None` when the
+    /// subscriber has none left for this epoch.
+    ///
+    /// `None` is a working answer: the exit then applies its configured quota,
+    /// which is the documented degrade path. Handing out an already-assigned
+    /// credential instead would make two rules read as one port at the exit.
+    #[must_use]
+    pub fn credential_for_slot(&self, slot: usize, now_unix_secs: u64) -> Option<Vec<u8>> {
+        let epoch = self.inner.epoch_at(now_unix_secs)?;
+        let mut assigned = self
+            .assigned
+            .lock()
+            .expect("port entitlement manager mutex poisoned");
+        if assigned.epoch != Some(epoch) {
+            assigned.epoch = Some(epoch);
+            assigned.slots.clear();
+        }
+        if let Some(held) = assigned.slots.get(&slot) {
+            return Some(held.clone());
+        }
+        // Popping is what makes "one entitlement, one port" locally true: the
+        // credential leaves the store for good and no other slot can draw it.
+        let credential = self.inner.take_current_stack(now_unix_secs).pop()?.to_vec();
+        assigned.slots.insert(slot, credential.clone());
+        Some(credential)
     }
 }
