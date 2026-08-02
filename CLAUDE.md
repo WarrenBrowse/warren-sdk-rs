@@ -35,11 +35,9 @@ layering.
    `ss58` and `signing`) and `warren-api` re-exports its `dto`; `warren-core`
    depends on the same crate, so this contract cannot drift between the SDK and
    the backend either.
-2. **Wire compatibility is non-negotiable** (see the shared wire-vectors rule).
-   Identity derivation, SS58, request signing, the handshake frames, the signed
-   relay list, NAT-PMP and the multihop frame must match warren-core
-   byte-for-byte, otherwise the SDK cannot talk to real exits or the production
-   API.
+2. **Wire compatibility is non-negotiable** (shared wire-vectors rule, imported
+   above); this repo is the reference implementation the sibling SDKs replay
+   against.
 3. **Portability in concept.** Keep each layer mappable to the other languages:
    no clever Rust-only constructs in the public surface, narrow async seams, and
    plain serializable types at boundaries (the FFI layer depends on this).
