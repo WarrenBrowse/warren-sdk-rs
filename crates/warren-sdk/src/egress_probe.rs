@@ -21,10 +21,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::sync::Notify;
-use warren_net::TunnelConnector;
+use warren_net::{TunnelConnector, UdpConnector, UdpFlow};
 use warren_transport::egress_probe::{
-    EgressProbeConfig, EgressProbeIo, PROBE_QNAME, PROBE_TIMEOUT, build_dns_query,
-    is_matching_response, jittered, run_egress_probe,
+    EgressProbeConfig, EgressProbeIo, PROBE_QNAME, PROBE_SENDS, PROBE_TIMEOUT, ProbeOutcome,
+    build_dns_query, is_matching_response, jittered, run_egress_probe,
 };
 
 use crate::supervisor::AbortOnDrop;
@@ -33,17 +33,19 @@ use crate::supervisor::AbortOnDrop;
 /// netstack UDP path; tests script the verdict, so the supervisor escalation is
 /// testable without a real exit.
 pub(crate) trait GatewayProber: Send {
-    /// One end-to-end probe through the tunnel. `true` = egress alive (a DNS
-    /// answer came back). `false` = no answer within the deadline. A local error
-    /// (the datapath is tearing down) is inconclusive and reports `true`, so a
-    /// host-side hiccup never raises a false dead verdict.
-    fn probe(&mut self) -> impl Future<Output = bool> + Send;
+    /// One end-to-end probe through the tunnel. A local error (the datapath is
+    /// tearing down) never reached the exit, so it reports
+    /// [`ProbeOutcome::Inconclusive`] and the scheduler spends it neither way.
+    fn probe(&mut self) -> impl Future<Output = ProbeOutcome> + Send;
 }
 
 /// Production prober: sends a DNS query over the netstack UDP path to the tunnel
 /// gateway resolver and waits for any matching response.
-pub(crate) struct ConnectorProber {
-    connector: TunnelConnector,
+///
+/// Generic over the connector so the retransmit schedule is testable against a
+/// scripted flow; production instantiates it at [`TunnelConnector`].
+pub(crate) struct ConnectorProber<C: UdpConnector = TunnelConnector> {
+    connector: C,
     gateway_dns: SocketAddr,
     /// Per-probe query id (wrapping): a stray datagram from a previous probe must
     /// not be mistaken for this probe's answer. Sequential is fine, the probe is
@@ -51,8 +53,8 @@ pub(crate) struct ConnectorProber {
     next_txid: u16,
 }
 
-impl ConnectorProber {
-    pub(crate) fn new(connector: TunnelConnector, gateway: Ipv4Addr) -> Self {
+impl<C: UdpConnector> ConnectorProber<C> {
+    pub(crate) fn new(connector: C, gateway: Ipv4Addr) -> Self {
         Self {
             connector,
             gateway_dns: SocketAddr::new(gateway.into(), 53),
@@ -61,28 +63,52 @@ impl ConnectorProber {
     }
 }
 
-impl GatewayProber for ConnectorProber {
-    async fn probe(&mut self) -> bool {
+impl<C: UdpConnector + Send + Sync> GatewayProber for ConnectorProber<C>
+where
+    C::Flow: Send,
+{
+    async fn probe(&mut self) -> ProbeOutcome {
         // A fresh UDP flow per probe (cheap): the netstack routes it into the
         // tunnel. A local open/send error means the datapath is gone, which is
         // inconclusive, not an egress-dead verdict.
         let mut sock = match self.connector.open_udp().await {
             Ok(s) => s,
-            Err(_) => return true,
+            Err(_) => return ProbeOutcome::Inconclusive,
         };
         self.next_txid = self.next_txid.wrapping_add(1);
         let txid = self.next_txid;
         let query = Bytes::from(build_dns_query(txid, PROBE_QNAME));
-        if sock.send_to(query, self.gateway_dns).await.is_err() {
-            return true;
+        let started = tokio::time::Instant::now();
+        if sock.send_to(query.clone(), self.gateway_dns).await.is_err() {
+            return ProbeOutcome::Inconclusive;
         }
-        let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+        let deadline = started + PROBE_TIMEOUT;
+        // PROBE_TIMEOUT is only safe because a lost datagram is retransmitted
+        // inside it: the engine sized the deadline and the schedule together, so
+        // sending once and waiting the deadline out would turn a single lost
+        // datagram into a failed probe, and three of those convict a healthy exit.
+        let mut retransmits = PROBE_SENDS.iter().skip(1).map(|offset| started + *offset);
+        let mut next_send = retransmits.next();
         loop {
-            match tokio::time::timeout_at(deadline, sock.recv_from()).await {
-                Ok(Some((buf, _))) if is_matching_response(&buf, txid) => return true,
-                Ok(Some(_)) => {} // stray datagram from an earlier probe: keep waiting
-                Ok(None) => return true, // the flow closed = teardown, inconclusive
-                Err(_) => return false, // no answer through the tunnel within the deadline
+            // Absolute instants, so re-arming on a stray datagram never shifts
+            // the remaining schedule.
+            let wake = next_send.unwrap_or(deadline).min(deadline);
+            tokio::select! {
+                recv = sock.recv_from() => match recv {
+                    Some((buf, _)) if is_matching_response(&buf, txid) => {
+                        return ProbeOutcome::Alive;
+                    }
+                    Some(_) => {} // stray datagram from an earlier probe: keep waiting
+                    // The flow closed under us: teardown, not an exit verdict.
+                    None => return ProbeOutcome::Inconclusive,
+                },
+                () = tokio::time::sleep_until(wake) => {
+                    if wake >= deadline {
+                        return ProbeOutcome::Dead;
+                    }
+                    let _ = sock.send_to(query.clone(), self.gateway_dns).await;
+                    next_send = retransmits.next();
+                }
             }
         }
     }
@@ -139,7 +165,7 @@ impl<P: GatewayProber> EgressProbeIo for ProxyEgressProbe<P> {
         true
     }
 
-    async fn probe(&mut self) -> bool {
+    async fn probe(&mut self) -> ProbeOutcome {
         self.prober.probe().await
     }
 
@@ -198,6 +224,155 @@ mod tests {
 
     use super::*;
 
+    use std::sync::Arc as StdArc;
+
+    use warren_net::socks5::Target;
+    use warren_net::{Connector, NetError};
+
+    /// What one fake flow recorded, shared with the test after the probe ends.
+    #[derive(Default)]
+    struct FlowLog {
+        /// Offset from the probe start at which each datagram was sent.
+        sends: Vec<Duration>,
+        /// The last query written, echoed back as the answer.
+        last_query: Option<bytes::Bytes>,
+    }
+
+    /// A UDP flow that records its send schedule and answers only on the
+    /// configured 1-based send index (`None` = never answers). The netstack is a
+    /// system boundary, so this is the right seam to pin the retransmit schedule
+    /// without a real exit.
+    struct FakeFlow {
+        log: StdArc<Mutex<FlowLog>>,
+        started: tokio::time::Instant,
+        answer_on: Option<usize>,
+        answered: bool,
+    }
+
+    impl UdpFlow for FakeFlow {
+        async fn send_to(&self, data: bytes::Bytes, _dst: SocketAddr) -> Result<(), NetError> {
+            let mut log = self.log.lock().unwrap();
+            log.sends.push(self.started.elapsed());
+            log.last_query = Some(data);
+            Ok(())
+        }
+
+        async fn recv_from(&mut self) -> Option<(bytes::Bytes, SocketAddr)> {
+            let ready = {
+                let log = self.log.lock().unwrap();
+                self.answer_on
+                    .is_some_and(|n| log.sends.len() >= n && !self.answered)
+                    .then(|| log.last_query.clone())
+                    .flatten()
+            };
+            match ready {
+                Some(query) => {
+                    self.answered = true;
+                    // The gateway's answer is the query with the QR bit set, so
+                    // it carries the same txid the prober is waiting on.
+                    let mut answer = query.to_vec();
+                    answer[2] |= 0x80;
+                    Some((
+                        bytes::Bytes::from(answer),
+                        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 53),
+                    ))
+                }
+                // No answer is due: stay pending so only the send schedule and
+                // the deadline drive the probe.
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    /// Opens [`FakeFlow`]s, or refuses to open one at all (`None`), which is the
+    /// datapath-gone case.
+    struct FakeConnector {
+        log: StdArc<Mutex<FlowLog>>,
+        answer_on: Option<usize>,
+        opens: bool,
+    }
+
+    impl Connector for FakeConnector {
+        type Stream = tokio::net::TcpStream;
+        async fn connect(&self, _target: Target) -> Result<Self::Stream, NetError> {
+            Err(NetError::Unsupported("tcp unused by the egress probe"))
+        }
+    }
+
+    impl UdpConnector for FakeConnector {
+        type Flow = FakeFlow;
+        async fn open_udp(&self) -> Result<Self::Flow, NetError> {
+            if !self.opens {
+                return Err(NetError::EngineStopped);
+            }
+            Ok(FakeFlow {
+                log: StdArc::clone(&self.log),
+                started: tokio::time::Instant::now(),
+                answer_on: self.answer_on,
+                answered: false,
+            })
+        }
+        async fn resolve_host(&self, _host: &str) -> Result<std::net::IpAddr, NetError> {
+            Err(NetError::Unsupported("no resolution in the probe test"))
+        }
+        fn supports_ipv6(&self) -> bool {
+            false
+        }
+    }
+
+    fn prober(
+        answer_on: Option<usize>,
+        opens: bool,
+    ) -> (ConnectorProber<FakeConnector>, StdArc<Mutex<FlowLog>>) {
+        let log = StdArc::new(Mutex::new(FlowLog::default()));
+        let connector = FakeConnector {
+            log: StdArc::clone(&log),
+            answer_on,
+            opens,
+        };
+        (
+            ConnectorProber::new(connector, Ipv4Addr::new(10, 64, 0, 1)),
+            log,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_probe_retransmits_on_the_engine_schedule() {
+        // The deadline and the schedule were sized together in the engine: 2.5 s
+        // is only safe because a lost datagram is retransmitted twice inside it.
+        // A driver that sends once and waits the deadline out turns one lost
+        // datagram into a failed probe, and three of those convict a healthy exit.
+        let (mut prober, log) = prober(None, true);
+        assert_eq!(prober.probe().await, ProbeOutcome::Dead);
+        assert_eq!(
+            log.lock().unwrap().sends,
+            PROBE_SENDS.to_vec(),
+            "every datagram in the engine schedule must go out before the verdict"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_first_datagram_is_recovered_by_the_retransmit() {
+        // The whole point of the schedule: losing the first datagram costs a
+        // retransmit, never the probe.
+        let (mut prober, log) = prober(Some(2), true);
+        assert_eq!(prober.probe().await, ProbeOutcome::Alive);
+        assert_eq!(
+            log.lock().unwrap().sends.len(),
+            2,
+            "the answer on the second datagram must end the probe there"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_datapath_that_will_not_open_is_inconclusive() {
+        // Nothing reached the exit, so this is host-side evidence: reported as
+        // alive it would mark a never-answered circuit proven and launder away
+        // accumulated failures.
+        let (mut prober, _log) = prober(None, false);
+        assert_eq!(prober.probe().await, ProbeOutcome::Inconclusive);
+    }
+
     /// A scripted gateway prober: one verdict per probe, `alive` once exhausted.
     /// The tunnel is a system boundary here, so scripting the probe verdict is the
     /// right seam to test the SDK escalation without a real exit.
@@ -212,8 +387,11 @@ mod tests {
         }
     }
     impl GatewayProber for ScriptedProber {
-        async fn probe(&mut self) -> bool {
-            self.script.lock().unwrap().pop_front().unwrap_or(true)
+        async fn probe(&mut self) -> ProbeOutcome {
+            match self.script.lock().unwrap().pop_front() {
+                Some(false) => ProbeOutcome::Dead,
+                _ => ProbeOutcome::Alive,
+            }
         }
     }
 
