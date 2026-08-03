@@ -42,6 +42,23 @@ layering.
    no clever Rust-only constructs in the public surface, narrow async seams, and
    plain serializable types at boundaries (the FFI layer depends on this).
 
+## Bumping a sibling pin: the version file is not the pin
+
+The engine and contract siblings are **git-deps with an explicit `rev`**, and a
+`[patch]` at the foot of `Cargo.toml` redirects them to your local checkout. So
+`.warrenguard-version` / `.warren-contract-version` are only half the pin: the
+build resolves through the patch and every test passes locally while the
+declared `rev` still points at the old commit. Nothing on your machine can see
+the divergence, and CI's lockstep gate is what fails.
+
+Bump the version file and the matching `rev = "..."` lines together (18 of them
+for warrenguard), then re-run the tests. Same check CI runs:
+
+```sh
+rev="$(tr -d '[:space:]' < .warrenguard-version)"
+grep -E 'warrenguard\.git.*\brev = "' Cargo.toml | grep -v "rev = \"${rev}\"" || echo "in lockstep"
+```
+
 ## Testing specifics (in addition to the shared TDD rule)
 
 - Async tests use `#[tokio::test]`; networking regression tests use
