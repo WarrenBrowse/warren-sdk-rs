@@ -1,14 +1,11 @@
 name: CI
 
-# Runs exclusively on the WarrenBrowse org self-hosted runners (Default runner
-# group, visibility: all). Label sets are matched against the live runners:
-#   [self-hosted, Linux, ARM64, macstudio-arm64] -> native arm64 Linux fleet
-#   [self-hosted, Windows, macstudio-win]  -> macstudio-win (Windows-ARM VM on the Mac Studio)
-#   [self-hosted, macOS, ARM64]  -> axiomStudio
-# Verification jobs run on the NATIVE arm64 Linux fleet: the x86-under-Rosetta
-# containers wedge cargo/nextest when rustc dies unreaped (zombie jobserver
-# deadlock, 2026-07-08 and 2026-07-16). Only jobs that must PRODUCE x86_64
-# artifacts belong on macstudio-rosetta; this workflow has none.
+# Runs exclusively on the WarrenBrowse self-hosted runners; the label sets
+# below are matched against the live fleet. Verification jobs run on the
+# NATIVE arm64 Linux runners: x86-under-emulation containers can wedge
+# cargo/nextest when rustc dies unreaped (zombie jobserver deadlock). Only
+# jobs that must PRODUCE x86_64 artifacts belong on the emulation runners;
+# this workflow has none.
 # Do not switch any job to a GitHub-hosted runner.
 
 on:
@@ -75,7 +72,7 @@ jobs:
         with:
           token: ${{ secrets.ENGINE_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.89.0
-      - name: single-home twin detector (doc 94 / doc 47 s5)
+      - name: single-home twin detector
         run: bash scripts/ci/anti-refrag.sh
 
   clippy:
@@ -129,9 +126,9 @@ jobs:
           - name: macos
             runner: [self-hosted, macOS, ARM64]
     steps:
-      # The golden vectors are a private submodule (warren-vectors); the test
-      # binaries read them at runtime, so this job needs them checked out.
-      # VECTORS_TOKEN is a PAT with read access to warren-sdk-rs + warren-vectors.
+      # The test binaries read the golden vectors submodule (warren-vectors)
+      # at runtime, so this job checks it out; VECTORS_TOKEN grants read
+      # access to it.
       - uses: actions/checkout@v4
         with:
           submodules: recursive
