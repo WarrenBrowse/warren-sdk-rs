@@ -138,7 +138,7 @@ rand = "0.8"
 # obfuscated-Initial padding/fragmentation knobs, which `warren_transport_config`
 # enables by default, so a Dart proxy via warren_sdk_frb presents the same QUIC
 # Initial fingerprint and network quality as warren-app with zero configuration.
-quinn = { git = "ssh://git@github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.16-fork.11", package = "warren-quinn" }
+quinn = { git = "https://github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.16-fork.11", package = "warren-quinn" }
 # No `logging` feature: rustls can emit handshake diagnostics (including the
 # SNI, which encodes the exit pubkey) through the `log` facade, which would leak
 # into an embedder's log sink and break Warren's no-log posture.
@@ -220,3 +220,12 @@ warrenguard-pump = { path = "../warrenguard/crates/warrenguard-pump" }
 [patch."https://github.com/WarrenBrowse/warren-contract.git"]
 warren-contract = { path = "../warren-contract" }
 warren-discovery-core = { path = "../warren-contract/warren-discovery" }
+
+# The warrenguard rev pinned above still declares the warren-quinn fork over
+# ssh://, which anonymous builds cannot fetch; redirect that source to https so
+# the whole graph resolves a single quinn from the anonymous-cloneable URL.
+# Drop this section once warrenguard declares quinn over https and the
+# .warrenguard-version pin has moved past that change.
+[patch."ssh://git@github.com/WarrenBrowse/warren-quinn.git"]
+quinn = { git = "https://github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.16-fork.11", package = "warren-quinn" }
+quinn-udp = { git = "https://github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.16-fork.11", package = "warren-quinn-udp" }
