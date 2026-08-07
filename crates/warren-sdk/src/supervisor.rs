@@ -80,6 +80,9 @@ pub struct SupervisedProxyHandle {
     /// engine verdict (and drives `state` to [`ConnectionState::Failed`]). `None`
     /// while the datapath is healing normally.
     pub(crate) fatal_rx: tokio::sync::watch::Receiver<Option<FatalCause>>,
+    /// Why the most recent epoch ended, published just before the
+    /// `Reconnecting` state it precedes.
+    pub(crate) epoch_end_rx: tokio::sync::watch::Receiver<Option<EpochEnd>>,
     pub(crate) task: tokio::task::JoinHandle<()>,
 }
 
@@ -108,6 +111,22 @@ impl SupervisedProxyHandle {
     #[must_use]
     pub fn watch_state(&self) -> tokio::sync::watch::Receiver<ConnectionState> {
         self.state_rx.clone()
+    }
+
+    /// Why the most recent serving epoch ended, or `None` while the first one is
+    /// still running. Published before the `Reconnecting` transition it
+    /// precedes, so a host that journals the transition can attach the cause and
+    /// stop recording every tunnel death as the same opaque reconnect.
+    #[must_use]
+    pub fn last_epoch_end(&self) -> Option<EpochEnd> {
+        *self.epoch_end_rx.borrow()
+    }
+
+    /// A watch receiver for the epoch-end reports, for a host that would rather
+    /// await them than sample [`Self::last_epoch_end`].
+    #[must_use]
+    pub fn watch_epoch_end(&self) -> tokio::sync::watch::Receiver<Option<EpochEnd>> {
+        self.epoch_end_rx.clone()
     }
 
     /// The fatal cause the supervisor stopped on, or `None` while it is healing
@@ -907,6 +926,60 @@ pub(crate) struct EpochGuards {
     pub(crate) migration: MigrationPolicy,
 }
 
+/// Which of the supervisor's four independent epoch enders won the race.
+///
+/// The supervisor used to publish only THAT an epoch ended, so every tunnel
+/// death in the fleet reached the host as an identical `Reconnecting` and none
+/// of them could be attributed. The four causes call for opposite remedies (a
+/// dead exit must be reselected; a healthy tunnel torn down by a probe verdict
+/// is a client defect), so they are published apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EpochEndCause {
+    /// The datapath itself died: the QUIC session closed or the netstack
+    /// stopped. [`EpochEnd::close`] carries the transport verdict.
+    SessionClosed,
+    /// The in-tunnel egress probe convicted the exit of forwarding nothing over
+    /// a session the transport still considered alive.
+    EgressDead,
+    /// The migration watchdog could not keep the session on a moved network
+    /// path, so it ended the epoch for a redial.
+    PathMoved,
+    /// The exit published a planned maintenance drain (ADR 36).
+    Drained,
+}
+
+/// Why one supervised epoch ended, published before the `Reconnecting` state
+/// that follows it so a host can journal the two together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EpochEnd {
+    /// Which epoch ender fired.
+    pub cause: EpochEndCause,
+    /// The QUIC close verdict at the moment the epoch ended
+    /// ([`warren_transport::close_label`]), or `None` when the connection was
+    /// still open (which is itself the signal: the transport was fine and
+    /// something above it ended the epoch). Carries no identity material.
+    pub close: Option<&'static str>,
+    /// How long the epoch served, in seconds.
+    pub up_s: u64,
+}
+
+/// How a supervisor arms the per-epoch in-tunnel egress probe. Production only
+/// ever spawns it; the other two arms exist because the in-process fake
+/// datapaths have no resolver behind them to answer a real probe.
+pub(crate) enum EgressProbeArm {
+    /// Spawn the probe over this epoch's connector.
+    Spawn,
+    /// Do not arm it at all.
+    #[cfg(test)]
+    Off,
+    /// Publish each epoch's escalation notifier instead of spawning a probe, so
+    /// the conviction path is drivable without a real exit.
+    #[cfg(test)]
+    Publish(tokio::sync::mpsc::UnboundedSender<Arc<tokio::sync::Notify>>),
+}
+
 /// The watch senders a supervisor publishes on: connection state, the
 /// per-epoch forwarder driving self-healing port forwards, and the structured
 /// maintenance-migration events. Grouped so the supervisor signature stays
@@ -928,7 +1001,11 @@ pub(crate) struct SupervisorOutputs {
     /// periodic DNS query through the tunnel catches an exit that ACKs keep-alives
     /// but forwards nothing, escalating a reselect. Off for the in-process tests
     /// (whose fake datapaths have no real exit resolver to answer), on in prod.
-    pub(crate) egress_probe: bool,
+    pub(crate) egress_probe: EgressProbeArm,
+    /// Why the epoch that just ended ended, published BEFORE the `Reconnecting`
+    /// transition it precedes so a host reading both sees the cause of the
+    /// death it is about to record.
+    pub(crate) epoch_end_tx: tokio::sync::watch::Sender<Option<EpochEnd>>,
 }
 
 /// Supervises a proxy datapath across tunnel rebuilds, keeping the local
@@ -1015,13 +1092,20 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                 // exit. Held as an `AbortOnDrop` for the epoch, so the probe is torn
                 // down with the session and never outlives it.
                 let egress_dead = Arc::new(tokio::sync::Notify::new());
-                let _egress_probe = outputs.egress_probe.then(|| {
-                    crate::egress_probe::spawn_egress_probe(
+                let _egress_probe = match &outputs.egress_probe {
+                    EgressProbeArm::Spawn => Some(crate::egress_probe::spawn_egress_probe(
                         connector.clone(),
                         gateway,
                         Arc::clone(&egress_dead),
-                    )
-                });
+                    )),
+                    #[cfg(test)]
+                    EgressProbeArm::Off => None,
+                    #[cfg(test)]
+                    EgressProbeArm::Publish(tx) => {
+                        let _ = tx.send(Arc::clone(&egress_dead));
+                        None
+                    }
+                };
                 // Publish this epoch's forwarder so self-healing port forwards
                 // can re-map on the fresh connector; cleared to `None` below when
                 // the tunnel dies.
@@ -1065,6 +1149,12 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                 // a migration that fails costs a redial and nothing more.
                 // Same exit either way: the network moved, the exit is fine.
                 let rebuild = Arc::new(tokio::sync::Notify::new());
+                // Kept for the epoch-end report: the watchdog takes the other
+                // clone, and reading the QUIC close verdict after the race is
+                // what separates a path that timed out from one the peer closed.
+                // Weak, like the watchdog's: a strong handle here would keep the
+                // connection alive past the epoch that owns it.
+                let closing_session = std::sync::Weak::clone(&watchdog_session);
                 let mut migration_io = EpochMigrationIo {
                     watch: network_watch.as_mut(),
                     session: watchdog_session,
@@ -1073,6 +1163,10 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                 };
                 let path_moved = migration_epoch(&mut migration_io, &rebuild);
                 tokio::pin!(path_moved);
+                // Which arm ended the epoch. Assigned in every arm, so a future
+                // arm that forgets to set it is a compile error, not a silent
+                // misattribution.
+                let cause;
                 let drained = match drain_rx {
                     Some(mut rx) => {
                         // The serve future is pinned OUTSIDE the drain loop so a
@@ -1089,14 +1183,21 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                         let mut drain_armed = true;
                         loop {
                             tokio::select! {
-                                () = &mut serve => break None,
-                                () = &mut path_moved => break None,
+                                () = &mut serve => {
+                                    cause = EpochEndCause::SessionClosed;
+                                    break None;
+                                }
+                                () = &mut path_moved => {
+                                    cause = EpochEndCause::PathMoved;
+                                    break None;
+                                }
                                 () = egress_dead.notified() => {
                                     // The exit forwards nothing over a live QUIC
                                     // session: reselect a fresh exit, exactly as
                                     // for a dead session. Not a planned drain, so
                                     // no advisory is carried out of this epoch.
                                     on_drain();
+                                    cause = EpochEndCause::EgressDead;
                                     break None;
                                 }
                                 advisory = wait_for_drain(&mut rx), if drain_armed => {
@@ -1105,6 +1206,7 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                                     )
                                     .await
                                     {
+                                        cause = EpochEndCause::Drained;
                                         break Some(advisory);
                                     }
                                     let _ = outputs.migration_tx.send(Some(
@@ -1126,18 +1228,33 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                         tokio::select! {
                             () = serve_epoch(
                                 &socks_listener, http_listener.as_ref(), connector, alive_rx,
-                            ) => {}
-                            () = &mut path_moved => {}
+                            ) => { cause = EpochEndCause::SessionClosed; }
+                            () = &mut path_moved => { cause = EpochEndCause::PathMoved; }
                             () = egress_dead.notified() => {
                                 // The exit forwards nothing over a live QUIC
                                 // session: reselect a fresh exit, exactly as for a
                                 // dead session.
                                 on_drain();
+                                cause = EpochEndCause::EgressDead;
                             }
                         }
                         None
                     }
                 };
+                // Read the transport verdict BEFORE dropping the epoch's
+                // handles: `None` here means the QUIC connection was still open
+                // when something above it ended the epoch, which is exactly the
+                // shape a probe conviction leaves behind.
+                let close = closing_session
+                    .upgrade()
+                    .and_then(|s| s.connection().close_reason())
+                    .as_ref()
+                    .map(warren_transport::close_label);
+                let _ = outputs.epoch_end_tx.send(Some(EpochEnd {
+                    cause,
+                    close,
+                    up_s: up_since.elapsed().as_secs(),
+                }));
                 let _ = outputs.forwarder_tx.send(None);
                 let _ = outputs.metrics_tx.send(None);
                 if let Some(advisory) = drained {

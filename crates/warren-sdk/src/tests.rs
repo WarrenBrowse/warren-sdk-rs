@@ -119,7 +119,8 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
                 None,
                 None,
                 crate::supervisor::SupervisorOutputs {
-                    egress_probe: false,
+                    egress_probe: crate::supervisor::EgressProbeArm::Off,
+                    epoch_end_tx: tokio::sync::watch::channel(None).0,
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
                     metrics_tx: tokio::sync::watch::channel(None).0,
@@ -203,7 +204,8 @@ async fn network_path_change_redials_immediately_without_rotating() {
                 None,
                 None,
                 crate::supervisor::SupervisorOutputs {
-                    egress_probe: false,
+                    egress_probe: crate::supervisor::EgressProbeArm::Off,
+                    epoch_end_tx: tokio::sync::watch::channel(None).0,
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
                     metrics_tx: tokio::sync::watch::channel(None).0,
@@ -306,7 +308,8 @@ async fn spawn_migration_harness(exit: VerifiedExit) -> MigrationHarness {
                 crate::supervisor::SupervisorOutputs {
                     // The fake exit runs no resolver, so the in-tunnel egress
                     // probe would report a dead path it cannot answer for.
-                    egress_probe: false,
+                    egress_probe: crate::supervisor::EgressProbeArm::Off,
+                    epoch_end_tx: tokio::sync::watch::channel(None).0,
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
                     metrics_tx: tokio::sync::watch::channel(None).0,
@@ -616,7 +619,8 @@ async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
                 None,
                 None,
                 crate::supervisor::SupervisorOutputs {
-                    egress_probe: false,
+                    egress_probe: crate::supervisor::EgressProbeArm::Off,
+                    epoch_end_tx: tokio::sync::watch::channel(None).0,
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
                     metrics_tx: tokio::sync::watch::channel(None).0,
@@ -700,7 +704,8 @@ async fn supervisor_reselects_on_an_exhaustion_refusal_without_going_fatal() {
                 None,
                 None,
                 crate::supervisor::SupervisorOutputs {
-                    egress_probe: false,
+                    egress_probe: crate::supervisor::EgressProbeArm::Off,
+                    epoch_end_tx: tokio::sync::watch::channel(None).0,
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
                     metrics_tx: tokio::sync::watch::channel(None).0,
@@ -766,7 +771,8 @@ async fn supervisor_metrics_probe_reads_the_live_epoch_and_never_outlives_it() {
             None,
             None,
             crate::supervisor::SupervisorOutputs {
-                egress_probe: false,
+                egress_probe: crate::supervisor::EgressProbeArm::Off,
+                epoch_end_tx: tokio::sync::watch::channel(None).0,
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
                 metrics_tx,
@@ -855,7 +861,8 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
             None,
             None,
             crate::supervisor::SupervisorOutputs {
-                egress_probe: false,
+                egress_probe: crate::supervisor::EgressProbeArm::Off,
+                epoch_end_tx: tokio::sync::watch::channel(None).0,
                 state_tx,
                 forwarder_tx,
                 metrics_tx: tokio::sync::watch::channel(None).0,
@@ -1428,7 +1435,8 @@ async fn supervisor_serves_both_socks_and_http_listeners() {
             Some(http_listener),
             None,
             crate::supervisor::SupervisorOutputs {
-                egress_probe: false,
+                egress_probe: crate::supervisor::EgressProbeArm::Off,
+                epoch_end_tx: tokio::sync::watch::channel(None).0,
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
                 metrics_tx: tokio::sync::watch::channel(None).0,
@@ -1482,7 +1490,8 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
             None,
             None,
             crate::supervisor::SupervisorOutputs {
-                egress_probe: false,
+                egress_probe: crate::supervisor::EgressProbeArm::Off,
+                epoch_end_tx: tokio::sync::watch::channel(None).0,
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
                 metrics_tx: tokio::sync::watch::channel(None).0,
@@ -1552,7 +1561,8 @@ async fn supervisor_failover_rotates_on_drain() {
             None,
             None,
             crate::supervisor::SupervisorOutputs {
-                egress_probe: false,
+                egress_probe: crate::supervisor::EgressProbeArm::Off,
+                epoch_end_tx: tokio::sync::watch::channel(None).0,
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
                 metrics_tx: tokio::sync::watch::channel(None).0,
@@ -1631,7 +1641,8 @@ async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
             None,
             None,
             crate::supervisor::SupervisorOutputs {
-                egress_probe: false,
+                egress_probe: crate::supervisor::EgressProbeArm::Off,
+                epoch_end_tx: tokio::sync::watch::channel(None).0,
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
                 metrics_tx: tokio::sync::watch::channel(None).0,
@@ -1713,7 +1724,8 @@ async fn supervisor_retries_past_failed_attempts_then_connects() {
                 None,
                 None,
                 crate::supervisor::SupervisorOutputs {
-                    egress_probe: false,
+                    egress_probe: crate::supervisor::EgressProbeArm::Off,
+                    epoch_end_tx: tokio::sync::watch::channel(None).0,
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
                     metrics_tx: tokio::sync::watch::channel(None).0,
@@ -1791,7 +1803,8 @@ async fn supervisor_emits_structured_migration_events_on_drain() {
             None,
             None,
             crate::supervisor::SupervisorOutputs {
-                egress_probe: false,
+                egress_probe: crate::supervisor::EgressProbeArm::Off,
+                epoch_end_tx: tokio::sync::watch::channel(None).0,
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
                 metrics_tx: tokio::sync::watch::channel(None).0,
@@ -1892,7 +1905,8 @@ async fn supervisor_gate_veto_cancels_the_migration_and_keeps_serving() {
                 None,
                 None,
                 crate::supervisor::SupervisorOutputs {
-                    egress_probe: false,
+                    egress_probe: crate::supervisor::EgressProbeArm::Off,
+                    epoch_end_tx: tokio::sync::watch::channel(None).0,
                     state_tx,
                     forwarder_tx: tokio::sync::watch::channel(None).0,
                     metrics_tx: tokio::sync::watch::channel(None).0,
@@ -1981,7 +1995,8 @@ async fn supervisor_gate_approval_lets_the_migration_proceed() {
             None,
             None,
             crate::supervisor::SupervisorOutputs {
-                egress_probe: false,
+                egress_probe: crate::supervisor::EgressProbeArm::Off,
+                epoch_end_tx: tokio::sync::watch::channel(None).0,
                 state_tx,
                 forwarder_tx: tokio::sync::watch::channel(None).0,
                 metrics_tx: tokio::sync::watch::channel(None).0,
@@ -2487,4 +2502,160 @@ async fn failover_refuses_an_all_dns_disabled_list_without_an_override() {
         .start_proxy_supervised_failover(&circuits, &cfg)
         .await;
     assert!(matches!(result, Err(SdkError::ExitDnsDisabled)));
+}
+
+/// The supervisor races four independent epoch enders (the datapath dying, the
+/// migration watchdog giving up, the in-tunnel egress probe convicting the exit,
+/// a maintenance drain) and, until now, published only that the epoch ended. A
+/// fleet death was therefore unattributable: every one of them reached the
+/// journal as a bare `connected -> reconnecting`, which is why nobody could tell
+/// a genuinely dead tunnel from a healthy one that a probe convicted. The cause
+/// must reach the host before the state transition that follows it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dead_datapath_is_reported_as_a_session_close_with_its_transport_reason() {
+    use crate::supervisor::{EpochEndCause, supervise_proxy};
+
+    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+    let (epoch_end_tx, mut epoch_end_rx) = tokio::sync::watch::channel(None);
+    let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let task = tokio::spawn(async move {
+        supervise_proxy(
+            socks_listener,
+            None,
+            None,
+            crate::supervisor::SupervisorOutputs {
+                egress_probe: crate::supervisor::EgressProbeArm::Off,
+                state_tx,
+                forwarder_tx: tokio::sync::watch::channel(None).0,
+                metrics_tx: tokio::sync::watch::channel(None).0,
+                migration_tx: tokio::sync::watch::channel(None).0,
+                fatal_tx: tokio::sync::watch::channel(None).0,
+                epoch_end_tx,
+            },
+            crate::supervisor::EpochGuards {
+                pre_migrate: None,
+                network_watch: None,
+                ..Default::default()
+            },
+            move || {
+                let kill_tx = kill_tx.clone();
+                async move {
+                    let close = Arc::new(tokio::sync::Notify::new());
+                    let _ = kill_tx.send(Arc::clone(&close));
+                    Ok::<_, SdkError>(EstablishedTunnel {
+                        sink: ClosableSink { close },
+                        local_ip: "10.66.0.2".parse().unwrap(),
+                        prefix: 24,
+                        gateway: "10.66.0.1".parse().unwrap(),
+                        ipv6: None,
+                    })
+                }
+            },
+            || {},
+        )
+        .await;
+    });
+
+    let kill = tokio::time::timeout(std::time::Duration::from_secs(5), kill_rx.recv())
+        .await
+        .expect("first connect happened")
+        .expect("kill handle");
+    assert!(
+        epoch_end_rx.borrow_and_update().is_none(),
+        "a live epoch has not ended, so nothing is published yet"
+    );
+
+    kill.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), epoch_end_rx.changed())
+        .await
+        .expect("the epoch end is published")
+        .expect("watch alive");
+    let report = epoch_end_rx.borrow().expect("an ended epoch reports why");
+    assert_eq!(
+        report.cause,
+        EpochEndCause::SessionClosed,
+        "the datapath read side closing is a session death, not a probe verdict"
+    );
+    task.abort();
+}
+
+/// The other half of the attribution: when the in-tunnel egress probe convicts
+/// the exit, the epoch must be reported as that verdict and never as a session
+/// death. The two demand opposite fixes (one is a real dead exit, the other is a
+/// working tunnel torn down), so conflating them is what kept this class of
+/// failure undiagnosed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_egress_probe_conviction_is_reported_as_such_not_as_a_session_close() {
+    use crate::supervisor::{EpochEndCause, supervise_proxy};
+
+    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+    let (epoch_end_tx, mut epoch_end_rx) = tokio::sync::watch::channel(None);
+    // Each epoch publishes its escalation notifier here, so the conviction the
+    // real probe would raise is drivable without a resolver behind the fake
+    // datapath.
+    let (escalate_tx, mut escalate_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let task = tokio::spawn(async move {
+        supervise_proxy(
+            socks_listener,
+            None,
+            None,
+            crate::supervisor::SupervisorOutputs {
+                egress_probe: crate::supervisor::EgressProbeArm::Publish(escalate_tx),
+                state_tx,
+                forwarder_tx: tokio::sync::watch::channel(None).0,
+                metrics_tx: tokio::sync::watch::channel(None).0,
+                migration_tx: tokio::sync::watch::channel(None).0,
+                fatal_tx: tokio::sync::watch::channel(None).0,
+                epoch_end_tx,
+            },
+            crate::supervisor::EpochGuards {
+                pre_migrate: None,
+                network_watch: None,
+                ..Default::default()
+            },
+            move || {
+                let kill_tx = kill_tx.clone();
+                async move {
+                    let close = Arc::new(tokio::sync::Notify::new());
+                    let _ = kill_tx.send(Arc::clone(&close));
+                    Ok::<_, SdkError>(EstablishedTunnel {
+                        sink: ClosableSink { close },
+                        local_ip: "10.66.0.2".parse().unwrap(),
+                        prefix: 24,
+                        gateway: "10.66.0.1".parse().unwrap(),
+                        ipv6: None,
+                    })
+                }
+            },
+            || {},
+        )
+        .await;
+    });
+
+    let _kill = tokio::time::timeout(std::time::Duration::from_secs(5), kill_rx.recv())
+        .await
+        .expect("first connect happened")
+        .expect("kill handle");
+    let escalate = tokio::time::timeout(std::time::Duration::from_secs(5), escalate_rx.recv())
+        .await
+        .expect("the epoch armed its egress escalation")
+        .expect("notifier");
+
+    escalate.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), epoch_end_rx.changed())
+        .await
+        .expect("the epoch end is published")
+        .expect("watch alive");
+    let report = epoch_end_rx.borrow().expect("an ended epoch reports why");
+    assert_eq!(
+        report.cause,
+        EpochEndCause::EgressDead,
+        "a probe verdict must be attributable to the probe, not to the datapath"
+    );
+    task.abort();
 }

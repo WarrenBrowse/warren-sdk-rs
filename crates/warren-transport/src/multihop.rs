@@ -185,6 +185,27 @@ impl MultihopError {
     }
 }
 
+/// Short, stable label for why a QUIC connection closed, for diagnostics.
+///
+/// A tunnel death reported as a bare "it reconnected" is unattributable, and the
+/// remedies differ by an order of magnitude: an idle timeout is a path that went
+/// silent, a peer close is a decision the other end made and can be read in its
+/// logs. The labels carry no identity material (no address, no port, no peer
+/// name), only the transport verdict, so they are safe on the no-log path.
+#[must_use]
+pub fn close_label(err: &quinn::ConnectionError) -> &'static str {
+    match err {
+        quinn::ConnectionError::TimedOut => "timed_out",
+        quinn::ConnectionError::ApplicationClosed(_) => "app_closed",
+        quinn::ConnectionError::ConnectionClosed(_) => "transport_closed",
+        quinn::ConnectionError::TransportError(_) => "transport_error",
+        quinn::ConnectionError::Reset => "reset",
+        quinn::ConnectionError::LocallyClosed => "locally_closed",
+        quinn::ConnectionError::VersionMismatch => "version_mismatch",
+        quinn::ConnectionError::CidsExhausted => "cids_exhausted",
+    }
+}
+
 /// Whether a QUIC connection error is the exit's maintenance-drain application
 /// close (`WARREN_MH_DRAINING`): a reselect signal, not a transient loss. Reads
 /// the engine's wire constant, so the SDK maps the engine's decision rather than
