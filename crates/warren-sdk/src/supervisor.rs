@@ -965,6 +965,17 @@ pub struct EpochEnd {
     pub up_s: u64,
 }
 
+impl EpochEnd {
+    /// Builds a report. The struct is `#[non_exhaustive]` so it can grow a field
+    /// without breaking consumers, which also means a host cannot build one with
+    /// a struct expression: this constructor is how a consumer's own tests pin
+    /// what they do with each cause.
+    #[must_use]
+    pub fn new(cause: EpochEndCause, close: Option<&'static str>, up_s: u64) -> Self {
+        Self { cause, close, up_s }
+    }
+}
+
 /// How a supervisor arms the per-epoch in-tunnel egress probe. Production only
 /// ever spawns it; the other two arms exist because the in-process fake
 /// datapaths have no resolver behind them to answer a real probe.
