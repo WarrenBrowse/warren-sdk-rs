@@ -24,10 +24,34 @@ use tokio::sync::Notify;
 use warren_net::{TunnelConnector, UdpConnector, UdpFlow};
 use warren_transport::egress_probe::{
     EgressProbeConfig, EgressProbeIo, PROBE_QNAME, PROBE_SENDS, PROBE_TIMEOUT, ProbeOutcome,
-    build_dns_query, is_matching_response, jittered, run_egress_probe,
+    TransportEvidence, build_dns_query, is_matching_response, jittered, run_egress_probe,
 };
 
 use crate::supervisor::AbortOnDrop;
+
+/// Reads the epoch's QUIC ACK counter, or `None` once the epoch is gone.
+///
+/// Type-erased and non-owning for the same reason as the metrics probe: a
+/// strong reference to the session would keep the QUIC connection alive past
+/// the epoch that owns it, so an observability read would change the tunnel's
+/// lifetime.
+#[derive(Clone)]
+pub(crate) struct AckReader(Arc<dyn Fn() -> Option<u64> + Send + Sync>);
+
+impl AckReader {
+    pub(crate) fn new(read: impl Fn() -> Option<u64> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(read))
+    }
+
+    /// Non-owning reader over a live multihop session.
+    pub(crate) fn over(session: std::sync::Weak<warren_transport::MultihopSession>) -> Self {
+        Self::new(move || session.upgrade().map(|s| s.acks_received()))
+    }
+
+    fn read(&self) -> Option<u64> {
+        (self.0)()
+    }
+}
 
 /// One in-tunnel DNS round trip: the gateway-probe seam. Production dials the
 /// netstack UDP path; tests script the verdict, so the supervisor escalation is
@@ -121,17 +145,30 @@ pub(crate) struct ProxyEgressProbe<P: GatewayProber> {
     prober: P,
     cfg: EgressProbeConfig,
     escalate: Arc<Notify>,
+    /// The epoch's ACK counter, and its value when the current failure streak
+    /// began. Only the peer can ACK what it received from us, so a counter that
+    /// has not moved across the streak means the path carried nothing and the
+    /// exit is not the suspect.
+    acks: AckReader,
+    acks_at_streak_start: Option<u64>,
     /// splitmix64 state for the tick jitter (de-regularization only, so a fleet
     /// never probes in lockstep; not a security primitive).
     rng: u64,
 }
 
 impl<P: GatewayProber> ProxyEgressProbe<P> {
-    pub(crate) fn new(prober: P, cfg: EgressProbeConfig, escalate: Arc<Notify>) -> Self {
+    pub(crate) fn new(
+        prober: P,
+        cfg: EgressProbeConfig,
+        escalate: Arc<Notify>,
+        acks: AckReader,
+    ) -> Self {
         Self {
             prober,
             cfg,
             escalate,
+            acks,
+            acks_at_streak_start: None,
             rng: 0x9E37_79B9_7F4A_7C15,
         }
     }
@@ -193,6 +230,22 @@ impl<P: GatewayProber> EgressProbeIo for ProxyEgressProbe<P> {
         // but the supervisor already logs the transition, so it is dropped here.
         self.escalate.notify_one();
     }
+
+    fn mark_streak_start(&mut self) {
+        self.acks_at_streak_start = self.acks.read();
+    }
+
+    fn transport_evidence(&mut self) -> TransportEvidence {
+        match (self.acks_at_streak_start, self.acks.read()) {
+            // The epoch ended under us (or never had a session to read): nobody
+            // observed the transport, which is not the same as observing it
+            // silent, and suppressing a conviction on absent evidence would let
+            // a dead exit hide behind it.
+            (None, _) | (_, None) => TransportEvidence::Unknown,
+            (Some(before), Some(now)) if now > before => TransportEvidence::Progressing,
+            _ => TransportEvidence::Silent,
+        }
+    }
 }
 
 /// Spawns the egress probe for one epoch over `connector`, escalating a reconnect
@@ -203,6 +256,7 @@ pub(crate) fn spawn_egress_probe(
     connector: TunnelConnector,
     gateway: Ipv4Addr,
     escalate: Arc<Notify>,
+    acks: AckReader,
 ) -> AbortOnDrop {
     let cfg = EgressProbeConfig::from_env();
     AbortOnDrop(tokio::spawn(async move {
@@ -210,8 +264,12 @@ pub(crate) fn spawn_egress_probe(
             return;
         }
         let threshold = cfg.failure_threshold;
-        let mut probe =
-            ProxyEgressProbe::new(ConnectorProber::new(connector, gateway), cfg, escalate);
+        let mut probe = ProxyEgressProbe::new(
+            ConnectorProber::new(connector, gateway),
+            cfg,
+            escalate,
+            acks,
+        );
         run_egress_probe(&mut probe, threshold).await;
     }))
 }
@@ -395,6 +453,59 @@ mod tests {
         }
     }
 
+    /// The conviction that tears a working tunnel down must not fire while the
+    /// transport carried nothing: this probe convicts an exit that ACKs and
+    /// forwards nothing, and while the peer ACKs nothing at all the premise
+    /// does not hold. The evidence comes from the QUIC ACK counter, which is
+    /// the only thing that separates a dead peer from a quiet one.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_path_reports_silent_and_a_live_one_reports_progress() {
+        use warren_transport::egress_probe::TransportEvidence;
+
+        let acks = StdArc::new(std::sync::atomic::AtomicU64::new(100));
+        let reader = {
+            let acks = StdArc::clone(&acks);
+            AckReader::new(move || Some(acks.load(std::sync::atomic::Ordering::Relaxed)))
+        };
+        let mut probe = ProxyEgressProbe::new(
+            ScriptedProber::new([false]),
+            fast_cfg(),
+            Arc::new(Notify::new()),
+            reader,
+        );
+
+        probe.mark_streak_start();
+        assert_eq!(
+            probe.transport_evidence(),
+            TransportEvidence::Silent,
+            "no ACK arrived since the streak began: the path carried nothing"
+        );
+
+        acks.fetch_add(7, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            probe.transport_evidence(),
+            TransportEvidence::Progressing,
+            "the peer acknowledged what we sent, so the path is live and an \
+             unanswered in-tunnel query is evidence against the exit"
+        );
+    }
+
+    /// Once the epoch is gone there is no connection left to read, and reporting
+    /// that as `Silent` would suppress a conviction on evidence nobody has.
+    #[tokio::test(start_paused = true)]
+    async fn a_datapath_with_no_session_reports_unknown_rather_than_silent() {
+        use warren_transport::egress_probe::TransportEvidence;
+
+        let mut probe = ProxyEgressProbe::new(
+            ScriptedProber::new([false]),
+            fast_cfg(),
+            Arc::new(Notify::new()),
+            AckReader::new(|| None),
+        );
+        probe.mark_streak_start();
+        assert_eq!(probe.transport_evidence(), TransportEvidence::Unknown);
+    }
+
     /// interval + startup 1 s so the paused-time ticks are fast; threshold 3.
     fn fast_cfg() -> EgressProbeConfig {
         EgressProbeConfig::resolve(None, Some("1"), Some("1"), Some("3"))
@@ -410,8 +521,12 @@ mod tests {
         let fired = Arc::clone(&escalate);
         let cfg = fast_cfg();
         let threshold = cfg.failure_threshold;
-        let mut probe =
-            ProxyEgressProbe::new(ScriptedProber::new([false, false, false]), cfg, escalate);
+        let mut probe = ProxyEgressProbe::new(
+            ScriptedProber::new([false, false, false]),
+            cfg,
+            escalate,
+            AckReader::new(|| None),
+        );
 
         let run = tokio::spawn(async move { run_egress_probe(&mut probe, threshold).await });
         for _ in 0..6 {
@@ -438,6 +553,7 @@ mod tests {
             ScriptedProber::new([false, false, true, false, false]),
             cfg,
             escalate,
+            AckReader::new(|| None),
         );
 
         let run = tokio::spawn(async move { run_egress_probe(&mut probe, threshold).await });

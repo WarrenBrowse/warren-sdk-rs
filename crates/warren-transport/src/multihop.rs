@@ -986,6 +986,18 @@ impl MultihopSession {
         self.conn.stats().path.rtt
     }
 
+    /// ACK frames received on this connection so far.
+    ///
+    /// The one counter that separates a dead peer from a quiet one: only the
+    /// peer can acknowledge what it received from us, so a rising count proves
+    /// the path is carrying traffic in both directions. Received bytes cannot
+    /// do that job once the peer sends unsolicited traffic of its own (DAITA
+    /// cover, idle padding), and an idle client still ACKs its keep-alives.
+    #[must_use]
+    pub fn acks_received(&self) -> u64 {
+        self.conn.stats().frame_rx.acks
+    }
+
     /// Seal one IP packet and send it as a QUIC datagram.
     ///
     /// # Errors

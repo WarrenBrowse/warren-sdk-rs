@@ -1108,6 +1108,12 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                         connector.clone(),
                         gateway,
                         Arc::clone(&egress_dead),
+                        // The probe's verdict is only about the exit while the
+                        // transport underneath is carrying traffic, so it reads
+                        // this epoch's ACK counter before it convicts.
+                        crate::egress_probe::AckReader::over(std::sync::Weak::clone(
+                            &watchdog_session,
+                        )),
                     )),
                     #[cfg(test)]
                     EgressProbeArm::Off => None,
