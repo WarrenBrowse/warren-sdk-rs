@@ -1,6 +1,6 @@
 # warren-sdk-rs
 
-Standalone Rust client SDK for the [Warren VPN](https://warrenbrowse.com): a
+Standalone Rust client SDK for the [Warren VPN](https://warren.ro): a
 no-log VPN whose client to exit tunnel is pure QUIC, with a non-custodial Ed25519
 identity derived from a BIP39 mnemonic.
 
