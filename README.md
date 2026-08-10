@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/warren-logo.svg" alt="Warren" width="130"/>
+</p>
+
 # warren-sdk-rs
 
 Standalone Rust client SDK for the [Warren VPN](https://warren.ro): a
