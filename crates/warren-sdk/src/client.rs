@@ -1280,6 +1280,8 @@ impl<T: HttpTransport> WarrenClient<T> {
         let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
         let (epoch_end_tx, epoch_end_rx) = tokio::sync::watch::channel(None);
         let dns_server = cfg.dns_server;
+        let reconnect_request = std::sync::Arc::new(tokio::sync::Notify::new());
+        let supervisor_reconnect = std::sync::Arc::clone(&reconnect_request);
         let task = tokio::spawn(async move {
             supervise_proxy(
                 socks_listener,
@@ -1293,6 +1295,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                     fatal_tx,
                     epoch_end_tx,
                     egress_probe: crate::supervisor::EgressProbeArm::Spawn,
+                    reconnect_request: supervisor_reconnect,
                 },
                 crate::supervisor::EpochGuards {
                     // Reserve-then-switch is OFF by default: the pre-migrate
@@ -1326,6 +1329,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             migration_rx,
             fatal_rx,
             epoch_end_rx,
+            reconnect_request,
             task,
         })
     }

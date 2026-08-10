@@ -83,6 +83,10 @@ pub struct SupervisedProxyHandle {
     /// Why the most recent epoch ended, published just before the
     /// `Reconnecting` state it precedes.
     pub(crate) epoch_end_rx: tokio::sync::watch::Receiver<Option<EpochEnd>>,
+    /// Raised by [`SupervisedProxyHandle::request_reconnect`], raced against the
+    /// supervisor's own epoch enders. Handle-level rather than per-epoch: a host
+    /// holds it for the life of the datapath, across every rebuild.
+    pub(crate) reconnect_request: Arc<tokio::sync::Notify>,
     pub(crate) task: tokio::task::JoinHandle<()>,
 }
 
@@ -157,6 +161,25 @@ impl SupervisedProxyHandle {
     #[must_use]
     pub fn metrics(&self) -> Option<warren_transport::MultihopMetricsSnapshot> {
         self.metrics_rx.borrow().as_ref().and_then(|probe| probe())
+    }
+
+    /// Asks the supervisor to end the current epoch and rebuild, keeping the
+    /// stable listeners bound throughout.
+    ///
+    /// For a host that has its own evidence the datapath carries nothing while
+    /// the supervisor's enders have not fired. The alternative, dropping the
+    /// handle and building a fresh one, unbinds the proxy for the whole dial,
+    /// and an application pointed at those ports gets connections REFUSED for
+    /// as long as it takes (18 s to 857 s, measured across a member fleet
+    /// 2026-08-10). Through here the listeners stay up and a fresh connection
+    /// waits for the rebuilt datapath instead.
+    ///
+    /// Idempotent: one permit is stored, so a request raised between two epochs
+    /// is honoured by the next one rather than lost, and several requests
+    /// collapse into a single rebuild. It never overrides a terminal
+    /// [`ConnectionState::Failed`].
+    pub fn request_reconnect(&self) {
+        self.reconnect_request.notify_one();
     }
 
     /// A detached [`MetricsReader`] for a background task that cannot hold this
@@ -947,6 +970,13 @@ pub enum EpochEndCause {
     PathMoved,
     /// The exit published a planned maintenance drain (ADR 36).
     Drained,
+    /// The host asked for a rebuild ([`SupervisedProxyHandle::request_reconnect`]).
+    ///
+    /// The host has evidence of its own that this datapath is not carrying
+    /// traffic, and the supervisor's own enders have not fired. Distinct from
+    /// the others because it says nothing about the exit: it is the host's
+    /// verdict, and only the host knows what it was based on.
+    HostRequested,
 }
 
 /// Why one supervised epoch ended, published before the `Reconnecting` state
@@ -1013,6 +1043,10 @@ pub(crate) struct SupervisorOutputs {
     /// but forwards nothing, escalating a reselect. Off for the in-process tests
     /// (whose fake datapaths have no real exit resolver to answer), on in prod.
     pub(crate) egress_probe: EgressProbeArm,
+    /// The host's own rebuild request
+    /// ([`SupervisedProxyHandle::request_reconnect`]), raced against the
+    /// supervisor's enders so the listeners never leave the air for it.
+    pub(crate) reconnect_request: Arc<tokio::sync::Notify>,
     /// Why the epoch that just ended ended, published BEFORE the `Reconnecting`
     /// transition it precedes so a host reading both sees the cause of the
     /// death it is about to record.
@@ -1055,6 +1089,9 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
     // `warren_transport::redial_policy`.
     let mut backoff = warren_transport::redial_policy::REDIAL_BACKOFF.forever();
     let mut first = true;
+    // Handle-level, so a request survives the epoch it was raised against and
+    // the next one honours it.
+    let host_reconnect = Arc::clone(&outputs.reconnect_request);
     // The advisory of an in-flight drain migration; consumed by the next
     // successful connect to emit the `Completed` migration event.
     let mut migrating: Option<warren_transport::DrainAdvisory> = None;
@@ -1223,6 +1260,14 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                                     cause = EpochEndCause::EgressDead;
                                     break None;
                                 }
+                                () = host_reconnect.notified() => {
+                                    // The host's own verdict. It says nothing
+                                    // about the exit, so the failover cursor is
+                                    // left where it is and the rebuild retries
+                                    // the same circuit.
+                                    cause = EpochEndCause::HostRequested;
+                                    break None;
+                                }
                                 advisory = wait_for_drain(&mut rx), if drain_armed => {
                                     if pre_migrate_allows(
                                         pre_migrate.as_mut(), advisory, PRE_MIGRATE_TIMEOUT,
@@ -1259,6 +1304,11 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                                 // dead session.
                                 on_drain();
                                 cause = EpochEndCause::EgressDead;
+                            }
+                            () = host_reconnect.notified() => {
+                                // The host's own verdict: rebuild this circuit,
+                                // and leave the failover cursor alone.
+                                cause = EpochEndCause::HostRequested;
                             }
                         }
                         None
