@@ -18,13 +18,14 @@
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::Notify;
 use warren_net::{TunnelConnector, UdpConnector, UdpFlow};
 use warren_transport::egress_probe::{
-    EgressProbeConfig, EgressProbeIo, PROBE_QNAME, PROBE_SENDS, PROBE_TIMEOUT, ProbeOutcome,
-    TransportEvidence, build_dns_query, is_matching_response, jittered, run_egress_probe,
+    EgressProbeConfig, EgressProbeIo, PROBE_QNAME, ProbeOutcome, ProbeSchedule, TransportEvidence,
+    build_dns_query, is_matching_response, jittered, run_egress_probe,
 };
 
 use crate::supervisor::AbortOnDrop;
@@ -53,6 +54,34 @@ impl AckReader {
     }
 }
 
+/// Reads the epoch's smoothed path round trip, or `None` once the epoch is gone.
+///
+/// Non-owning for the same reason as [`AckReader`]. The probe deadline is sized
+/// from this: a path whose queueing delay alone exceeds the shipped deadline
+/// expires every datagram of the schedule together, and the exit is convicted
+/// for a congestion the probe never measured.
+#[derive(Clone)]
+pub(crate) struct RttReader(Arc<dyn Fn() -> Option<Duration> + Send + Sync>);
+
+impl RttReader {
+    pub(crate) fn new(read: impl Fn() -> Option<Duration> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(read))
+    }
+
+    /// Non-owning reader over a live multihop session.
+    pub(crate) fn over(session: std::sync::Weak<warren_transport::MultihopSession>) -> Self {
+        Self::new(move || {
+            session
+                .upgrade()
+                .map(|s| Duration::from_millis(u64::from(s.path_quality().rtt_ms)))
+        })
+    }
+
+    fn read(&self) -> Option<Duration> {
+        (self.0)()
+    }
+}
+
 /// One in-tunnel DNS round trip: the gateway-probe seam. Production dials the
 /// netstack UDP path; tests script the verdict, so the supervisor escalation is
 /// testable without a real exit.
@@ -75,14 +104,18 @@ pub(crate) struct ConnectorProber<C: UdpConnector = TunnelConnector> {
     /// not be mistaken for this probe's answer. Sequential is fine, the probe is
     /// not adversarial and QUIC encrypts the wire.
     next_txid: u16,
+    /// The path the next probe will run on, read once per probe so the schedule
+    /// follows a link whose delay changes under load.
+    rtt: RttReader,
 }
 
 impl<C: UdpConnector> ConnectorProber<C> {
-    pub(crate) fn new(connector: C, gateway: Ipv4Addr) -> Self {
+    pub(crate) fn new(connector: C, gateway: Ipv4Addr, rtt: RttReader) -> Self {
         Self {
             connector,
             gateway_dns: SocketAddr::new(gateway.into(), 53),
             next_txid: 0,
+            rtt,
         }
     }
 }
@@ -102,16 +135,31 @@ where
         self.next_txid = self.next_txid.wrapping_add(1);
         let txid = self.next_txid;
         let query = Bytes::from(build_dns_query(txid, PROBE_QNAME));
+        // Read once per probe, before the first datagram: the schedule has to
+        // describe the path this probe will actually run on, and on a link that
+        // congests under its own load that changes within a session.
+        let path_rtt = self.rtt.read();
+        let schedule = ProbeSchedule::for_path_rtt(path_rtt);
+        // A deadline the path cannot fit a round trip into convicts nothing.
+        let expired = if ProbeSchedule::carries_exit_evidence(path_rtt) {
+            ProbeOutcome::Dead
+        } else {
+            ProbeOutcome::Inconclusive
+        };
         let started = tokio::time::Instant::now();
         if sock.send_to(query.clone(), self.gateway_dns).await.is_err() {
             return ProbeOutcome::Inconclusive;
         }
-        let deadline = started + PROBE_TIMEOUT;
-        // PROBE_TIMEOUT is only safe because a lost datagram is retransmitted
-        // inside it: the engine sized the deadline and the schedule together, so
+        let deadline = started + schedule.deadline;
+        // The deadline is only safe because a lost datagram is retransmitted
+        // inside it: the engine sizes the deadline and the schedule together, so
         // sending once and waiting the deadline out would turn a single lost
         // datagram into a failed probe, and three of those convict a healthy exit.
-        let mut retransmits = PROBE_SENDS.iter().skip(1).map(|offset| started + *offset);
+        let mut retransmits = schedule
+            .sends
+            .iter()
+            .skip(1)
+            .map(|offset| started + *offset);
         let mut next_send = retransmits.next();
         loop {
             // Absolute instants, so re-arming on a stray datagram never shifts
@@ -128,7 +176,7 @@ where
                 },
                 () = tokio::time::sleep_until(wake) => {
                     if wake >= deadline {
-                        return ProbeOutcome::Dead;
+                        return expired;
                     }
                     let _ = sock.send_to(query.clone(), self.gateway_dns).await;
                     next_send = retransmits.next();
@@ -257,6 +305,7 @@ pub(crate) fn spawn_egress_probe(
     gateway: Ipv4Addr,
     escalate: Arc<Notify>,
     acks: AckReader,
+    rtt: RttReader,
 ) -> AbortOnDrop {
     let cfg = EgressProbeConfig::from_env();
     AbortOnDrop(tokio::spawn(async move {
@@ -265,7 +314,7 @@ pub(crate) fn spawn_egress_probe(
         }
         let threshold = cfg.failure_threshold;
         let mut probe = ProxyEgressProbe::new(
-            ConnectorProber::new(connector, gateway),
+            ConnectorProber::new(connector, gateway, rtt),
             cfg,
             escalate,
             acks,
@@ -382,6 +431,15 @@ mod tests {
         answer_on: Option<usize>,
         opens: bool,
     ) -> (ConnectorProber<FakeConnector>, StdArc<Mutex<FlowLog>>) {
+        prober_on_path(answer_on, opens, None)
+    }
+
+    /// A prober whose datapath reports `rtt` as its smoothed round trip.
+    fn prober_on_path(
+        answer_on: Option<usize>,
+        opens: bool,
+        rtt: Option<Duration>,
+    ) -> (ConnectorProber<FakeConnector>, StdArc<Mutex<FlowLog>>) {
         let log = StdArc::new(Mutex::new(FlowLog::default()));
         let connector = FakeConnector {
             log: StdArc::clone(&log),
@@ -389,7 +447,11 @@ mod tests {
             opens,
         };
         (
-            ConnectorProber::new(connector, Ipv4Addr::new(10, 64, 0, 1)),
+            ConnectorProber::new(
+                connector,
+                Ipv4Addr::new(10, 64, 0, 1),
+                RttReader::new(move || rtt),
+            ),
             log,
         )
     }
@@ -404,9 +466,35 @@ mod tests {
         assert_eq!(prober.probe().await, ProbeOutcome::Dead);
         assert_eq!(
             log.lock().unwrap().sends,
-            PROBE_SENDS.to_vec(),
+            ProbeSchedule::SHIPPED.sends.to_vec(),
             "every datagram in the engine schedule must go out before the verdict"
         );
+    }
+
+    /// The member-line failure this plumbing exists for: on a link whose
+    /// queueing delay alone is 1400 ms, the shipped schedule expires all three
+    /// datagrams together and convicts an exit that was answering fine. The
+    /// driver must follow the engine's path-sized schedule, not the constants.
+    #[tokio::test(start_paused = true)]
+    async fn a_congested_path_stretches_the_retransmit_schedule() {
+        let congested = Duration::from_millis(1400);
+        let (mut prober, log) = prober_on_path(None, true, Some(congested));
+        assert_eq!(prober.probe().await, ProbeOutcome::Dead);
+        assert_eq!(
+            log.lock().unwrap().sends,
+            ProbeSchedule::for_path_rtt(Some(congested)).sends.to_vec(),
+            "the driver must retransmit on the schedule the engine sized for \
+             this path, not on the shipped constants"
+        );
+    }
+
+    /// Past the engine cap the probe cannot tell a dead exit from a path that
+    /// cannot carry the query inside any deadline, so it must report no
+    /// evidence rather than convict.
+    #[tokio::test(start_paused = true)]
+    async fn a_path_past_the_probe_cap_reports_no_evidence_about_the_exit() {
+        let (mut prober, _log) = prober_on_path(None, true, Some(Duration::from_secs(20)));
+        assert_eq!(prober.probe().await, ProbeOutcome::Inconclusive);
     }
 
     #[tokio::test(start_paused = true)]

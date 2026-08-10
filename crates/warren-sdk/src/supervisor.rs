@@ -1114,6 +1114,12 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                         crate::egress_probe::AckReader::over(std::sync::Weak::clone(
                             &watchdog_session,
                         )),
+                        // And its deadline is only meaningful against the delay
+                        // the path is actually carrying, so it sizes the probe
+                        // schedule from this epoch's smoothed round trip.
+                        crate::egress_probe::RttReader::over(std::sync::Weak::clone(
+                            &watchdog_session,
+                        )),
                     )),
                     #[cfg(test)]
                     EgressProbeArm::Off => None,
