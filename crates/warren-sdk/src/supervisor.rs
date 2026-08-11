@@ -1157,6 +1157,12 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                         crate::egress_probe::RttReader::over(std::sync::Weak::clone(
                             &watchdog_session,
                         )),
+                        // And a conviction is only about the exit while the exit
+                        // has stopped delivering: this counter is the one thing
+                        // only the exit can move.
+                        crate::egress_probe::RxReader::over(std::sync::Weak::clone(
+                            &watchdog_session,
+                        )),
                     )),
                     #[cfg(test)]
                     EgressProbeArm::Off => None,

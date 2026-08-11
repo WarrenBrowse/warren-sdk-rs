@@ -24,8 +24,8 @@ use bytes::Bytes;
 use tokio::sync::Notify;
 use warren_net::{TunnelConnector, UdpConnector, UdpFlow};
 use warren_transport::egress_probe::{
-    EgressProbeConfig, EgressProbeIo, PROBE_QNAME, ProbeOutcome, ProbeSchedule, TransportEvidence,
-    build_dns_query, is_matching_response, jittered, run_egress_probe,
+    EgressProbeConfig, EgressProbeIo, ExitEvidence, PROBE_QNAME, ProbeOutcome, ProbeSchedule,
+    TransportEvidence, build_dns_query, is_matching_response, jittered, run_egress_probe,
 };
 
 use crate::supervisor::AbortOnDrop;
@@ -78,6 +78,32 @@ impl RttReader {
     }
 
     fn read(&self) -> Option<Duration> {
+        (self.0)()
+    }
+}
+
+/// Reads the epoch's received inner-payload counter, or `None` once the epoch is
+/// gone.
+///
+/// Non-owning for the same reason as [`AckReader`]. This is the counter that
+/// answers the question a conviction actually rests on: only the EXIT can
+/// produce an inner IP packet that survives the exit-id pin, the replay window
+/// and the AEAD, so a counter that moved across a failure streak means the exit
+/// was forwarding while its answers were not coming back.
+#[derive(Clone)]
+pub(crate) struct RxReader(Arc<dyn Fn() -> Option<u64> + Send + Sync>);
+
+impl RxReader {
+    pub(crate) fn new(read: impl Fn() -> Option<u64> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(read))
+    }
+
+    /// Non-owning reader over a live multihop session.
+    pub(crate) fn over(session: std::sync::Weak<warren_transport::MultihopSession>) -> Self {
+        Self::new(move || session.upgrade().map(|s| s.metrics_snapshot().bytes_recv))
+    }
+
+    fn read(&self) -> Option<u64> {
         (self.0)()
     }
 }
@@ -199,6 +225,11 @@ pub(crate) struct ProxyEgressProbe<P: GatewayProber> {
     /// exit is not the suspect.
     acks: AckReader,
     acks_at_streak_start: Option<u64>,
+    /// The epoch's received-payload counter, and its value when the current
+    /// failure streak began. Only the exit can produce what it counts, so a
+    /// counter that moved across the streak means the exit kept forwarding.
+    rx: RxReader,
+    rx_at_streak_start: Option<u64>,
     /// splitmix64 state for the tick jitter (de-regularization only, so a fleet
     /// never probes in lockstep; not a security primitive).
     rng: u64,
@@ -210,6 +241,7 @@ impl<P: GatewayProber> ProxyEgressProbe<P> {
         cfg: EgressProbeConfig,
         escalate: Arc<Notify>,
         acks: AckReader,
+        rx: RxReader,
     ) -> Self {
         Self {
             prober,
@@ -217,6 +249,8 @@ impl<P: GatewayProber> ProxyEgressProbe<P> {
             escalate,
             acks,
             acks_at_streak_start: None,
+            rx,
+            rx_at_streak_start: None,
             rng: 0x9E37_79B9_7F4A_7C15,
         }
     }
@@ -281,6 +315,17 @@ impl<P: GatewayProber> EgressProbeIo for ProxyEgressProbe<P> {
 
     fn mark_streak_start(&mut self) {
         self.acks_at_streak_start = self.acks.read();
+        self.rx_at_streak_start = self.rx.read();
+    }
+
+    fn exit_evidence(&mut self) -> ExitEvidence {
+        match (self.rx_at_streak_start, self.rx.read()) {
+            // The epoch ended under us (or never had a session to read): nobody
+            // observed the exit, which is not the same as observing it silent.
+            (None, _) | (_, None) => ExitEvidence::Unknown,
+            (Some(before), Some(now)) if now > before => ExitEvidence::Delivering,
+            _ => ExitEvidence::Quiet,
+        }
     }
 
     fn transport_evidence(&mut self) -> TransportEvidence {
@@ -306,6 +351,7 @@ pub(crate) fn spawn_egress_probe(
     escalate: Arc<Notify>,
     acks: AckReader,
     rtt: RttReader,
+    rx: RxReader,
 ) -> AbortOnDrop {
     let cfg = EgressProbeConfig::from_env();
     AbortOnDrop(tokio::spawn(async move {
@@ -318,6 +364,7 @@ pub(crate) fn spawn_egress_probe(
             cfg,
             escalate,
             acks,
+            rx,
         );
         run_egress_probe(&mut probe, threshold).await;
     }))
@@ -560,6 +607,7 @@ mod tests {
             fast_cfg(),
             Arc::new(Notify::new()),
             reader,
+            RxReader::new(|| None),
         );
 
         probe.mark_streak_start();
@@ -578,6 +626,55 @@ mod tests {
         );
     }
 
+    /// The counter only the exit can move. A streak it grew across means the
+    /// exit was forwarding while its answers were not coming back, which is what
+    /// a saturated uplink does to the probe's own query.
+    #[tokio::test(start_paused = true)]
+    async fn a_delivering_exit_reports_delivering_and_a_silent_one_reports_quiet() {
+        let rx = StdArc::new(std::sync::atomic::AtomicU64::new(4096));
+        let reader = {
+            let rx = StdArc::clone(&rx);
+            RxReader::new(move || Some(rx.load(std::sync::atomic::Ordering::Relaxed)))
+        };
+        let mut probe = ProxyEgressProbe::new(
+            ScriptedProber::new([false]),
+            fast_cfg(),
+            Arc::new(Notify::new()),
+            AckReader::new(|| None),
+            reader,
+        );
+
+        probe.mark_streak_start();
+        assert_eq!(
+            probe.exit_evidence(),
+            ExitEvidence::Quiet,
+            "nothing arrived since the streak began"
+        );
+
+        rx.fetch_add(1_400_000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            probe.exit_evidence(),
+            ExitEvidence::Delivering,
+            "payload only the exit can produce arrived over the streak, so the \
+             exit is forwarding whatever its answers did"
+        );
+    }
+
+    /// Once the epoch is gone there is no connection left to read, and reporting
+    /// that as `Quiet` would suppress a conviction on evidence nobody has.
+    #[tokio::test(start_paused = true)]
+    async fn a_datapath_with_no_session_reports_unknown_exit_evidence() {
+        let mut probe = ProxyEgressProbe::new(
+            ScriptedProber::new([false]),
+            fast_cfg(),
+            Arc::new(Notify::new()),
+            AckReader::new(|| None),
+            RxReader::new(|| None),
+        );
+        probe.mark_streak_start();
+        assert_eq!(probe.exit_evidence(), ExitEvidence::Unknown);
+    }
+
     /// Once the epoch is gone there is no connection left to read, and reporting
     /// that as `Silent` would suppress a conviction on evidence nobody has.
     #[tokio::test(start_paused = true)]
@@ -589,6 +686,7 @@ mod tests {
             fast_cfg(),
             Arc::new(Notify::new()),
             AckReader::new(|| None),
+            RxReader::new(|| None),
         );
         probe.mark_streak_start();
         assert_eq!(probe.transport_evidence(), TransportEvidence::Unknown);
@@ -614,6 +712,7 @@ mod tests {
             cfg,
             escalate,
             AckReader::new(|| None),
+            RxReader::new(|| None),
         );
 
         let run = tokio::spawn(async move { run_egress_probe(&mut probe, threshold).await });
@@ -642,6 +741,7 @@ mod tests {
             cfg,
             escalate,
             AckReader::new(|| None),
+            RxReader::new(|| None),
         );
 
         let run = tokio::spawn(async move { run_egress_probe(&mut probe, threshold).await });
