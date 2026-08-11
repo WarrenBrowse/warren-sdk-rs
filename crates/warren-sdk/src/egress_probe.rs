@@ -25,7 +25,8 @@ use tokio::sync::Notify;
 use warren_net::{TunnelConnector, UdpConnector, UdpFlow};
 use warren_transport::egress_probe::{
     EgressProbeConfig, EgressProbeIo, ExitEvidence, PROBE_QNAME, ProbeOutcome, ProbeSchedule,
-    TransportEvidence, build_dns_query, is_matching_response, jittered, run_egress_probe,
+    TransportEvidence, build_dns_query, exit_evidence_from, is_matching_response, jittered,
+    run_egress_probe, transport_evidence_from,
 };
 
 use crate::supervisor::AbortOnDrop;
@@ -319,25 +320,11 @@ impl<P: GatewayProber> EgressProbeIo for ProxyEgressProbe<P> {
     }
 
     fn exit_evidence(&mut self) -> ExitEvidence {
-        match (self.rx_at_streak_start, self.rx.read()) {
-            // The epoch ended under us (or never had a session to read): nobody
-            // observed the exit, which is not the same as observing it silent.
-            (None, _) | (_, None) => ExitEvidence::Unknown,
-            (Some(before), Some(now)) if now > before => ExitEvidence::Delivering,
-            _ => ExitEvidence::Quiet,
-        }
+        exit_evidence_from(self.rx_at_streak_start, self.rx.read())
     }
 
     fn transport_evidence(&mut self) -> TransportEvidence {
-        match (self.acks_at_streak_start, self.acks.read()) {
-            // The epoch ended under us (or never had a session to read): nobody
-            // observed the transport, which is not the same as observing it
-            // silent, and suppressing a conviction on absent evidence would let
-            // a dead exit hide behind it.
-            (None, _) | (_, None) => TransportEvidence::Unknown,
-            (Some(before), Some(now)) if now > before => TransportEvidence::Progressing,
-            _ => TransportEvidence::Silent,
-        }
+        transport_evidence_from(self.acks_at_streak_start, self.acks.read())
     }
 }
 
