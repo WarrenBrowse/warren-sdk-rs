@@ -1,0 +1,237 @@
+# Release pipeline for the warren-proxy binary and its container image.
+#
+# Tag shapes (shared release-channel contract: one run publishes one channel):
+#   proxy-vX.Y.Z       prod  -> assets warren-proxy-<ver>-...,      image :<ver> + :latest
+#   proxy-beta-vX.Y.Z  beta  -> assets warren-proxy-beta-<ver>-..., image :beta-<ver> + :beta
+#
+# Artifacts: static musl binaries for linux x86_64 (built on the Rosetta
+# docker pool, the proven warren-core musl recipe) and linux aarch64 (native
+# arm64 pool), a published GitHub release with SHA256SUMS, and the multi-arch
+# image ghcr.io/warrenbrowse/warren-proxy.
+#
+# workflow_dispatch builds the binaries as run artifacts without publishing
+# anything (a dry run of the matrix).
+
+name: release-proxy
+
+on:
+  push:
+    tags:
+      - "proxy-v*"
+      - "proxy-beta-v*"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "prod | beta (dry run: build only, no publish)"
+        required: false
+        default: "beta"
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  resolve:
+    name: Resolve channel and version
+    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    timeout-minutes: 10
+    outputs:
+      channel: ${{ steps.resolve.outputs.channel }}
+      version: ${{ steps.resolve.outputs.version }}
+      env_tag: ${{ steps.resolve.outputs.env_tag }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_CHANNEL: ${{ github.event.inputs.channel }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "push" ]; then
+            case "$REF_NAME" in
+              proxy-beta-v*) channel=beta; prefix="proxy-beta-v"; version="${REF_NAME#proxy-beta-v}" ;;
+              proxy-v*)      channel=prod; prefix="proxy-v";      version="${REF_NAME#proxy-v}" ;;
+              *) echo "unexpected tag $REF_NAME" >&2; exit 1 ;;
+            esac
+            # Version-truth guard (shared git-commits rule): refuse a tag that
+            # is not the strictly highest of ITS OWN series, reading the
+            # remote's tags rather than the clone's.
+            highest=$(git ls-remote --tags origin "refs/tags/${prefix}*" \
+              | sed "s|.*refs/tags/${prefix}||" | grep -v '\^{}' | sort -V | tail -1)
+            if [ "$highest" != "$version" ]; then
+              echo "refusing ${REF_NAME}: highest ${prefix}* on origin is ${prefix}${highest}" >&2
+              exit 1
+            fi
+            publish=true
+          else
+            channel="${INPUT_CHANNEL:-beta}"
+            version="0.0.0-dry"
+            publish=false
+          fi
+          env_tag=""
+          [ "$channel" = "beta" ] && env_tag="-beta"
+          {
+            echo "channel=$channel"
+            echo "version=$version"
+            echo "env_tag=$env_tag"
+            echo "publish=$publish"
+          } >>"$GITHUB_OUTPUT"
+          echo "building $channel $version (publish=$publish)"
+
+  build:
+    name: Build ${{ matrix.arch }}-musl
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            runner: [self-hosted, linux, x64, docker, warren]
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            runner: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: ${{ matrix.runner }}
+    # Generous: the real anti-hang guard is the per-invocation timeout below.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-engine
+        with:
+          token: ${{ secrets.ENGINE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl toolchain
+        run: |
+          set -euo pipefail
+          if ! command -v musl-gcc >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends musl-tools
+          fi
+      - name: Build static binary
+        env:
+          WARREN_PRODUCT_ENV: ${{ needs.resolve.outputs.channel }}
+          CARGO_TARGET: ${{ matrix.target }}
+          # musl-gcc builds the C bits (ring). Both vars are target-scoped,
+          # so the one not matching this matrix leg is inert.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: |
+          set -euo pipefail
+          # Persistent cache outside _work (the runner GC wipes leaf target/
+          # dirs in _work between jobs).
+          export CARGO_TARGET_DIR="$HOME/warren-sdk-target"
+          # retry_flaky (proven on the Rosetta pools): a rustc can die
+          # unreaped under emulation and cargo waits on its jobserver token
+          # forever; timeout SIGKILLs (rc 124/137) and the retry resumes on
+          # the warm target dir. A genuine failure fails the first pass.
+          retry_flaky() {
+            for attempt in 1 2 3; do
+              if timeout -k 60s 40m "$@" 2>&1 | tee /tmp/cargo-out.txt; then return 0; fi
+              rc=$?
+              if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+                echo "::warning::cargo hung and was killed (attempt $attempt/3); retrying"
+              elif grep -q 'SIGSEGV\|signal: 11' /tmp/cargo-out.txt; then
+                echo "::warning::rustc crashed (attempt $attempt/3); retrying"
+              else
+                return "$rc"
+              fi
+            done
+            return 1
+          }
+          retry_flaky cargo build --locked --release -p warren-proxy --target "$CARGO_TARGET"
+          BIN="$CARGO_TARGET_DIR/$CARGO_TARGET/release/warren-proxy"
+          # Static check without `file`: a musl static binary is "not a
+          # dynamic executable" to ldd.
+          if ldd "$BIN" 2>&1 | grep -qvi 'not a dynamic executable\|statically linked'; then
+            echo "binary is dynamically linked:"; ldd "$BIN"; exit 1
+          fi
+          mkdir -p dist
+          cp "$BIN" dist/warren-proxy
+      - uses: actions/upload-artifact@v4
+        with:
+          name: warren-proxy-${{ matrix.arch }}
+          path: dist/warren-proxy
+          if-no-files-found: error
+
+  publish:
+    name: Publish release and image
+    needs: [resolve, build]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: [self-hosted, linux, x64, docker, warren]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: warren-proxy-x86_64
+          path: dist/amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: warren-proxy-aarch64
+          path: dist/arm64
+      - name: Package release assets
+        id: package
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          ENV_TAG: ${{ needs.resolve.outputs.env_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for pair in "amd64 x86_64" "arm64 aarch64"; do
+            set -- $pair
+            chmod 755 "dist/$1/warren-proxy"
+            name="warren-proxy${ENV_TAG}-${VERSION}-linux-$2-musl"
+            tar -C "dist/$1" -czf "out/${name}.tar.gz" warren-proxy
+          done
+          (cd out && sha256sum ./*.tar.gz > SHA256SUMS)
+          ls -l out
+      - name: Create published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          prerelease=""
+          [ "$CHANNEL" = "beta" ] && prerelease="--prerelease"
+          gh release create "$TAG" out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "warren-proxy ${CHANNEL} ${VERSION}" \
+            --notes "Static musl builds of the headless warren-proxy daemon (${CHANNEL} channel). See crates/warren-proxy/README.md for the env contract." \
+            $prerelease
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up QEMU
+        # The arm64 layer of the image runs `apk add` under emulation on this
+        # x64 docker pool.
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build and push multi-arch image
+        env:
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANNEL" = "beta" ]; then
+            tags="-t ghcr.io/warrenbrowse/warren-proxy:beta-${VERSION} -t ghcr.io/warrenbrowse/warren-proxy:beta"
+          else
+            tags="-t ghcr.io/warrenbrowse/warren-proxy:${VERSION} -t ghcr.io/warrenbrowse/warren-proxy:latest"
+          fi
+          docker buildx build --push --platform linux/amd64,linux/arm64 \
+            -f docker/warren-proxy.Dockerfile $tags .

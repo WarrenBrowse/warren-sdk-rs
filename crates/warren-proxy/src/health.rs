@@ -91,6 +91,25 @@ pub async fn serve(listener: tokio::net::TcpListener, view: HealthView) {
     }
 }
 
+/// Synchronous `/healthz` probe for the `warren-proxy healthcheck`
+/// subcommand (the container HEALTHCHECK shape: the binary probes its own
+/// daemon, so the image needs no shell and no wget).
+///
+/// # Errors
+///
+/// I/O errors reaching the endpoint; `Ok(false)` when it answered non-200.
+pub fn probe_healthz(addr: std::net::SocketAddr) -> std::io::Result<bool> {
+    use std::io::{Read as _, Write as _};
+    let timeout = std::time::Duration::from_secs(8);
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.write_all(b"GET /healthz HTTP/1.1\r\nhost: healthcheck\r\nconnection: close\r\n\r\n")?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response.starts_with("HTTP/1.1 200"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +159,35 @@ mod tests {
             render("/nope", ConnectionState::Connected, true, None).0,
             404
         );
+    }
+
+    #[tokio::test]
+    async fn probe_healthz_matches_the_served_state() {
+        let (state_tx, state_rx) = watch::channel(ConnectionState::Connected);
+        let (_port_tx, port_rx) = watch::channel(None);
+        let verified = Arc::new(AtomicBool::new(true));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let view = HealthView {
+            state_rx,
+            egress_verified: Arc::clone(&verified),
+            port_rx,
+        };
+        let server = tokio::spawn(serve(listener, view));
+
+        let healthy = tokio::task::spawn_blocking(move || probe_healthz(addr))
+            .await
+            .unwrap()
+            .expect("probe must reach the endpoint");
+        assert!(healthy, "Connected + verified must probe healthy");
+
+        state_tx.send(ConnectionState::Reconnecting).unwrap();
+        let unhealthy = tokio::task::spawn_blocking(move || probe_healthz(addr))
+            .await
+            .unwrap()
+            .expect("probe must reach the endpoint");
+        assert!(!unhealthy, "Reconnecting must probe unhealthy");
+        server.abort();
     }
 
     #[tokio::test]
