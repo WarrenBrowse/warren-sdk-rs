@@ -101,7 +101,7 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
         None => Vec::new(),
     };
 
-    let code = supervise(&handle, &config).await;
+    let code = supervise(&handle, &config, &port_rx).await;
     handle.shutdown();
     Ok(code)
 }
@@ -213,22 +213,9 @@ async fn start_forwards(
         loop {
             let current = *external_rx.borrow_and_update();
             if current != last {
-                if let Some(old) = last
-                    && let Some(cmd) = &fwd.down_command
-                {
-                    hooks::run_hook(cmd, old, "down").await;
-                }
-                if let Some(port) = current {
-                    log(&format!("public port granted: {port}"));
-                    if let Some(path) = &fwd.status_file
-                        && let Err(err) = hooks::write_status_file(path, port).await
-                    {
-                        eprintln!("warren-proxy: writing the port status file failed: {err}");
-                    }
-                    if let Some(cmd) = &fwd.up_command {
-                        hooks::run_hook(cmd, port, "up").await;
-                    }
-                }
+                apply_port_change(&fwd, last, current).await;
+                // Published after the hooks have run, so a reader that sees a
+                // port knows the up command already fired for it.
                 let _ = port_tx.send(current);
                 last = current;
             }
@@ -241,7 +228,11 @@ async fn start_forwards(
 }
 
 /// Waits for a signal or a terminal supervisor failure.
-async fn supervise(handle: &SupervisedProxyHandle, config: &Config) -> i32 {
+async fn supervise(
+    handle: &SupervisedProxyHandle,
+    config: &Config,
+    port_rx: &watch::Receiver<Option<u16>>,
+) -> i32 {
     let mut state_rx = handle.watch_state();
     let failed = async {
         loop {
@@ -261,21 +252,45 @@ async fn supervise(handle: &SupervisedProxyHandle, config: &Config) -> i32 {
         }
         () = signals => {
             log("signal received, shutting down");
-            if let Some(fwd) = &config.forward
-                && let Some(cmd) = &fwd.down_command
-                && let Some(port) = current_port(fwd)
-            {
-                hooks::run_hook(cmd, port, "down").await;
-            }
+            // The live port comes from the watch channel the forward watcher
+            // publishes, never from the status file: the file is optional, and
+            // reading it there skipped the down hook for everyone who had not
+            // configured one.
+            run_shutdown_hook(config.forward.as_ref(), *port_rx.borrow()).await;
             0
         }
     }
 }
 
-/// Best-effort read-back of the last granted port for the shutdown hook.
-fn current_port(fwd: &ForwardConfig) -> Option<u16> {
-    let path = fwd.status_file.as_ref()?;
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+/// Runs the down command once at shutdown, when a port was actually granted.
+async fn run_shutdown_hook(forward: Option<&ForwardConfig>, port: Option<u16>) {
+    if let Some(fwd) = forward
+        && let Some(cmd) = &fwd.down_command
+        && let Some(port) = port
+    {
+        hooks::run_hook(cmd, port, "down").await;
+    }
+}
+
+/// Reacts to the exit granting a different public port: retire the old one,
+/// publish the new one, then announce it. Split out of the watcher loop so the
+/// ordering is testable without a live tunnel.
+async fn apply_port_change(fwd: &ForwardConfig, previous: Option<u16>, current: Option<u16>) {
+    if let Some(old) = previous
+        && let Some(cmd) = &fwd.down_command
+    {
+        hooks::run_hook(cmd, old, "down").await;
+    }
+    let Some(port) = current else { return };
+    log(&format!("public port granted: {port}"));
+    if let Some(path) = &fwd.status_file
+        && let Err(err) = hooks::write_status_file(path, port).await
+    {
+        eprintln!("warren-proxy: writing the port status file failed: {err}");
+    }
+    if let Some(cmd) = &fwd.up_command {
+        hooks::run_hook(cmd, port, "up").await;
+    }
 }
 
 async fn wait_for_signal() {
@@ -303,6 +318,99 @@ async fn wait_for_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ForwardProto;
+
+    /// A unique scratch path per test, so the suite stays parallel-safe.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("warren-proxy-run-{}-{name}", std::process::id()))
+    }
+
+    fn forward_writing(
+        marker: &std::path::Path,
+        status_file: Option<std::path::PathBuf>,
+    ) -> ForwardConfig {
+        ForwardConfig {
+            proto: ForwardProto::Both,
+            internal_port: 56881,
+            target: "127.0.0.1:56881".parse().expect("valid literal address"),
+            up_command: Some(format!("printf up:%s {{{{PORT}}}} > {}", marker.display())),
+            down_command: Some(format!(
+                "printf down:%s {{{{PORT}}}} > {}",
+                marker.display()
+            )),
+            status_file,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_shutdown_hook_runs_without_a_status_file() {
+        let marker = scratch("shutdown-nofile");
+        let _ = std::fs::remove_file(&marker);
+        let fwd = forward_writing(&marker, None);
+
+        run_shutdown_hook(Some(&fwd), Some(49587)).await;
+
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("down hook must have run"),
+            "down:49587",
+            "the down command must fire on the granted port even with no status file configured"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn the_shutdown_hook_is_skipped_when_no_port_was_granted() {
+        let marker = scratch("shutdown-noport");
+        let _ = std::fs::remove_file(&marker);
+        let fwd = forward_writing(&marker, None);
+
+        run_shutdown_hook(Some(&fwd), None).await;
+
+        assert!(
+            !marker.exists(),
+            "with no port granted there is nothing to retire, so the hook must not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_grant_writes_the_status_file_and_fires_the_up_hook() {
+        let marker = scratch("grant-marker");
+        let status = scratch("grant-status");
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&status);
+        let fwd = forward_writing(&marker, Some(status.clone()));
+
+        apply_port_change(&fwd, None, Some(58364)).await;
+
+        assert_eq!(
+            std::fs::read_to_string(&status).expect("status file written"),
+            "58364\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("up hook must have run"),
+            "up:58364"
+        );
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&status);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_port_retires_the_old_one_before_announcing_the_new() {
+        let marker = scratch("replace-marker");
+        let _ = std::fs::remove_file(&marker);
+        let fwd = forward_writing(&marker, None);
+
+        apply_port_change(&fwd, Some(49587), Some(58364)).await;
+
+        // Both hooks write the same marker, so the surviving content proves the
+        // order: down for the old port ran first, up for the new port last.
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("hooks must have run"),
+            "up:58364",
+            "the up hook for the new port must be the last thing to run"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
 
     #[test]
     fn probe_address_maps_unspecified_to_loopback() {

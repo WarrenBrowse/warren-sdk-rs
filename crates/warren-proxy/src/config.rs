@@ -87,7 +87,8 @@ pub struct Config {
     /// Local liveness endpoint (`/healthz`, `/state`, `/port`); `None`
     /// disables it.
     pub health_listen: Option<SocketAddr>,
-    /// Budget for reaching `Connected` plus verified egress at startup.
+    /// Budget for the tunnel to reach `Connected` at startup. The first-egress
+    /// probe that follows carries its own budget, so it is not bounded by this.
     pub connect_timeout: Duration,
     /// Optional tunnel-side port forward.
     pub forward: Option<ForwardConfig>,
