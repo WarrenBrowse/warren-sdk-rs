@@ -18,6 +18,7 @@ members = [
     "crates/warren-net",
     "crates/warren-sdk",
     "crates/warren-sdk-ffi",
+    "crates/warren-proxy",
     "crates/warren-multihop",
     "crates/warren-daita",
     "crates/warren-tun",
