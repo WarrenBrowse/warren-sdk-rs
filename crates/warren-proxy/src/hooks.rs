@@ -163,6 +163,16 @@ pub async fn write_status_file(path: &Path, port: u16) -> std::io::Result<()> {
     tokio::fs::rename(&tmp, path).await
 }
 
+/// Clears the status file when the mapping is gone, so a consumer reading it
+/// stops announcing a port the exit no longer maps. A file that was never
+/// written is not an error.
+pub async fn clear_status_file(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -235,6 +245,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_failing_hook_is_reported_and_does_not_panic() {
         assert_eq!(run_hook("exit 3", 1, "up").await, HookOutcome::Failed);
+    }
+
+    #[tokio::test]
+    async fn clearing_the_status_file_is_idempotent() {
+        let path = std::env::temp_dir().join(format!("warren-proxy-clear-{}", std::process::id()));
+        write_status_file(&path, 51820).await.expect("write");
+        clear_status_file(&path).await.expect("first clear");
+        assert!(!path.exists());
+        clear_status_file(&path)
+            .await
+            .expect("a file that was never written is not an error");
     }
 
     #[tokio::test]

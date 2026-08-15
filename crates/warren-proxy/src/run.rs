@@ -313,7 +313,17 @@ async fn apply_port_change<H: HookSink>(
     {
         sink.run(cmd, old, "down").await;
     }
-    let Some(port) = current else { return };
+    let Some(port) = current else {
+        // The mapping is gone: a stale file would keep naming a dead public
+        // port to whoever reads it (the documented sibling-container seam),
+        // while `/port` already answers 404.
+        if let Some(path) = &fwd.status_file
+            && let Err(err) = hooks::clear_status_file(path).await
+        {
+            eprintln!("warren-proxy: clearing the port status file failed: {err}");
+        }
+        return;
+    };
     log(&format!("public port granted: {port}"));
     if let Some(path) = &fwd.status_file
         && let Err(err) = hooks::write_status_file(path, port).await
@@ -435,6 +445,32 @@ mod tests {
         );
         assert_eq!(sink.calls(), vec!["up:58364:up {{PORT}}".to_owned()]);
         let _ = std::fs::remove_file(&status);
+    }
+
+    /// The file is the documented integration seam (a sibling container reads
+    /// it), so leaving it behind makes that consumer announce a port the exit
+    /// no longer maps, while `/port` already answers 404.
+    #[tokio::test]
+    async fn a_withdrawn_grant_clears_the_status_file_after_the_down_hook() {
+        let status = scratch("withdrawn-status");
+        let sink = Recorder::default();
+        let fwd = forward(Some(status.clone()));
+
+        apply_port_change(&sink, &fwd, None, Some(58364)).await;
+        apply_port_change(&sink, &fwd, Some(58364), None).await;
+
+        assert!(
+            !status.exists(),
+            "the status file must not survive the mapping it names"
+        );
+        assert_eq!(
+            sink.calls(),
+            vec![
+                "up:58364:up {{PORT}}".to_owned(),
+                "down:58364:down {{PORT}}".to_owned(),
+            ],
+            "the down hook still runs, and runs before the file is cleared"
+        );
     }
 
     #[tokio::test]
