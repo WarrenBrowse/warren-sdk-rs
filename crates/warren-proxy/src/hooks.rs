@@ -285,15 +285,18 @@ pub(crate) mod tests {
         let marker =
             std::env::temp_dir().join(format!("warren-proxy-orphan-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
+        // The descendant writes late enough that the kill (budget, then the
+        // SIGTERM/SIGKILL grace) has room to finish first on a loaded or
+        // emulated CI runner, and the wait below outlasts the write.
         let command = format!(
-            "sh -c 'sleep 1; echo survived > {}' & sleep 30",
+            "sh -c 'sleep 3; echo survived > {}' & sleep 30",
             marker.display()
         );
 
         let outcome = run_hook_with_timeout(&command, 1, "up", Duration::from_millis(200)).await;
 
         assert_eq!(outcome, HookOutcome::TimedOut);
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
         assert!(
             !marker.exists(),
             "what the hook started must die with it, not outlive the budget"
