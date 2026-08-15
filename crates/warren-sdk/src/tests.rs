@@ -860,6 +860,12 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let (forwarder_tx, mut forwarder_rx) = tokio::sync::watch::channel(None);
     let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The redial after a dead epoch is immediate (the engine's first backoff
+    // draw is zero), so without a gate the supervisor can republish a forwarder
+    // before this test reads the cleared one: a watch keeps only the latest
+    // value. One permit is charged, so the first dial runs and the redial waits.
+    let dial_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let connect_gate = Arc::clone(&dial_gate);
 
     let task = tokio::spawn(async move {
         supervise_proxy(
@@ -883,7 +889,12 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
             },
             move || {
                 let kill_tx = kill_tx.clone();
+                let gate = Arc::clone(&connect_gate);
                 async move {
+                    gate.acquire()
+                        .await
+                        .expect("the dial gate stays open")
+                        .forget();
                     let close = Arc::new(tokio::sync::Notify::new());
                     let _ = kill_tx.send(Arc::clone(&close));
                     Ok::<_, SdkError>(EstablishedTunnel {
@@ -917,6 +928,17 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
     assert!(
         forwarder_rx.borrow_and_update().is_none(),
         "forwarder cleared when the tunnel dies"
+    );
+
+    // The rebuild still happens: the gate was what held it, not a stuck loop.
+    dial_gate.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), forwarder_rx.changed())
+        .await
+        .expect("the next epoch is dialed once the gate opens")
+        .unwrap();
+    assert!(
+        forwarder_rx.borrow_and_update().is_some(),
+        "the next epoch publishes its own forwarder"
     );
 
     task.abort();
