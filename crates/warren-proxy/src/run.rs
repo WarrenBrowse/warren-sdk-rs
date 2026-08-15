@@ -108,7 +108,7 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
     egress_verified.store(true, Ordering::Relaxed);
     log("tunnel up, egress verified");
 
-    let _forward: Option<SupervisedForwardedPort> = config
+    let forward: Option<SupervisedForwardedPort> = config
         .forward
         .as_ref()
         .map(|fwd| start_forward(&handle, fwd, port_tx));
@@ -121,6 +121,12 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
             // reading it there skipped the down hook for everyone who had not
             // configured one.
             run_shutdown_hook(&ShellHooks, config.forward.as_ref(), *port_rx.borrow()).await;
+            // Release the lease at the exit rather than let it lapse: it runs
+            // for two hours, so a restart on another internal port or protocol
+            // would leave the public port stranded that long.
+            if let Some(forward) = forward {
+                forward.shutdown().await;
+            }
             0
         }
         Stop::Fatal(cause) => {
