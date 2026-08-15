@@ -39,6 +39,8 @@ pub mod netstack;
 pub mod portforward;
 #[cfg(feature = "proxy")]
 pub mod proxy;
+#[cfg(feature = "proxy")]
+pub mod raw_udp;
 pub mod sink;
 pub mod socks5;
 pub mod tun_sink;
@@ -64,6 +66,8 @@ pub use portforward::{
 };
 #[cfg(feature = "proxy")]
 pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy, UdpConnector, UdpFlow};
+#[cfg(feature = "proxy")]
+pub use raw_udp::{RawUdpDemux, RawUdpFlow, build_udp_packet};
 pub use sink::{BondedPacketSink, CloseRttObserver, MultihopPacketSink, PacketSink};
 pub use tun_sink::{
     PumpStats, TunBridge, TunPacketSink, forward_bidirectional, forward_bidirectional_with_stats,
