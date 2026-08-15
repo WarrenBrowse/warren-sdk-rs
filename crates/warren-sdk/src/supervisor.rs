@@ -359,16 +359,18 @@ impl SupervisedForwardedPort {
         self.outcome_rx.clone()
     }
 
-    /// Releases the forward at the exit, then tears it down.
+    /// Releases the forward at the exit, then tears it down. Returns whether
+    /// the release was carried out inside [`PORT_RELEASE_BUDGET`]; `false`
+    /// means the tunnel was already gone and the exit will reclaim the port
+    /// when the lease lapses.
     ///
-    /// Dropping the handle instead stops the local tasks and leaves the
-    /// mapping to lapse on its own (up to two hours), which strands the public
-    /// port for anyone restarting on a different internal port or protocol.
-    /// Bounded by [`PORT_RELEASE_BUDGET`], so a dead tunnel cannot hold a
-    /// shutdown open.
-    pub async fn shutdown(self) {
-        self.release.release(PORT_RELEASE_BUDGET).await;
+    /// Dropping the handle instead stops the local tasks and always leaves the
+    /// mapping to lapse (up to two hours), which strands the public port for
+    /// anyone restarting on a different internal port or protocol.
+    pub async fn shutdown(self) -> bool {
+        let released = self.release.release(PORT_RELEASE_BUDGET).await;
         self.task.abort();
+        released
     }
 }
 
@@ -413,9 +415,12 @@ pub(crate) struct ReleaseGate {
 impl ReleaseGate {
     /// Asks for the release and waits for it, giving up after `budget` (the
     /// gateway is reached through the tunnel, which may already be gone).
-    pub(crate) async fn release(&self, budget: std::time::Duration) {
+    /// Reports whether the release was actually carried out.
+    pub(crate) async fn release(&self, budget: std::time::Duration) -> bool {
         self.requested.notify_one();
-        let _ = tokio::time::timeout(budget, self.released.notified()).await;
+        tokio::time::timeout(budget, self.released.notified())
+            .await
+            .is_ok()
     }
 
     /// Resolves when a release has been asked for.

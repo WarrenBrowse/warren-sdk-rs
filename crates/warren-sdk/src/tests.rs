@@ -1058,13 +1058,39 @@ async fn supervise_forward_releases_the_mapping_when_asked_to_stop() {
     ext_rx.changed().await.unwrap();
     assert_eq!(*ext_rx.borrow(), Some(5000));
 
-    gate.release(std::time::Duration::from_secs(5)).await;
+    let acknowledged = gate.release(std::time::Duration::from_secs(5)).await;
 
     assert!(
         released.load(Ordering::SeqCst),
         "the graceful stop must reach the mapping's own release, not just abort the task"
     );
+    assert!(
+        acknowledged,
+        "a release the task carried out must be reported as done, not as a timeout"
+    );
     task.abort();
+}
+
+/// The release travels through the tunnel, which may already be gone when a
+/// stop is asked for. The caller must learn that instead of waiting forever.
+#[tokio::test]
+async fn a_release_nobody_carries_out_gives_up_on_its_budget() {
+    use crate::supervisor::ReleaseGate;
+
+    let gate = ReleaseGate::default();
+    let started = std::time::Instant::now();
+
+    let acknowledged = gate.release(std::time::Duration::from_millis(50)).await;
+
+    assert!(
+        !acknowledged,
+        "with nobody to carry the release out it must report the give-up, not a success"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the budget must cut the wait short, took {:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]
