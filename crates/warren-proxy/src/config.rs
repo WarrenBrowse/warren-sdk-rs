@@ -31,16 +31,18 @@ pub struct ExitFilter {
     pub city: Option<String>,
 }
 
-/// Transport(s) to forward for [`ForwardConfig`].
+/// Transport to forward for [`ForwardConfig`].
+///
+/// One transport per daemon. The exit allocates each proto independently: a
+/// NAT-PMP request with no explicit suggestion can never land on a port whose
+/// other proto slot is live, so asking for TCP and UDP would map two different
+/// public ports, of which the daemon can only ever announce one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardProto {
     /// TCP only.
     Tcp,
     /// UDP only.
     Udp,
-    /// Both transports on the same port (one entitlement: both legs present
-    /// the same credential).
-    Both,
 }
 
 /// Tunnel-side port forward: the exit maps a public port and inbound
@@ -318,13 +320,15 @@ fn parse_forward(
             })?;
 
     let proto = match get("WARREN_PORT_FORWARD_PROTOCOL").as_deref() {
-        None | Some("both") => ForwardProto::Both,
-        Some("tcp") => ForwardProto::Tcp,
+        None | Some("tcp") => ForwardProto::Tcp,
         Some("udp") => ForwardProto::Udp,
+        // `both` is refused rather than silently half-honoured: it maps two
+        // public ports (see [`ForwardProto`]), burns two of the account's five
+        // forward slots, and only the TCP one could be published.
         Some(_) => {
             return Err(ConfigError::Invalid {
                 var: "WARREN_PORT_FORWARD_PROTOCOL",
-                expected: "tcp, udp or both",
+                expected: "tcp or udp (one transport: the exit maps each proto on its own public port)",
             });
         }
     };
@@ -535,7 +539,7 @@ mod tests {
         .unwrap();
         let fwd = cfg.forward.expect("forward must be enabled");
         assert_eq!(fwd.internal_port, 56881);
-        assert_eq!(fwd.proto, ForwardProto::Both);
+        assert_eq!(fwd.proto, ForwardProto::Tcp);
         assert_eq!(fwd.target, "127.0.0.1:56881".parse().unwrap());
         assert_eq!(fwd.up_command.as_deref(), Some("echo {{PORT}}"));
         assert_eq!(fwd.down_command, None);
@@ -562,11 +566,7 @@ mod tests {
 
     #[test]
     fn forward_protocol_parses_all_variants() {
-        for (raw, want) in [
-            ("tcp", ForwardProto::Tcp),
-            ("udp", ForwardProto::Udp),
-            ("both", ForwardProto::Both),
-        ] {
+        for (raw, want) in [("tcp", ForwardProto::Tcp), ("udp", ForwardProto::Udp)] {
             let cfg = load(
                 env(&[
                     ("WARREN_MNEMONIC", "m"),
@@ -578,5 +578,28 @@ mod tests {
             .unwrap();
             assert_eq!(cfg.forward.unwrap().proto, want, "protocol {raw}");
         }
+    }
+
+    /// The exit maps TCP and UDP on two different public ports, and the daemon
+    /// publishes one port, so accepting `both` announced a port whose UDP half
+    /// was dead. Refused at parse time rather than half-honoured.
+    #[test]
+    fn forward_protocol_both_is_refused() {
+        let err = load(
+            env(&[
+                ("WARREN_MNEMONIC", "m"),
+                ("WARREN_PORT_FORWARD_INTERNAL_PORT", "56881"),
+                ("WARREN_PORT_FORWARD_PROTOCOL", "both"),
+            ]),
+            no_file,
+        )
+        .expect_err("both maps two public ports and must not be accepted");
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "WARREN_PORT_FORWARD_PROTOCOL",
+                ..
+            }
+        ));
     }
 }

@@ -29,7 +29,7 @@ netns ownership) is the sibling for the gluetun-style `network_mode:
 | `WARREN_API_URL` | channel default | control-plane override (e.g. the beta host on a prod-built binary) |
 | `WARREN_SERVER_PUBKEY_HEX` | compiled pin | relay-list signing key override (bench/rotation) |
 | `WARREN_PORT_FORWARD_INTERNAL_PORT` | off | enables NAT-PMP forwarding of a tunnel-side port |
-| `WARREN_PORT_FORWARD_PROTOCOL` | `both` | `tcp`, `udp` or `both` |
+| `WARREN_PORT_FORWARD_PROTOCOL` | `tcp` | `tcp` or `udp`, one transport per daemon: the exit picks each proto's public port independently, so a TCP+UDP pair would be reachable on two ports of which only one could be announced (and would burn two of the account's five forward slots) |
 | `WARREN_PORT_FORWARD_TARGET` | `127.0.0.1:<internal>` | local socket inbound connections are relayed to |
 | `WARREN_PORT_FORWARD_UP_COMMAND` | | run via `sh -c` on every grant, `{{PORT}}` substituted (the gluetun up-command shape) |
 | `WARREN_PORT_FORWARD_DOWN_COMMAND` | | run when the port is replaced and at shutdown |

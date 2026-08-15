@@ -96,10 +96,10 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
     egress_verified.store(true, Ordering::Relaxed);
     log("tunnel up, egress verified");
 
-    let _forwards: Vec<SupervisedForwardedPort> = match &config.forward {
-        Some(fwd) => start_forwards(&handle, fwd, port_tx).await,
-        None => Vec::new(),
-    };
+    let _forward: Option<SupervisedForwardedPort> = config
+        .forward
+        .as_ref()
+        .map(|fwd| start_forward(&handle, fwd, port_tx));
 
     let code = supervise(&handle, &config, &port_rx).await;
     handle.shutdown();
@@ -183,30 +183,28 @@ fn probe_address(bound: SocketAddr) -> SocketAddr {
     }
 }
 
-/// Starts the configured forward(s) and the watcher that keeps the status
-/// file and the up/down hooks in sync with the granted public port.
-async fn start_forwards(
+/// Starts the configured forward and the watcher that keeps the status file
+/// and the up/down hooks in sync with the granted public port.
+///
+/// One transport, one mapping, one published port: the exit picks each proto's
+/// public port independently, so a second leg would be reachable on a port the
+/// daemon never announces (see [`ForwardProto`]).
+fn start_forward(
     handle: &SupervisedProxyHandle,
     fwd: &ForwardConfig,
     port_tx: watch::Sender<Option<u16>>,
-) -> Vec<SupervisedForwardedPort> {
-    let protos: &[MapProto] = match fwd.proto {
-        ForwardProto::Tcp => &[MapProto::Tcp],
-        ForwardProto::Udp => &[MapProto::Udp],
-        ForwardProto::Both => &[MapProto::Tcp, MapProto::Udp],
+) -> SupervisedForwardedPort {
+    let proto = match fwd.proto {
+        ForwardProto::Tcp => MapProto::Tcp,
+        ForwardProto::Udp => MapProto::Udp,
     };
-    let mut forwards = Vec::with_capacity(protos.len());
-    for proto in protos {
-        forwards.push(handle.forward_port(*proto, fwd.internal_port, fwd.target));
-    }
+    let forward = handle.forward_port(proto, fwd.internal_port, fwd.target);
     log(&format!(
         "port forward requested: internal {} -> {} ({:?})",
         fwd.internal_port, fwd.target, fwd.proto
     ));
 
-    // The first proto's mapping drives the hooks and the status file; with
-    // Both, the exit grants the pair on one credential so the ports match.
-    let mut external_rx = forwards[0].watch_external_port();
+    let mut external_rx = forward.watch_external_port();
     let fwd = fwd.clone();
     tokio::spawn(async move {
         let mut last: Option<u16> = None;
@@ -224,7 +222,7 @@ async fn start_forwards(
             }
         }
     });
-    forwards
+    forward
 }
 
 /// Waits for a signal or a terminal supervisor failure.
@@ -377,7 +375,7 @@ mod tests {
 
     fn forward(status_file: Option<std::path::PathBuf>) -> ForwardConfig {
         ForwardConfig {
-            proto: ForwardProto::Both,
+            proto: ForwardProto::Tcp,
             internal_port: 56881,
             target: "127.0.0.1:56881".parse().expect("valid literal address"),
             up_command: Some("up {{PORT}}".to_owned()),
