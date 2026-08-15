@@ -1853,6 +1853,132 @@ mod tests {
     }
 
     #[test]
+    fn a_prefix_owner_covers_every_address_inside_it() {
+        let mut own = Ownership::new();
+        assert!(own.is_empty());
+        own.insert(
+            IpNetwork::new(IpAddr::V4(Ipv4Addr::new(10, 67, 1, 0)), 24).expect("a prefix"),
+            A,
+        );
+        assert!(!own.is_empty());
+        assert_eq!(
+            own.owner_of(IpAddr::V4(Ipv4Addr::new(10, 67, 1, 55))),
+            Some(A)
+        );
+        assert_eq!(own.owner_of(IpAddr::V4(Ipv4Addr::new(10, 67, 2, 55))), None);
+    }
+
+    #[test]
+    fn forgets_every_mapping_one_peer_holds_and_no_other() {
+        let mut nat = napt();
+        let now = Instant::now();
+        let mut mine = testpkt::udp(A4, 5000, REMOTE4, 53, b"q");
+        nat.translate_uplink(A, &mut mine, now).expect("uplink");
+        let mine_port = read_ports(&mine, 20).expect("ports").0;
+        let mut theirs = testpkt::udp(B4, 5000, REMOTE4, 53, b"q");
+        nat.translate_uplink(B, &mut theirs, now).expect("uplink");
+        let theirs_port = read_ports(&theirs, 20).expect("ports").0;
+
+        nat.flush_peer(A);
+        assert_eq!(nat.mapping_count(), 1);
+        let mut to_mine = testpkt::udp(REMOTE4, 53, ext4(), mine_port, b"a");
+        assert_eq!(
+            nat.translate_downlink(&mut to_mine, now),
+            Err(NatDrop::NoMapping)
+        );
+        let mut to_theirs = testpkt::udp(REMOTE4, 53, ext4(), theirs_port, b"a");
+        assert_eq!(
+            nat.translate_downlink(&mut to_theirs, now)
+                .expect("the other peer keeps its flows")
+                .peer,
+            B
+        );
+    }
+
+    #[test]
+    fn removing_a_static_forward_returns_its_port_to_the_pool() {
+        let mut nat = napt();
+        let now = Instant::now();
+        nat.add_static(
+            StaticDnat {
+                proto: MapProto::Udp,
+                external_port: 51_820,
+                target: SocketAddr::new(A4, 8080),
+            },
+            now,
+        )
+        .expect("pin");
+        assert!(nat.remove_static(MapProto::Udp, 51_820, false));
+        assert!(
+            !nat.remove_static(MapProto::Udp, 51_820, false),
+            "nothing holds that port any more"
+        );
+        assert_eq!(nat.mapping_count(), 0);
+        let mut inbound = testpkt::udp(OTHER4, 40_000, ext4(), 51_820, b"hello");
+        assert_eq!(
+            nat.translate_downlink(&mut inbound, now),
+            Err(NatDrop::NoMapping)
+        );
+        let mut up = testpkt::udp(A4, 51_820, REMOTE4, 53, b"q");
+        nat.translate_uplink(A, &mut up, now).expect("uplink");
+        assert_eq!(
+            read_ports(&up, 20).expect("ports").0,
+            51_820,
+            "the port is allocatable again"
+        );
+    }
+
+    #[test]
+    fn reports_the_epoch_its_addresses_belong_to() {
+        let mut nat = napt();
+        assert_eq!(nat.epoch(), Some(epoch(1, 1)));
+        nat.set_external(epoch(2, 5), EXT4, None);
+        assert_eq!(nat.epoch(), Some(epoch(2, 5)));
+    }
+
+    #[test]
+    fn an_exit_with_no_identity_is_not_a_configured_one() {
+        assert_eq!(ExitId::UNKNOWN.as_bytes(), &[0u8; EXIT_ID_LEN]);
+        assert_ne!(ExitId::from_bytes([1; EXIT_ID_LEN]), ExitId::UNKNOWN);
+        assert_eq!(format!("{:?}", ExitId::UNKNOWN), "ExitId(unknown)");
+        assert_eq!(
+            format!("{:?}", ExitId::from_bytes([1; EXIT_ID_LEN])),
+            "ExitId(set)"
+        );
+    }
+
+    #[test]
+    fn seeds_its_port_draw_from_the_system_when_given_no_generator() {
+        let mut nat = Napt::new(NatConfig::default());
+        nat.set_ownership(ownership());
+        nat.set_external(epoch(1, 1), EXT4, None);
+        let mut up = testpkt::udp(A4, 5000, REMOTE4, 53, b"q");
+        nat.translate_uplink(A, &mut up, Instant::now())
+            .expect("uplink");
+        assert_eq!(nat.mapping_count(), 1);
+    }
+
+    #[test]
+    fn renders_no_address_of_a_peer_or_of_the_tunnel() {
+        let mut nat = napt();
+        let now = Instant::now();
+        let mut up = testpkt::udp(A4, 5000, REMOTE4, 53, b"q");
+        nat.translate_uplink(A, &mut up, now).expect("uplink");
+        let port = read_ports(&up, 20).expect("ports").0;
+        let mut down = testpkt::udp(REMOTE4, 53, ext4(), port, b"a");
+        let out = nat.translate_downlink(&mut down, now).expect("answer");
+
+        for rendered in [format!("{nat:?}"), format!("{out:?}")] {
+            for forbidden in ["10.67", "10.66", "1.1.1.1"] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "an address reached a Debug rendering: {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn releases_the_external_port_of_a_flow_it_forgets() {
         let mut nat = napt_with(small_pool(1, 16));
         let now = Instant::now();

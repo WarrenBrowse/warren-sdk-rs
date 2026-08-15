@@ -700,6 +700,15 @@ mod tests {
     }
 
     #[test]
+    fn renders_no_endpoint_when_a_header_is_printed() {
+        let pkt = testpkt::udp(v4([10, 67, 0, 2]), 1234, v4([1, 1, 1, 1]), 53, b"q");
+        let rendered = format!("{:?}", parse_ip(&pkt).expect("valid packet"));
+        assert!(!rendered.contains("10.67"), "{rendered}");
+        assert!(!rendered.contains("1.1.1.1"), "{rendered}");
+        assert!(rendered.contains("protocol"), "{rendered}");
+    }
+
+    #[test]
     fn never_panics_on_a_buffer_shorter_than_the_header_says() {
         let full = testpkt::udp(v4([10, 67, 0, 2]), 1234, v4([1, 1, 1, 1]), 53, b"payload");
         let hdr = parse_ip(&full).expect("valid packet");
