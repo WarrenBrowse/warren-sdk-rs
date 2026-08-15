@@ -55,4 +55,7 @@ pub enum CoreError {
     /// The port is already pinned to a static forward.
     #[error("port already reserved")]
     PortAlreadyReserved,
+    /// The endpoint a static forward points at belongs to no peer.
+    #[error("forward target owned by no peer")]
+    TargetNotOwned,
 }

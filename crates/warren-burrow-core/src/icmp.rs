@@ -375,12 +375,17 @@ pub fn recompute_icmp_checksum(pkt: &mut [u8], outer: &IpHeader) -> Result<(), P
         return Err(PacketError::Truncated);
     }
     let ck_at = outer.l4_offset + 2;
-    let seed = match (outer.protocol, outer.src, outer.dst) {
-        (PROTO_ICMPV4, _, _) => 0,
-        (PROTO_ICMPV6, IpAddr::V6(src), IpAddr::V6(dst)) => {
+    // The addresses are read back from the buffer, never from `outer`: a
+    // caller that has just rewritten one endpoint holds a header describing
+    // the packet as it was, and an ICMPv6 checksum covers the addresses.
+    let seed = match outer.protocol {
+        PROTO_ICMPV4 if !outer.is_v6() => 0,
+        PROTO_ICMPV6 if outer.is_v6() => {
+            let src = <[u8; 16]>::try_from(&pkt[8..24]).map_err(|_| PacketError::Truncated)?;
+            let dst = <[u8; 16]>::try_from(&pkt[24..40]).map_err(|_| PacketError::Truncated)?;
             let len = u32::try_from(outer.total_len - outer.l4_offset)
                 .map_err(|_| PacketError::Truncated)?;
-            icmpv6_pseudo_sum(src, dst, len)
+            icmpv6_pseudo_sum(Ipv6Addr::from(src), Ipv6Addr::from(dst), len)
         }
         _ => return Err(PacketError::UnsupportedProtocol),
     };

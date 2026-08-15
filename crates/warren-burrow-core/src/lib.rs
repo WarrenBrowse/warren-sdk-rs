@@ -15,7 +15,10 @@
 pub mod error;
 pub mod icmp;
 pub mod ip;
+pub mod nat;
+pub mod peer;
 pub mod ports;
+pub mod stats;
 
 #[cfg(test)]
 mod testpkt;
@@ -25,9 +28,15 @@ pub use icmp::{
     ErrorQuote, build_echo_reply_v4, build_echo_reply_v6, build_unreachable_v4,
     build_unreachable_v6, parse_error_quote, recompute_icmp_checksum, rewrite_error_quote,
 };
+pub use nat::{
+    EXIT_ID_LEN, EpochId, ExitId, MapProto, MappingId, Napt, NatConfig, NatDrop, Ownership,
+    StaticDnat, Translated,
+};
+pub use peer::PeerId;
 pub use ports::{
     CONTROL_RANGE_END, CONTROL_RANGE_START, DYNAMIC_POOL_END, DYNAMIC_POOL_START, PortAllocator,
 };
+pub use stats::{Counters, Snapshot};
 
 pub use ip::{
     IcmpHeader, IpHeader, Side, checksum_update, is_echo, is_icmp_error, parse_ip, parse_ip_quote,
