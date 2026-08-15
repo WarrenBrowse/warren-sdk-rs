@@ -175,16 +175,21 @@ async fn track_egress_across_epochs<R, Fut>(
         if state_rx.changed().await.is_err() {
             return;
         }
-        if *state_rx.borrow_and_update() == ConnectionState::Connected {
-            let proven = recheck().await;
-            egress_verified.store(proven, Ordering::Relaxed);
-            if proven {
-                log("reconnected, egress verified");
-            } else {
-                eprintln!("warren-proxy: reconnected but egress is not proven, staying unhealthy");
-            }
-        } else {
+        if *state_rx.borrow_and_update() != ConnectionState::Connected {
             egress_verified.store(false, Ordering::Relaxed);
+            continue;
+        }
+        // Every change that lands on Connected is re-proven, including a
+        // republication of a state that never left. A watch channel coalesces,
+        // so a short Reconnecting between two polls is invisible here: probing
+        // once too often costs three quick connects, while trusting a state
+        // this task cannot distinguish would report 200 on an unproven epoch.
+        let proven = recheck().await;
+        egress_verified.store(proven, Ordering::Relaxed);
+        if proven {
+            log("egress re-verified for the current epoch");
+        } else {
+            eprintln!("warren-proxy: egress is not proven on this epoch, staying unhealthy");
         }
     }
 }
@@ -663,6 +668,43 @@ mod tests {
             probes.load(Ordering::Relaxed),
             1,
             "the new epoch must be proven by its own probe"
+        );
+        task.abort();
+    }
+
+    /// A watch channel coalesces, so a `Reconnecting` raised and cleared
+    /// between two polls of this task is invisible to it. Re-proving on every
+    /// change that lands on `Connected` is what keeps that invisible epoch from
+    /// being reported healthy on the previous epoch's evidence.
+    #[tokio::test]
+    async fn a_republished_connected_state_is_re_proven_rather_than_trusted() {
+        let (state_tx, state_rx) = watch::channel(ConnectionState::Connected);
+        let verified = Arc::new(AtomicBool::new(true));
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let task = tokio::spawn({
+            let verified = Arc::clone(&verified);
+            let probes = Arc::clone(&probes);
+            track_egress_across_epochs(state_rx, verified, move || {
+                let probes = Arc::clone(&probes);
+                async move {
+                    probes.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+            })
+        });
+
+        state_tx.send(ConnectionState::Connected).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            1,
+            "a state change this task cannot interpret is re-proven, not trusted"
+        );
+        assert!(
+            verified.load(Ordering::Relaxed),
+            "and the fresh probe passed, so the endpoint stays green"
         );
         task.abort();
     }
