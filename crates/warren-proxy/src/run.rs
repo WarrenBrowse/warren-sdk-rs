@@ -168,9 +168,8 @@ async fn track_egress_across_epochs<R, Fut>(
     Fut: std::future::Future<Output = bool>,
 {
     // The receiver arrives having seen the state its creator saw (tokio marks
-    // the current version at clone time), so this reacts to what happens NEXT
-    // without a spurious probe, and without a window where a transition raised
-    // before the first poll is lost.
+    // the current version at clone time), so no transition raised before the
+    // first poll is lost.
     loop {
         if state_rx.changed().await.is_err() {
             return;
