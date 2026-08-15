@@ -189,13 +189,16 @@ impl MultihopError {
     /// epoch down.
     ///
     /// The uplink pump reads the current send budget and then sends; a DPLPMTUD
-    /// shrink in between answers `TooLarge` for that packet alone. Every other
-    /// variant, `ConnectionLost` included, is session-level and still ends the
-    /// epoch.
+    /// shrink in between answers `TooLarge` for that packet alone, and the next
+    /// packet fits. Every other refusal is settled for the whole session:
+    /// `UnsupportedByPeer` and `Disabled` are decided at the handshake and
+    /// refuse every datagram until it is rebuilt, so treating them as
+    /// per-packet would drop the entire uplink in silence while the pump that
+    /// carries the datapath's only liveness signal never returns.
     #[must_use]
     pub fn is_per_packet(&self) -> bool {
         match self {
-            Self::SendDatagram(e) => !matches!(e, quinn::SendDatagramError::ConnectionLost(_)),
+            Self::SendDatagram(e) => matches!(e, quinn::SendDatagramError::TooLarge),
             _ => false,
         }
     }
@@ -206,19 +209,24 @@ mod per_packet_tests {
     use super::*;
 
     #[test]
-    fn a_datagram_refusal_is_per_packet_and_a_lost_connection_is_not() {
+    fn only_an_over_budget_datagram_is_per_packet() {
         // The uplink pump reads the send budget, then sends: a DPLPMTUD shrink
         // in between refuses THIS packet over a session that is still fine, so
-        // the datapath drops it and keeps serving. A lost connection is the
-        // session itself, and must still end the epoch.
+        // the datapath drops it and keeps serving. Every other refusal is
+        // settled for the whole session and must end the epoch, otherwise the
+        // pump drops every packet forever and never reports.
         assert!(
             MultihopError::SendDatagram(quinn::SendDatagramError::TooLarge).is_per_packet(),
             "an over-budget datagram is one packet's problem"
         );
         assert!(
-            MultihopError::SendDatagram(quinn::SendDatagramError::UnsupportedByPeer)
+            !MultihopError::SendDatagram(quinn::SendDatagramError::UnsupportedByPeer)
                 .is_per_packet(),
-            "a datagram-level refusal never ends a session on its own"
+            "a peer that never negotiated datagrams refuses every one of them"
+        );
+        assert!(
+            !MultihopError::SendDatagram(quinn::SendDatagramError::Disabled).is_per_packet(),
+            "datagrams disabled locally is fixed for the session"
         );
         assert!(
             !MultihopError::SendDatagram(quinn::SendDatagramError::ConnectionLost(

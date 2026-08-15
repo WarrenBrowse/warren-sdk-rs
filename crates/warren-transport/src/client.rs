@@ -373,13 +373,16 @@ impl TunnelError {
     /// epoch down.
     ///
     /// The uplink pump reads the current send budget and then sends; a DPLPMTUD
-    /// shrink in between answers `TooLarge` for that packet alone. Every other
-    /// variant, `ConnectionLost` included, is session-level and still ends the
-    /// epoch.
+    /// shrink in between answers `TooLarge` for that packet alone, and the next
+    /// packet fits. Every other refusal is settled for the whole session:
+    /// `UnsupportedByPeer` and `Disabled` are decided at the handshake and
+    /// refuse every datagram until it is rebuilt, so treating them as
+    /// per-packet would drop the entire uplink in silence while the pump that
+    /// carries the datapath's only liveness signal never returns.
     #[must_use]
     pub fn is_per_packet(&self) -> bool {
         match self {
-            Self::SendDatagram(e) => !matches!(e, quinn::SendDatagramError::ConnectionLost(_)),
+            Self::SendDatagram(e) => matches!(e, quinn::SendDatagramError::TooLarge),
             _ => false,
         }
     }
@@ -390,10 +393,14 @@ mod per_packet_tests {
     use super::*;
 
     #[test]
-    fn a_datagram_refusal_is_per_packet_and_a_lost_connection_is_not() {
-        // Same asymmetry as the multihop plane: a refused datagram is one
-        // packet, a lost connection is the session.
+    fn only_an_over_budget_datagram_is_per_packet() {
+        // Same asymmetry as the multihop plane: an over-budget datagram is one
+        // packet, everything else is settled for the session.
         assert!(TunnelError::SendDatagram(quinn::SendDatagramError::TooLarge).is_per_packet());
+        assert!(
+            !TunnelError::SendDatagram(quinn::SendDatagramError::UnsupportedByPeer).is_per_packet()
+        );
+        assert!(!TunnelError::SendDatagram(quinn::SendDatagramError::Disabled).is_per_packet());
         assert!(
             !TunnelError::SendDatagram(quinn::SendDatagramError::ConnectionLost(
                 quinn::ConnectionError::LocallyClosed
