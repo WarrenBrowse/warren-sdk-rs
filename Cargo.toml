@@ -16,6 +16,7 @@ members = [
     "crates/warren-discovery",
     "crates/warren-transport",
     "crates/warren-net",
+    "crates/warren-burrow-core",
     "crates/warren-sdk",
     "crates/warren-sdk-ffi",
     "crates/warren-proxy",

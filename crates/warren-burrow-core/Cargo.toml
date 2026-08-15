@@ -1,0 +1,35 @@
+[package]
+name = "warren-burrow-core"
+description = "Engine-clean core of the Warren local gateway: the WireGuard-protocol responder state machine and the peer-aware NAPT that rewrites peer packets onto the address the exit assigned. Pure packet logic: it opens no socket, spawns no task, and reads no clock."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Checksum arithmetic (RFC 1071 full sum, RFC 1624 incremental update, the
+# ICMPv6 pseudo-header seed) has exactly one home, the engine: the client pump
+# and this NAT must agree byte for byte, or a rewritten packet the pump then
+# clamps carries two disagreeing checksums.
+warrenguard-transport-core = { workspace = true }
+# The WireGuard protocol responder (noise handshake, sessions, timers, cookie
+# rate limiter). Pinned exactly: 0.7.1 is a release whose upstream master is
+# being restructured, and the crate's session-index and double-count accounting
+# is load-bearing here.
+boringtun = { version = "=0.7.1", default-features = false }
+# Longest-prefix tries: the NAT resolves which peer owns a source address
+# through the same structure cryptokey routing uses, so one address can never
+# be claimed by two peers.
+ip_network = "0.4.1"
+ip_network_table = "0.2.0"
+# Key encoding of the gateway and peer configuration files.
+base64 = "0.22"
+rand = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
