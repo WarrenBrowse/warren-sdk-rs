@@ -3,9 +3,11 @@
 //! A deliberately tiny HTTP/1.1 responder (no framework: the attack surface
 //! of a health port should be a request line and three routes):
 //!
-//! - `/healthz`: `200 ok` when the tunnel is `Connected` AND first egress was
-//!   verified, `503` otherwise. Wire it to Docker `HEALTHCHECK` / Kubernetes
-//!   probes.
+//! - `/healthz`: `200 ok` when the tunnel is `Connected` AND egress is proven
+//!   for the epoch running now, `503` otherwise. The proof belongs to its
+//!   epoch: leaving `Connected` clears it, and every change that lands back on
+//!   `Connected` re-proves it, so a reconnect answers `503` until a fresh
+//!   probe passes. Wire it to Docker `HEALTHCHECK` / Kubernetes probes.
 //! - `/state`: the current [`ConnectionState`] as text, always `200`.
 //! - `/port`: the granted public forward port as text, `404` while unset.
 
@@ -21,7 +23,9 @@ use warren_sdk::ConnectionState;
 pub struct HealthView {
     /// Supervised tunnel state.
     pub state_rx: watch::Receiver<ConnectionState>,
-    /// Set once the first SOCKS egress probe succeeded.
+    /// Whether a SOCKS egress probe succeeded on the epoch running now. The
+    /// daemon clears it on any state that is not `Connected` and re-proves it
+    /// on every change that lands on `Connected`.
     pub egress_verified: Arc<AtomicBool>,
     /// Granted public forward port, if forwarding is on and granted.
     pub port_rx: watch::Receiver<Option<u16>>,
