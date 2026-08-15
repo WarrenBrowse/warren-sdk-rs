@@ -333,13 +333,19 @@ mod tests {
             proto: ForwardProto::Both,
             internal_port: 56881,
             target: "127.0.0.1:56881".parse().expect("valid literal address"),
-            up_command: Some(format!("printf up:%s {{{{PORT}}}} > {}", marker.display())),
-            down_command: Some(format!(
-                "printf down:%s {{{{PORT}}}} > {}",
-                marker.display()
-            )),
+            up_command: Some(crate::hooks::tests::write_marker("up:{{PORT}}", marker)),
+            down_command: Some(crate::hooks::tests::write_marker("down:{{PORT}}", marker)),
             status_file,
         }
+    }
+
+    /// Hooks run under the platform's own shell, and cmd appends a line ending,
+    /// so every assertion compares trimmed content.
+    fn marker_content(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path)
+            .expect("hook must have run")
+            .trim()
+            .to_owned()
     }
 
     #[tokio::test]
@@ -351,7 +357,7 @@ mod tests {
         run_shutdown_hook(Some(&fwd), Some(49587)).await;
 
         assert_eq!(
-            std::fs::read_to_string(&marker).expect("down hook must have run"),
+            marker_content(&marker),
             "down:49587",
             "the down command must fire on the granted port even with no status file configured"
         );
@@ -386,10 +392,7 @@ mod tests {
             std::fs::read_to_string(&status).expect("status file written"),
             "58364\n"
         );
-        assert_eq!(
-            std::fs::read_to_string(&marker).expect("up hook must have run"),
-            "up:58364"
-        );
+        assert_eq!(marker_content(&marker), "up:58364");
         let _ = std::fs::remove_file(&marker);
         let _ = std::fs::remove_file(&status);
     }
@@ -405,7 +408,7 @@ mod tests {
         // Both hooks write the same marker, so the surviving content proves the
         // order: down for the old port ran first, up for the new port last.
         assert_eq!(
-            std::fs::read_to_string(&marker).expect("hooks must have run"),
+            marker_content(&marker),
             "up:58364",
             "the up hook for the new port must be the last thing to run"
         );

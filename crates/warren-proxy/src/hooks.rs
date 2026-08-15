@@ -1,5 +1,6 @@
 //! Port-forward command hooks, the gluetun `VPN_PORT_FORWARDING_UP_COMMAND`
-//! shape: a user command run through `sh -c` with `{{PORT}}` substituted.
+//! shape: a user command run through the platform's shell with `{{PORT}}`
+//! substituted.
 
 use std::path::Path;
 use std::time::Duration;
@@ -30,12 +31,30 @@ pub fn substitute_port(command: &str, port: u16) -> String {
     command.replace("{{PORT}}", &port.to_string())
 }
 
-/// Runs a hook command through `sh -c` under [`HOOK_TIMEOUT`].
+/// A hook is an operator-written command line, so it runs under the platform's
+/// own shell rather than being parsed here. Without this the whole feature is
+/// dead on Windows, where there is no `sh`.
+fn shell_command(resolved: &str) -> tokio::process::Command {
+    #[cfg(windows)]
+    {
+        let mut command = tokio::process::Command::new("cmd");
+        command.arg("/C").arg(resolved);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(resolved);
+        command
+    }
+}
+
+/// Runs a hook command through the platform's shell under [`HOOK_TIMEOUT`].
 pub async fn run_hook(command: &str, port: u16, label: &str) -> HookOutcome {
     run_hook_with_timeout(command, port, label, HOOK_TIMEOUT).await
 }
 
-/// Runs a hook command through `sh -c`, killing it past `timeout`.
+/// Runs a hook command through the platform's shell, killing it past `timeout`.
 pub async fn run_hook_with_timeout(
     command: &str,
     port: u16,
@@ -43,11 +62,7 @@ pub async fn run_hook_with_timeout(
     timeout: Duration,
 ) -> HookOutcome {
     let resolved = substitute_port(command, port);
-    let mut child = match tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(&resolved)
-        .spawn()
-    {
+    let mut child = match shell_command(&resolved).spawn() {
         Ok(child) => child,
         Err(err) => {
             eprintln!("warren-proxy: port-forward {label} command failed to spawn: {err}");
@@ -89,7 +104,7 @@ pub async fn write_status_file(path: &Path, port: u16) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -110,19 +125,37 @@ mod tests {
         std::env::temp_dir().join(format!("warren-proxy-hook-{}-{name}", std::process::id()))
     }
 
+    /// A hook that writes `text` to `path`, in the syntax of the shell the
+    /// hook will actually run under on this platform.
+    pub(crate) fn write_marker(text: &str, path: &std::path::Path) -> String {
+        if cfg!(windows) {
+            // No space before the redirect, or cmd writes it into the file, and
+            // the target is quoted because a temp path may contain a space.
+            format!("echo {text}>\"{}\"", path.display())
+        } else {
+            format!("printf %s '{text}' > '{}'", path.display())
+        }
+    }
+
+    /// A hook that outlives any sane timeout, in the same per-shell way.
+    fn never_returns() -> &'static str {
+        if cfg!(windows) {
+            "ping -n 31 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        }
+    }
+
     #[tokio::test]
     async fn a_successful_hook_runs_the_substituted_command() {
         let marker = scratch("ok");
         let _ = std::fs::remove_file(&marker);
-        let outcome = run_hook(
-            &format!("printf %s {{{{PORT}}}} > {}", marker.display()),
-            51820,
-            "up",
-        )
-        .await;
+        let outcome = run_hook(&write_marker("{{PORT}}", &marker), 51820, "up").await;
         assert_eq!(outcome, HookOutcome::Succeeded);
         assert_eq!(
-            std::fs::read_to_string(&marker).expect("marker written"),
+            std::fs::read_to_string(&marker)
+                .expect("marker written")
+                .trim(),
             "51820",
             "the hook must receive the granted port, substituted"
         );
@@ -138,7 +171,7 @@ mod tests {
     async fn a_hanging_hook_is_killed_by_its_timeout() {
         let started = std::time::Instant::now();
         let outcome =
-            run_hook_with_timeout("sleep 30", 1, "down", Duration::from_millis(200)).await;
+            run_hook_with_timeout(never_returns(), 1, "down", Duration::from_millis(200)).await;
         assert_eq!(
             outcome,
             HookOutcome::TimedOut,
