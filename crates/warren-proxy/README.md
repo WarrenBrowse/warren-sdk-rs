@@ -31,7 +31,7 @@ netns ownership) is the sibling for the gluetun-style `network_mode:
 | `WARREN_PORT_FORWARD_INTERNAL_PORT` | off | enables NAT-PMP forwarding of a tunnel-side port |
 | `WARREN_PORT_FORWARD_PROTOCOL` | `tcp` | `tcp` or `udp`, one transport per daemon: the exit picks each proto's public port independently, so a TCP+UDP pair would be reachable on two ports of which only one could be announced (and would burn two of the account's five forward slots) |
 | `WARREN_PORT_FORWARD_TARGET` | `127.0.0.1:<internal>` | local socket inbound connections are relayed to |
-| `WARREN_PORT_FORWARD_UP_COMMAND` | | run via `sh -c` on every grant, `{{PORT}}` substituted (the gluetun up-command shape) |
+| `WARREN_PORT_FORWARD_UP_COMMAND` | | run via the platform shell on every grant, `{{PORT}}` substituted (the gluetun up-command shape). The recovery phrase is stripped from the child's environment, so a hook and everything it spawns never see it |
 | `WARREN_PORT_FORWARD_DOWN_COMMAND` | | run when the port is replaced and at shutdown |
 | `WARREN_PORT_FORWARD_STATUS_FILE` | | the granted public port, one decimal line, atomically rewritten |
 
