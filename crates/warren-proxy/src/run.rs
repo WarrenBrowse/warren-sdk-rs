@@ -130,7 +130,7 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
             // publishes, never from the status file: the file is optional, and
             // reading it there skipped the down hook for everyone who had not
             // configured one.
-            run_shutdown_hook(&ShellHooks, config.forward.as_ref(), *port_rx.borrow()).await;
+            retire_forward_state(&ShellHooks, config.forward.as_ref(), *port_rx.borrow()).await;
             // Release the lease at the exit rather than let it lapse: it runs
             // for two hours, so a restart on another internal port or protocol
             // would leave the public port stranded that long.
@@ -369,17 +369,24 @@ impl HookSink for ShellHooks {
     }
 }
 
-/// Runs the down command once at shutdown, when a port was actually granted.
-async fn run_shutdown_hook<H: HookSink>(
+/// Retires the forward's published state at shutdown: the down command for the
+/// port that was granted, then the status file, which must not outlive the
+/// mapping it names.
+async fn retire_forward_state<H: HookSink>(
     sink: &H,
     forward: Option<&ForwardConfig>,
     port: Option<u16>,
 ) {
-    if let Some(fwd) = forward
-        && let Some(cmd) = &fwd.down_command
+    let Some(fwd) = forward else { return };
+    if let Some(cmd) = &fwd.down_command
         && let Some(port) = port
     {
         sink.run(cmd, port, "down").await;
+    }
+    if let Some(path) = &fwd.status_file
+        && let Err(err) = hooks::clear_status_file(path).await
+    {
+        eprintln!("warren-proxy: clearing the port status file failed: {err}");
     }
 }
 
@@ -488,11 +495,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_shutdown_hook_runs_without_a_status_file() {
+    async fn the_shutdown_down_hook_runs_without_a_status_file() {
         let sink = Recorder::default();
         let fwd = forward(None);
 
-        run_shutdown_hook(&sink, Some(&fwd), Some(49587)).await;
+        retire_forward_state(&sink, Some(&fwd), Some(49587)).await;
 
         assert_eq!(
             sink.calls(),
@@ -501,12 +508,33 @@ mod tests {
         );
     }
 
+    /// The file names a live mapping, and the mapping is released as the daemon
+    /// stops, so a file left behind would announce a port to the next reader of
+    /// a directory the daemon no longer owns.
+    #[tokio::test]
+    async fn shutdown_runs_the_down_hook_then_clears_the_status_file() {
+        let status = scratch("shutdown-status");
+        hooks::write_status_file(&status, 49587)
+            .await
+            .expect("a granted port was published");
+        let sink = Recorder::default();
+        let fwd = forward(Some(status.clone()));
+
+        retire_forward_state(&sink, Some(&fwd), Some(49587)).await;
+
+        assert_eq!(sink.calls(), vec!["down:49587:down {{PORT}}".to_owned()]);
+        assert!(
+            !status.exists(),
+            "the status file must not survive the daemon that published it"
+        );
+    }
+
     #[tokio::test]
     async fn the_shutdown_hook_is_skipped_when_no_port_was_granted() {
         let sink = Recorder::default();
         let fwd = forward(None);
 
-        run_shutdown_hook(&sink, Some(&fwd), None).await;
+        retire_forward_state(&sink, Some(&fwd), None).await;
 
         assert!(
             sink.calls().is_empty(),

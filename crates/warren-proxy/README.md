@@ -39,9 +39,10 @@ Port forwarding runs on the exit's default per-client quota: this daemon
 presents no entitlement credential, so the account's fleet-wide slot count is
 not what bounds it. The engine implements the atomic TCP+UDP pair (one public
 port, one credential); the SDK forward path this daemon uses does not carry it
-yet, which is why `both` is refused. On `SIGTERM` the down command runs and the
-NAT-PMP mapping is released at the exit rather than left to lapse with its
-lease.
+yet, which is why `both` is refused. On `SIGTERM` the down command runs, the
+status file is removed, and the NAT-PMP mapping is released at the exit rather
+than left to lapse with its lease (the release is bounded: if the tunnel is
+already gone the daemon says so and exits, and the lease lapses on its own).
 
 Exit codes: `0` clean signal shutdown, `1` configuration or startup failure,
 `2` a terminal control-plane refusal, printed with its cause (unauthorized
