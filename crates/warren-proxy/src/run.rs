@@ -213,7 +213,7 @@ async fn start_forwards(
         loop {
             let current = *external_rx.borrow_and_update();
             if current != last {
-                apply_port_change(&fwd, last, current).await;
+                apply_port_change(&ShellHooks, &fwd, last, current).await;
                 // Published after the hooks have run, so a reader that sees a
                 // port knows the up command already fired for it.
                 let _ = port_tx.send(current);
@@ -256,30 +256,55 @@ async fn supervise(
             // publishes, never from the status file: the file is optional, and
             // reading it there skipped the down hook for everyone who had not
             // configured one.
-            run_shutdown_hook(config.forward.as_ref(), *port_rx.borrow()).await;
+            run_shutdown_hook(&ShellHooks, config.forward.as_ref(), *port_rx.borrow()).await;
             0
         }
     }
 }
 
+/// Where a hook actually runs. Injected so the orchestration below (which hook
+/// fires, for which port, in which order) is tested by observing calls rather
+/// than by spawning a shell, whose syntax and quoting differ per platform.
+pub(crate) trait HookSink {
+    async fn run(&self, command: &str, port: u16, label: &str);
+}
+
+/// The production sink: the platform's shell, under the hook timeout.
+pub(crate) struct ShellHooks;
+
+impl HookSink for ShellHooks {
+    async fn run(&self, command: &str, port: u16, label: &str) {
+        hooks::run_hook(command, port, label).await;
+    }
+}
+
 /// Runs the down command once at shutdown, when a port was actually granted.
-async fn run_shutdown_hook(forward: Option<&ForwardConfig>, port: Option<u16>) {
+async fn run_shutdown_hook<H: HookSink>(
+    sink: &H,
+    forward: Option<&ForwardConfig>,
+    port: Option<u16>,
+) {
     if let Some(fwd) = forward
         && let Some(cmd) = &fwd.down_command
         && let Some(port) = port
     {
-        hooks::run_hook(cmd, port, "down").await;
+        sink.run(cmd, port, "down").await;
     }
 }
 
 /// Reacts to the exit granting a different public port: retire the old one,
 /// publish the new one, then announce it. Split out of the watcher loop so the
 /// ordering is testable without a live tunnel.
-async fn apply_port_change(fwd: &ForwardConfig, previous: Option<u16>, current: Option<u16>) {
+async fn apply_port_change<H: HookSink>(
+    sink: &H,
+    fwd: &ForwardConfig,
+    previous: Option<u16>,
+    current: Option<u16>,
+) {
     if let Some(old) = previous
         && let Some(cmd) = &fwd.down_command
     {
-        hooks::run_hook(cmd, old, "down").await;
+        sink.run(cmd, old, "down").await;
     }
     let Some(port) = current else { return };
     log(&format!("public port granted: {port}"));
@@ -289,7 +314,7 @@ async fn apply_port_change(fwd: &ForwardConfig, previous: Option<u16>, current: 
         eprintln!("warren-proxy: writing the port status file failed: {err}");
     }
     if let Some(cmd) = &fwd.up_command {
-        hooks::run_hook(cmd, port, "up").await;
+        sink.run(cmd, port, "up").await;
     }
 }
 
@@ -325,94 +350,101 @@ mod tests {
         std::env::temp_dir().join(format!("warren-proxy-run-{}-{name}", std::process::id()))
     }
 
-    fn forward_writing(
-        marker: &std::path::Path,
-        status_file: Option<std::path::PathBuf>,
-    ) -> ForwardConfig {
+    /// Records what the orchestration asked for, instead of running it. The
+    /// shell itself is covered once, in the hooks module.
+    #[derive(Default)]
+    struct Recorder {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Recorder {
+        fn calls(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .expect("test mutex is never poisoned")
+                .clone()
+        }
+    }
+
+    impl HookSink for Recorder {
+        async fn run(&self, command: &str, port: u16, label: &str) {
+            self.calls
+                .lock()
+                .expect("test mutex is never poisoned")
+                .push(format!("{label}:{port}:{command}"));
+        }
+    }
+
+    fn forward(status_file: Option<std::path::PathBuf>) -> ForwardConfig {
         ForwardConfig {
             proto: ForwardProto::Both,
             internal_port: 56881,
             target: "127.0.0.1:56881".parse().expect("valid literal address"),
-            up_command: Some(crate::hooks::tests::write_marker("up:{{PORT}}", marker)),
-            down_command: Some(crate::hooks::tests::write_marker("down:{{PORT}}", marker)),
+            up_command: Some("up {{PORT}}".to_owned()),
+            down_command: Some("down {{PORT}}".to_owned()),
             status_file,
         }
     }
 
-    /// Hooks run under the platform's own shell, and cmd appends a line ending,
-    /// so every assertion compares trimmed content.
-    fn marker_content(path: &std::path::Path) -> String {
-        std::fs::read_to_string(path)
-            .expect("hook must have run")
-            .trim()
-            .to_owned()
-    }
-
     #[tokio::test]
     async fn the_shutdown_hook_runs_without_a_status_file() {
-        let marker = scratch("shutdown-nofile");
-        let _ = std::fs::remove_file(&marker);
-        let fwd = forward_writing(&marker, None);
+        let sink = Recorder::default();
+        let fwd = forward(None);
 
-        run_shutdown_hook(Some(&fwd), Some(49587)).await;
+        run_shutdown_hook(&sink, Some(&fwd), Some(49587)).await;
 
         assert_eq!(
-            marker_content(&marker),
-            "down:49587",
+            sink.calls(),
+            vec!["down:49587:down {{PORT}}".to_owned()],
             "the down command must fire on the granted port even with no status file configured"
         );
-        let _ = std::fs::remove_file(&marker);
     }
 
     #[tokio::test]
     async fn the_shutdown_hook_is_skipped_when_no_port_was_granted() {
-        let marker = scratch("shutdown-noport");
-        let _ = std::fs::remove_file(&marker);
-        let fwd = forward_writing(&marker, None);
+        let sink = Recorder::default();
+        let fwd = forward(None);
 
-        run_shutdown_hook(Some(&fwd), None).await;
+        run_shutdown_hook(&sink, Some(&fwd), None).await;
 
         assert!(
-            !marker.exists(),
+            sink.calls().is_empty(),
             "with no port granted there is nothing to retire, so the hook must not run"
         );
     }
 
     #[tokio::test]
     async fn a_new_grant_writes_the_status_file_and_fires_the_up_hook() {
-        let marker = scratch("grant-marker");
         let status = scratch("grant-status");
-        let _ = std::fs::remove_file(&marker);
         let _ = std::fs::remove_file(&status);
-        let fwd = forward_writing(&marker, Some(status.clone()));
+        let sink = Recorder::default();
+        let fwd = forward(Some(status.clone()));
 
-        apply_port_change(&fwd, None, Some(58364)).await;
+        apply_port_change(&sink, &fwd, None, Some(58364)).await;
 
         assert_eq!(
             std::fs::read_to_string(&status).expect("status file written"),
             "58364\n"
         );
-        assert_eq!(marker_content(&marker), "up:58364");
-        let _ = std::fs::remove_file(&marker);
+        assert_eq!(sink.calls(), vec!["up:58364:up {{PORT}}".to_owned()]);
         let _ = std::fs::remove_file(&status);
     }
 
     #[tokio::test]
     async fn a_replaced_port_retires_the_old_one_before_announcing_the_new() {
-        let marker = scratch("replace-marker");
-        let _ = std::fs::remove_file(&marker);
-        let fwd = forward_writing(&marker, None);
+        let sink = Recorder::default();
+        let fwd = forward(None);
 
-        apply_port_change(&fwd, Some(49587), Some(58364)).await;
+        apply_port_change(&sink, &fwd, Some(49587), Some(58364)).await;
 
-        // Both hooks write the same marker, so the surviving content proves the
-        // order: down for the old port ran first, up for the new port last.
         assert_eq!(
-            marker_content(&marker),
-            "up:58364",
-            "the up hook for the new port must be the last thing to run"
+            sink.calls(),
+            vec![
+                "down:49587:down {{PORT}}".to_owned(),
+                "up:58364:up {{PORT}}".to_owned(),
+            ],
+            "the old port must be retired before the new one is announced"
         );
-        let _ = std::fs::remove_file(&marker);
     }
 
     #[test]

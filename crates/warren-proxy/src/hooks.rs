@@ -120,48 +120,35 @@ pub(crate) mod tests {
         assert_eq!(substitute_port("echo done", 1), "echo done");
     }
 
-    /// A unique scratch path per test, so the suite stays parallel-safe.
-    fn scratch(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("warren-proxy-hook-{}-{name}", std::process::id()))
-    }
-
-    /// A hook that writes `text` to `path`, in the syntax of the shell the
-    /// hook will actually run under on this platform.
-    pub(crate) fn write_marker(text: &str, path: &std::path::Path) -> String {
-        if cfg!(windows) {
-            // Redirect FIRST: in cmd a digit touching `>` is a stream handle, so
-            // `echo up:58364>file` redirects handle 4 and writes nothing, and a
-            // space before `>` would land inside the file instead. The target is
-            // quoted because a temp path may contain a space.
-            format!(">\"{}\" echo {text}", path.display())
-        } else {
-            format!("printf %s '{text}' > '{}'", path.display())
-        }
-    }
-
-    /// A hook that outlives any sane timeout, in the same per-shell way.
+    /// A hook that outlives any sane timeout. `sleep` is not a cmd builtin, so
+    /// Windows gets the usual `ping` idiom; both forms need no quoting and no
+    /// redirection, which is what keeps this test portable.
     fn never_returns() -> &'static str {
         if cfg!(windows) {
-            "ping -n 31 127.0.0.1 >NUL"
+            "ping -n 31 127.0.0.1"
         } else {
             "sleep 30"
         }
     }
 
+    /// The one test that exercises the real shell. It observes the child's exit
+    /// code rather than a file it writes: `exit N` is spelled identically in sh
+    /// and cmd, while every file-writing form differs in quoting, in line
+    /// endings, and (in cmd) in whether a digit before `>` is read as a stream
+    /// handle. The orchestration around hooks is tested in `run`, against a
+    /// recording sink.
     #[tokio::test]
-    async fn a_successful_hook_runs_the_substituted_command() {
-        let marker = scratch("ok");
-        let _ = std::fs::remove_file(&marker);
-        let outcome = run_hook(&write_marker("{{PORT}}", &marker), 51820, "up").await;
-        assert_eq!(outcome, HookOutcome::Succeeded);
+    async fn the_substituted_port_reaches_the_shell() {
         assert_eq!(
-            std::fs::read_to_string(&marker)
-                .expect("marker written")
-                .trim(),
-            "51820",
-            "the hook must receive the granted port, substituted"
+            run_hook("exit {{PORT}}", 0, "up").await,
+            HookOutcome::Succeeded,
+            "a hook substituted to `exit 0` must be reported as success"
         );
-        let _ = std::fs::remove_file(&marker);
+        assert_eq!(
+            run_hook("exit {{PORT}}", 3, "up").await,
+            HookOutcome::Failed,
+            "the port must reach the shell: substituted to `exit 3` this must fail"
+        );
     }
 
     #[tokio::test]
