@@ -35,13 +35,24 @@ const TAKEN: u32 = u32::MAX;
 /// One instance per (protocol, address family): TCP and UDP each own their own
 /// port space, and the ICMP echo identifiers are a third space of the same
 /// shape.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PortAllocator {
     base: u16,
     free: Vec<u16>,
     /// Per port: its index in `free`, or [`TAKEN`].
     slot: Vec<u32>,
     reserved: Vec<bool>,
+}
+
+impl std::fmt::Debug for PortAllocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The free list is tens of thousands of entries; only its shape is
+        // worth rendering.
+        f.debug_struct("PortAllocator")
+            .field("capacity", &self.capacity())
+            .field("available", &self.available())
+            .finish()
+    }
 }
 
 impl PortAllocator {

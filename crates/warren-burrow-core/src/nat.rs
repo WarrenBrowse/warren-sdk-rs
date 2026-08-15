@@ -109,7 +109,7 @@ impl MapProto {
 pub struct MappingId(u64);
 
 /// Where a translated downlink packet must go.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Translated {
     /// The peer that opened the mapping.
@@ -118,9 +118,19 @@ pub struct Translated {
     pub destination: IpAddr,
 }
 
+impl std::fmt::Debug for Translated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The destination is a peer's own address, which stays out of traces.
+        f.debug_struct("Translated")
+            .field("peer", &self.peer.index())
+            .field("v6", &self.destination.is_ipv6())
+            .finish()
+    }
+}
+
 /// A forward the operator pinned: an external port that always reaches one
 /// peer endpoint, whoever the remote is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct StaticDnat {
     /// The protocol the forward serves.
     pub proto: MapProto,
@@ -128,6 +138,16 @@ pub struct StaticDnat {
     pub external_port: u16,
     /// The peer endpoint it reaches.
     pub target: SocketAddr,
+}
+
+impl std::fmt::Debug for StaticDnat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticDnat")
+            .field("proto", &self.proto)
+            .field("external_port", &self.external_port)
+            .field("v6", &self.target.is_ipv6())
+            .finish()
+    }
 }
 
 /// Why the NAT refused a packet. Each variant is one counter on `/status`.
@@ -284,7 +304,7 @@ impl Default for NatConfig {
 }
 
 /// What a mapping knows about one remote it has exchanged packets with.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct RemoteFlow {
     addr: IpAddr,
     port: u16,
@@ -304,7 +324,6 @@ enum FlowState {
     Icmp,
 }
 
-#[derive(Debug)]
 struct Mapping {
     owner: PeerId,
     proto: MapProto,
@@ -324,7 +343,6 @@ impl Mapping {
 }
 
 /// The peer-aware network address and port translator.
-#[derive(Debug)]
 pub struct Napt {
     config: NatConfig,
     ownership: Ownership,
@@ -341,6 +359,19 @@ pub struct Napt {
     next_id: u64,
     counters: Counters,
     rng: StdRng,
+}
+
+impl std::fmt::Debug for Napt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Every mapping names a peer address and a remote it talks to, so the
+        // table is summarised and never rendered.
+        f.debug_struct("Napt")
+            .field("epoch", &self.epoch.map(|e| e.generation))
+            .field("mappings", &self.mappings.len())
+            .field("dual_stack", &self.v6.is_some())
+            .field("counters", &self.counters.snapshot())
+            .finish()
+    }
 }
 
 impl Napt {
@@ -436,7 +467,7 @@ impl Napt {
     ///
     /// [`CoreError::TargetNotOwned`] when no peer owns the target address, and
     /// the reservation errors of [`PortAllocator::reserve`].
-    pub fn add_static(&mut self, dnat: StaticDnat) -> Result<MappingId, CoreError> {
+    pub fn add_static(&mut self, dnat: StaticDnat, now: Instant) -> Result<MappingId, CoreError> {
         let owner = self
             .ownership
             .owner_of(dnat.target.ip())
@@ -457,7 +488,6 @@ impl Napt {
         {
             self.remove_mapping(id);
         }
-        let now = Instant::now();
         let id = self.insert_mapping(Mapping {
             owner,
             proto: dnat.proto,
@@ -1384,11 +1414,14 @@ mod tests {
     fn never_hands_a_flow_the_port_a_static_forward_holds() {
         let mut nat = napt_with(small_pool(4, 16));
         let now = Instant::now();
-        nat.add_static(StaticDnat {
-            proto: MapProto::Udp,
-            external_port: 32_770,
-            target: SocketAddr::new(A4, 8080),
-        })
+        nat.add_static(
+            StaticDnat {
+                proto: MapProto::Udp,
+                external_port: 32_770,
+                target: SocketAddr::new(A4, 8080),
+            },
+            now,
+        )
         .expect("a free pool port can be pinned");
 
         let mut ports = Vec::new();
@@ -1410,11 +1443,14 @@ mod tests {
     fn serves_a_static_forward_in_both_directions() {
         let mut nat = napt();
         let now = Instant::now();
-        nat.add_static(StaticDnat {
-            proto: MapProto::Udp,
-            external_port: 51_820,
-            target: SocketAddr::new(A4, 8080),
-        })
+        nat.add_static(
+            StaticDnat {
+                proto: MapProto::Udp,
+                external_port: 51_820,
+                target: SocketAddr::new(A4, 8080),
+            },
+            now,
+        )
         .expect("pin");
 
         // Unsolicited inbound: a pinned forward answers any remote.
@@ -1443,19 +1479,25 @@ mod tests {
         let mut nat = napt();
         let orphan = IpAddr::V4(Ipv4Addr::new(10, 67, 9, 9));
         assert_eq!(
-            nat.add_static(StaticDnat {
-                proto: MapProto::Udp,
-                external_port: 51_820,
-                target: SocketAddr::new(orphan, 8080),
-            }),
+            nat.add_static(
+                StaticDnat {
+                    proto: MapProto::Udp,
+                    external_port: 51_820,
+                    target: SocketAddr::new(orphan, 8080),
+                },
+                Instant::now()
+            ),
             Err(CoreError::TargetNotOwned)
         );
         assert_eq!(
-            nat.add_static(StaticDnat {
-                proto: MapProto::Udp,
-                external_port: 80,
-                target: SocketAddr::new(A4, 8080),
-            }),
+            nat.add_static(
+                StaticDnat {
+                    proto: MapProto::Udp,
+                    external_port: 80,
+                    target: SocketAddr::new(A4, 8080),
+                },
+                Instant::now()
+            ),
             Err(CoreError::PortOutsidePool),
             "a forward outside the pool cannot be reserved"
         );
@@ -1564,11 +1606,14 @@ mod tests {
     fn rewrites_an_icmp_error_a_peer_sends_about_an_inbound_packet() {
         let mut nat = napt();
         let now = Instant::now();
-        nat.add_static(StaticDnat {
-            proto: MapProto::Udp,
-            external_port: 51_820,
-            target: SocketAddr::new(A4, 8080),
-        })
+        nat.add_static(
+            StaticDnat {
+                proto: MapProto::Udp,
+                external_port: 51_820,
+                target: SocketAddr::new(A4, 8080),
+            },
+            now,
+        )
         .expect("pin");
         let mut inbound = testpkt::udp(OTHER4, 40_000, ext4(), 51_820, b"hello");
         nat.translate_downlink(&mut inbound, now).expect("forward");
@@ -1589,11 +1634,14 @@ mod tests {
     fn expires_an_idle_mapping_and_never_a_pinned_one() {
         let mut nat = napt();
         let now = Instant::now();
-        nat.add_static(StaticDnat {
-            proto: MapProto::Udp,
-            external_port: 51_820,
-            target: SocketAddr::new(A4, 8080),
-        })
+        nat.add_static(
+            StaticDnat {
+                proto: MapProto::Udp,
+                external_port: 51_820,
+                target: SocketAddr::new(A4, 8080),
+            },
+            now,
+        )
         .expect("pin");
         let mut up = testpkt::udp(A4, 5000, REMOTE4, 53, b"q");
         nat.translate_uplink(A, &mut up, now).expect("uplink");
@@ -1677,11 +1725,14 @@ mod tests {
     fn flushes_the_table_when_another_exit_grants_the_same_address() {
         let mut nat = napt();
         let now = Instant::now();
-        nat.add_static(StaticDnat {
-            proto: MapProto::Udp,
-            external_port: 51_820,
-            target: SocketAddr::new(A4, 8080),
-        })
+        nat.add_static(
+            StaticDnat {
+                proto: MapProto::Udp,
+                external_port: 51_820,
+                target: SocketAddr::new(A4, 8080),
+            },
+            now,
+        )
         .expect("pin");
         let mut up = testpkt::udp(A4, 5000, REMOTE4, 53, b"q");
         nat.translate_uplink(A, &mut up, now).expect("uplink");
