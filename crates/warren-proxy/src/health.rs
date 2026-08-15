@@ -52,43 +52,65 @@ pub fn render(
     }
 }
 
+/// How long a client has to send its request line. A probe that connects and
+/// says nothing would otherwise hold a task for the life of the daemon.
+const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Pause after a failed `accept`, so a persistent error (the process out of
+/// file descriptors) costs a slow retry loop instead of a burnt core.
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Serves the health endpoint until the task is dropped.
 pub async fn serve(listener: tokio::net::TcpListener, view: HealthView) {
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            continue;
+        let accepted = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(_) => {
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
         };
-        let view = view.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            let Ok(n) = stream.read(&mut buf).await else {
-                return;
-            };
-            let request = String::from_utf8_lossy(&buf[..n]);
-            let path = request
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .unwrap_or("/");
-            let (status, body) = render(
-                path,
-                *view.state_rx.borrow(),
-                view.egress_verified.load(Ordering::Relaxed),
-                *view.port_rx.borrow(),
-            );
-            let reason = match status {
-                200 => "OK",
-                503 => "Service Unavailable",
-                _ => "Not Found",
-            };
-            let response = format!(
-                "HTTP/1.1 {status} {reason}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
-        });
+        tokio::spawn(handle_connection(
+            accepted.0,
+            view.clone(),
+            REQUEST_READ_TIMEOUT,
+        ));
     }
+}
+
+/// Answers one client: read the request line under `read_timeout`, render, close.
+async fn handle_connection(
+    mut stream: tokio::net::TcpStream,
+    view: HealthView,
+    read_timeout: std::time::Duration,
+) {
+    let mut buf = [0u8; 1024];
+    let Ok(Ok(n)) = tokio::time::timeout(read_timeout, stream.read(&mut buf)).await else {
+        return;
+    };
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let (status, body) = render(
+        path,
+        *view.state_rx.borrow(),
+        view.egress_verified.load(Ordering::Relaxed),
+        *view.port_rx.borrow(),
+    );
+    let reason = match status {
+        200 => "OK",
+        503 => "Service Unavailable",
+        _ => "Not Found",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
 }
 
 /// Synchronous `/healthz` probe for the `warren-proxy healthcheck`
@@ -187,6 +209,43 @@ mod tests {
             .unwrap()
             .expect("probe must reach the endpoint");
         assert!(!unhealthy, "Reconnecting must probe unhealthy");
+        server.abort();
+    }
+
+    /// A probe that connects and says nothing (a half-open TCP scan, a wedged
+    /// orchestrator) must not pin a task for the life of the daemon.
+    #[tokio::test]
+    async fn a_client_that_never_sends_is_dropped_at_the_read_timeout() {
+        let (_state_tx, state_rx) = watch::channel(ConnectionState::Connected);
+        let (_port_tx, port_rx) = watch::channel(None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let view = HealthView {
+            state_rx,
+            egress_verified: Arc::new(AtomicBool::new(true)),
+            port_rx,
+        };
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, view, std::time::Duration::from_millis(50)).await;
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut response = Vec::new();
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut response),
+        )
+        .await;
+
+        assert!(
+            closed.is_ok(),
+            "a silent client must be dropped at the read timeout, not held forever"
+        );
+        assert!(
+            response.is_empty(),
+            "no request was sent, so there is nothing to answer"
+        );
         server.abort();
     }
 

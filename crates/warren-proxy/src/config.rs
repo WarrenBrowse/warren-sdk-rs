@@ -202,7 +202,7 @@ pub fn load(
         })?),
     };
 
-    let forward = parse_forward(&get, &read_file)?;
+    let forward = parse_forward(&get)?;
 
     Ok(Config {
         mnemonic,
@@ -328,7 +328,6 @@ fn parse_exit_filters(raw: &str) -> Result<Vec<ExitFilter>, ConfigError> {
 
 fn parse_forward(
     get: &impl Fn(&str) -> Option<String>,
-    _read_file: &impl Fn(&std::path::Path) -> std::io::Result<String>,
 ) -> Result<Option<ForwardConfig>, ConfigError> {
     let Some(port_raw) = get("WARREN_PORT_FORWARD_INTERNAL_PORT").filter(|v| !v.is_empty()) else {
         return Ok(None);
