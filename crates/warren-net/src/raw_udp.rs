@@ -200,8 +200,13 @@ fn parse_udp(packet: &[u8]) -> Option<(SocketAddr, SocketAddr, &[u8])> {
     ))
 }
 
+/// One flow's registration: the identity of the registration itself, so a
+/// superseded flow can tell its own entry from the one that replaced it, and
+/// the inbox its datagrams are queued on.
+type Registration = (u64, mpsc::Sender<(Bytes, SocketAddr)>);
+
 /// The registered flows of one device, keyed by the local port they own.
-type Registrations = Arc<Mutex<HashMap<u16, mpsc::Sender<(Bytes, SocketAddr)>>>>;
+type Registrations = Arc<Mutex<HashMap<u16, Registration>>>;
 
 /// Routes downlink UDP datagrams to the flows that own their destination port.
 ///
@@ -214,6 +219,9 @@ pub struct RawUdpDemux {
     /// The device's uplink: every flow's datagram is pushed here as a whole IP
     /// packet.
     injector: mpsc::Sender<Vec<u8>>,
+    /// Stamps each registration, so the port alone never decides whose entry a
+    /// dropped flow is looking at.
+    next_token: std::sync::atomic::AtomicU64,
 }
 
 impl RawUdpDemux {
@@ -223,6 +231,7 @@ impl RawUdpDemux {
         Self {
             flows: Registrations::default(),
             injector,
+            next_token: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -239,13 +248,17 @@ impl RawUdpDemux {
     #[must_use]
     pub fn register(&self, local: SocketAddr, expected_remote: SocketAddr) -> RawUdpFlow {
         let (tx, rx) = mpsc::channel(FLOW_INBOX_DEPTH);
+        let token = self
+            .next_token
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.flows
             .lock()
             .expect("raw udp registrations lock")
-            .insert(local.port(), tx);
+            .insert(local.port(), (token, tx));
         RawUdpFlow {
             local,
             expected_remote,
+            token,
             injector: self.injector.clone(),
             inbox: rx,
             flows: Arc::clone(&self.flows),
@@ -264,7 +277,7 @@ impl RawUdpDemux {
         };
         let sender = {
             let flows = self.flows.lock().expect("raw udp registrations lock");
-            flows.get(&dst.port()).cloned()
+            flows.get(&dst.port()).map(|(_, tx)| tx.clone())
         };
         let Some(sender) = sender else {
             return false;
@@ -290,6 +303,8 @@ impl RawUdpDemux {
 pub struct RawUdpFlow {
     local: SocketAddr,
     expected_remote: SocketAddr,
+    /// Which registration on this port is this flow's own.
+    token: u64,
     injector: mpsc::Sender<Vec<u8>>,
     inbox: mpsc::Receiver<(Bytes, SocketAddr)>,
     flows: Registrations,
@@ -305,7 +320,14 @@ impl RawUdpFlow {
 
 impl Drop for RawUdpFlow {
     fn drop(&mut self) {
-        if let Ok(mut flows) = self.flows.lock() {
+        // Only ever this flow's own registration: a re-registration across an
+        // epoch change replaces the entry, and this flow is dropped after the
+        // live one exists.
+        if let Ok(mut flows) = self.flows.lock()
+            && flows
+                .get(&self.local.port())
+                .is_some_and(|(token, _)| *token == self.token)
+        {
             flows.remove(&self.local.port());
         }
     }
@@ -553,6 +575,29 @@ mod tests {
             ),
             "a gone uplink is reported, never silently swallowed"
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_superseded_flow_leaves_its_replacement_registered() {
+        // A re-registration after an epoch change replaces the flow on that
+        // port, and the flow of the epoch that ended is dropped afterwards.
+        // Freeing the port then would silently end the LIVE flow, which the
+        // control plane above reads as "this epoch is over".
+        let (demux, _uplink) = demux();
+        let stale = demux.register(addr(CLIENT), addr(GATEWAY));
+        let mut live = demux.register(addr(CLIENT), addr(GATEWAY));
+        drop(stale);
+
+        let answer = build_udp_packet(addr(GATEWAY), addr(CLIENT), b"granted").expect("built");
+        assert!(
+            demux.deliver(&answer),
+            "the port is still owned by the live flow"
+        );
+        let (payload, _) = live
+            .recv_from()
+            .await
+            .expect("the live flow still receives");
+        assert_eq!(payload, Bytes::from_static(b"granted"));
     }
 
     #[tokio::test]
