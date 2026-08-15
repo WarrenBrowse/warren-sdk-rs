@@ -23,6 +23,15 @@ fn log(msg: &str) {
     println!("warren-proxy: {msg}");
 }
 
+/// The startup account line. The SS58 address is the paying account's
+/// identifier and this daemon's stdout is the container log (shipped to
+/// whatever aggregator the host runs), so only the short prefix the app's UI
+/// shows ever reaches it, per the shared no-log rule.
+fn account_line(address: &str) -> String {
+    let prefix: String = address.chars().take(8).collect();
+    format!("account {prefix}...")
+}
+
 /// Runs the daemon until a signal or a terminal failure; returns the process
 /// exit code (0 clean shutdown, 1 startup failure, 2 the supervisor gave up).
 ///
@@ -33,7 +42,7 @@ fn log(msg: &str) {
 pub async fn run(config: Config) -> anyhow::Result<i32> {
     let identity = WarrenIdentity::from_mnemonic(config.mnemonic.trim())
         .context("the recovery phrase must be 12 or 24 BIP39 words")?;
-    log(&format!("account: {}", identity.address()));
+    log(&account_line(&identity.address()));
 
     let mut builder = WarrenClient::builder()
         .identity(identity)
@@ -442,6 +451,19 @@ mod tests {
                 "up:58364:up {{PORT}}".to_owned(),
             ],
             "the old port must be retired before the new one is announced"
+        );
+    }
+
+    /// The SS58 address is the paying account's identifier and this daemon's
+    /// stdout is the container log, so the startup line carries the prefix only.
+    #[test]
+    fn the_startup_account_line_carries_only_the_address_prefix() {
+        let address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+        let line = account_line(address);
+        assert_eq!(line, "account 5GrwvaEF...");
+        assert!(
+            !line.contains(address),
+            "the full account address must never reach a log: {line}"
         );
     }
 
