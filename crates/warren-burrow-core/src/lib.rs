@@ -12,6 +12,7 @@
 //! timers. That is what keeps the code portable to the engine later, and what
 //! makes every behaviour here testable without a network.
 
+pub mod conf;
 pub mod error;
 pub mod icmp;
 pub mod index;
@@ -28,6 +29,10 @@ pub mod stats;
 #[cfg(test)]
 mod testpkt;
 
+pub use conf::{
+    ClientConf, ConfError, GatewayConf, PeerConf, parse_gateway_conf, render_client_conf,
+    render_gateway_conf, render_gluetun_env,
+};
 pub use error::{CoreError, PacketError};
 pub use icmp::{
     ErrorQuote, build_echo_reply_v4, build_echo_reply_v6, build_unreachable_v4,

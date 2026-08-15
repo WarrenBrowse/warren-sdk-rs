@@ -48,6 +48,10 @@ pub enum LabelError {
 pub struct PeerLabel(String);
 
 impl PeerLabel {
+    /// The placeholder a parser uses while it does not yet know a peer's
+    /// position in the file, which is what numbers an unlabelled peer.
+    pub(crate) const EMPTY: Self = Self(String::new());
+
     /// Validates an operator-supplied label.
     ///
     /// # Errors
