@@ -98,6 +98,12 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
         tokio::spawn(health::serve(listener, view));
     }
 
+    // Subscribed before the first probe rather than after it: the probe runs
+    // for up to eighteen attempts, and an epoch that ends and restarts inside
+    // that window is invisible to a receiver cloned once it is over, which
+    // would leave the proof standing on a probe made against the epoch before.
+    let tracker_rx = handle.watch_state();
+
     wait_until_connected(&handle, config.connect_timeout)
         .await
         .context("the tunnel never reached Connected")?;
@@ -110,7 +116,7 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
     log("tunnel up, egress verified");
 
     tokio::spawn(track_egress_across_epochs(
-        handle.watch_state(),
+        tracker_rx,
         Arc::clone(&egress_verified),
         move || async move {
             verify_first_egress(probe_addr, FIRST_EGRESS_RECHECK)
@@ -193,9 +199,9 @@ async fn track_egress_across_epochs<R, Fut>(
     R: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    // The receiver arrives having seen the state its creator saw (tokio marks
-    // the current version at clone time), so no transition raised before the
-    // first poll is lost.
+    // A change raised since this receiver was cloned is still pending on the
+    // first poll (tokio marks the version at clone time), which is what makes
+    // cloning it before the first egress probe enough to cover that probe.
     loop {
         if state_rx.changed().await.is_err() {
             return;
