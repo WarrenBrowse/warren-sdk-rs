@@ -94,10 +94,18 @@ async fn kill_hook(child: &mut tokio::process::Child) {
         return;
     };
     let _ = killpg(group, Signal::SIGTERM);
-    let reaped = tokio::time::timeout(KILL_GRACE, child.wait()).await.is_ok();
+    // A wait that errored reaped nothing, so it must still take the fallback
+    // below rather than be read as a clean exit.
+    let reaped = matches!(
+        tokio::time::timeout(KILL_GRACE, child.wait()).await,
+        Ok(Ok(_))
+    );
     // Unconditional, even once the leader is gone: a descendant that ignores
     // SIGTERM keeps the group (and the port) alive, and the escalation is the
-    // only thing that ends it.
+    // only thing that ends it. It cannot reach a stranger's group either: the
+    // kernel holds a pid allocated while it is still the pgid of a group that
+    // has members, so a group that answers here is still this hook's, and an
+    // empty one only yields ESRCH.
     let _ = killpg(group, Signal::SIGKILL);
     if !reaped {
         let _ = child.kill().await;
