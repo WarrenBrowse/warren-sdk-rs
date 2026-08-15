@@ -33,4 +33,8 @@ pub enum PacketError {
     /// An identifier rewrite was asked of an ICMP message that carries none.
     #[error("not an ICMP echo message")]
     NotAnEcho,
+    /// A quote was asked of an ICMP message that is not an error, so it quotes
+    /// nothing.
+    #[error("not an ICMP error message")]
+    NotAnIcmpError,
 }

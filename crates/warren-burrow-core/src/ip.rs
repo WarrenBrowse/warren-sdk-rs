@@ -152,6 +152,23 @@ const fn is_extension_header(next: u8) -> bool {
 /// [`PacketError::ExtensionHeader`] for an IPv6 packet whose next header is not
 /// a transport header.
 pub fn parse_ip(pkt: &[u8]) -> Result<IpHeader, PacketError> {
+    parse(pkt, false)
+}
+
+/// Reads the IP header of a packet quoted inside an ICMP error, where the
+/// buffer deliberately stops short of the length the header declares.
+///
+/// [`IpHeader::total_len`] then reports the bytes actually present, so a caller
+/// rewriting the quote knows which fields it may touch.
+///
+/// # Errors
+///
+/// As [`parse_ip`], minus the length check the quote cannot satisfy.
+pub fn parse_ip_quote(pkt: &[u8]) -> Result<IpHeader, PacketError> {
+    parse(pkt, true)
+}
+
+fn parse(pkt: &[u8], quoted: bool) -> Result<IpHeader, PacketError> {
     let first = *pkt.first().ok_or(PacketError::Truncated)?;
     match first >> 4 {
         4 => {
@@ -159,10 +176,18 @@ pub fn parse_ip(pkt: &[u8]) -> Result<IpHeader, PacketError> {
                 return Err(PacketError::Truncated);
             }
             let ihl = usize::from(first & 0x0f) * 4;
-            let total_len = usize::from(u16::from_be_bytes([pkt[2], pkt[3]]));
-            if ihl < IPV4_MIN_HEADER || total_len < ihl || total_len > pkt.len() {
+            let declared = usize::from(u16::from_be_bytes([pkt[2], pkt[3]]));
+            if ihl < IPV4_MIN_HEADER || declared < ihl || pkt.len() < ihl {
                 return Err(PacketError::Truncated);
             }
+            let total_len = if quoted {
+                declared.min(pkt.len())
+            } else {
+                if declared > pkt.len() {
+                    return Err(PacketError::Truncated);
+                }
+                declared
+            };
             let frag = u16::from_be_bytes([pkt[6], pkt[7]]);
             // More-fragments set, or a non-zero offset: either way the ports
             // are not reliably here.
@@ -183,10 +208,15 @@ pub fn parse_ip(pkt: &[u8]) -> Result<IpHeader, PacketError> {
             if pkt.len() < IPV6_HEADER {
                 return Err(PacketError::Truncated);
             }
-            let total_len = IPV6_HEADER + usize::from(u16::from_be_bytes([pkt[4], pkt[5]]));
-            if total_len > pkt.len() {
-                return Err(PacketError::Truncated);
-            }
+            let declared = IPV6_HEADER + usize::from(u16::from_be_bytes([pkt[4], pkt[5]]));
+            let total_len = if quoted {
+                declared.min(pkt.len())
+            } else {
+                if declared > pkt.len() {
+                    return Err(PacketError::Truncated);
+                }
+                declared
+            };
             if is_extension_header(pkt[6]) {
                 return Err(PacketError::ExtensionHeader);
             }
