@@ -79,10 +79,10 @@ impl GatewayKey {
         self.public
     }
 
-    /// The secret itself, which only the responder needs: boringtun clones it
-    /// into every peer tunnel.
-    #[must_use]
-    pub fn secret(&self) -> &x25519_dalek::StaticSecret {
+    // The secret itself, which only the responder needs: boringtun clones it
+    // into every peer tunnel. Deliberately not public: nothing outside this
+    // crate has a reason to hold the gateway's private key.
+    pub(crate) fn secret(&self) -> &x25519_dalek::StaticSecret {
         &self.secret
     }
 
