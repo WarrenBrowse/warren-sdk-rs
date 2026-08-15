@@ -183,6 +183,55 @@ impl MultihopError {
             _ => Retryability::RetrySameTarget,
         }
     }
+
+    /// True when the failure refused ONE datagram over a session that is still
+    /// usable, so a datapath drops and counts the packet instead of tearing the
+    /// epoch down.
+    ///
+    /// The uplink pump reads the current send budget and then sends; a DPLPMTUD
+    /// shrink in between answers `TooLarge` for that packet alone. Every other
+    /// variant, `ConnectionLost` included, is session-level and still ends the
+    /// epoch.
+    #[must_use]
+    pub fn is_per_packet(&self) -> bool {
+        match self {
+            Self::SendDatagram(e) => !matches!(e, quinn::SendDatagramError::ConnectionLost(_)),
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod per_packet_tests {
+    use super::*;
+
+    #[test]
+    fn a_datagram_refusal_is_per_packet_and_a_lost_connection_is_not() {
+        // The uplink pump reads the send budget, then sends: a DPLPMTUD shrink
+        // in between refuses THIS packet over a session that is still fine, so
+        // the datapath drops it and keeps serving. A lost connection is the
+        // session itself, and must still end the epoch.
+        assert!(
+            MultihopError::SendDatagram(quinn::SendDatagramError::TooLarge).is_per_packet(),
+            "an over-budget datagram is one packet's problem"
+        );
+        assert!(
+            MultihopError::SendDatagram(quinn::SendDatagramError::UnsupportedByPeer)
+                .is_per_packet(),
+            "a datagram-level refusal never ends a session on its own"
+        );
+        assert!(
+            !MultihopError::SendDatagram(quinn::SendDatagramError::ConnectionLost(
+                quinn::ConnectionError::LocallyClosed
+            ))
+            .is_per_packet(),
+            "a lost connection is session-level"
+        );
+        assert!(
+            !MultihopError::ReadDatagram(quinn::ConnectionError::LocallyClosed).is_per_packet(),
+            "a read failure is the session's read side, never one packet"
+        );
+    }
 }
 
 /// Short, stable label for why a QUIC connection closed, for diagnostics.

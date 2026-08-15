@@ -60,6 +60,8 @@ experimental-tun = ["dep:warren-tun", "warren-tun/experimental-tun"]
 [dev-dependencies]
 # `test-util` enables `start_paused` for the NAT-PMP retransmit/refresh tests.
 tokio = { workspace = true, features = ["test-util"] }
+# Builds the datagram-refusal values the per-packet classification is pinned on.
+quinn = { workspace = true }
 ed25519-dalek = { workspace = true }
 warren-test-support = { path = "../warren-test-support" }
 # Build a real DAITA driver handle to prove the idle-cover / DAITA mutual

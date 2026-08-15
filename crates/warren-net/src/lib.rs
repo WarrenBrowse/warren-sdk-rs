@@ -59,7 +59,10 @@ pub use portforward::{
 #[cfg(feature = "proxy")]
 pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy, UdpConnector, UdpFlow};
 pub use sink::{BondedPacketSink, CloseRttObserver, MultihopPacketSink, PacketSink};
-pub use tun_sink::{TunBridge, TunPacketSink, forward_bidirectional, tun_channels};
+pub use tun_sink::{
+    PumpStats, TunBridge, TunPacketSink, forward_bidirectional, forward_bidirectional_with_stats,
+    tun_channels,
+};
 /// The NAT-PMP mapping protocol selector (TCP or UDP) and the gateway result
 /// code, re-exported from the wire codec so callers can name them (notably to
 /// classify a strict suggestion refusal) without depending on `warren-wire`

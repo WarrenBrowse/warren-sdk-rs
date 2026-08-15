@@ -49,3 +49,56 @@ pub enum NetError {
     #[error("unsupported: {0}")]
     Unsupported(&'static str),
 }
+
+impl NetError {
+    /// True when the failure refused ONE packet over a datapath that is still
+    /// usable, so a pump drops and counts it instead of ending the epoch.
+    ///
+    /// The classification belongs to the transport error that carries it (a
+    /// datagram refused for its size against a live session, versus a session
+    /// that is gone); this only routes to it. Everything else, a closed
+    /// session, a stopped engine, a device error, is fatal to the epoch, which
+    /// is the asymmetry the netstack writer already applies.
+    #[must_use]
+    pub fn is_per_packet(&self) -> bool {
+        match self {
+            Self::Tunnel(e) => e.is_per_packet(),
+            Self::Multihop(e) => e.is_per_packet(),
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_live_session_datagram_refusal_is_per_packet() {
+        assert!(
+            NetError::Multihop(warren_transport::MultihopError::SendDatagram(
+                quinn::SendDatagramError::TooLarge
+            ))
+            .is_per_packet(),
+            "an over-budget datagram is one packet's problem"
+        );
+        assert!(
+            !NetError::Multihop(warren_transport::MultihopError::SendDatagram(
+                quinn::SendDatagramError::ConnectionLost(quinn::ConnectionError::LocallyClosed)
+            ))
+            .is_per_packet(),
+            "a lost session must still end the epoch"
+        );
+        assert!(
+            NetError::Tunnel(warren_transport::TunnelError::SendDatagram(
+                quinn::SendDatagramError::TooLarge
+            ))
+            .is_per_packet(),
+            "the single-hop plane classifies the same way"
+        );
+        assert!(
+            !NetError::EngineStopped.is_per_packet(),
+            "a stopped engine is not a packet-level refusal"
+        );
+    }
+}

@@ -86,7 +86,11 @@ pub fn tun_channels<D: RawTunDevice>(
 /// an ICMP Fragmentation-Needed / Packet-Too-Big written into the device
 /// instead of being sent (and silently dropped): the local OS's own PMTUD
 /// then converges on later packets rather than the flow black-holing.
-async fn pump_uplink<D: PacketSink, T: PacketSink>(device: &D, tunnel: &T) -> Result<(), NetError> {
+async fn pump_uplink<D: PacketSink, T: PacketSink>(
+    device: &D,
+    tunnel: &T,
+    stats: &PumpStats,
+) -> Result<(), NetError> {
     loop {
         let packet = device.recv_packet().await?;
         let budget = u16::try_from(tunnel.max_payload()).unwrap_or(u16::MAX);
@@ -99,12 +103,23 @@ async fn pump_uplink<D: PacketSink, T: PacketSink>(device: &D, tunnel: &T) -> Re
             }
             continue;
         }
-        if is_tcp_syn(&packet) {
+        let sent = if is_tcp_syn(&packet) {
             let mut owned = packet.to_vec();
             let _ = clamp_uplink_syn(&mut owned, budget);
-            tunnel.send_packet(&owned).await?;
+            tunnel.send_packet(&owned).await
         } else {
-            tunnel.send_packet(&packet).await?;
+            tunnel.send_packet(&packet).await
+        };
+        // The budget read above and the send below are two moments: a DPLPMTUD
+        // shrink in between refuses this packet over a session that is still
+        // carrying. Dropping it costs one packet (IP is lossy); ending the run
+        // would cost the whole datapath, which for a device fronting several
+        // clients is every one of them at once.
+        if let Err(e) = sent {
+            if !e.is_per_packet() {
+                return Err(e);
+            }
+            stats.dropped_uplink_send();
         }
     }
 }
@@ -148,11 +163,51 @@ pub async fn forward_bidirectional<A: PacketSink, B: PacketSink>(
     device: A,
     tunnel: B,
 ) -> Result<(), NetError> {
+    forward_bidirectional_with_stats(device, tunnel, &PumpStats::default()).await
+}
+
+/// [`forward_bidirectional`] with the counters of the run kept by the caller,
+/// so the packets the uplink drops on a per-packet tunnel refusal are
+/// observable rather than silent.
+///
+/// # Errors
+///
+/// The first fatal [`NetError`] from either direction; the other direction is
+/// then cancelled (the datapath has stopped).
+pub async fn forward_bidirectional_with_stats<A: PacketSink, B: PacketSink>(
+    device: A,
+    tunnel: B,
+    stats: &PumpStats,
+) -> Result<(), NetError> {
     tokio::try_join!(
-        pump_uplink(&device, &tunnel),
+        pump_uplink(&device, &tunnel, stats),
         pump_downlink(&tunnel, &device)
     )
     .map(|_| ())
+}
+
+/// What one packet-forwarding run dropped rather than carried.
+///
+/// A drop is invisible by construction (the sender learns nothing), so the
+/// count is the only evidence a datapath has that its uplink is shedding
+/// packets instead of an exit losing them.
+#[derive(Debug, Default)]
+pub struct PumpStats {
+    uplink_send_dropped: std::sync::atomic::AtomicU64,
+}
+
+impl PumpStats {
+    /// Uplink packets the tunnel refused per-packet, dropped and counted.
+    #[must_use]
+    pub fn uplink_send_dropped(&self) -> u64 {
+        self.uplink_send_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn dropped_uplink_send(&self) {
+        self.uplink_send_dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl<D: RawTunDevice> TunBridge<D> {
@@ -516,6 +571,112 @@ mod tests {
         }
     }
 
+    /// A tunnel sink whose sends fail on a script: one entry is popped per
+    /// send, an error entry is returned as-is, and anything past the script is
+    /// recorded. `recv_packet` parks, so the uplink leg alone decides the run.
+    struct ScriptedTunnel {
+        script: std::sync::Mutex<VecDeque<NetError>>,
+        sent: mpsc::Sender<Vec<u8>>,
+    }
+
+    impl PacketSink for ScriptedTunnel {
+        async fn send_packet(&self, packet: &[u8]) -> Result<(), NetError> {
+            if let Some(err) = self.script.lock().expect("script lock").pop_front() {
+                return Err(err);
+            }
+            let _ = self.sent.send(packet.to_vec()).await;
+            Ok(())
+        }
+
+        async fn recv_packet(&self) -> Result<Bytes, NetError> {
+            std::future::pending().await
+        }
+
+        fn max_payload(&self) -> usize {
+            1280
+        }
+    }
+
+    /// Wires a device fed from `packets` (then closed) to a tunnel running
+    /// `script`, and returns the pump verdict, what reached the tunnel and the
+    /// drop count.
+    async fn run_uplink(
+        packets: Vec<Vec<u8>>,
+        script: VecDeque<NetError>,
+    ) -> (Result<(), NetError>, Vec<Vec<u8>>, u64) {
+        let (dev_in_tx, dev_in_rx) = mpsc::channel::<Bytes>(4);
+        let (dev_out_tx, _dev_out_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (tun_out_tx, mut tun_out_rx) = mpsc::channel::<Vec<u8>>(4);
+        let device = MockSink {
+            inbound: Mutex::new(dev_in_rx),
+            outbound: dev_out_tx,
+        };
+        let tunnel = ScriptedTunnel {
+            script: std::sync::Mutex::new(script),
+            sent: tun_out_tx,
+        };
+        for packet in packets {
+            dev_in_tx.send(Bytes::from(packet)).await.expect("queued");
+        }
+        drop(dev_in_tx); // the device ends once the queue is drained
+        let stats = PumpStats::default();
+        let verdict = forward_bidirectional_with_stats(device, tunnel, &stats).await;
+        let mut forwarded = Vec::new();
+        while let Ok(packet) = tun_out_rx.try_recv() {
+            forwarded.push(packet);
+        }
+        (verdict, forwarded, stats.uplink_send_dropped())
+    }
+
+    #[tokio::test]
+    async fn a_per_packet_send_failure_is_dropped_and_counted_not_fatal() {
+        // The budget can shrink between the size check and the send, so the
+        // tunnel refuses THAT packet over a session that is still carrying. For
+        // a gateway that is every peer at once, ending the epoch there would
+        // drop every peer, flush the uplink and re-arm the port forward.
+        let (verdict, forwarded, dropped) = run_uplink(
+            vec![vec![0x45, 1], vec![0x45, 2]],
+            VecDeque::from(vec![NetError::Multihop(
+                warren_transport::MultihopError::SendDatagram(quinn::SendDatagramError::TooLarge),
+            )]),
+        )
+        .await;
+
+        assert_eq!(dropped, 1, "the refused packet is counted");
+        assert_eq!(
+            forwarded,
+            vec![vec![0x45, 2]],
+            "the pump kept serving and carried the next packet"
+        );
+        assert!(
+            matches!(verdict, Err(NetError::Tun(_))),
+            "the run ended on the device closing, not on the refused packet: {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_level_send_failure_still_ends_the_pump() {
+        let (verdict, forwarded, dropped) = run_uplink(
+            vec![vec![0x45, 1], vec![0x45, 2]],
+            VecDeque::from(vec![NetError::Multihop(
+                warren_transport::MultihopError::SendDatagram(
+                    quinn::SendDatagramError::ConnectionLost(quinn::ConnectionError::LocallyClosed),
+                ),
+            )]),
+        )
+        .await;
+
+        assert_eq!(dropped, 0, "a dead session is not a counted packet drop");
+        assert!(
+            forwarded.is_empty(),
+            "nothing may be sent after the session is gone"
+        );
+        assert!(
+            matches!(verdict, Err(NetError::Multihop(_))),
+            "the session error must end the epoch: {verdict:?}"
+        );
+    }
+
     /// A minimal IPv4 TCP SYN with a single MSS option. Neither `is_tcp_syn`
     /// nor `clamp_syn_mss` verify the checksum before rewriting, so this test
     /// packet never bothers computing a valid one.
@@ -557,7 +718,7 @@ mod tests {
         dev_in_tx.send(Bytes::from(syn_packet(1460))).await.unwrap();
         drop(dev_in_tx); // ends the pump's loop after this one packet
 
-        let _ = pump_uplink(&device, &tunnel).await;
+        let _ = pump_uplink(&device, &tunnel, &PumpStats::default()).await;
 
         let forwarded = tun_out_rx.try_recv().expect("the SYN reached the tunnel");
         assert_eq!(
@@ -593,7 +754,7 @@ mod tests {
         dev_in_tx.send(Bytes::from(too_big)).await.unwrap();
         drop(dev_in_tx);
 
-        let _ = pump_uplink(&device, &tunnel).await;
+        let _ = pump_uplink(&device, &tunnel, &PumpStats::default()).await;
 
         assert!(
             tun_out_rx.try_recv().is_err(),
