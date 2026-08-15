@@ -18,6 +18,7 @@ pub mod ip;
 pub mod nat;
 pub mod peer;
 pub mod ports;
+pub mod scratch;
 pub mod stats;
 
 #[cfg(test)]
@@ -36,6 +37,7 @@ pub use peer::PeerId;
 pub use ports::{
     CONTROL_RANGE_END, CONTROL_RANGE_START, DYNAMIC_POOL_END, DYNAMIC_POOL_START, PortAllocator,
 };
+pub use scratch::{SCRATCH_LEN, ScratchBuf};
 pub use stats::{Counters, Snapshot};
 
 pub use ip::{
