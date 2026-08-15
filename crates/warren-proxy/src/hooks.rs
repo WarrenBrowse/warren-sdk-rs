@@ -129,9 +129,11 @@ pub(crate) mod tests {
     /// hook will actually run under on this platform.
     pub(crate) fn write_marker(text: &str, path: &std::path::Path) -> String {
         if cfg!(windows) {
-            // No space before the redirect, or cmd writes it into the file, and
-            // the target is quoted because a temp path may contain a space.
-            format!("echo {text}>\"{}\"", path.display())
+            // Redirect FIRST: in cmd a digit touching `>` is a stream handle, so
+            // `echo up:58364>file` redirects handle 4 and writes nothing, and a
+            // space before `>` would land inside the file instead. The target is
+            // quoted because a temp path may contain a space.
+            format!(">\"{}\" echo {text}", path.display())
         } else {
             format!("printf %s '{text}' > '{}'", path.display())
         }
