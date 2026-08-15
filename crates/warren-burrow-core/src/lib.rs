@@ -15,6 +15,7 @@
 pub mod error;
 pub mod icmp;
 pub mod ip;
+pub mod keys;
 pub mod nat;
 pub mod peer;
 pub mod ports;
@@ -29,6 +30,7 @@ pub use icmp::{
     ErrorQuote, build_echo_reply_v4, build_echo_reply_v6, build_unreachable_v4,
     build_unreachable_v6, parse_error_quote, recompute_icmp_checksum, rewrite_error_quote,
 };
+pub use keys::{GatewayKey, KEY_LEN, KeyError, PeerPublicKey, PresharedKey};
 pub use nat::{
     EXIT_ID_LEN, EpochId, ExitId, MapProto, MappingId, Napt, NatConfig, NatDrop, Ownership,
     StaticDnat, Translated,

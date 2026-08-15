@@ -20,6 +20,10 @@ warrenguard-transport-core = { workspace = true }
 # being restructured, and the crate's session-index and double-count accounting
 # is load-bearing here.
 boringtun = { version = "=0.7.1", default-features = false }
+# Declared directly rather than inherited from boringtun so `StaticSecret`
+# zeroization on drop is a property of this crate's own dependency edge and
+# cannot be lost to an upstream feature change.
+x25519-dalek = { version = "2", features = ["zeroize", "static_secrets"] }
 # Longest-prefix tries: the NAT resolves which peer owns a source address
 # through the same structure cryptokey routing uses, so one address can never
 # be claimed by two peers.
