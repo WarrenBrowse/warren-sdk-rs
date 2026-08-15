@@ -41,8 +41,8 @@ pub struct ExitFilter {
 ///
 /// The engine implements the atomic TCP+UDP pair on ONE public port under ONE
 /// entitlement credential, which is what a BitTorrent client wants. The SDK
-/// forward path this daemon runs on does not carry that pair yet, so the
-/// limitation here is the SDK's and not the protocol's.
+/// forward path this daemon runs on does not carry that pair yet: that is what
+/// refuses `both` here, and the protocol imposes no such limit.
 ///
 /// This daemon also presents no entitlement credential, so the exit applies
 /// its default per-client quota rather than the account's fleet-wide slot
