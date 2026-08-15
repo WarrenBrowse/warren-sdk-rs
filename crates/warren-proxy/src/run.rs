@@ -133,7 +133,7 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
     // hours, so a restart on another internal port or protocol would leave the
     // public port stranded that long.
     if let Some(forward) = forward {
-        if forward.shutdown().await {
+        if forward.release_and_shutdown().await {
             log("forwarded port released at the exit");
         } else {
             log("the forwarded port release timed out, its lease will lapse");

@@ -313,8 +313,8 @@ pub struct SupervisedForwardedPort {
     task: tokio::task::JoinHandle<()>,
 }
 
-/// How long [`SupervisedForwardedPort::shutdown`] waits for the exit to
-/// acknowledge the delete. The exchange is one round trip through the tunnel;
+/// How long [`SupervisedForwardedPort::release_and_shutdown`] waits for the
+/// exit to acknowledge the delete. The exchange is one round trip through the tunnel;
 /// past that the tunnel is gone and the lease has to lapse on its own.
 const PORT_RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -359,15 +359,24 @@ impl SupervisedForwardedPort {
         self.outcome_rx.clone()
     }
 
+    /// Tears the forward down, leaving the mapping at the exit to lapse with
+    /// its lease (up to two hours), which strands the public port for anyone
+    /// restarting on a different internal port or protocol.
+    /// [`Self::release_and_shutdown`] is the graceful stop. Dropping the handle
+    /// does the same as this.
+    ///
+    /// Synchronous on purpose: the sibling-language SDKs bind it from
+    /// non-async teardown paths, so making the graceful release the additive
+    /// method keeps them compiling across an SDK bump.
+    pub fn shutdown(self) {
+        self.task.abort();
+    }
+
     /// Releases the forward at the exit, then tears it down. Returns whether
     /// the release was carried out inside [`PORT_RELEASE_BUDGET`]; `false`
     /// means the tunnel was already gone and the exit will reclaim the port
     /// when the lease lapses.
-    ///
-    /// Dropping the handle instead stops the local tasks and always leaves the
-    /// mapping to lapse (up to two hours), which strands the public port for
-    /// anyone restarting on a different internal port or protocol.
-    pub async fn shutdown(self) -> bool {
+    pub async fn release_and_shutdown(self) -> bool {
         let released = self.release.release(PORT_RELEASE_BUDGET).await;
         self.task.abort();
         released
