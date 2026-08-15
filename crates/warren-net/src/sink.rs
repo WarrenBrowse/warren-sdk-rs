@@ -130,6 +130,58 @@ pub trait PacketSink: Send + Sync {
     }
 }
 
+/// A shared sink IS a sink: every method delegates to the inner one.
+///
+/// One epoch hands the same sink to two owners (the datapath that pumps it and
+/// the forwarder or probe that rides it), so the shared handle has to satisfy
+/// the seam itself. Every method is forwarded, the optional ones included: a
+/// method left on the trait default would silently disarm the drain advisory,
+/// the metrics read or the migration session for the whole epoch.
+impl<S: PacketSink> PacketSink for Arc<S> {
+    fn send_packet(
+        &self,
+        packet: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), NetError>> + Send {
+        S::send_packet(self, packet)
+    }
+
+    fn recv_packet(&self) -> impl std::future::Future<Output = Result<Bytes, NetError>> + Send {
+        S::recv_packet(self)
+    }
+
+    fn max_payload(&self) -> usize {
+        S::max_payload(self)
+    }
+
+    fn drain_watch(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<Option<warren_transport::DrainAdvisory>>> {
+        S::drain_watch(self)
+    }
+
+    fn metrics_snapshot(&self) -> Option<warren_transport::MultihopMetricsSnapshot> {
+        S::metrics_snapshot(self)
+    }
+
+    fn multihop_session(&self) -> Option<Arc<MultihopSession>> {
+        S::multihop_session(self)
+    }
+
+    fn send_batch(
+        &self,
+        packets: &[&[u8]],
+    ) -> impl std::future::Future<Output = Result<(), NetError>> + Send {
+        S::send_batch(self, packets)
+    }
+
+    fn recv_batch(
+        &self,
+        max: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<Bytes>, NetError>> + Send {
+        S::recv_batch(self, max)
+    }
+}
+
 /// Observer of the session's final smoothed path RTT (ms), fired once when
 /// the owning sink is dropped (the datapath teardown, the natural pre-close
 /// lifecycle point). The sink stays discovery-agnostic: the SDK client
@@ -424,6 +476,107 @@ mod tests {
         fn max_payload(&self) -> usize {
             self.payload
         }
+    }
+
+    /// A sink that answers every optional method, so a delegating wrapper is
+    /// caught forwarding one of them to the trait default instead.
+    struct FullSink {
+        drain_tx: tokio::sync::watch::Sender<Option<warren_transport::DrainAdvisory>>,
+        session: Arc<MultihopSession>,
+    }
+
+    impl PacketSink for FullSink {
+        async fn send_packet(&self, _packet: &[u8]) -> Result<(), NetError> {
+            Ok(())
+        }
+        async fn recv_packet(&self) -> Result<Bytes, NetError> {
+            Ok(Bytes::from_static(b"down"))
+        }
+        fn max_payload(&self) -> usize {
+            1337
+        }
+        fn drain_watch(
+            &self,
+        ) -> Option<tokio::sync::watch::Receiver<Option<warren_transport::DrainAdvisory>>> {
+            Some(self.drain_tx.subscribe())
+        }
+        fn metrics_snapshot(&self) -> Option<warren_transport::MultihopMetricsSnapshot> {
+            Some(warren_transport::MultihopMetrics::default().snapshot())
+        }
+        fn multihop_session(&self) -> Option<Arc<MultihopSession>> {
+            Some(Arc::clone(&self.session))
+        }
+        async fn send_batch(&self, packets: &[&[u8]]) -> Result<(), NetError> {
+            // Distinguishable from the trait default (which would loop over
+            // `send_packet` and return `Ok`).
+            if packets.len() == 2 {
+                Err(NetError::EngineStopped)
+            } else {
+                Ok(())
+            }
+        }
+        async fn recv_batch(&self, _max: usize) -> Result<Vec<Bytes>, NetError> {
+            Ok(vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")])
+        }
+    }
+
+    /// Exercises the seam through the trait, so the delegating `Arc` impl is
+    /// what answers rather than an auto-deref to the inner sink.
+    async fn assert_delegates<S: PacketSink>(
+        sink: &S,
+        drain_tx: &tokio::sync::watch::Sender<Option<warren_transport::DrainAdvisory>>,
+    ) {
+        assert!(sink.send_packet(b"up").await.is_ok());
+        assert_eq!(sink.recv_packet().await.expect("downlink"), "down");
+        assert_eq!(sink.max_payload(), 1337);
+        let mut drain_rx = sink.drain_watch().expect("the drain watch is delegated");
+        drain_tx
+            .send(Some(warren_transport::DrainAdvisory {
+                deadline_unix_secs: 42,
+                reason_code: 7,
+            }))
+            .expect("receiver live");
+        assert_eq!(
+            drain_rx.borrow_and_update().expect("advisory").reason_code,
+            7,
+            "the delegated watch must be the inner sink's own"
+        );
+        assert!(
+            sink.metrics_snapshot().is_some(),
+            "the metrics snapshot is delegated"
+        );
+        assert!(
+            sink.multihop_session().is_some(),
+            "the live session is delegated"
+        );
+        assert!(
+            matches!(
+                sink.send_batch(&[b"a".as_slice(), b"b".as_slice()]).await,
+                Err(NetError::EngineStopped)
+            ),
+            "the batch send is delegated, not re-implemented over send_packet"
+        );
+        assert_eq!(
+            sink.recv_batch(4).await.expect("batch").len(),
+            2,
+            "the batch receive is delegated"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_arc_delegates_every_packet_sink_method() {
+        // The supervisor hands ONE epoch sink to both the netstack engine and
+        // the packet forwarder, so the shared `Arc` has to be a sink itself; a
+        // method left on the trait default would silently disarm a drain
+        // advisory or a metrics read for the whole epoch.
+        let session = Arc::new(loopback_multihop_session().await);
+        let (drain_tx, _drain_rx) = tokio::sync::watch::channel(None);
+        let inner = Arc::new(FullSink {
+            drain_tx: drain_tx.clone(),
+            session: Arc::clone(&session),
+        });
+
+        assert_delegates(&inner, &drain_tx).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
