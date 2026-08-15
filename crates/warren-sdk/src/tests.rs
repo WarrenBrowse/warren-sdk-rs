@@ -3041,8 +3041,10 @@ async fn supervise_datapath_starts_a_fresh_epoch_per_tunnel_and_stamps_it() {
         "the first epoch publishes its forwarder"
     );
 
-    // End the epoch the way a dead datapath does.
-    kill.notify_waiters();
+    // End the epoch the way a dead datapath does. A stored permit, because
+    // the supervisor publishes the forwarder before it first polls the
+    // epoch: a wake-only signal fired here reaches nobody.
+    kill.notify_one();
     assert_eq!(
         next_published(&mut forwarder_rx, budget).await,
         None,
