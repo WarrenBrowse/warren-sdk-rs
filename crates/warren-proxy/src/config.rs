@@ -245,8 +245,32 @@ fn read_secret(
         .map(|v| Zeroizing::new(v.trim().to_owned())))
 }
 
-fn is_off(v: &str) -> bool {
+/// Whether a value spells "this knob is deliberately disabled" (empty, `off`
+/// or `none`, in any case).
+#[must_use]
+pub fn is_off(v: &str) -> bool {
     v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none")
+}
+
+/// What the `healthcheck` subcommand should probe, resolved from the raw
+/// `WARREN_HEALTH_LISTEN` value: `None` when the endpoint is disabled, so the
+/// probe reports the container healthy instead of hunting an address nobody
+/// bound. Shares [`is_off`] and the default with [`load`], which is the point:
+/// the two must never disagree.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] when the value is neither an off spelling nor an
+/// `ip:port`.
+pub fn healthcheck_target(raw: Option<String>) -> Result<Option<SocketAddr>, ConfigError> {
+    match raw {
+        Some(v) if is_off(&v) => Ok(None),
+        Some(v) => Ok(Some(parse_addr(&v, "WARREN_HEALTH_LISTEN")?)),
+        None => Ok(Some(parse_addr(
+            DEFAULT_HEALTH_LISTEN,
+            "WARREN_HEALTH_LISTEN",
+        )?)),
+    }
 }
 
 fn parse_addr(v: &str, var: &'static str) -> Result<SocketAddr, ConfigError> {
@@ -486,6 +510,46 @@ mod tests {
         assert_eq!(cfg.socks_listen, "0.0.0.0:1080".parse().unwrap());
         assert_eq!(cfg.http_listen, Some("0.0.0.0:8888".parse().unwrap()));
         assert_eq!(cfg.health_listen, None);
+    }
+
+    /// The daemon and the `healthcheck` subcommand read the same variable, so a
+    /// spelling that disables the endpoint for one and not the other marks a
+    /// container unhealthy for as long as it runs.
+    #[test]
+    fn the_healthcheck_target_agrees_with_the_daemon_on_every_off_spelling() {
+        for raw in ["", "off", "OFF", "none", "NONE"] {
+            let cfg = load(
+                env(&[("WARREN_MNEMONIC", "m"), ("WARREN_HEALTH_LISTEN", raw)]),
+                no_file,
+            )
+            .expect("an off spelling is valid configuration");
+            assert_eq!(cfg.health_listen, None, "{raw:?} must disable the endpoint");
+            assert_eq!(
+                healthcheck_target(Some(raw.to_owned())).expect("an off spelling is not an error"),
+                None,
+                "{raw:?} disables the endpoint, so there is nothing to probe"
+            );
+        }
+    }
+
+    #[test]
+    fn the_healthcheck_target_follows_the_daemon_default_and_refuses_junk() {
+        assert_eq!(
+            healthcheck_target(None).expect("the default is a valid address"),
+            Some(DEFAULT_HEALTH_LISTEN.parse().unwrap()),
+            "with the variable unset the probe must reach where the daemon binds"
+        );
+        assert_eq!(
+            healthcheck_target(Some("127.0.0.1:19999".to_owned())).unwrap(),
+            Some("127.0.0.1:19999".parse().unwrap())
+        );
+        assert!(matches!(
+            healthcheck_target(Some("1080".to_owned())),
+            Err(ConfigError::Invalid {
+                var: "WARREN_HEALTH_LISTEN",
+                ..
+            })
+        ));
     }
 
     #[test]

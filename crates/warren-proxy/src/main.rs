@@ -6,13 +6,20 @@ use std::process::ExitCode;
 /// `warren-proxy healthcheck`: probe the running daemon's `/healthz` and
 /// exit 0/1, so a container HEALTHCHECK needs no shell and no wget.
 fn healthcheck() -> ExitCode {
-    let addr = std::env::var("WARREN_HEALTH_LISTEN")
-        .ok()
-        .filter(|v| !v.is_empty() && v != "off")
-        .unwrap_or_else(|| "127.0.0.1:9999".to_owned());
-    let Ok(addr) = addr.parse() else {
-        eprintln!("warren-proxy: WARREN_HEALTH_LISTEN is not an ip:port");
-        return ExitCode::from(1);
+    let addr = match warren_proxy::config::healthcheck_target(
+        std::env::var("WARREN_HEALTH_LISTEN").ok(),
+    ) {
+        // The operator turned the endpoint off, so there is nothing to assert
+        // and reporting unhealthy would be reporting on their own choice.
+        Ok(None) => {
+            println!("warren-proxy: health endpoint disabled, nothing to probe");
+            return ExitCode::SUCCESS;
+        }
+        Ok(Some(addr)) => addr,
+        Err(err) => {
+            eprintln!("warren-proxy: {err}");
+            return ExitCode::from(1);
+        }
     };
     match warren_proxy::health::probe_healthz(addr) {
         Ok(true) => ExitCode::SUCCESS,
