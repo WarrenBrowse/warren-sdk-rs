@@ -9,6 +9,9 @@
 # arm64 pool), a published GitHub release with SHA256SUMS, and the multi-arch
 # image ghcr.io/warrenbrowse/warren-proxy.
 #
+# A tag publishes only when its commit is on main and that commit already has a
+# green CI run, so the release inherits the four gates.
+#
 # workflow_dispatch builds the binaries as run artifacts without publishing
 # anything (a dry run of the matrix).
 
@@ -27,6 +30,8 @@ on:
         default: "beta"
 
 permissions:
+  # actions: read is what lets the resolve gate below read this commit's CI run.
+  actions: read
   contents: write
   packages: write
 
@@ -60,6 +65,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_CHANNEL: ${{ github.event.inputs.channel }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ "$EVENT" = "push" ]; then
@@ -75,6 +81,26 @@ jobs:
               | sed "s|.*refs/tags/${prefix}||" | grep -v '\^{}' | sort -V | tail -1)
             if [ "$highest" != "$version" ]; then
               echo "refusing ${REF_NAME}: highest ${prefix}* on origin is ${prefix}${highest}" >&2
+              exit 1
+            fi
+            # A tag can be cut on any commit, so the release inherits the four
+            # gates instead of re-running one of them: the tagged commit has to
+            # be on main and to carry a CI run that concluded success.
+            git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "refusing ${REF_NAME}: its commit is not on main" >&2
+              exit 1
+            fi
+            runs=$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&status=success&per_page=1") \
+              || { echo "refusing ${REF_NAME}: the workflow-runs API is unreadable" >&2; exit 1; }
+            # total_count is the first field of the response, and jq is not on
+            # every runner pool.
+            green=$(printf '%s' "$runs" | tr -d ' \n' | sed -nE 's/^\{"total_count":([0-9]+).*/\1/p')
+            if [ "${green:-0}" -lt 1 ]; then
+              echo "refusing ${REF_NAME}: no successful CI run on its commit; wait for CI, then re-run this workflow" >&2
               exit 1
             fi
             publish=true
