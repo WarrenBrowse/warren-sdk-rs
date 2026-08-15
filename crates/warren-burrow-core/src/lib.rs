@@ -14,12 +14,14 @@
 
 pub mod error;
 pub mod icmp;
+pub mod index;
 pub mod ip;
 pub mod keys;
 pub mod nat;
 pub mod peer;
 pub mod plan;
 pub mod ports;
+pub mod ratelimit;
 pub mod scratch;
 pub mod stats;
 
@@ -31,12 +33,13 @@ pub use icmp::{
     ErrorQuote, build_echo_reply_v4, build_echo_reply_v6, build_unreachable_v4,
     build_unreachable_v6, parse_error_quote, recompute_icmp_checksum, rewrite_error_quote,
 };
+pub use index::{IndexGen, MAX_INDEX};
 pub use keys::{GatewayKey, KEY_LEN, KeyError, PeerPublicKey, PresharedKey};
 pub use nat::{
     EXIT_ID_LEN, EpochId, ExitId, MapProto, MappingId, Napt, NatConfig, NatDrop, Ownership,
     StaticDnat, Translated,
 };
-pub use peer::PeerId;
+pub use peer::{DropReason, LabelError, PeerId, PeerLabel, PeerStats, PeerStatus};
 pub use plan::{
     DEFAULT_PEER_SUBNET_V4, DEFAULT_PEER_SUBNET_V6, PeerPlan, PlanError, TUNNEL_GATEWAY_V4,
     TUNNEL_GATEWAY_V6, TUNNEL_POOL_V4, TUNNEL_POOL_V6, complement, is_tunnel_gateway,
@@ -44,6 +47,9 @@ pub use plan::{
 };
 pub use ports::{
     CONTROL_RANGE_END, CONTROL_RANGE_START, DYNAMIC_POOL_END, DYNAMIC_POOL_START, PortAllocator,
+};
+pub use ratelimit::{
+    HANDSHAKE_BURST_PER_IP, HANDSHAKE_RATE_PER_IP, HANDSHAKE_SOURCES_TRACKED, HandshakeBuckets,
 };
 pub use scratch::{SCRATCH_LEN, ScratchBuf};
 pub use stats::{Counters, Snapshot};
