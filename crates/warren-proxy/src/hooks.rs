@@ -40,6 +40,11 @@ pub fn substitute_port(command: &str, port: u16) -> String {
 /// forbids unsafe), so the strip happens per child, which is where it matters.
 const SECRET_ENV: [&str; 2] = ["WARREN_MNEMONIC", "WARREN_MNEMONIC_FILE"];
 
+/// How long the hook's process group is given between its SIGTERM and its
+/// SIGKILL: enough for a shell trap to undo what the hook did, short enough
+/// that a stop is not held up by a hook that ignores the polite signal.
+const KILL_GRACE: Duration = Duration::from_millis(500);
+
 /// A hook is an operator-written command line, so it runs under the platform's
 /// own shell rather than being parsed here. Without this the whole feature is
 /// dead on Windows, where there is no `sh`.
@@ -54,12 +59,54 @@ fn shell_command(resolved: &str) -> tokio::process::Command {
     let mut command = {
         let mut command = tokio::process::Command::new("sh");
         command.arg("-c").arg(resolved);
+        // Own process group, so the timeout below can reach everything the
+        // hook spawned. Without it a backgrounded child outlives the budget,
+        // and in the container image (the daemon is PID 1, no init) it is
+        // never reaped either.
+        command.process_group(0);
         command
     };
     for name in SECRET_ENV {
         command.env_remove(name);
     }
     command
+}
+
+/// Kills a hook that outlived its budget, and everything it spawned.
+///
+/// Unix signals the process GROUP the child leads: `Child::kill` reaches the
+/// shell alone, which leaves the descendants that actually hold the forwarded
+/// port open. SIGTERM first so a hook with a trap can undo its own work, then
+/// SIGKILL for the rest.
+#[cfg(unix)]
+async fn kill_hook(child: &mut tokio::process::Child) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+
+    let group = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .map(Pid::from_raw);
+    let Some(group) = group else {
+        // Already reaped: nothing to signal, and no group id left to trust.
+        let _ = child.kill().await;
+        return;
+    };
+    let _ = killpg(group, Signal::SIGTERM);
+    let reaped = tokio::time::timeout(KILL_GRACE, child.wait()).await.is_ok();
+    // Unconditional, even once the leader is gone: a descendant that ignores
+    // SIGTERM keeps the group (and the port) alive, and the escalation is the
+    // only thing that ends it.
+    let _ = killpg(group, Signal::SIGKILL);
+    if !reaped {
+        let _ = child.kill().await;
+    }
+}
+
+/// Windows has no process groups to signal here, so the child alone is killed.
+#[cfg(not(unix))]
+async fn kill_hook(child: &mut tokio::process::Child) {
+    let _ = child.kill().await;
 }
 
 /// Runs a hook command through the platform's shell under [`HOOK_TIMEOUT`].
@@ -96,7 +143,7 @@ pub async fn run_hook_with_timeout(
             HookOutcome::SpawnFailed
         }
         Err(_) => {
-            let _ = child.kill().await;
+            kill_hook(&mut child).await;
             eprintln!(
                 "warren-proxy: port-forward {label} command exceeded {timeout:?} and was killed"
             );
@@ -205,6 +252,31 @@ pub(crate) mod tests {
             "the timeout must cut the wait short, took {:?}",
             started.elapsed()
         );
+    }
+
+    /// A hook is an operator's shell line, so what it backgrounds is what
+    /// actually holds the port open. In the image the daemon is PID 1 with no
+    /// init, so a descendant that outlives the budget is never reaped either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hooks_own_children_are_killed_with_it() {
+        let marker =
+            std::env::temp_dir().join(format!("warren-proxy-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let command = format!(
+            "sh -c 'sleep 1; echo survived > {}' & sleep 30",
+            marker.display()
+        );
+
+        let outcome = run_hook_with_timeout(&command, 1, "up", Duration::from_millis(200)).await;
+
+        assert_eq!(outcome, HookOutcome::TimedOut);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "what the hook started must die with it, not outlive the budget"
+        );
+        let _ = std::fs::remove_file(&marker);
     }
 
     #[tokio::test]

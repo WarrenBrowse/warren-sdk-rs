@@ -3661,6 +3661,7 @@ name = "warren-proxy"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "nix 0.31.3",
  "thiserror",
  "tokio",
  "warren-sdk",
