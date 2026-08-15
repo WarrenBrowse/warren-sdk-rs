@@ -100,6 +100,18 @@ pub struct GatewayConf {
 }
 
 impl GatewayConf {
+    /// Checks the rules that hold whatever the deployment's plan is.
+    ///
+    /// Parsing already runs these; a configuration built in memory (a reload
+    /// assembled by the admin path) has not been through the parser.
+    ///
+    /// # Errors
+    ///
+    /// A [`ConfError`] naming the rule that refused.
+    pub fn validate(&self) -> Result<(), ConfError> {
+        check_peers(&self.peers)
+    }
+
     /// Checks the rules that need the deployment's address plan.
     ///
     /// # Errors

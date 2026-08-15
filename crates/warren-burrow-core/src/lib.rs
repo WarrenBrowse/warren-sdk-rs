@@ -23,6 +23,7 @@ pub mod peer;
 pub mod plan;
 pub mod ports;
 pub mod ratelimit;
+pub mod responder;
 pub mod scratch;
 pub mod stats;
 
@@ -56,8 +57,12 @@ pub use ports::{
 pub use ratelimit::{
     HANDSHAKE_BURST_PER_IP, HANDSHAKE_RATE_PER_IP, HANDSHAKE_SOURCES_TRACKED, HandshakeBuckets,
 };
+pub use responder::{
+    DEFAULT_HANDSHAKE_RATE, Encapsulated, Gate, Inbound, ReloadReport, Responder, ResponderOptions,
+    RouteError, UnknownPeer, V6State,
+};
 pub use scratch::{SCRATCH_LEN, ScratchBuf};
-pub use stats::{Counters, Snapshot};
+pub use stats::{Counters, ResponderCounters, ResponderSnapshot, Snapshot};
 
 pub use ip::{
     IcmpHeader, IpHeader, Side, checksum_update, is_echo, is_icmp_error, parse_ip, parse_ip_quote,

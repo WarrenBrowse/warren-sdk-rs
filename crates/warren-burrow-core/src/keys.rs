@@ -79,6 +79,13 @@ impl GatewayKey {
         self.public
     }
 
+    /// The secret itself, which only the responder needs: boringtun clones it
+    /// into every peer tunnel.
+    #[must_use]
+    pub fn secret(&self) -> &x25519_dalek::StaticSecret {
+        &self.secret
+    }
+
     /// The base64 spelling of the private key, wiped when the caller drops it.
     #[must_use]
     pub fn to_base64_zeroizing(&self) -> Zeroizing<String> {
