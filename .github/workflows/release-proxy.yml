@@ -130,6 +130,11 @@ jobs:
           # Persistent cache outside _work (the runner GC wipes leaf target/
           # dirs in _work between jobs).
           export CARGO_TARGET_DIR="$HOME/warren-sdk-target"
+          BIN="$CARGO_TARGET_DIR/$CARGO_TARGET/release/warren-proxy"
+          # That cache is deliberately persistent, so the previous run's binary
+          # is sitting at $BIN: remove it, and no failure downstream can package
+          # a binary that was not compiled from this tag.
+          rm -f "$BIN"
           # retry_flaky (proven on the Rosetta pools): a rustc can die
           # unreaped under emulation and cargo waits on its jobserver token
           # forever; timeout SIGKILLs (rc 124/137) and the retry resumes on
@@ -137,7 +142,10 @@ jobs:
           retry_flaky() {
             for attempt in 1 2 3; do
               if timeout -k 60s 40m "$@" 2>&1 | tee /tmp/cargo-out.txt; then return 0; fi
-              rc=$?
+              # PIPESTATUS, never $?: an `if` whose condition failed and which
+              # has no else exits 0, so `$?` here reads that 0 and every real
+              # compile error would be reported as a success.
+              rc=${PIPESTATUS[0]}
               if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
                 echo "::warning::cargo hung and was killed (attempt $attempt/3); retrying"
               elif grep -q 'SIGSEGV\|signal: 11' /tmp/cargo-out.txt; then
@@ -149,7 +157,9 @@ jobs:
             return 1
           }
           retry_flaky cargo build --locked --release -p warren-proxy --target "$CARGO_TARGET"
-          BIN="$CARGO_TARGET_DIR/$CARGO_TARGET/release/warren-proxy"
+          if [ ! -x "$BIN" ]; then
+            echo "cargo reported success but produced no binary at $BIN"; exit 1
+          fi
           # Static check without `file`: a musl static binary is "not a
           # dynamic executable" to ldd.
           if ldd "$BIN" 2>&1 | grep -qvi 'not a dynamic executable\|statically linked'; then
@@ -195,21 +205,11 @@ jobs:
           done
           (cd out && sha256sum ./*.tar.gz > SHA256SUMS)
           ls -l out
-      - name: Create published release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-          CHANNEL: ${{ needs.resolve.outputs.channel }}
-          VERSION: ${{ needs.resolve.outputs.version }}
-        run: |
-          set -euo pipefail
-          prerelease=""
-          [ "$CHANNEL" = "beta" ] && prerelease="--prerelease"
-          gh release create "$TAG" out/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "warren-proxy ${CHANNEL} ${VERSION}" \
-            --notes "Static musl builds of the headless warren-proxy daemon (${CHANNEL} channel). See crates/warren-proxy/README.md for the env contract." \
-            $prerelease
+      # The image is pushed BEFORE the release is created. A release is the
+      # announcement, and its notes point at the image: publishing it first and
+      # then failing on the push (a transient GHCR denial, a QEMU/buildx setup
+      # failure) left a visible release whose image 404s, and the rerun could
+      # not recover it because `gh release create` refuses an existing tag.
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -226,6 +226,7 @@ jobs:
         env:
           CHANNEL: ${{ needs.resolve.outputs.channel }}
           VERSION: ${{ needs.resolve.outputs.version }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if [ "$CHANNEL" = "beta" ]; then
@@ -233,5 +234,36 @@ jobs:
           else
             tags="-t ghcr.io/warrenbrowse/warren-proxy:${VERSION} -t ghcr.io/warrenbrowse/warren-proxy:latest"
           fi
-          docker buildx build --push --platform linux/amd64,linux/arm64 \
-            -f docker/warren-proxy.Dockerfile $tags .
+          push_image() {
+            docker buildx build --push --platform linux/amd64,linux/arm64 \
+              -f docker/warren-proxy.Dockerfile $tags .
+          }
+          # GHCR's token exchange occasionally answers `denied` on the push
+          # (transient, documented in warren-core's docker.yml); a fresh login
+          # and one retry clears it. A real build error fails twice.
+          if ! push_image; then
+            echo "::warning::image push failed, re-logging in to GHCR and retrying once"
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+            push_image
+          fi
+      - name: Create published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          prerelease=""
+          [ "$CHANNEL" = "beta" ] && prerelease="--prerelease"
+          # Idempotent: a rerun after a partial publish re-uploads the assets
+          # instead of dying on "a release with that tag already exists".
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" out/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "warren-proxy ${CHANNEL} ${VERSION}" \
+              --notes "Static musl builds of the headless warren-proxy daemon (${CHANNEL} channel). See crates/warren-proxy/README.md for the env contract." \
+              $prerelease
+          fi
