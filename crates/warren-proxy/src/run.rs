@@ -123,24 +123,42 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
         .as_ref()
         .map(|fwd| start_forward(&handle, fwd, port_tx));
 
-    let code = match supervise(&handle).await {
+    let stop = supervise(&handle).await;
+    // The live port comes from the watch channel the forward watcher
+    // publishes, never from the status file: the file is optional, and reading
+    // it there skipped the down hook for everyone who had not configured one.
+    let granted = *port_rx.borrow();
+    let code = conclude(&ShellHooks, stop, config.forward.as_ref(), granted).await;
+    // Release the lease at the exit rather than let it lapse: it runs for two
+    // hours, so a restart on another internal port or protocol would leave the
+    // public port stranded that long.
+    if let Some(forward) = forward {
+        if forward.shutdown().await {
+            log("forwarded port released at the exit");
+        } else {
+            log("the forwarded port release timed out, its lease will lapse");
+        }
+    }
+    handle.shutdown();
+    Ok(code)
+}
+
+/// Announces why the daemon is stopping, retires the forward's published
+/// state, and returns the process exit code.
+///
+/// Every stop path retires, because every stop path leaves the same thing
+/// behind: a down hook that has not run and a status file naming a public port
+/// the exit no longer maps. Leaving the terminal path to the forward watcher
+/// raced the process exit and truncated a hook slower than the failing redial.
+async fn conclude<H: HookSink>(
+    sink: &H,
+    stop: Stop,
+    forward: Option<&ForwardConfig>,
+    port: Option<u16>,
+) -> i32 {
+    let code = match stop {
         Stop::Signal => {
             log("signal received, shutting down");
-            // The live port comes from the watch channel the forward watcher
-            // publishes, never from the status file: the file is optional, and
-            // reading it there skipped the down hook for everyone who had not
-            // configured one.
-            retire_forward_state(&ShellHooks, config.forward.as_ref(), *port_rx.borrow()).await;
-            // Release the lease at the exit rather than let it lapse: it runs
-            // for two hours, so a restart on another internal port or protocol
-            // would leave the public port stranded that long.
-            if let Some(forward) = forward {
-                if forward.shutdown().await {
-                    log("forwarded port released at the exit");
-                } else {
-                    log("the forwarded port release timed out, its lease will lapse");
-                }
-            }
             0
         }
         Stop::Fatal(cause) => {
@@ -148,8 +166,8 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
             2
         }
     };
-    handle.shutdown();
-    Ok(code)
+    retire_forward_state(sink, forward, port).await;
+    code
 }
 
 /// Keeps `/healthz` honest across reconnects.
@@ -608,6 +626,39 @@ mod tests {
             ],
             "the old port must be retired before the new one is announced"
         );
+    }
+
+    /// A terminal verdict leaves exactly what a signal leaves: a down hook
+    /// that has not run and a status file naming a public port the exit no
+    /// longer maps. The forward watcher would clear it, but on this path it is
+    /// racing the process exit, so a hook slower than the failing redial is
+    /// truncated mid-run.
+    #[tokio::test]
+    async fn every_stop_path_retires_the_published_state_and_maps_its_exit_code() {
+        for (name, stop, want_code) in [
+            ("signal", Stop::Signal, 0),
+            ("fatal", Stop::Fatal(Some(FatalCause::NotAuthorized)), 2),
+        ] {
+            let status = scratch(&format!("conclude-{name}"));
+            hooks::write_status_file(&status, 49587)
+                .await
+                .expect("a granted port was published");
+            let sink = Recorder::default();
+            let fwd = forward(Some(status.clone()));
+
+            let code = conclude(&sink, stop, Some(&fwd), Some(49587)).await;
+
+            assert_eq!(code, want_code, "{name} must exit {want_code}");
+            assert_eq!(
+                sink.calls(),
+                vec!["down:49587:down {{PORT}}".to_owned()],
+                "the down command must fire on the {name} path"
+            );
+            assert!(
+                !status.exists(),
+                "the status file must not survive the {name} path"
+            );
+        }
     }
 
     /// Polls a latch until it reads `want`, so the assertions do not race the
