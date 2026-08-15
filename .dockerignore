@@ -1,0 +1,4 @@
+# The image is one static binary: everything the build needs is dist/, and
+# without this the whole checkout (target/, .git/) is uploaded to the builder.
+*
+!dist

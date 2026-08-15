@@ -5,10 +5,17 @@
 # other containers point at. Built by .github/workflows/release-proxy.yml,
 # which drops the per-arch static binaries under dist/<arch>/ first.
 
-FROM alpine:3.22
+# Pinned by digest, not by tag alone: the same tag is rebuilt under a new
+# digest, so a tag-only base makes two builds of one release differ.
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 # curl, because the documented port-forward hook shape is a curl into an
-# application API (BusyBox wget cannot express it).
-RUN apk add --no-cache ca-certificates curl && adduser -D -H warren
+# application API (BusyBox wget cannot express it). /run/warren is a writable
+# home for WARREN_PORT_FORWARD_STATUS_FILE, whose documented seam is a sibling
+# container reading that file: every other path in the image belongs to root.
+RUN apk add --no-cache ca-certificates curl \
+    && adduser -D -H warren \
+    && mkdir -p /run/warren \
+    && chown warren:warren /run/warren
 ARG TARGETARCH
 COPY dist/${TARGETARCH}/warren-proxy /usr/local/bin/warren-proxy
 
