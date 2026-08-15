@@ -1558,11 +1558,6 @@ fn warren_api_default_base() -> String {
     String::new()
 }
 
-/// The failover candidates that can resolve DNS over the tunnel: with a
-/// `dns_server` override every exit qualifies, otherwise only exits that run the
-/// in-tunnel forwarder (`!dns_disabled`). Keeps failover from rotating onto an
-/// exit that would silently break name resolution (the per-rotation analogue of
-/// [`ensure_dns_reachable`]).
 /// How a supervised raw-IP datapath is configured.
 ///
 /// Deliberately smaller than [`ProxyConfig`](warren_net::ProxyConfig): a device
@@ -1581,6 +1576,11 @@ pub struct PacketDatapathConfig {
     pub socket_bypass: Option<SocketBypass>,
 }
 
+/// The failover candidates that can resolve DNS over the tunnel: with an
+/// override every exit qualifies, otherwise only exits that run the in-tunnel
+/// forwarder (`!dns_disabled`). Keeps failover from rotating onto an exit that
+/// would silently break name resolution (the per-rotation analogue of
+/// [`ensure_dns_reachable`]).
 pub(crate) fn dns_capable_candidates(
     exits: &[VerifiedExit],
     has_dns_override: bool,
