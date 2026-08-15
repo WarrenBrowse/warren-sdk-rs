@@ -999,6 +999,17 @@ impl MultihopSession {
         self.assignment.ipv6.map(Ipv6Addr::from)
     }
 
+    /// The stable identifier of the exit this session reached.
+    ///
+    /// A datapath that keeps state across reconnects (a NAT table, a set of
+    /// local clients) keys it on this: it survives an exit's key rotation,
+    /// unlike the Ed25519 pubkey, so "the same exit came back" stays
+    /// recognizable. Identity material, so it is never rendered in a trace.
+    #[must_use]
+    pub fn exit_id(&self) -> [u8; EXIT_ID_LEN] {
+        *self.inner.exit_id().as_bytes()
+    }
+
     /// The largest datagram payload the current path can carry, if known.
     #[must_use]
     pub fn max_datagram_size(&self) -> Option<usize> {
@@ -1842,6 +1853,29 @@ mod path_quality_tests {
             )
             .await
             .expect("loopback multihop connect")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_session_names_the_exit_it_reached() {
+        // What a device keys its cross-epoch state on: the identifier the dial
+        // pinned, read back from the live session.
+        let exit_key = SigningKey::from_bytes(&[9u8; 32]);
+        let (exit_addr, keys) = warren_test_support::spawn_fake_multihop_exit(exit_key).await;
+        let session = MultihopClientTunnel::new(SigningKey::from_bytes(&[4u8; 32]))
+            .connect(
+                keys.ed25519_pubkey,
+                keys.x25519_pubkey,
+                keys.exit_id,
+                exit_addr,
+            )
+            .await
+            .expect("loopback multihop connect");
+
+        assert_eq!(
+            session.exit_id(),
+            keys.exit_id,
+            "the session reports the exit it was dialed to"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

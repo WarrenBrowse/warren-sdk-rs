@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::Notify;
-use warren_net::{TunnelConnector, UdpConnector, UdpFlow};
+use warren_net::{TunnelConnector, UdpFlow, UdpOpener};
 use warren_transport::egress_probe::{
     EgressProbeConfig, EgressProbeIo, ExitEvidence, PROBE_QNAME, ProbeOutcome, ProbeSchedule,
     TransportEvidence, build_dns_query, exit_evidence_from, is_matching_response, jittered,
@@ -119,12 +119,14 @@ pub(crate) trait GatewayProber: Send {
     fn probe(&mut self) -> impl Future<Output = ProbeOutcome> + Send;
 }
 
-/// Production prober: sends a DNS query over the netstack UDP path to the tunnel
+/// Production prober: sends a DNS query over the epoch's UDP path to the tunnel
 /// gateway resolver and waits for any matching response.
 ///
-/// Generic over the connector so the retransmit schedule is testable against a
-/// scripted flow; production instantiates it at [`TunnelConnector`].
-pub(crate) struct ConnectorProber<C: UdpConnector = TunnelConnector> {
+/// Generic over the opener so the retransmit schedule is testable against a
+/// scripted flow, and so a raw datapath (which builds its own datagrams) rides
+/// the same prober as the netstack; the proxy datapath instantiates it at
+/// [`TunnelConnector`].
+pub(crate) struct ConnectorProber<C: UdpOpener = TunnelConnector> {
     connector: C,
     gateway_dns: SocketAddr,
     /// Per-probe query id (wrapping): a stray datagram from a previous probe must
@@ -136,7 +138,7 @@ pub(crate) struct ConnectorProber<C: UdpConnector = TunnelConnector> {
     rtt: RttReader,
 }
 
-impl<C: UdpConnector> ConnectorProber<C> {
+impl<C: UdpOpener> ConnectorProber<C> {
     pub(crate) fn new(connector: C, gateway: Ipv4Addr, rtt: RttReader) -> Self {
         Self {
             connector,
@@ -147,10 +149,7 @@ impl<C: UdpConnector> ConnectorProber<C> {
     }
 }
 
-impl<C: UdpConnector + Send + Sync> GatewayProber for ConnectorProber<C>
-where
-    C::Flow: Send,
-{
+impl<C: UdpOpener> GatewayProber for ConnectorProber<C> {
     async fn probe(&mut self) -> ProbeOutcome {
         // A fresh UDP flow per probe (cheap): the netstack routes it into the
         // tunnel. A local open/send error means the datapath is gone, which is
@@ -332,8 +331,8 @@ impl<P: GatewayProber> EgressProbeIo for ProxyEgressProbe<P> {
 /// on the dead verdict by notifying `escalate`. The returned [`AbortOnDrop`] is
 /// held by the supervisor for the epoch, so the probe is torn down with it (it
 /// never outlives the session). A no-op task when `WARREN_EGRESS_PROBE=0`.
-pub(crate) fn spawn_egress_probe(
-    connector: TunnelConnector,
+pub(crate) fn spawn_egress_probe<O: UdpOpener>(
+    opener: O,
     gateway: Ipv4Addr,
     escalate: Arc<Notify>,
     acks: AckReader,
@@ -347,7 +346,7 @@ pub(crate) fn spawn_egress_probe(
         }
         let threshold = cfg.failure_threshold;
         let mut probe = ProxyEgressProbe::new(
-            ConnectorProber::new(connector, gateway, rtt),
+            ConnectorProber::new(opener, gateway, rtt),
             cfg,
             escalate,
             acks,
@@ -368,7 +367,7 @@ mod tests {
     use std::sync::Arc as StdArc;
 
     use warren_net::socks5::Target;
-    use warren_net::{Connector, NetError};
+    use warren_net::{Connector, NetError, UdpConnector};
 
     /// What one fake flow recorded, shared with the test after the probe ends.
     #[derive(Default)]
