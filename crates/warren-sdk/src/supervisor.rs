@@ -321,6 +321,8 @@ pub struct SupervisedPacketHandle {
     pub(crate) fatal_rx: tokio::sync::watch::Receiver<Option<FatalCause>>,
     pub(crate) epoch_end_rx: tokio::sync::watch::Receiver<Option<EpochEnd>>,
     pub(crate) reconnect_request: Arc<tokio::sync::Notify>,
+    /// The counters of the pump under every epoch of this datapath.
+    pub(crate) pump_stats: Arc<warren_net::PumpStats>,
     pub(crate) task: tokio::task::JoinHandle<()>,
 }
 
@@ -397,6 +399,17 @@ impl SupervisedPacketHandle {
         MetricsReader {
             rx: self.metrics_rx.clone(),
         }
+    }
+
+    /// Uplink packets this datapath dropped because the tunnel refused them
+    /// one at a time (an over-budget datagram against a live session), summed
+    /// over every epoch it has served.
+    ///
+    /// A drop is invisible to the sender, so this count is what separates an
+    /// uplink shedding packets here from an exit losing them out there.
+    #[must_use]
+    pub fn uplink_send_dropped(&self) -> u64 {
+        self.pump_stats.uplink_send_dropped()
     }
 
     /// The latest maintenance-migration event, or `None` while no drain has
@@ -1498,16 +1511,22 @@ impl<S: warren_net::PacketSink + 'static> EpochDatapath<S> for ProxyDatapath {
 pub(crate) struct PacketDatapath<D: warren_net::EpochPacketDevice> {
     device: Arc<D>,
     addressing_tx: tokio::sync::watch::Sender<Option<warren_net::EpochAddressing>>,
+    /// Shared with the handle above: the uplink drops a refused packet in
+    /// silence, so the count is the only evidence it happened, and it has to
+    /// outlive the epoch it happened in.
+    stats: Arc<warren_net::PumpStats>,
 }
 
 impl<D: warren_net::EpochPacketDevice> PacketDatapath<D> {
     pub(crate) fn new(
         device: D,
         addressing_tx: tokio::sync::watch::Sender<Option<warren_net::EpochAddressing>>,
+        stats: Arc<warren_net::PumpStats>,
     ) -> Self {
         Self {
             device: Arc::new(device),
             addressing_tx,
+            stats,
         }
     }
 }
@@ -1524,6 +1543,7 @@ impl<S: warren_net::PacketSink + 'static, D: warren_net::EpochPacketDevice> Epoc
     ) -> EpochRun<PacketForwarder> {
         let (device_sink, udp) = self.device.begin_epoch(*addressing);
         let gateway = addressing.gateway;
+        let stats = Arc::clone(&self.stats);
         let probe_udp = udp.clone();
         let forwarder = PacketForwarder {
             udp: Arc::new(udp),
@@ -1540,7 +1560,8 @@ impl<S: warren_net::PacketSink + 'static, D: warren_net::EpochPacketDevice> Epoc
             served: Box::pin(async move {
                 // A pump error IS the epoch ending; the supervisor reads the
                 // transport verdict itself for the epoch-end report.
-                let _ = warren_net::forward_bidirectional(device_sink, sink).await;
+                let _ =
+                    warren_net::forward_bidirectional_with_stats(device_sink, sink, &stats).await;
             }),
         }
     }

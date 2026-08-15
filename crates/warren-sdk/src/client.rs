@@ -1406,6 +1406,8 @@ impl<T: HttpTransport> WarrenClient<T> {
         DR: Fn() + Send + 'static,
     {
         let migration = packet_migration_policy(cfg);
+        let pump_stats = std::sync::Arc::new(warren_net::PumpStats::default());
+        let datapath_stats = std::sync::Arc::clone(&pump_stats);
         let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
         let (forwarder_tx, forwarder_rx) = tokio::sync::watch::channel(None);
         let (addressing_tx, addressing_rx) = tokio::sync::watch::channel(None);
@@ -1417,7 +1419,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         let supervisor_reconnect = std::sync::Arc::clone(&reconnect_request);
         let task = tokio::spawn(async move {
             crate::supervisor::supervise_datapath(
-                crate::supervisor::PacketDatapath::new(device, addressing_tx),
+                crate::supervisor::PacketDatapath::new(device, addressing_tx, datapath_stats),
                 crate::supervisor::SupervisorOutputs {
                     state_tx,
                     forwarder_tx,
@@ -1452,6 +1454,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             fatal_rx,
             epoch_end_rx,
             reconnect_request,
+            pump_stats,
             task,
         })
     }

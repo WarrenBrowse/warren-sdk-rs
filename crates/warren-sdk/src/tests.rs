@@ -3499,6 +3499,125 @@ fn a_carrier_bypass_reaches_the_dial_the_datapath_will_make() {
     );
 }
 
+/// A device whose epoch sink hands the pump exactly one uplink packet and then
+/// parks, so what the uplink does with a refused packet is observable.
+#[derive(Clone, Default)]
+struct OneShotUplinkDevice;
+
+struct OneShotUplinkSink {
+    handed: std::sync::atomic::AtomicBool,
+}
+
+impl warren_net::PacketSink for OneShotUplinkSink {
+    async fn send_packet(&self, _packet: &[u8]) -> Result<(), warren_net::NetError> {
+        Ok(())
+    }
+
+    async fn recv_packet(&self) -> Result<bytes::Bytes, warren_net::NetError> {
+        if self.handed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return std::future::pending().await;
+        }
+        Ok(bytes::Bytes::from_static(&[0x45, 0x00, 0x00, 0x14]))
+    }
+
+    fn max_payload(&self) -> usize {
+        1280
+    }
+}
+
+impl warren_net::EpochPacketDevice for OneShotUplinkDevice {
+    type Sink = OneShotUplinkSink;
+    type Udp = FakeDeviceUdp;
+
+    fn begin_epoch(
+        &self,
+        _addressing: warren_net::EpochAddressing,
+    ) -> (OneShotUplinkSink, FakeDeviceUdp) {
+        (
+            OneShotUplinkSink {
+                handed: std::sync::atomic::AtomicBool::new(false),
+            },
+            FakeDeviceUdp,
+        )
+    }
+}
+
+/// A tunnel that refuses every datagram for its size: the DPLPMTUD shrink race,
+/// which costs one packet and leaves the session carrying.
+struct OverBudgetSink;
+
+impl warren_net::PacketSink for OverBudgetSink {
+    async fn send_packet(&self, _packet: &[u8]) -> Result<(), warren_net::NetError> {
+        Err(warren_net::NetError::Multihop(
+            warren_transport::MultihopError::SendDatagram(quinn::SendDatagramError::TooLarge),
+        ))
+    }
+
+    async fn recv_packet(&self) -> Result<bytes::Bytes, warren_net::NetError> {
+        std::future::pending().await
+    }
+
+    fn max_payload(&self) -> usize {
+        1280
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_supervised_packet_datapath_counts_the_uplink_it_drops() {
+    // A dropped packet is invisible by construction (the sender learns
+    // nothing), so the count is the only evidence that separates an uplink
+    // shedding packets from an exit losing them. It has to survive the epoch
+    // it happened in and be readable from the handle.
+    use crate::supervisor::EpochDatapath;
+
+    let stats = Arc::new(warren_net::PumpStats::default());
+    let (addressing_tx, addressing_rx) = tokio::sync::watch::channel(None);
+    let mut datapath = crate::supervisor::PacketDatapath::new(
+        OneShotUplinkDevice,
+        addressing_tx,
+        Arc::clone(&stats),
+    );
+    let run = EpochDatapath::<OverBudgetSink>::start(
+        &mut datapath,
+        Arc::new(OverBudgetSink),
+        &test_addressing(1),
+    );
+
+    let mut served = run.served;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                () = &mut served => panic!("a per-packet refusal must not end the epoch"),
+                () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {
+                    if stats.uplink_send_dropped() >= 1 {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("the refused packet is counted rather than swallowed");
+
+    let handle = crate::supervisor::SupervisedPacketHandle {
+        state_rx: tokio::sync::watch::channel(ConnectionState::Connecting).1,
+        forwarder_rx: tokio::sync::watch::channel(None).1,
+        addressing_rx,
+        metrics_rx: tokio::sync::watch::channel(None).1,
+        migration_rx: tokio::sync::watch::channel(None).1,
+        fatal_rx: tokio::sync::watch::channel(None).1,
+        epoch_end_rx: tokio::sync::watch::channel(None).1,
+        reconnect_request: Arc::new(tokio::sync::Notify::new()),
+        pump_stats: Arc::clone(&stats),
+        task: tokio::spawn(async {}),
+    };
+    assert_eq!(
+        handle.uplink_send_dropped(),
+        1,
+        "the host reads the same count the pump kept"
+    );
+}
+
 #[test]
 fn a_packet_datapath_reapplies_its_carrier_bypass_on_a_migration_rebind() {
     // The dial is not the only socket: a network change rebinds a fresh one,

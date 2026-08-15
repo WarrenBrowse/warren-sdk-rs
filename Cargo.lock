@@ -3744,6 +3744,7 @@ dependencies = [
  "warren-discovery",
  "warren-identity",
  "warren-net",
+ "warren-quinn",
  "warren-test-support",
  "warren-transport",
  "warren-tun",

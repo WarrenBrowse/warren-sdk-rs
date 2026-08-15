@@ -83,6 +83,8 @@ required-features = ["experimental-tun"]
 # `test-util` enables `start_paused` for the egress-probe scheduler tests.
 tokio = { workspace = true, features = ["test-util"] }
 ed25519-dalek = { workspace = true }
+# Builds the datagram-refusal the uplink drop counter is pinned on.
+quinn = { workspace = true }
 # Enable the directory/relay-list minting helpers for facade tests (test-only;
 # the feature is off in production builds, which never compile dev-dependencies).
 warren-discovery = { path = "../warren-discovery", features = ["test-helpers"] }
