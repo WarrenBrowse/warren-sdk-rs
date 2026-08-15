@@ -302,6 +302,196 @@ impl Drop for SupervisedProxyHandle {
     }
 }
 
+/// A self-healing raw-IP datapath (see
+/// [`WarrenClient::start_packet_datapath_supervised`](crate::WarrenClient::start_packet_datapath_supervised)).
+///
+/// The device keeps serving its own clients while the supervisor rebuilds the
+/// tunnel under it, and learns each fresh assignment through
+/// [`Self::watch_addressing`]. Dropping the handle stops the supervisor and the
+/// datapath.
+pub struct SupervisedPacketHandle {
+    pub(crate) state_rx: tokio::sync::watch::Receiver<ConnectionState>,
+    pub(crate) forwarder_rx: tokio::sync::watch::Receiver<Option<PacketForwarder>>,
+    /// The addresses of the current epoch, republished on every (re)connect and
+    /// cleared while the tunnel is down.
+    pub(crate) addressing_rx: tokio::sync::watch::Receiver<Option<warren_net::EpochAddressing>>,
+    pub(crate) metrics_rx: tokio::sync::watch::Receiver<Option<MetricsProbe>>,
+    pub(crate) migration_rx:
+        tokio::sync::watch::Receiver<Option<crate::portfollow::MigrationEvent>>,
+    pub(crate) fatal_rx: tokio::sync::watch::Receiver<Option<FatalCause>>,
+    pub(crate) epoch_end_rx: tokio::sync::watch::Receiver<Option<EpochEnd>>,
+    pub(crate) reconnect_request: Arc<tokio::sync::Notify>,
+    pub(crate) task: tokio::task::JoinHandle<()>,
+}
+
+impl SupervisedPacketHandle {
+    /// The current connection state ([`ConnectionState::Connecting`] until the
+    /// first tunnel is up, then `Connected`/`Reconnecting` as it heals).
+    #[must_use]
+    pub fn state(&self) -> ConnectionState {
+        *self.state_rx.borrow()
+    }
+
+    /// A watch receiver for state changes, so a host can await transitions
+    /// rather than poll [`Self::state`].
+    #[must_use]
+    pub fn watch_state(&self) -> tokio::sync::watch::Receiver<ConnectionState> {
+        self.state_rx.clone()
+    }
+
+    /// The addresses the exit assigned to the current epoch, or `None` while
+    /// the tunnel is down. They change on every reconnect, so read them fresh
+    /// rather than caching them.
+    #[must_use]
+    pub fn addressing(&self) -> Option<warren_net::EpochAddressing> {
+        *self.addressing_rx.borrow()
+    }
+
+    /// A watch receiver for the per-epoch addressing, which is how a device
+    /// learns it has been renumbered.
+    #[must_use]
+    pub fn watch_addressing(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<warren_net::EpochAddressing>> {
+        self.addressing_rx.clone()
+    }
+
+    /// Why the most recent serving epoch ended, or `None` while the first one
+    /// is still running.
+    #[must_use]
+    pub fn last_epoch_end(&self) -> Option<EpochEnd> {
+        *self.epoch_end_rx.borrow()
+    }
+
+    /// A watch receiver for the epoch-end reports.
+    #[must_use]
+    pub fn watch_epoch_end(&self) -> tokio::sync::watch::Receiver<Option<EpochEnd>> {
+        self.epoch_end_rx.clone()
+    }
+
+    /// The fatal cause the supervisor stopped on, or `None` while it is healing
+    /// normally. Set exactly once, alongside the terminal
+    /// [`ConnectionState::Failed`].
+    #[must_use]
+    pub fn last_fatal(&self) -> Option<FatalCause> {
+        *self.fatal_rx.borrow()
+    }
+
+    /// A watch receiver for the fatal cause.
+    #[must_use]
+    pub fn watch_fatal(&self) -> tokio::sync::watch::Receiver<Option<FatalCause>> {
+        self.fatal_rx.clone()
+    }
+
+    /// A snapshot of the current epoch's counters and live path quality, or
+    /// `None` while the tunnel is down.
+    #[must_use]
+    pub fn metrics(&self) -> Option<warren_transport::MultihopMetricsSnapshot> {
+        self.metrics_rx.borrow().as_ref().and_then(|probe| probe())
+    }
+
+    /// A detached [`MetricsReader`] for a background task that cannot hold this
+    /// handle. Follows reconnects.
+    #[must_use]
+    pub fn metrics_reader(&self) -> MetricsReader {
+        MetricsReader {
+            rx: self.metrics_rx.clone(),
+        }
+    }
+
+    /// The latest maintenance-migration event, or `None` while no drain has
+    /// been seen.
+    #[must_use]
+    pub fn last_migration(&self) -> Option<crate::portfollow::MigrationEvent> {
+        *self.migration_rx.borrow()
+    }
+
+    /// A watch receiver for migration events.
+    #[must_use]
+    pub fn watch_migration(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<crate::portfollow::MigrationEvent>> {
+        self.migration_rx.clone()
+    }
+
+    /// Asks the supervisor to end the current epoch and rebuild. The device
+    /// keeps its clients throughout; it is told about the fresh assignment
+    /// through [`Self::watch_addressing`].
+    ///
+    /// Idempotent: one permit is stored, so a request raised between two epochs
+    /// is honoured by the next one rather than lost.
+    pub fn request_reconnect(&self) {
+        self.reconnect_request.notify_one();
+    }
+
+    /// Forwards a tunnel-side port that survives reconnects: maps
+    /// `internal_port` at the exit via NAT-PMP and re-establishes the mapping on
+    /// every rebuild, re-suggesting the granted port so it follows the client.
+    ///
+    /// Delivering what arrives on it is the device's business: a raw datapath
+    /// has no local relay target. Needs an exit that runs a NAT-PMP gateway;
+    /// not every exit does.
+    #[must_use]
+    pub fn forward_port(&self, proto: MapProto, internal_port: u16) -> SupervisedForwardedPort {
+        self.forward_port_with_policy(
+            proto,
+            internal_port,
+            crate::portfollow::PortFollowConfig::default(),
+        )
+    }
+
+    /// Like [`Self::forward_port`], with an explicit follow policy (see
+    /// [`PortFollowConfig`](crate::PortFollowConfig)).
+    #[must_use]
+    pub fn forward_port_with_policy(
+        &self,
+        proto: MapProto,
+        internal_port: u16,
+        config: crate::portfollow::PortFollowConfig,
+    ) -> SupervisedForwardedPort {
+        let (external_tx, external_rx) = tokio::sync::watch::channel(None);
+        let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
+        let forwarder_rx = self.forwarder_rx.clone();
+        let release = ReleaseGate::default();
+        let task = tokio::spawn({
+            let release = release.clone();
+            async move {
+                supervise_forward(
+                    forwarder_rx,
+                    external_tx,
+                    outcome_tx,
+                    config,
+                    release,
+                    move |forwarder: PacketForwarder, suggested| async move {
+                        forwarder
+                            .forward_port_with_suggested(proto, internal_port, suggested)
+                            .await
+                    },
+                )
+                .await;
+            }
+        });
+        SupervisedForwardedPort {
+            internal_port,
+            external_rx,
+            outcome_rx,
+            release,
+            task,
+        }
+    }
+
+    /// Stops the supervisor and tears the datapath down.
+    pub fn shutdown(self) {
+        self.task.abort();
+    }
+}
+
+impl Drop for SupervisedPacketHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// A tunnel-side forwarded port that re-establishes itself across reconnects
 /// (see [`SupervisedProxyHandle::forward_port`]). Dropping it tears the mapping
 /// down (the exit reclaims the port when the lease lapses).
@@ -1160,9 +1350,9 @@ pub(crate) enum EgressProbeArm {
 /// per-epoch forwarder driving self-healing port forwards, and the structured
 /// maintenance-migration events. Grouped so the supervisor signature stays
 /// readable as its outputs grow.
-pub(crate) struct SupervisorOutputs {
+pub(crate) struct SupervisorOutputs<Fw> {
     pub(crate) state_tx: tokio::sync::watch::Sender<ConnectionState>,
-    pub(crate) forwarder_tx: tokio::sync::watch::Sender<Option<ProxyForwarder>>,
+    pub(crate) forwarder_tx: tokio::sync::watch::Sender<Option<Fw>>,
     /// Reads the current epoch's datapath counters without owning the datapath,
     /// republished per epoch like `forwarder_tx` and cleared when it ends.
     pub(crate) metrics_tx: tokio::sync::watch::Sender<Option<MetricsProbe>>,
@@ -1188,23 +1378,299 @@ pub(crate) struct SupervisorOutputs {
     pub(crate) epoch_end_tx: tokio::sync::watch::Sender<Option<EpochEnd>>,
 }
 
+/// What one epoch's datapath hands back to the supervisor.
+pub(crate) struct EpochRun<Fw> {
+    /// Published on `forwarder_tx` for the life of the epoch.
+    pub(crate) forwarder: Fw,
+    /// Arms the in-tunnel egress probe over this datapath's own UDP path (the
+    /// netstack connector, or a device's raw-UDP control plane). A `FnOnce`
+    /// because the probe is armed at most once per epoch, and only when the
+    /// supervisor is configured to spawn one.
+    pub(crate) probe: Box<
+        dyn FnOnce(
+                Arc<tokio::sync::Notify>,
+                crate::egress_probe::AckReader,
+                crate::egress_probe::RttReader,
+                crate::egress_probe::RxReader,
+            ) -> AbortOnDrop
+            + Send,
+    >,
+    /// Resolves when the datapath dies (the netstack liveness flips, or the
+    /// packet forwarder returns).
+    pub(crate) served: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+}
+
+/// The datapath one epoch runs, behind the lifecycle the supervisor owns.
+///
+/// Everything that makes a supervised datapath self-healing (the states, the
+/// four epoch enders, the drain gate, the migration watchdog, the redial
+/// policy, the fatal verdicts, the epoch-end reports and the metrics probe) is
+/// the same whatever rides the tunnel. This is the part that is not: what the
+/// epoch's sink is pumped against, and what a host can ask of it while it runs.
+pub(crate) trait EpochDatapath<S: warren_net::PacketSink + 'static>: Send {
+    /// The per-epoch capability published to the host (port forwards).
+    type Forwarder: Clone + Send + Sync + 'static;
+
+    /// Starts the datapath over this epoch's sink.
+    fn start(
+        &mut self,
+        sink: Arc<S>,
+        addressing: &warren_net::EpochAddressing,
+    ) -> EpochRun<Self::Forwarder>;
+
+    /// Called once the epoch's `served` future has resolved, so a datapath can
+    /// retire what it published for that epoch. The proxy datapath publishes
+    /// nothing of its own, hence the no-op default.
+    fn end_epoch(&mut self) {}
+}
+
+/// The proxy shape: the stable SOCKS5 (and optional HTTP CONNECT) listeners,
+/// served over a fresh netstack for each epoch.
+pub(crate) struct ProxyDatapath {
+    socks: Arc<tokio::net::TcpListener>,
+    http: Option<Arc<tokio::net::TcpListener>>,
+    dns_server: Option<std::net::Ipv4Addr>,
+}
+
+impl ProxyDatapath {
+    pub(crate) fn new(
+        socks: tokio::net::TcpListener,
+        http: Option<tokio::net::TcpListener>,
+        dns_server: Option<std::net::Ipv4Addr>,
+    ) -> Self {
+        Self {
+            socks: Arc::new(socks),
+            http: http.map(Arc::new),
+            dns_server,
+        }
+    }
+}
+
+impl<S: warren_net::PacketSink + 'static> EpochDatapath<S> for ProxyDatapath {
+    type Forwarder = ProxyForwarder;
+
+    fn start(
+        &mut self,
+        sink: Arc<S>,
+        addressing: &warren_net::EpochAddressing,
+    ) -> EpochRun<ProxyForwarder> {
+        let config = build_netstack_config(
+            sink.as_ref(),
+            addressing.ipv4,
+            addressing.prefix,
+            addressing.gateway,
+            addressing.ipv6,
+            self.dns_server,
+        );
+        let gateway = addressing.gateway;
+        let (connector, alive_rx) = warren_net::spawn_over_sink(sink, config);
+        let probe_connector = connector.clone();
+        let forwarder = ProxyForwarder {
+            connector: connector.clone(),
+            gateway,
+            // Supervised path is multihop, which carries no per-exit NAT-PMP
+            // flag yet; stay permissive (doc 79).
+            port_forward_supported: true,
+        };
+        let socks = Arc::clone(&self.socks);
+        let http = self.http.clone();
+        EpochRun {
+            forwarder,
+            probe: Box::new(move |escalate, acks, rtt, rx| {
+                crate::egress_probe::spawn_egress_probe(
+                    probe_connector,
+                    gateway,
+                    escalate,
+                    acks,
+                    rtt,
+                    rx,
+                )
+            }),
+            served: Box::pin(async move {
+                serve_epoch(&socks, http.as_deref(), connector, alive_rx).await;
+            }),
+        }
+    }
+}
+
+/// The raw shape: a device that owns its own packet plane receives one sink per
+/// epoch and is pumped against the tunnel.
+pub(crate) struct PacketDatapath<D: warren_net::EpochPacketDevice> {
+    device: Arc<D>,
+    addressing_tx: tokio::sync::watch::Sender<Option<warren_net::EpochAddressing>>,
+}
+
+impl<D: warren_net::EpochPacketDevice> PacketDatapath<D> {
+    pub(crate) fn new(
+        device: D,
+        addressing_tx: tokio::sync::watch::Sender<Option<warren_net::EpochAddressing>>,
+    ) -> Self {
+        Self {
+            device: Arc::new(device),
+            addressing_tx,
+        }
+    }
+}
+
+impl<S: warren_net::PacketSink + 'static, D: warren_net::EpochPacketDevice> EpochDatapath<S>
+    for PacketDatapath<D>
+{
+    type Forwarder = PacketForwarder;
+
+    fn start(
+        &mut self,
+        sink: Arc<S>,
+        addressing: &warren_net::EpochAddressing,
+    ) -> EpochRun<PacketForwarder> {
+        let (device_sink, udp) = self.device.begin_epoch(*addressing);
+        let gateway = addressing.gateway;
+        let probe_udp = udp.clone();
+        let forwarder = PacketForwarder {
+            udp: Arc::new(udp),
+            gateway,
+        };
+        // Published after the device has begun the epoch, so a host reading the
+        // addressing knows the device is already serving it.
+        let _ = self.addressing_tx.send(Some(*addressing));
+        EpochRun {
+            forwarder,
+            probe: Box::new(move |escalate, acks, rtt, rx| {
+                crate::egress_probe::spawn_egress_probe(probe_udp, gateway, escalate, acks, rtt, rx)
+            }),
+            served: Box::pin(async move {
+                // A pump error IS the epoch ending; the supervisor reads the
+                // transport verdict itself for the epoch-end report.
+                let _ = warren_net::forward_bidirectional(device_sink, sink).await;
+            }),
+        }
+    }
+
+    fn end_epoch(&mut self) {
+        // The addresses belonged to the epoch that just ended; a host must see
+        // "down", never a stale assignment.
+        let _ = self.addressing_tx.send(None);
+    }
+}
+
+/// A detached, cloneable capability to request NAT-PMP port forwards over a
+/// raw-IP datapath (see [`SupervisedPacketHandle::forward_port`]).
+///
+/// The opener is type-erased so the handle above it stays one type whatever
+/// device is under it.
+#[derive(Clone)]
+pub struct PacketForwarder {
+    udp: Arc<dyn warren_net::DynUdpOpener>,
+    gateway: std::net::Ipv4Addr,
+}
+
+impl std::fmt::Debug for PacketForwarder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The gateway address is the exit-side half of this client's
+        // assignment; the type alone is what a diagnosis needs.
+        f.write_str("PacketForwarder")
+    }
+}
+
+impl PacketForwarder {
+    /// Maps `internal_port` at the exit, asking for `suggested_external_port`
+    /// (`0` lets the exit choose). Delivery of what arrives on the mapped port
+    /// is the device's own business: a raw datapath has no local relay target.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::PortForward`] if the epoch's UDP path is gone or the exit
+    /// refuses the mapping.
+    pub async fn forward_port_with_suggested(
+        &self,
+        proto: MapProto,
+        internal_port: u16,
+        suggested_external_port: u16,
+    ) -> Result<warren_net::RawForwardedPort, SdkError> {
+        let flow = self
+            .udp
+            .open_udp_boxed()
+            .await
+            .map_err(|e| SdkError::PortForward(warren_net::PortForwardError::Transport(e)))?;
+        warren_net::forward_port_raw(
+            flow,
+            self.gateway,
+            proto,
+            internal_port,
+            suggested_external_port,
+        )
+        .await
+        .map_err(SdkError::from)
+    }
+
+    /// [`Self::forward_port_with_suggested`] letting the exit choose the port.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::forward_port_with_suggested`].
+    pub async fn forward_port(
+        &self,
+        proto: MapProto,
+        internal_port: u16,
+    ) -> Result<warren_net::RawForwardedPort, SdkError> {
+        self.forward_port_with_suggested(proto, internal_port, 0)
+            .await
+    }
+}
+
+impl ExternalPort for warren_net::RawForwardedPort {
+    fn external_port(&self) -> u16 {
+        warren_net::RawForwardedPort::external_port(self)
+    }
+
+    fn shutdown(self) -> impl std::future::Future<Output = ()> + Send {
+        warren_net::RawForwardedPort::shutdown(self)
+    }
+}
+
 /// Supervises a proxy datapath across tunnel rebuilds, keeping the local
-/// listeners (and thus the app-facing proxy addresses) stable: it establishes a
-/// tunnel, serves until the tunnel dies, then reconnects (immediately after a
-/// drop, with capped exponential backoff between failed attempts), reporting each
-/// [`ConnectionState`] transition and each maintenance-migration event.
-/// `connect` is the (re)establish closure; it is
-/// generic so the loop is testable with a fake sink and a fake connector.
+/// listeners (and thus the app-facing proxy addresses) stable.
+///
+/// One line over [`supervise_datapath`]: the lifecycle is shared with every
+/// other datapath, the listeners are what makes this one the proxy.
 pub(crate) async fn supervise_proxy<S, F, Fut, D>(
     socks_listener: tokio::net::TcpListener,
     http_listener: Option<tokio::net::TcpListener>,
     dns_server: Option<std::net::Ipv4Addr>,
-    outputs: SupervisorOutputs,
+    outputs: SupervisorOutputs<ProxyForwarder>,
+    guards: EpochGuards,
+    connect: F,
+    on_drain: D,
+) where
+    S: warren_net::PacketSink + 'static,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<EstablishedTunnel<S>, SdkError>>,
+    D: Fn(),
+{
+    supervise_datapath(
+        ProxyDatapath::new(socks_listener, http_listener, dns_server),
+        outputs,
+        guards,
+        connect,
+        on_drain,
+    )
+    .await;
+}
+
+/// Supervises a datapath across tunnel rebuilds: it establishes a tunnel, runs
+/// `datapath` over it until it dies, then reconnects (immediately after a drop,
+/// with capped exponential backoff between failed attempts), reporting each
+/// [`ConnectionState`] transition and each maintenance-migration event.
+/// `connect` is the (re)establish closure; it is generic so the loop is
+/// testable with a fake sink and a fake datapath.
+pub(crate) async fn supervise_datapath<S, P, F, Fut, D>(
+    mut datapath: P,
+    outputs: SupervisorOutputs<P::Forwarder>,
     guards: EpochGuards,
     mut connect: F,
     on_drain: D,
 ) where
     S: warren_net::PacketSink + 'static,
+    P: EpochDatapath<S>,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<EstablishedTunnel<S>, SdkError>>,
     // Invoked once per drain advisory, BEFORE the proactive reconnect (ADR 36).
@@ -1224,6 +1690,10 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
     // `warren_transport::redial_policy`.
     let mut backoff = warren_transport::redial_policy::REDIAL_BACKOFF.forever();
     let mut first = true;
+    // Bumped for every epoch, so a device that keeps state across reconnects can
+    // tell this epoch's sink from the one it replaced. Starts at 1: generation
+    // zero is "no epoch has run".
+    let mut generation: u64 = 0;
     // Handle-level, so a request survives the epoch it was raised against and
     // the next one honours it.
     let host_reconnect = Arc::clone(&outputs.reconnect_request);
@@ -1239,35 +1709,46 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
         first = false;
         match connect().await {
             Ok(est) => {
-                let config = build_netstack_config(
-                    &est.sink,
-                    est.local_ip,
-                    est.prefix,
-                    est.gateway,
-                    est.ipv6,
-                    dns_server,
-                );
                 let gateway = est.gateway;
                 // ADR 36: grab the drain watch before the sink is moved into the
-                // netstack engine. `None` for paths that emit no drain signal.
+                // datapath. `None` for paths that emit no drain signal.
                 let drain_rx = est.sink.drain_watch();
                 let sink = Arc::new(est.sink);
                 // Publish a NON-owning reader of this epoch's counters. The weak
-                // reference is load-bearing: the netstack owns the datapath for
-                // the epoch, and a strong clone here would hold the QUIC
-                // connection open past its teardown.
+                // reference is load-bearing: the datapath owns the sink for the
+                // epoch, and a strong clone here would hold the QUIC connection
+                // open past its teardown.
                 let weak_sink = Arc::downgrade(&sink);
-                // Taken before the sink moves into the netstack engine, and
-                // held weakly: the session it points at dies with the epoch.
+                // Taken before the sink moves into the datapath, and held
+                // weakly: the session it points at dies with the epoch.
                 let watchdog_session = sink
                     .multihop_session()
                     .as_ref()
                     .map(Arc::downgrade)
                     .unwrap_or_default();
+                generation += 1;
+                let addressing = warren_net::EpochAddressing {
+                    epoch: warren_net::EpochId {
+                        // The identifier of the exit actually reached, so a
+                        // device can key cross-epoch state on it. A datapath
+                        // with no sealed session (the in-process fakes) has
+                        // none to report.
+                        exit: sink
+                            .multihop_session()
+                            .map_or(warren_net::ExitId::UNKNOWN, |s| {
+                                warren_net::ExitId::from_bytes(s.exit_id())
+                            }),
+                        generation,
+                    },
+                    ipv4: est.local_ip,
+                    prefix: est.prefix,
+                    gateway,
+                    ipv6: est.ipv6,
+                };
                 let _ = outputs.metrics_tx.send(Some(Arc::new(move || {
                     weak_sink.upgrade().and_then(|s| s.metrics_snapshot())
                 })));
-                let (connector, alive_rx) = warren_net::spawn_over_sink(sink, config);
+                let run = datapath.start(sink, &addressing);
                 // Arm the in-tunnel egress probe for this epoch: it rides the same
                 // netstack UDP path and, on a debounced dead verdict (the exit ACKs
                 // keep-alives but forwards nothing), fires `egress_dead` so the
@@ -1276,9 +1757,7 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                 // down with the session and never outlives it.
                 let egress_dead = Arc::new(tokio::sync::Notify::new());
                 let _egress_probe = match &outputs.egress_probe {
-                    EgressProbeArm::Spawn => Some(crate::egress_probe::spawn_egress_probe(
-                        connector.clone(),
-                        gateway,
+                    EgressProbeArm::Spawn => Some((run.probe)(
                         Arc::clone(&egress_dead),
                         // The probe's verdict is only about the exit while the
                         // transport underneath is carrying traffic, so it reads
@@ -1308,15 +1787,11 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                     }
                 };
                 // Publish this epoch's forwarder so self-healing port forwards
-                // can re-map on the fresh connector; cleared to `None` below when
+                // can re-map on the fresh datapath; cleared to `None` below when
                 // the tunnel dies.
-                let _ = outputs.forwarder_tx.send(Some(ProxyForwarder {
-                    connector: connector.clone(),
-                    gateway,
-                    // Supervised path is multihop, which carries no per-exit
-                    // NAT-PMP flag yet; stay permissive (doc 79).
-                    port_forward_supported: true,
-                }));
+                let _ = outputs.forwarder_tx.send(Some(run.forwarder));
+                let served = run.served;
+                tokio::pin!(served);
                 let _ = outputs.state_tx.send(ConnectionState::Connected);
                 // A reconnect that follows a drain completes that migration:
                 // tell the host (forwards re-map immediately on the fresh
@@ -1370,21 +1845,14 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                 let cause;
                 let drained = match drain_rx {
                     Some(mut rx) => {
-                        // The serve future is pinned OUTSIDE the drain loop so a
-                        // cancelled migration resumes it (active proxy
-                        // connections survive the refusal) instead of
-                        // re-creating the accept loops.
-                        let serve = serve_epoch(
-                            &socks_listener,
-                            http_listener.as_ref(),
-                            connector,
-                            alive_rx,
-                        );
-                        tokio::pin!(serve);
+                        // The serve future was pinned OUTSIDE this loop so a
+                        // cancelled migration resumes it (active connections
+                        // survive the refusal) instead of restarting the
+                        // datapath.
                         let mut drain_armed = true;
                         loop {
                             tokio::select! {
-                                () = &mut serve => {
+                                () = &mut served => {
                                     cause = EpochEndCause::SessionClosed;
                                     break None;
                                 }
@@ -1435,9 +1903,7 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                     }
                     None => {
                         tokio::select! {
-                            () = serve_epoch(
-                                &socks_listener, http_listener.as_ref(), connector, alive_rx,
-                            ) => { cause = EpochEndCause::SessionClosed; }
+                            () = &mut served => { cause = EpochEndCause::SessionClosed; }
                             () = &mut path_moved => { cause = EpochEndCause::PathMoved; }
                             () = egress_dead.notified() => {
                                 // The exit forwards nothing over a live QUIC
@@ -1471,6 +1937,7 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
                 }));
                 let _ = outputs.forwarder_tx.send(None);
                 let _ = outputs.metrics_tx.send(None);
+                datapath.end_epoch();
                 if let Some(advisory) = drained {
                     // Rotate the failover cursor PAST the draining exit so the
                     // reconnect lands on a different one (no-op for single-exit).
@@ -1580,7 +2047,62 @@ pub(crate) async fn establish_multihop(
     transport_config: Option<std::sync::Arc<warren_transport::TransportConfig>>,
     rtt_cache: std::sync::Arc<std::sync::Mutex<warren_discovery::RttCache>>,
 ) -> Result<EstablishedTunnel<MultihopPacketSink>, SdkError> {
+    // The userland proxy installs no OS tunnel, so its carrier socket has
+    // nothing to escape from.
+    establish_multihop_with_bypass(
+        signing,
+        exit,
+        auto_local_ip,
+        wants_ipv6,
+        transport_config,
+        rtt_cache,
+        None,
+    )
+    .await
+}
+
+/// [`establish_multihop`] with an explicit carrier-socket bypass, for a
+/// datapath whose own clients can capture the host's default route (a local
+/// gateway whose peers route everything into it): the QUIC socket is marked or
+/// bound to the physical link BEFORE its first send, so the tunnel cannot
+/// swallow its own carrier.
+pub(crate) async fn establish_multihop_with_bypass(
+    signing: warren_identity::ed25519_dalek::SigningKey,
+    exit: &VerifiedExit,
+    auto_local_ip: bool,
+    wants_ipv6: bool,
+    transport_config: Option<std::sync::Arc<warren_transport::TransportConfig>>,
+    rtt_cache: std::sync::Arc<std::sync::Mutex<warren_discovery::RttCache>>,
+    socket_bypass: Option<warren_transport::SocketBypass>,
+) -> Result<EstablishedTunnel<MultihopPacketSink>, SdkError> {
+    let tunnel = multihop_dial(
+        signing,
+        exit,
+        auto_local_ip,
+        wants_ipv6,
+        transport_config,
+        socket_bypass,
+    );
+    connect_established(tunnel, exit, rtt_cache).await
+}
+
+/// Builds the multihop dial for `exit` with the supervised path's options.
+///
+/// Split out of the connect because an option that only takes effect when the
+/// socket is bound (the carrier bypass) is otherwise unobservable until a real
+/// dial; built separately, it can be read back off the dial.
+pub(crate) fn multihop_dial(
+    signing: warren_identity::ed25519_dalek::SigningKey,
+    exit: &VerifiedExit,
+    auto_local_ip: bool,
+    wants_ipv6: bool,
+    transport_config: Option<std::sync::Arc<warren_transport::TransportConfig>>,
+    socket_bypass: Option<warren_transport::SocketBypass>,
+) -> MultihopClientTunnel {
     let mut tunnel = MultihopClientTunnel::new(signing);
+    if let Some(bypass) = socket_bypass {
+        tunnel = tunnel.with_socket_bypass(bypass);
+    }
     if auto_local_ip {
         tunnel = tunnel.with_auto_local_ip();
     }
@@ -1609,6 +2131,15 @@ pub(crate) async fn establish_multihop(
     {
         tunnel = tunnel.with_exit_mlkem768(exit.exit_mlkem768_pubkey.clone());
     }
+    tunnel
+}
+
+/// Dials the built tunnel and packages the session with its addressing.
+async fn connect_established(
+    tunnel: MultihopClientTunnel,
+    exit: &VerifiedExit,
+    rtt_cache: std::sync::Arc<std::sync::Mutex<warren_discovery::RttCache>>,
+) -> Result<EstablishedTunnel<MultihopPacketSink>, SdkError> {
     let session = tunnel
         .connect(
             exit.exit_ed25519_pubkey,

@@ -2924,3 +2924,660 @@ async fn a_host_requested_rebuild_ends_the_epoch_without_dropping_the_listener()
     .expect("the stable listener is still bound across a host-requested rebuild");
     task.abort();
 }
+
+/// A datapath that records the epoch it was started on and serves until it is
+/// killed, so the supervisor's lifecycle can be observed with no netstack, no
+/// listeners and no device under it.
+struct FakeDatapath {
+    started: Arc<std::sync::Mutex<Vec<warren_net::EpochAddressing>>>,
+    kill: Arc<tokio::sync::Notify>,
+    ended: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FakeDatapath {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(std::sync::Mutex::new(Vec::new())),
+            kill: Arc::new(tokio::sync::Notify::new()),
+            ended: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl<S: warren_net::PacketSink + 'static> crate::supervisor::EpochDatapath<S> for FakeDatapath {
+    /// The generation stands in for a real forwarder: it is what the test reads
+    /// off `forwarder_rx` to tell one epoch's publication from the next.
+    type Forwarder = u64;
+
+    fn start(
+        &mut self,
+        sink: Arc<S>,
+        addressing: &warren_net::EpochAddressing,
+    ) -> crate::supervisor::EpochRun<u64> {
+        self.started.lock().expect("epoch log").push(*addressing);
+        let kill = Arc::clone(&self.kill);
+        crate::supervisor::EpochRun {
+            forwarder: addressing.epoch.generation,
+            probe: Box::new(|_, _, _, _| crate::supervisor::AbortOnDrop(tokio::spawn(async {}))),
+            served: Box::pin(async move {
+                kill.notified().await;
+                // The epoch's sink dies with the epoch, as a real datapath's
+                // does when its pump returns.
+                drop(sink);
+            }),
+        }
+    }
+
+    fn end_epoch(&mut self) {
+        self.ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Awaits the next value published on a watch, up to `budget`.
+async fn next_published<T: Clone + Send + Sync + 'static>(
+    rx: &mut tokio::sync::watch::Receiver<T>,
+    budget: std::time::Duration,
+) -> T {
+    tokio::time::timeout(budget, rx.changed())
+        .await
+        .expect("a publication was expected")
+        .expect("the supervisor is still running");
+    rx.borrow_and_update().clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn supervise_datapath_starts_a_fresh_epoch_per_tunnel_and_stamps_it() {
+    // The lifecycle the proxy already had, over a datapath that is not the
+    // proxy: one start per tunnel, a forwarder published while it serves and
+    // cleared when it dies, and a generation the device can tell epochs apart
+    // by (which is what lets it make a stale sink inert).
+    use std::sync::atomic::Ordering;
+
+    let datapath = FakeDatapath::new();
+    let started = Arc::clone(&datapath.started);
+    let kill = Arc::clone(&datapath.kill);
+    let ended = Arc::clone(&datapath.ended);
+    let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+    let (forwarder_tx, mut forwarder_rx) = tokio::sync::watch::channel(None);
+
+    let task = tokio::spawn(async move {
+        crate::supervisor::supervise_datapath(
+            datapath,
+            crate::supervisor::SupervisorOutputs {
+                egress_probe: crate::supervisor::EgressProbeArm::Off,
+                reconnect_request: Arc::new(tokio::sync::Notify::new()),
+                epoch_end_tx: tokio::sync::watch::channel(None).0,
+                state_tx,
+                forwarder_tx,
+                metrics_tx: tokio::sync::watch::channel(None).0,
+                migration_tx: tokio::sync::watch::channel(None).0,
+                fatal_tx: tokio::sync::watch::channel(None).0,
+            },
+            crate::supervisor::EpochGuards {
+                pre_migrate: None,
+                network_watch: None,
+                ..Default::default()
+            },
+            move || async move {
+                Ok::<_, SdkError>(EstablishedTunnel {
+                    sink: ClosableSink {
+                        close: Arc::new(tokio::sync::Notify::new()),
+                    },
+                    local_ip: "10.66.0.2".parse().unwrap(),
+                    prefix: 24,
+                    gateway: "10.66.0.1".parse().unwrap(),
+                    ipv6: None,
+                })
+            },
+            || {},
+        )
+        .await;
+    });
+
+    let budget = std::time::Duration::from_secs(5);
+    assert_eq!(
+        next_published(&mut forwarder_rx, budget).await,
+        Some(1),
+        "the first epoch publishes its forwarder"
+    );
+
+    // End the epoch the way a dead datapath does.
+    kill.notify_waiters();
+    assert_eq!(
+        next_published(&mut forwarder_rx, budget).await,
+        None,
+        "a dead datapath clears the forwarder"
+    );
+    assert_eq!(
+        next_published(&mut forwarder_rx, budget).await,
+        Some(2),
+        "the rebuild publishes the next epoch's forwarder"
+    );
+
+    let epochs = started.lock().expect("epoch log").clone();
+    assert_eq!(epochs.len(), 2, "one start per tunnel");
+    assert_eq!(epochs[0].epoch.generation, 1);
+    assert_eq!(
+        epochs[1].epoch.generation, 2,
+        "the generation never repeats"
+    );
+    assert_eq!(
+        epochs[1].gateway,
+        "10.66.0.1".parse::<std::net::Ipv4Addr>().unwrap(),
+        "each epoch carries the addressing its tunnel was assigned"
+    );
+    assert!(
+        ended.load(Ordering::SeqCst) >= 1,
+        "the datapath is told when its epoch is over"
+    );
+
+    kill.notify_waiters();
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn supervise_datapath_ends_the_epoch_on_a_host_request() {
+    // The host's own verdict, reported apart from the exit's: a device that
+    // knows it is carrying nothing asks for a rebuild, and the cause published
+    // says the exit was not the suspect.
+    let datapath = FakeDatapath::new();
+    let kill = Arc::clone(&datapath.kill);
+    let (epoch_end_tx, mut epoch_end_rx) = tokio::sync::watch::channel(None);
+    let reconnect = Arc::new(tokio::sync::Notify::new());
+    let host = Arc::clone(&reconnect);
+
+    let task = tokio::spawn(async move {
+        crate::supervisor::supervise_datapath(
+            datapath,
+            crate::supervisor::SupervisorOutputs {
+                egress_probe: crate::supervisor::EgressProbeArm::Off,
+                reconnect_request: reconnect,
+                epoch_end_tx,
+                state_tx: tokio::sync::watch::channel(ConnectionState::Connecting).0,
+                forwarder_tx: tokio::sync::watch::channel(None).0,
+                metrics_tx: tokio::sync::watch::channel(None).0,
+                migration_tx: tokio::sync::watch::channel(None).0,
+                fatal_tx: tokio::sync::watch::channel(None).0,
+            },
+            crate::supervisor::EpochGuards {
+                pre_migrate: None,
+                network_watch: None,
+                ..Default::default()
+            },
+            move || async move {
+                Ok::<_, SdkError>(EstablishedTunnel {
+                    sink: ClosableSink {
+                        close: Arc::new(tokio::sync::Notify::new()),
+                    },
+                    local_ip: "10.66.0.2".parse().unwrap(),
+                    prefix: 24,
+                    gateway: "10.66.0.1".parse().unwrap(),
+                    ipv6: None,
+                })
+            },
+            || {},
+        )
+        .await;
+    });
+
+    // Raised repeatedly: the request only lands once an epoch is racing it, and
+    // a stored permit is honoured by the next epoch either way.
+    let end = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            host.notify_one();
+            if let Ok(Ok(())) = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                epoch_end_rx.changed(),
+            )
+            .await
+                && let Some(end) = *epoch_end_rx.borrow_and_update()
+            {
+                return end;
+            }
+        }
+    })
+    .await
+    .expect("the host request ends an epoch");
+
+    assert_eq!(
+        end.cause,
+        crate::supervisor::EpochEndCause::HostRequested,
+        "the host's verdict is published as its own cause"
+    );
+    kill.notify_waiters();
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn supervise_datapath_never_starts_a_datapath_on_a_fatal_verdict() {
+    use warren_transport::{FatalCause, MultihopError, SetupError};
+
+    let datapath = FakeDatapath::new();
+    let started = Arc::clone(&datapath.started);
+    let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+    let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+
+    let task = tokio::spawn(async move {
+        crate::supervisor::supervise_datapath(
+            datapath,
+            crate::supervisor::SupervisorOutputs {
+                egress_probe: crate::supervisor::EgressProbeArm::Off,
+                reconnect_request: Arc::new(tokio::sync::Notify::new()),
+                epoch_end_tx: tokio::sync::watch::channel(None).0,
+                state_tx,
+                forwarder_tx: tokio::sync::watch::channel(None).0,
+                metrics_tx: tokio::sync::watch::channel(None).0,
+                migration_tx: tokio::sync::watch::channel(None).0,
+                fatal_tx,
+            },
+            crate::supervisor::EpochGuards {
+                pre_migrate: None,
+                network_watch: None,
+                ..Default::default()
+            },
+            move || async move {
+                Err::<EstablishedTunnel<ClosableSink>, SdkError>(SdkError::Multihop(
+                    MultihopError::Setup(SetupError::Rejected),
+                ))
+            },
+            || {},
+        )
+        .await;
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("a fatal verdict stops the supervisor instead of looping")
+        .expect("the supervisor task joined cleanly");
+    assert_eq!(
+        *state_rx.borrow(),
+        ConnectionState::Failed,
+        "the terminal state is Failed on any datapath"
+    );
+    assert_eq!(*fatal_rx.borrow(), Some(FatalCause::NotAuthorized));
+    assert!(
+        started.lock().expect("epoch log").is_empty(),
+        "no epoch is started when no tunnel was established"
+    );
+}
+
+/// A device that keeps state across epochs and stamps each epoch's sink with
+/// its generation, the shape [`warren_net::EpochPacketDevice`] documents: a
+/// sink from a replaced epoch must be inert rather than write into the live
+/// one.
+#[derive(Clone)]
+struct FakeDevice(Arc<FakeDeviceInner>);
+
+#[derive(Default)]
+struct FakeDeviceInner {
+    /// The generation of the epoch currently being served.
+    current: std::sync::atomic::AtomicU64,
+    epochs: std::sync::Mutex<Vec<warren_net::EpochAddressing>>,
+    /// Downlink packets the device accepted from the live epoch.
+    delivered: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// Packets a stale sink was handed, dropped and counted.
+    stale_sends: std::sync::atomic::AtomicUsize,
+}
+
+impl FakeDevice {
+    fn new() -> Self {
+        Self(Arc::new(FakeDeviceInner::default()))
+    }
+
+    fn epochs(&self) -> Vec<warren_net::EpochAddressing> {
+        self.0.epochs.lock().expect("epoch log").clone()
+    }
+
+    fn delivered(&self) -> Vec<Vec<u8>> {
+        self.0.delivered.lock().expect("delivered").clone()
+    }
+
+    fn stale_sends(&self) -> usize {
+        self.0.stale_sends.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// One epoch's device-side sink, stamped with the generation it belongs to.
+struct FakeEpochSink {
+    device: Arc<FakeDeviceInner>,
+    generation: u64,
+}
+
+impl FakeEpochSink {
+    fn is_current(&self) -> bool {
+        self.device
+            .current
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == self.generation
+    }
+}
+
+impl warren_net::PacketSink for FakeEpochSink {
+    async fn send_packet(&self, packet: &[u8]) -> Result<(), warren_net::NetError> {
+        if !self.is_current() {
+            // A stale epoch's downlink must not reach the device's clients, and
+            // must not be reported as a failure either: the epoch it belonged
+            // to is simply over.
+            self.device
+                .stale_sends
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(());
+        }
+        self.device
+            .delivered
+            .lock()
+            .expect("delivered")
+            .push(packet.to_vec());
+        Ok(())
+    }
+
+    async fn recv_packet(&self) -> Result<bytes::Bytes, warren_net::NetError> {
+        if !self.is_current() {
+            return Err(warren_net::NetError::EngineStopped);
+        }
+        // The device has nothing of its own to send in these tests; a real one
+        // would hand over its clients' uplink packets here.
+        std::future::pending().await
+    }
+
+    fn max_payload(&self) -> usize {
+        1280
+    }
+}
+
+/// The device's control plane: flows that answer a DNS query the way the exit
+/// resolver would, so the in-tunnel egress probe over a fake exit stays alive.
+#[derive(Clone)]
+struct FakeDeviceUdp;
+
+struct EchoingResolverFlow {
+    query: Option<bytes::Bytes>,
+}
+
+impl warren_net::UdpFlow for EchoingResolverFlow {
+    async fn send_to(
+        &self,
+        _data: bytes::Bytes,
+        _dst: SocketAddr,
+    ) -> Result<(), warren_net::NetError> {
+        Ok(())
+    }
+
+    async fn recv_from(&mut self) -> Option<(bytes::Bytes, SocketAddr)> {
+        match self.query.take() {
+            Some(_) => None,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+impl warren_net::UdpOpener for FakeDeviceUdp {
+    type Flow = EchoingResolverFlow;
+
+    async fn open_udp(&self) -> Result<EchoingResolverFlow, warren_net::NetError> {
+        Ok(EchoingResolverFlow { query: None })
+    }
+}
+
+impl warren_net::EpochPacketDevice for FakeDevice {
+    type Sink = FakeEpochSink;
+    type Udp = FakeDeviceUdp;
+
+    fn begin_epoch(
+        &self,
+        addressing: warren_net::EpochAddressing,
+    ) -> (FakeEpochSink, FakeDeviceUdp) {
+        self.0.current.store(
+            addressing.epoch.generation,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.0.epochs.lock().expect("epoch log").push(addressing);
+        (
+            FakeEpochSink {
+                device: Arc::clone(&self.0),
+                generation: addressing.epoch.generation,
+            },
+            FakeDeviceUdp,
+        )
+    }
+}
+
+fn test_addressing(generation: u64) -> warren_net::EpochAddressing {
+    warren_net::EpochAddressing {
+        epoch: warren_net::EpochId {
+            exit: warren_net::ExitId::UNKNOWN,
+            generation,
+        },
+        ipv4: "10.66.0.2".parse().unwrap(),
+        prefix: 24,
+        gateway: "10.66.0.1".parse().unwrap(),
+        ipv6: None,
+    }
+}
+
+#[tokio::test]
+async fn a_stale_epoch_sink_is_inert_while_the_live_one_serves() {
+    // The contract `begin_epoch` documents, with a device that implements it:
+    // the supervisor may drop a replaced epoch's sink after the next one has
+    // started, so that sink must write nothing and end its own pump.
+    use warren_net::{EpochPacketDevice, PacketSink};
+
+    let device = FakeDevice::new();
+    let (stale, _udp) = device.begin_epoch(test_addressing(1));
+    let (live, _udp2) = device.begin_epoch(test_addressing(2));
+
+    stale
+        .send_packet(b"from the epoch that ended")
+        .await
+        .expect("a stale sink reports success and drops");
+    live.send_packet(b"from the live epoch")
+        .await
+        .expect("the live sink carries");
+
+    assert_eq!(
+        device.delivered(),
+        vec![b"from the live epoch".to_vec()],
+        "only the current epoch reaches the device's clients"
+    );
+    assert_eq!(device.stale_sends(), 1, "the stale packet is counted");
+    assert!(
+        matches!(
+            stale.recv_packet().await,
+            Err(warren_net::NetError::EngineStopped)
+        ),
+        "a stale sink ends the pump that still holds it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_supervised_packet_datapath_connects_and_renumbers_the_device_on_a_rebuild() {
+    // The whole seam in one run: a device is handed an epoch over a real sealed
+    // tunnel, learns the addresses the exit assigned, and is told about the
+    // fresh ones when the datapath rebuilds.
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    // The looping exit, because the rebuild is a second dial: the single-accept
+    // fake would leave the redial hanging.
+    let (addr, keys, observer) =
+        warren_test_support::spawn_migratable_multihop_exit(exit_key, true).await;
+    let exit = fake_verified_exit(addr, &keys);
+    let device = FakeDevice::new();
+
+    let handle = test_client()
+        .start_packet_datapath_supervised(
+            &Circuit::SingleHop(exit),
+            device.clone(),
+            &crate::client::PacketDatapathConfig::default(),
+        )
+        .await
+        .expect("the supervised packet datapath starts");
+
+    let mut state_rx = handle.watch_state();
+    await_connected(&mut state_rx, std::time::Duration::from_secs(10)).await;
+
+    let first = handle
+        .addressing()
+        .expect("the epoch published its addresses");
+    assert_eq!(first.epoch.generation, 1, "the first epoch is generation 1");
+    assert_eq!(
+        first.epoch.exit.as_bytes(),
+        &keys.exit_id,
+        "the epoch names the exit it actually reached"
+    );
+    assert_eq!(
+        first.ipv4,
+        "10.66.0.2".parse::<std::net::Ipv4Addr>().unwrap()
+    );
+    assert_eq!(
+        first.gateway,
+        "10.66.0.1".parse::<std::net::Ipv4Addr>().unwrap()
+    );
+
+    handle.request_reconnect();
+    let mut addressing_rx = handle.watch_addressing();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if let Some(a) = *addressing_rx.borrow_and_update()
+                && a.epoch.generation == 2
+            {
+                return a;
+            }
+            if addressing_rx.changed().await.is_err() {
+                panic!("the supervisor stopped instead of rebuilding");
+            }
+        }
+    })
+    .await
+    .expect("the rebuild republishes the addressing");
+
+    assert_eq!(
+        second.epoch.exit.as_bytes(),
+        &keys.exit_id,
+        "the same pinned exit is redialed"
+    );
+    assert_eq!(
+        device.epochs().len(),
+        2,
+        "the device was given one epoch per tunnel"
+    );
+    assert_eq!(
+        observer.accepts(),
+        2,
+        "the rebuild is a fresh dial, not the same session renamed"
+    );
+}
+
+#[test]
+fn a_carrier_bypass_reaches_the_dial_the_datapath_will_make() {
+    // A device whose own clients route everything into it can capture the
+    // carrier socket; the bypass is what keeps that socket on the physical
+    // link, and it has to be on the dial before it binds.
+    let exit = exit_with_dns(false);
+    let (identity, _mnemonic) = WarrenIdentity::generate();
+
+    let plain =
+        crate::supervisor::multihop_dial(identity.signing_key(), &exit, false, false, None, None);
+    assert!(
+        plain.socket_bypass().is_none(),
+        "the userland proxy dial marks nothing"
+    );
+
+    let bypass = warren_transport::SocketBypass::Fwmark(0x7761_7272);
+    let marked = crate::supervisor::multihop_dial(
+        identity.signing_key(),
+        &exit,
+        false,
+        false,
+        None,
+        Some(bypass),
+    );
+    assert_eq!(
+        marked.socket_bypass(),
+        Some(bypass),
+        "the configured bypass is carried into the dial"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_packet_datapath_refuses_a_dns_disabled_exit_without_an_override() {
+    // Same fail-fast as the proxy datapath: an exit with no in-tunnel forwarder
+    // resolves nothing, so it is refused unless the device's clients resolve
+    // elsewhere.
+    let exit = exit_with_dns(true);
+    let cfg = crate::client::PacketDatapathConfig::default();
+    match test_client()
+        .start_packet_datapath_supervised(
+            &Circuit::SingleHop(exit.clone()),
+            FakeDevice::new(),
+            &cfg,
+        )
+        .await
+    {
+        Err(SdkError::ExitDnsDisabled) => {}
+        Err(other) => panic!("expected ExitDnsDisabled, got {other:?}"),
+        Ok(_) => panic!("a dns-disabled exit must be refused without an override"),
+    }
+
+    let with_override = crate::client::PacketDatapathConfig {
+        dns_override: true,
+        socket_bypass: None,
+    };
+    let handle = test_client()
+        .start_packet_datapath_supervised(
+            &Circuit::SingleHop(exit),
+            FakeDevice::new(),
+            &with_override,
+        )
+        .await
+        .expect("a device that resolves elsewhere keeps the exit in the rotation");
+    handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bypass_this_os_cannot_honour_keeps_the_packet_datapath_down() {
+    // The end of the bypass wiring: the configured value reaches the carrier
+    // socket's bind, which fails closed on a variant this OS cannot honour
+    // rather than binding an unmarked socket the device's clients could
+    // capture. Proven from the outside: the datapath never reports Connected.
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let (addr, keys) = warren_test_support::spawn_fake_multihop_exit(exit_key).await;
+    let exit = fake_verified_exit(addr, &keys);
+
+    #[cfg(target_vendor = "apple")]
+    let unhonourable = warren_transport::SocketBypass::Fwmark(0x7761_7272);
+    #[cfg(not(target_vendor = "apple"))]
+    let unhonourable = warren_transport::SocketBypass::BoundIf(1);
+
+    let handle = test_client()
+        .start_packet_datapath_supervised(
+            &Circuit::SingleHop(exit),
+            FakeDevice::new(),
+            &crate::client::PacketDatapathConfig {
+                dns_override: false,
+                socket_bypass: Some(unhonourable),
+            },
+        )
+        .await
+        .expect("the datapath starts; the dial is what fails");
+
+    let mut state_rx = handle.watch_state();
+    let connected = tokio::time::timeout(std::time::Duration::from_millis(1500), async {
+        loop {
+            if *state_rx.borrow_and_update() == ConnectionState::Connected {
+                return true;
+            }
+            if state_rx.changed().await.is_err() {
+                return false;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        !connected,
+        "an unhonourable bypass must fail the dial closed, never bind unmarked"
+    );
+    assert!(
+        handle.addressing().is_none(),
+        "nothing is published while no epoch ever ran"
+    );
+}

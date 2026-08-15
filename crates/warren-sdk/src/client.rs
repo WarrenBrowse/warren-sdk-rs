@@ -23,7 +23,8 @@ use warrenguard_config::TUNNEL_GATEWAY_IP;
 use crate::error::{BuildError, SdkError};
 use crate::proxy::{ProxyHandle, addressing_from_session, serve_proxy_over_sink};
 use crate::supervisor::{
-    EstablishedTunnel, SupervisedProxyHandle, establish_multihop, supervise_proxy,
+    EstablishedTunnel, SupervisedPacketHandle, SupervisedProxyHandle, establish_multihop,
+    establish_multihop_with_bypass, supervise_proxy,
 };
 
 /// A dial target, labeled by hop count. Both variants run the same supervised
@@ -1243,6 +1244,218 @@ impl<T: HttpTransport> WarrenClient<T> {
         .await
     }
 
+    /// Self-healing raw-IP datapath over one pinned circuit: `device` receives
+    /// one epoch sink per (re)connect and is pumped against the tunnel, so it
+    /// keeps serving its own clients while the supervisor rebuilds under it.
+    ///
+    /// The mirror of [`Self::start_proxy_supervised`] for a datapath that
+    /// carries whole IP packets instead of terminating flows locally.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::ExitDnsDisabled`] if the exit runs no DNS forwarder and the
+    /// device's clients do not resolve elsewhere
+    /// ([`PacketDatapathConfig::dns_override`]). Tunnel establishment happens in
+    /// the background, so connect failures surface as state, not here.
+    pub async fn start_packet_datapath_supervised<D: warren_net::EpochPacketDevice>(
+        &self,
+        circuit: &Circuit,
+        device: D,
+        cfg: &PacketDatapathConfig,
+    ) -> Result<SupervisedPacketHandle, SdkError> {
+        let exit = circuit.dialed_exit().clone();
+        dns_reachable(exit.dns_disabled, cfg.dns_override)?;
+        let signing = self.signing.clone();
+        let auto_local_ip = self.auto_local_ip;
+        let wants_ipv6 = self.wants_ipv6;
+        let transport_config = self.transport_config.clone();
+        let rtt_cache = Arc::clone(&self.rtt_cache);
+        let socket_bypass = cfg.socket_bypass;
+        self.spawn_supervised_packet(
+            device,
+            move || {
+                let signing = signing.clone();
+                let exit = exit.clone();
+                let transport_config = transport_config.clone();
+                let rtt_cache = Arc::clone(&rtt_cache);
+                async move {
+                    establish_multihop_with_bypass(
+                        signing,
+                        &exit,
+                        auto_local_ip,
+                        wants_ipv6,
+                        transport_config,
+                        rtt_cache,
+                        socket_bypass,
+                    )
+                    .await
+                }
+            },
+            // Single pinned exit: a drain has nowhere to rotate.
+            || {},
+        )
+        .await
+    }
+
+    /// [`Self::start_packet_datapath_supervised`] with exit FAILOVER over a
+    /// prioritized candidate list: it sticks with the first exit that connects
+    /// and rotates to the next only when the current one fails to (re)establish.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::NoMultihopExit`] if `circuits` is empty, or
+    /// [`SdkError::ExitDnsDisabled`] if no candidate can resolve names and the
+    /// device's clients do not resolve elsewhere.
+    pub async fn start_packet_datapath_supervised_failover<D: warren_net::EpochPacketDevice>(
+        &self,
+        circuits: &[Circuit],
+        device: D,
+        cfg: &PacketDatapathConfig,
+    ) -> Result<SupervisedPacketHandle, SdkError> {
+        if circuits.is_empty() {
+            return Err(SdkError::NoMultihopExit);
+        }
+        let exits: Vec<VerifiedExit> = circuits.iter().map(|c| c.dialed_exit().clone()).collect();
+        // Same rule as the proxy rotation: without an override, an exit that
+        // runs no in-tunnel forwarder cannot resolve names, so it is dropped
+        // from the rotation rather than silently landed on.
+        let exits = dns_capable_candidates(&exits, cfg.dns_override);
+        if exits.is_empty() {
+            return Err(SdkError::ExitDnsDisabled);
+        }
+        let signing = self.signing.clone();
+        let auto_local_ip = self.auto_local_ip;
+        let wants_ipv6 = self.wants_ipv6;
+        let transport_config = self.transport_config.clone();
+        let socket_bypass = cfg.socket_bypass;
+        let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drain_cursor = Arc::clone(&cursor);
+        let avoid = Arc::new(std::sync::Mutex::new(
+            crate::portfollow::AvoidSet::<[u8; 16]>::default(),
+        ));
+        let rtt_cache = Arc::clone(&self.rtt_cache);
+        self.spawn_supervised_packet(
+            device,
+            move || {
+                let signing = signing.clone();
+                let exits = exits.clone();
+                let cursor = Arc::clone(&cursor);
+                let avoid = Arc::clone(&avoid);
+                let transport_config = transport_config.clone();
+                let rtt_cache = Arc::clone(&rtt_cache);
+                async move {
+                    let idx = {
+                        let avoid = avoid.lock().expect("avoid-set lock poisoned");
+                        let ids: Vec<_> = exits.iter().map(|e| e.exit_id).collect();
+                        crate::portfollow::next_candidate(
+                            cursor.load(Ordering::Relaxed),
+                            &ids,
+                            &*avoid,
+                        )
+                    };
+                    match establish_multihop_with_bypass(
+                        signing,
+                        &exits[idx],
+                        auto_local_ip,
+                        wants_ipv6,
+                        transport_config,
+                        rtt_cache,
+                        socket_bypass,
+                    )
+                    .await
+                    {
+                        Ok(tunnel) => {
+                            cursor.store(idx, Ordering::Relaxed);
+                            Ok(tunnel)
+                        }
+                        Err(e) => {
+                            avoid
+                                .lock()
+                                .expect("avoid-set lock poisoned")
+                                .insert(exits[idx].exit_id);
+                            cursor.store(idx.wrapping_add(1), Ordering::Relaxed);
+                            Err(e)
+                        }
+                    }
+                }
+            },
+            move || {
+                drain_cursor.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .await
+    }
+
+    /// Spawns the supervisor over `device` and returns the
+    /// [`SupervisedPacketHandle`]. Shared by the single-exit and failover
+    /// packet datapaths; only the (re)connect closure differs.
+    async fn spawn_supervised_packet<D, F, Fut, DR>(
+        &self,
+        device: D,
+        connect: F,
+        on_drain: DR,
+    ) -> Result<SupervisedPacketHandle, SdkError>
+    where
+        D: warren_net::EpochPacketDevice,
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<EstablishedTunnel<MultihopPacketSink>, SdkError>>
+            + Send,
+        DR: Fn() + Send + 'static,
+    {
+        let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+        let (forwarder_tx, forwarder_rx) = tokio::sync::watch::channel(None);
+        let (addressing_tx, addressing_rx) = tokio::sync::watch::channel(None);
+        let (metrics_tx, metrics_rx) = tokio::sync::watch::channel(None);
+        let (migration_tx, migration_rx) = tokio::sync::watch::channel(None);
+        let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
+        let (epoch_end_tx, epoch_end_rx) = tokio::sync::watch::channel(None);
+        let reconnect_request = std::sync::Arc::new(tokio::sync::Notify::new());
+        let supervisor_reconnect = std::sync::Arc::clone(&reconnect_request);
+        let task = tokio::spawn(async move {
+            crate::supervisor::supervise_datapath(
+                crate::supervisor::PacketDatapath::new(device, addressing_tx),
+                crate::supervisor::SupervisorOutputs {
+                    state_tx,
+                    forwarder_tx,
+                    metrics_tx,
+                    migration_tx,
+                    fatal_tx,
+                    epoch_end_tx,
+                    egress_probe: crate::supervisor::EgressProbeArm::Spawn,
+                    reconnect_request: supervisor_reconnect,
+                },
+                crate::supervisor::EpochGuards {
+                    // Reserve-then-switch is off by default, as on the proxy
+                    // path: the candidate pre-flight it needs is not live yet.
+                    pre_migrate: None,
+                    // A moved default path migrates the live session and,
+                    // failing that, redials at once.
+                    network_watch: Some(crate::supervisor::NetworkWatch::system()),
+                    // The device captures no host route of the SDK's making;
+                    // when its own clients capture one, the carrier escapes by
+                    // socket (`PacketDatapathConfig::socket_bypass`), which the
+                    // rebind policy reapplies.
+                    migration: crate::supervisor::MigrationPolicy::default(),
+                },
+                connect,
+                on_drain,
+            )
+            .await;
+        });
+
+        Ok(SupervisedPacketHandle {
+            state_rx,
+            forwarder_rx,
+            addressing_rx,
+            metrics_rx,
+            migration_rx,
+            fatal_rx,
+            epoch_end_rx,
+            reconnect_request,
+            task,
+        })
+    }
+
     /// Binds the stable proxy listeners, spawns the supervisor over `connect`, and
     /// returns the [`SupervisedProxyHandle`]. Shared by the single-exit and
     /// failover supervised datapaths; only the (re)connect closure differs.
@@ -1350,6 +1563,24 @@ fn warren_api_default_base() -> String {
 /// in-tunnel forwarder (`!dns_disabled`). Keeps failover from rotating onto an
 /// exit that would silently break name resolution (the per-rotation analogue of
 /// [`ensure_dns_reachable`]).
+/// How a supervised raw-IP datapath is configured.
+///
+/// Deliberately smaller than [`ProxyConfig`](warren_net::ProxyConfig): a device
+/// that carries whole packets binds no listener and needs no resolver of the
+/// SDK's choosing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PacketDatapathConfig {
+    /// True when the device's clients resolve names somewhere other than the
+    /// exit forwarder, which lets an exit that runs no forwarder stay in the
+    /// rotation (the same rule as `ProxyConfig::dns_server`).
+    pub dns_override: bool,
+    /// Marks or binds the carrier socket so a client of this device, whose own
+    /// default route points into it, cannot capture the datapath's own QUIC
+    /// datagrams (`SO_MARK` on Linux, `IP_BOUND_IF` on macOS, `IP_UNICAST_IF`
+    /// on Windows). `None` for a device whose clients capture no route.
+    pub socket_bypass: Option<SocketBypass>,
+}
+
 pub(crate) fn dns_capable_candidates(
     exits: &[VerifiedExit],
     has_dns_override: bool,
@@ -1370,7 +1601,14 @@ pub(crate) fn ensure_dns_reachable(
     dns_disabled: bool,
     cfg: &warren_net::ProxyConfig,
 ) -> Result<(), SdkError> {
-    if dns_disabled && cfg.dns_server.is_none() {
+    dns_reachable(dns_disabled, cfg.dns_server.is_some())
+}
+
+/// The rule behind [`ensure_dns_reachable`], over the plain fact of an
+/// override, so every datapath applies the same one whatever shape its config
+/// has.
+pub(crate) fn dns_reachable(dns_disabled: bool, has_override: bool) -> Result<(), SdkError> {
+    if dns_disabled && !has_override {
         return Err(SdkError::ExitDnsDisabled);
     }
     Ok(())

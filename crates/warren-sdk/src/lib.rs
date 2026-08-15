@@ -84,8 +84,8 @@ mod tun_setup;
 #[cfg(all(unix, feature = "experimental-tun"))]
 pub use client::TunDatapathHandle;
 pub use client::{
-    Circuit, DefaultClient, GenerationStore, InMemoryGenerationStore, ServerKeyStore, WarrenClient,
-    WarrenClientBuilder,
+    Circuit, DefaultClient, GenerationStore, InMemoryGenerationStore, PacketDatapathConfig,
+    ServerKeyStore, WarrenClient, WarrenClientBuilder,
 };
 pub use error::{BuildError, SdkError};
 pub use portfollow::{
@@ -95,8 +95,8 @@ pub use portfollow::{
 pub use proxy::{ProxyForwarder, ProxyHandle, TunnelState};
 pub use store::{FileGenerationStore, FileServerKeyStore};
 pub use supervisor::{
-    EpochEnd, EpochEndCause, MetricsReader, PortRelease, SupervisedForwardedPort,
-    SupervisedProxyHandle,
+    EpochEnd, EpochEndCause, MetricsReader, PacketForwarder, PortRelease, SupervisedForwardedPort,
+    SupervisedPacketHandle, SupervisedProxyHandle,
 };
 
 #[cfg(test)]
