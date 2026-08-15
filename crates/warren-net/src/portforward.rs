@@ -501,6 +501,119 @@ pub async fn forward_port_with_suggested(
     })
 }
 
+/// A live forwarded port over a raw IP datapath: the mapping at the exit, with
+/// no local listener and no relay.
+///
+/// The exit maps [`Self::external_port`] to the tunnel-side
+/// [`Self::internal_port`] and the mapping is renewed in the background;
+/// delivering an inbound connection is the device's own business (a raw
+/// datapath has no local target to relay to). Dropping the handle lets the
+/// lease lapse at the exit; [`Self::shutdown`] releases it now.
+#[derive(Debug)]
+pub struct RawForwardedPort {
+    external_port: u16,
+    internal_port: u16,
+    proto: MapProto,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    refresh: tokio::task::JoinHandle<()>,
+}
+
+impl RawForwardedPort {
+    /// The external port the exit allocated; remote peers arrive here.
+    #[must_use]
+    pub fn external_port(&self) -> u16 {
+        self.external_port
+    }
+
+    /// The tunnel-side port the exit forwards to.
+    #[must_use]
+    pub fn internal_port(&self) -> u16 {
+        self.internal_port
+    }
+
+    /// The mapped transport protocol.
+    #[must_use]
+    pub fn proto(&self) -> MapProto {
+        self.proto
+    }
+
+    /// Releases the mapping at the exit and waits for that teardown, so the
+    /// public port is free when this returns.
+    pub async fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        // Moved out so `Drop` cannot abort the delete mid-flight.
+        let refresh = std::mem::replace(&mut self.refresh, tokio::spawn(async {}));
+        let _ = refresh.await;
+    }
+}
+
+impl Drop for RawForwardedPort {
+    fn drop(&mut self) {
+        // The flow lives in the refresh task, so there is no way to delete the
+        // mapping from here; the exit reclaims the port when the lease lapses.
+        self.refresh.abort();
+    }
+}
+
+/// Maps `internal_port` at the exit over an already-open UDP `flow` and keeps
+/// the mapping alive until the returned [`RawForwardedPort`] is dropped.
+///
+/// The initial mapping is awaited, so the caller learns the granted external
+/// port and a refusal surfaces here rather than in a background task. The
+/// renewals then re-suggest exactly what was granted, so a refresh cannot move
+/// the public port under a client that has already published it.
+///
+/// `suggested_external_port` is `0` to let the exit choose, or a previously
+/// granted port for a forward that follows the client across reconnects; the
+/// exit honours it strictly and answers
+/// [`ResultCode::SuggestedPortUnavailable`] when it is taken.
+///
+/// # Errors
+///
+/// [`PortForwardError::Transport`] if the flow is gone,
+/// [`PortForwardError::Gateway`] if the exit refuses the mapping, plus the
+/// remaining [`PortForwardError`] variants from the initial [`map`] exchange.
+pub async fn forward_port_raw<F>(
+    mut flow: F,
+    gateway: Ipv4Addr,
+    proto: MapProto,
+    internal_port: u16,
+    suggested_external_port: u16,
+) -> Result<RawForwardedPort, PortForwardError>
+where
+    F: UdpFlow + Send + 'static,
+{
+    let spec = MapSpec {
+        proto,
+        internal_port,
+        suggested_external_port,
+        lifetime_secs: DEFAULT_MAP_LIFETIME_SECS,
+    };
+    let granted = map(&mut flow, gateway, spec).await?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let renewal = MapSpec {
+        suggested_external_port: granted.external_port,
+        ..spec
+    };
+    let refresh = tokio::spawn(async move {
+        let _ = run_refresh(flow, gateway, renewal, |_| {}, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await;
+    });
+
+    Ok(RawForwardedPort {
+        external_port: granted.external_port,
+        internal_port,
+        proto,
+        shutdown: Some(shutdown_tx),
+        refresh,
+    })
+}
+
 /// Accepts inbound connections on `listener` (a tunnel-side forwarded port) and
 /// relays each to the local `target`, one task per connection up to a bounded
 /// number in flight (see `MAX_INBOUND_RELAYS`). Returns when the listener ends
@@ -878,6 +991,66 @@ mod tests {
             err,
             PortForwardError::Gateway(ResultCode::NotAuthorized)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_raw_forward_reports_the_granted_port_and_keeps_renewing_it() {
+        // The raw datapath has no listener to bind: the mapping alone is the
+        // forward, and delivery to a client is the device's business.
+        let gw = FakeGateway::new(Behavior::Grant(40001));
+        let requests = Arc::clone(&gw.requests);
+
+        let port = forward_port_raw(gw, GW, MapProto::Tcp, 8080, 0)
+            .await
+            .expect("the gateway grants the mapping");
+
+        assert_eq!(port.external_port(), 40001);
+        assert_eq!(port.internal_port(), 8080);
+        assert_eq!(port.proto(), MapProto::Tcp);
+
+        // The renewal re-suggests exactly what was granted, so a refresh can
+        // never silently move the public port.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let renewal = requests.lock().unwrap().last().cloned().expect("a request");
+        assert_eq!(
+            u16::from_be_bytes([renewal[6], renewal[7]]),
+            40001,
+            "the renewal asks for the port the exit already granted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_raw_forward_releases_its_mapping_on_shutdown() {
+        let gw = FakeGateway::new(Behavior::Grant(40001));
+        let requests = Arc::clone(&gw.requests);
+        let port = forward_port_raw(gw, GW, MapProto::Udp, 51820, 0)
+            .await
+            .expect("granted");
+
+        port.shutdown().await;
+
+        let reqs = requests.lock().unwrap();
+        let last = reqs.last().expect("a request was sent");
+        assert_eq!(
+            u32::from_be_bytes([last[8], last[9], last[10], last[11]]),
+            0,
+            "the exit reclaims the port now instead of waiting for the lease"
+        );
+        assert_eq!(u16::from_be_bytes([last[4], last[5]]), 51820);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_raw_forward_surfaces_a_strict_suggestion_refusal() {
+        // The follow policy above this reads the conflict to decide whether to
+        // degrade to a server pick or hold a pinned port.
+        let gw = FakeGateway::new(Behavior::Reject(ResultCode::SuggestedPortUnavailable));
+        let err = forward_port_raw(gw, GW, MapProto::Tcp, 8080, 40001)
+            .await
+            .expect_err("the exit refuses a taken port");
+        assert!(
+            err.is_suggested_port_conflict(),
+            "the refusal must stay distinguishable: {err:?}"
+        );
     }
 
     #[tokio::test]
