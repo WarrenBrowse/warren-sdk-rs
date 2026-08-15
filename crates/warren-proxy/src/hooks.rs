@@ -43,6 +43,7 @@ const SECRET_ENV: [&str; 2] = ["WARREN_MNEMONIC", "WARREN_MNEMONIC_FILE"];
 /// How long the hook's process group is given between its SIGTERM and its
 /// SIGKILL: enough for a shell trap to undo what the hook did, short enough
 /// that a stop is not held up by a hook that ignores the polite signal.
+#[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_millis(500);
 
 /// A hook is an operator-written command line, so it runs under the platform's

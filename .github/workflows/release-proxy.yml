@@ -164,10 +164,10 @@ jobs:
             return 1
           }
           retry_flaky cargo build --locked --release -p warren-proxy --target "$CARGO_TARGET"
-          # The gate this pipeline had none of: a tag can be cut on any commit,
-          # so nothing else guarantees the code being packaged ever passed its
-          # tests. Release profile and same target as the build above, so it
-          # reuses what was just compiled instead of building a second time.
+          # A tag can be cut on any commit, so nothing else in this pipeline
+          # guarantees the code being packaged passed its tests. Release profile
+          # and same target as the build above, so it reuses what was just
+          # compiled instead of building a second time.
           retry_flaky cargo test --locked --release -p warren-proxy --target "$CARGO_TARGET"
           if [ ! -x "$BIN" ]; then
             echo "cargo reported success but produced no binary at $BIN"; exit 1
