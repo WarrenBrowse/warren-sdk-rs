@@ -6,7 +6,7 @@
 //! plane: [`RawUdpDemux`] hands out [`RawUdpFlow`]s bound to a source port,
 //! [`RawUdpFlow`] builds the IP + UDP packet and pushes it into the device's
 //! uplink, and [`RawUdpDemux::deliver`] routes a downlink packet back to the
-//! flow that owns its destination port.
+//! flow that owns its destination address and port.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -153,7 +153,13 @@ fn push_udp(
 
 /// The source, destination and payload of a UDP packet, or `None` when the
 /// packet is not a UDP datagram this plane can read (a fragment, an unsupported
-/// family, an IPv6 extension header, a truncated header).
+/// family, an IPv6 extension header, a truncated header, a length field that
+/// claims more than the packet carries).
+///
+/// The payload is bounded by the IP and UDP length fields rather than by the
+/// buffer: the downlink hands over whatever it read, and a control-plane answer
+/// parsed with trailing bytes appended is a different message from the one that
+/// was sent.
 fn parse_udp(packet: &[u8]) -> Option<(SocketAddr, SocketAddr, &[u8])> {
     let (src_ip, dst_ip, udp) = match packet.first()? >> 4 {
         4 => {
@@ -170,12 +176,25 @@ fn parse_udp(packet: &[u8]) -> Option<(SocketAddr, SocketAddr, &[u8])> {
             if frag & 0x1FFF != 0 || frag & 0x2000 != 0 {
                 return None;
             }
+            let total = usize::from(u16::from_be_bytes([*packet.get(2)?, *packet.get(3)?]));
+            if total < ihl || total > packet.len() {
+                return None;
+            }
             let src: [u8; 4] = packet.get(12..16)?.try_into().ok()?;
             let dst: [u8; 4] = packet.get(16..20)?.try_into().ok()?;
-            (IpAddr::from(src), IpAddr::from(dst), packet.get(ihl..)?)
+            (
+                IpAddr::from(src),
+                IpAddr::from(dst),
+                packet.get(ihl..total)?,
+            )
         }
         6 => {
             if packet.len() < IPV6_HEADER_LEN || packet.get(6)? != &PROTO_UDP {
+                return None;
+            }
+            let payload_len = usize::from(u16::from_be_bytes([*packet.get(4)?, *packet.get(5)?]));
+            let end = IPV6_HEADER_LEN.checked_add(payload_len)?;
+            if end > packet.len() {
                 return None;
             }
             let src: [u8; 16] = packet.get(8..24)?.try_into().ok()?;
@@ -183,7 +202,7 @@ fn parse_udp(packet: &[u8]) -> Option<(SocketAddr, SocketAddr, &[u8])> {
             (
                 IpAddr::from(src),
                 IpAddr::from(dst),
-                packet.get(IPV6_HEADER_LEN..)?,
+                packet.get(IPV6_HEADER_LEN..end)?,
             )
         }
         _ => return None,
@@ -191,19 +210,31 @@ fn parse_udp(packet: &[u8]) -> Option<(SocketAddr, SocketAddr, &[u8])> {
     if udp.len() < UDP_HEADER_LEN {
         return None;
     }
+    let udp_len = usize::from(u16::from_be_bytes([udp[4], udp[5]]));
+    if udp_len < UDP_HEADER_LEN || udp_len > udp.len() {
+        return None;
+    }
     let src_port = u16::from_be_bytes([udp[0], udp[1]]);
     let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
     Some((
         SocketAddr::new(src_ip, src_port),
         SocketAddr::new(dst_ip, dst_port),
-        &udp[UDP_HEADER_LEN..],
+        &udp[UDP_HEADER_LEN..udp_len],
     ))
 }
 
-/// One flow's registration: the identity of the registration itself, so a
-/// superseded flow can tell its own entry from the one that replaced it, and
-/// the inbox its datagrams are queued on.
-type Registration = (u64, mpsc::Sender<(Bytes, SocketAddr)>);
+/// One flow's registration.
+struct Registration {
+    /// The identity of the registration itself, so a superseded flow can tell
+    /// its own entry from the one that replaced it.
+    token: u64,
+    /// The address this flow answers on. A device shares its downlink with
+    /// everything the exit forwards, so the port alone does not say that a
+    /// packet is this flow's.
+    local: SocketAddr,
+    /// Where this flow's datagrams are queued.
+    inbox: mpsc::Sender<(Bytes, SocketAddr)>,
+}
 
 /// The registered flows of one device, keyed by the local port they own.
 type Registrations = Arc<Mutex<HashMap<u16, Registration>>>;
@@ -243,6 +274,9 @@ impl RawUdpDemux {
     /// on a query id): without it, anything that can reach this device's
     /// address on the control port could answer for the gateway.
     ///
+    /// `local` is matched in full on delivery: a flow owns one address on its
+    /// port, not every address the device sees on it.
+    ///
     /// A second registration on a port replaces the first, which is what a
     /// re-registration after an epoch change means.
     #[must_use]
@@ -254,7 +288,14 @@ impl RawUdpDemux {
         self.flows
             .lock()
             .expect("raw udp registrations lock")
-            .insert(local.port(), (token, tx));
+            .insert(
+                local.port(),
+                Registration {
+                    token,
+                    local,
+                    inbox: tx,
+                },
+            );
         RawUdpFlow {
             local,
             expected_remote,
@@ -267,9 +308,11 @@ impl RawUdpDemux {
 
     /// Offers one downlink packet to the registered flows.
     ///
-    /// Returns `true` when the packet was addressed to a registered port (the
-    /// device must not route it anywhere else), whether it was queued or
-    /// dropped for a full queue.
+    /// Returns `true` when the packet was addressed to a registered flow's own
+    /// address and port (the device must not route it anywhere else), whether
+    /// it was queued or dropped for a full queue. A packet carrying any other
+    /// destination address belongs to whatever else the device serves, even on
+    /// a port a flow holds.
     #[must_use]
     pub fn deliver(&self, packet: &[u8]) -> bool {
         let Some((src, dst, payload)) = parse_udp(packet) else {
@@ -277,7 +320,10 @@ impl RawUdpDemux {
         };
         let sender = {
             let flows = self.flows.lock().expect("raw udp registrations lock");
-            flows.get(&dst.port()).map(|(_, tx)| tx.clone())
+            flows
+                .get(&dst.port())
+                .filter(|registered| registered.local == dst)
+                .map(|registered| registered.inbox.clone())
         };
         let Some(sender) = sender else {
             return false;
@@ -299,7 +345,8 @@ impl RawUdpDemux {
 
 /// One UDP flow over a raw IP plane (see [`RawUdpDemux`]).
 ///
-/// Dropping it frees its local port at the demux.
+/// Dropping it frees its local port at the demux, unless a later registration
+/// has already taken that port over.
 pub struct RawUdpFlow {
     local: SocketAddr,
     expected_remote: SocketAddr,
@@ -326,7 +373,7 @@ impl Drop for RawUdpFlow {
         if let Ok(mut flows) = self.flows.lock()
             && flows
                 .get(&self.local.port())
-                .is_some_and(|(token, _)| *token == self.token)
+                .is_some_and(|registered| registered.token == self.token)
         {
             flows.remove(&self.local.port());
         }
@@ -374,6 +421,8 @@ mod tests {
 
     const CLIENT: &str = "10.66.0.2:61000";
     const GATEWAY: &str = "10.66.0.1:5351";
+    const V6_CLIENT: &str = "[fdcc:f:1::2]:61000";
+    const V6_GATEWAY: &str = "[fdcc:f:1::1]:5351";
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().expect("test address")
@@ -535,6 +584,103 @@ mod tests {
             "only the expected remote is delivered"
         );
         assert_eq!(from, addr(GATEWAY));
+    }
+
+    #[tokio::test]
+    async fn trailing_bytes_never_extend_a_delivered_payload() {
+        // The downlink hands over whatever buffer it read; the length fields
+        // are what delimit the datagram. A control-plane answer parsed with
+        // trailing bytes appended is a different message.
+        let (demux, _uplink) = demux();
+        let mut flow = demux.register(addr(CLIENT), addr(GATEWAY));
+        let mut packet =
+            build_udp_packet(addr(GATEWAY), addr(CLIENT), b"granted").expect("the answer");
+        packet.extend_from_slice(b"trailing");
+        assert!(demux.deliver(&packet));
+        let (payload, _) = flow.recv_from().await.expect("the answer arrives");
+        assert_eq!(
+            payload,
+            Bytes::from_static(b"granted"),
+            "the declared length bounds the payload, never the buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ip_total_length_beyond_the_buffer_is_refused() {
+        let (demux, _uplink) = demux();
+        let _flow = demux.register(addr(CLIENT), addr(GATEWAY));
+        let mut packet =
+            build_udp_packet(addr(GATEWAY), addr(CLIENT), b"granted").expect("the answer");
+        let over = u16::try_from(packet.len() + 8).expect("fits");
+        packet[2..4].copy_from_slice(&over.to_be_bytes());
+        assert!(
+            !demux.deliver(&packet),
+            "a packet that declares more than it carries is not one this plane can read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_udp_length_shorter_than_its_ip_packet_bounds_the_payload() {
+        // The two lengths are independent: padding between the UDP datagram and
+        // the end of the IP packet is not payload.
+        let (demux, _uplink) = demux();
+        let mut flow = demux.register(addr(CLIENT), addr(GATEWAY));
+        let mut packet =
+            build_udp_packet(addr(GATEWAY), addr(CLIENT), b"granted").expect("the answer");
+        let shortened = u16::try_from(UDP_HEADER_LEN + 2).expect("fits");
+        packet[IPV4_HEADER_LEN + 4..IPV4_HEADER_LEN + 6].copy_from_slice(&shortened.to_be_bytes());
+        assert!(demux.deliver(&packet));
+        let (payload, _) = flow.recv_from().await.expect("the answer arrives");
+        assert_eq!(
+            payload,
+            Bytes::from_static(b"gr"),
+            "the UDP length bounds the payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_udp_length_beyond_the_packet_is_refused() {
+        let (demux, _uplink) = demux();
+        let _flow = demux.register(addr(CLIENT), addr(GATEWAY));
+        let mut packet =
+            build_udp_packet(addr(GATEWAY), addr(CLIENT), b"granted").expect("the answer");
+        packet[IPV4_HEADER_LEN + 4..IPV4_HEADER_LEN + 6].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(
+            !demux.deliver(&packet),
+            "a UDP header claiming more than the packet holds is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_v6_payload_length_bounds_the_delivered_payload() {
+        let (demux, _uplink) = demux();
+        let mut flow = demux.register(addr(V6_CLIENT), addr(V6_GATEWAY));
+        let mut packet =
+            build_udp_packet(addr(V6_GATEWAY), addr(V6_CLIENT), b"answer").expect("the answer");
+        packet.extend_from_slice(b"padding");
+        assert!(demux.deliver(&packet));
+        let (payload, _) = flow.recv_from().await.expect("the answer arrives");
+        assert_eq!(
+            payload,
+            Bytes::from_static(b"answer"),
+            "the v6 payload length bounds the datagram"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_packet_addressed_to_another_host_is_not_consumed() {
+        // Peers of this tunnel share the exit's forwarding plane, so a downlink
+        // packet can carry any destination address. Routing on the port alone
+        // would hand this flow a datagram addressed to somebody else, and take
+        // it away from whatever the device would have done with it.
+        let (demux, _uplink) = demux();
+        let _flow = demux.register(addr(CLIENT), addr(GATEWAY));
+        let elsewhere = build_udp_packet(addr(GATEWAY), addr("10.66.0.9:61000"), b"not ours")
+            .expect("a packet for another client");
+        assert!(
+            !demux.deliver(&elsewhere),
+            "the flow owns one address, not every address on its port"
+        );
     }
 
     #[tokio::test]
