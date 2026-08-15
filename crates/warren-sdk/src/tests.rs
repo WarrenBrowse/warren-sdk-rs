@@ -926,7 +926,7 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
 async fn supervise_forward_remaps_across_epochs_and_clears_on_drop() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use crate::supervisor::{ExternalPort, supervise_forward};
+    use crate::supervisor::{ExternalPort, ReleaseGate, supervise_forward};
 
     #[derive(Clone)]
     struct FakeForwarder(u16);
@@ -939,6 +939,8 @@ async fn supervise_forward_remaps_across_epochs_and_clears_on_drop() {
         fn external_port(&self) -> u16 {
             self.external
         }
+
+        async fn shutdown(self) {}
     }
     impl Drop for FakePort {
         fn drop(&mut self) {
@@ -960,6 +962,7 @@ async fn supervise_forward_remaps_across_epochs_and_clears_on_drop() {
                 ext_tx,
                 tokio::sync::watch::channel(None).0,
                 crate::portfollow::PortFollowConfig::default(),
+                ReleaseGate::default(),
                 move |f: FakeForwarder, _suggested: u16| {
                     let establishes = Arc::clone(&establishes);
                     let dropped = Arc::clone(&first_dropped);
@@ -1003,6 +1006,67 @@ async fn supervise_forward_remaps_across_epochs_and_clears_on_drop() {
     task.abort();
 }
 
+/// Stopping must RELEASE the mapping at the exit rather than let the lease
+/// lapse: it is requested for 7200 s, so a daemon that restarts on another
+/// internal port strands the old public port for two hours.
+#[tokio::test]
+async fn supervise_forward_releases_the_mapping_when_asked_to_stop() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::supervisor::{ExternalPort, ReleaseGate, supervise_forward};
+
+    #[derive(Clone)]
+    struct FakeForwarder;
+
+    struct FakePort {
+        released: Arc<AtomicBool>,
+    }
+    impl ExternalPort for FakePort {
+        fn external_port(&self) -> u16 {
+            5000
+        }
+        async fn shutdown(self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let (fwd_tx, fwd_rx) = tokio::sync::watch::channel::<Option<FakeForwarder>>(None);
+    let (ext_tx, mut ext_rx) = tokio::sync::watch::channel::<Option<u16>>(None);
+    let released = Arc::new(AtomicBool::new(false));
+    let gate = ReleaseGate::default();
+
+    let task = {
+        let gate = gate.clone();
+        let released = Arc::clone(&released);
+        tokio::spawn(async move {
+            supervise_forward(
+                fwd_rx,
+                ext_tx,
+                tokio::sync::watch::channel(None).0,
+                crate::portfollow::PortFollowConfig::default(),
+                gate,
+                move |_f: FakeForwarder, _suggested: u16| {
+                    let released = Arc::clone(&released);
+                    async move { Ok::<_, SdkError>(FakePort { released }) }
+                },
+            )
+            .await;
+        })
+    };
+
+    fwd_tx.send(Some(FakeForwarder)).unwrap();
+    ext_rx.changed().await.unwrap();
+    assert_eq!(*ext_rx.borrow(), Some(5000));
+
+    gate.release(std::time::Duration::from_secs(5)).await;
+
+    assert!(
+        released.load(Ordering::SeqCst),
+        "the graceful stop must reach the mapping's own release, not just abort the task"
+    );
+    task.abort();
+}
+
 #[tokio::test]
 async fn supervise_forward_resuggests_the_last_granted_external_port() {
     // The public port must "follow" the client: the first establish suggests 0
@@ -1011,7 +1075,7 @@ async fn supervise_forward_resuggests_the_last_granted_external_port() {
     // a fresh random one.
     use std::sync::Mutex;
 
-    use crate::supervisor::{ExternalPort, supervise_forward};
+    use crate::supervisor::{ExternalPort, ReleaseGate, supervise_forward};
 
     #[derive(Clone)]
     struct FakeForwarder(u16);
@@ -1021,6 +1085,8 @@ async fn supervise_forward_resuggests_the_last_granted_external_port() {
         fn external_port(&self) -> u16 {
             self.0
         }
+
+        async fn shutdown(self) {}
     }
 
     let (fwd_tx, fwd_rx) = tokio::sync::watch::channel::<Option<FakeForwarder>>(None);
@@ -1035,6 +1101,7 @@ async fn supervise_forward_resuggests_the_last_granted_external_port() {
                 ext_tx,
                 tokio::sync::watch::channel(None).0,
                 crate::portfollow::PortFollowConfig::default(),
+                ReleaseGate::default(),
                 move |f: FakeForwarder, suggested: u16| {
                     let suggested_seen = Arc::clone(&suggested_seen);
                     async move {
@@ -1098,7 +1165,7 @@ async fn supervise_forward_auto_conflict_degrades_to_a_server_pick() {
     use std::sync::Mutex;
 
     use crate::portfollow::{PortFollowConfig, PortFollowOutcome};
-    use crate::supervisor::{ExternalPort, supervise_forward};
+    use crate::supervisor::{ExternalPort, ReleaseGate, supervise_forward};
 
     #[derive(Clone)]
     struct FakeForwarder {
@@ -1110,6 +1177,8 @@ async fn supervise_forward_auto_conflict_degrades_to_a_server_pick() {
         fn external_port(&self) -> u16 {
             self.0
         }
+
+        async fn shutdown(self) {}
     }
 
     let (fwd_tx, fwd_rx) = tokio::sync::watch::channel::<Option<FakeForwarder>>(None);
@@ -1125,6 +1194,7 @@ async fn supervise_forward_auto_conflict_degrades_to_a_server_pick() {
                 ext_tx,
                 out_tx,
                 PortFollowConfig::default(),
+                ReleaseGate::default(),
                 move |f: FakeForwarder, suggested: u16| {
                     let suggested_seen = Arc::clone(&suggested_seen);
                     async move {
@@ -1195,7 +1265,7 @@ async fn supervise_forward_pinned_conflict_stays_without_degrading() {
     use std::sync::Mutex;
 
     use crate::portfollow::{PortFollowConfig, PortFollowOutcome, PortFollowPolicy};
-    use crate::supervisor::{ExternalPort, supervise_forward};
+    use crate::supervisor::{ExternalPort, ReleaseGate, supervise_forward};
 
     #[derive(Clone)]
     struct FakeForwarder {
@@ -1206,6 +1276,8 @@ async fn supervise_forward_pinned_conflict_stays_without_degrading() {
         fn external_port(&self) -> u16 {
             self.0
         }
+
+        async fn shutdown(self) {}
     }
 
     let (fwd_tx, fwd_rx) = tokio::sync::watch::channel::<Option<FakeForwarder>>(None);
@@ -1226,6 +1298,7 @@ async fn supervise_forward_pinned_conflict_stays_without_degrading() {
                 ext_tx,
                 out_tx,
                 config,
+                ReleaseGate::default(),
                 move |f: FakeForwarder, suggested: u16| {
                     let suggested_seen = Arc::clone(&suggested_seen);
                     async move {
@@ -1291,7 +1364,7 @@ async fn supervise_forward_disabled_policy_never_resuggests() {
     use std::sync::Mutex;
 
     use crate::portfollow::{PortFollowConfig, PortFollowPolicy};
-    use crate::supervisor::{ExternalPort, supervise_forward};
+    use crate::supervisor::{ExternalPort, ReleaseGate, supervise_forward};
 
     #[derive(Clone)]
     struct FakeForwarder(u16);
@@ -1300,6 +1373,8 @@ async fn supervise_forward_disabled_policy_never_resuggests() {
         fn external_port(&self) -> u16 {
             self.0
         }
+
+        async fn shutdown(self) {}
     }
 
     let (fwd_tx, fwd_rx) = tokio::sync::watch::channel::<Option<FakeForwarder>>(None);
@@ -1319,6 +1394,7 @@ async fn supervise_forward_disabled_policy_never_resuggests() {
                 ext_tx,
                 out_tx,
                 config,
+                ReleaseGate::default(),
                 move |f: FakeForwarder, suggested: u16| {
                     let suggested_seen = Arc::clone(&suggested_seen);
                     async move {
@@ -1355,7 +1431,7 @@ async fn supervise_forward_retries_a_transient_failure_within_the_epoch() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::portfollow::{PortFollowConfig, PortFollowOutcome};
-    use crate::supervisor::{ExternalPort, supervise_forward};
+    use crate::supervisor::{ExternalPort, ReleaseGate, supervise_forward};
 
     #[derive(Clone)]
     struct FakeForwarder;
@@ -1364,6 +1440,8 @@ async fn supervise_forward_retries_a_transient_failure_within_the_epoch() {
         fn external_port(&self) -> u16 {
             self.0
         }
+
+        async fn shutdown(self) {}
     }
 
     let (fwd_tx, fwd_rx) = tokio::sync::watch::channel::<Option<FakeForwarder>>(None);
@@ -1384,6 +1462,7 @@ async fn supervise_forward_retries_a_transient_failure_within_the_epoch() {
                 ext_tx,
                 out_tx,
                 config,
+                ReleaseGate::default(),
                 move |_f: FakeForwarder, _suggested: u16| {
                     let attempts = Arc::clone(&attempts);
                     async move {

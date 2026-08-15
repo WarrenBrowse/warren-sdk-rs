@@ -257,24 +257,35 @@ impl SupervisedProxyHandle {
         let (external_tx, external_rx) = tokio::sync::watch::channel(None);
         let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
         let forwarder_rx = self.forwarder_rx.clone();
-        let task = tokio::spawn(async move {
-            supervise_forward(
-                forwarder_rx,
-                external_tx,
-                outcome_tx,
-                config,
-                move |forwarder: ProxyForwarder, suggested| async move {
-                    forwarder
-                        .forward_port_with_suggested(proto, internal_port, local_target, suggested)
-                        .await
-                },
-            )
-            .await;
+        let release = ReleaseGate::default();
+        let task = tokio::spawn({
+            let release = release.clone();
+            async move {
+                supervise_forward(
+                    forwarder_rx,
+                    external_tx,
+                    outcome_tx,
+                    config,
+                    release,
+                    move |forwarder: ProxyForwarder, suggested| async move {
+                        forwarder
+                            .forward_port_with_suggested(
+                                proto,
+                                internal_port,
+                                local_target,
+                                suggested,
+                            )
+                            .await
+                    },
+                )
+                .await;
+            }
         });
         SupervisedForwardedPort {
             internal_port,
             external_rx,
             outcome_rx,
+            release,
             task,
         }
     }
@@ -298,8 +309,14 @@ pub struct SupervisedForwardedPort {
     internal_port: u16,
     external_rx: tokio::sync::watch::Receiver<Option<u16>>,
     outcome_rx: tokio::sync::watch::Receiver<Option<crate::portfollow::PortFollowOutcome>>,
+    release: ReleaseGate,
     task: tokio::task::JoinHandle<()>,
 }
+
+/// How long [`SupervisedForwardedPort::shutdown`] waits for the exit to
+/// acknowledge the delete. The exchange is one round trip through the tunnel;
+/// past that the tunnel is gone and the lease has to lapse on its own.
+const PORT_RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl SupervisedForwardedPort {
     /// The local internal port being forwarded (stable for the life of this
@@ -342,8 +359,15 @@ impl SupervisedForwardedPort {
         self.outcome_rx.clone()
     }
 
-    /// Tears the forward down.
-    pub fn shutdown(self) {
+    /// Releases the forward at the exit, then tears it down.
+    ///
+    /// Dropping the handle instead stops the local tasks and leaves the
+    /// mapping to lapse on its own (up to two hours), which strands the public
+    /// port for anyone restarting on a different internal port or protocol.
+    /// Bounded by [`PORT_RELEASE_BUDGET`], so a dead tunnel cannot hold a
+    /// shutdown open.
+    pub async fn shutdown(self) {
+        self.release.release(PORT_RELEASE_BUDGET).await;
         self.task.abort();
     }
 }
@@ -354,17 +378,67 @@ impl Drop for SupervisedForwardedPort {
     }
 }
 
-/// An established forwarded port whose granted external port can be read. Lets
-/// [`supervise_forward`] be unit-tested with a fake port (the production type is
-/// [`ForwardedPort`]).
+/// An established forwarded port whose granted external port can be read, and
+/// whose mapping can be released at the gateway. Lets [`supervise_forward`] be
+/// unit-tested with a fake port (the production type is [`ForwardedPort`]).
 pub(crate) trait ExternalPort {
     fn external_port(&self) -> u16;
+
+    /// Releases the mapping at the exit and returns once it is gone. Declared
+    /// as an explicit `impl Future + Send` rather than `async fn` so the
+    /// supervising task stays `Send` for `tokio::spawn`.
+    fn shutdown(self) -> impl std::future::Future<Output = ()> + Send;
 }
 
 impl ExternalPort for ForwardedPort {
     fn external_port(&self) -> u16 {
         ForwardedPort::external_port(self)
     }
+
+    fn shutdown(self) -> impl std::future::Future<Output = ()> + Send {
+        ForwardedPort::shutdown(self)
+    }
+}
+
+/// The graceful-stop rendezvous between a [`SupervisedForwardedPort`] and the
+/// task that owns its live mapping: the handle asks, the task deletes the
+/// mapping at the gateway and answers. Dropping the handle alone cannot do it,
+/// because the NAT-PMP flow lives inside that task.
+#[derive(Clone, Default)]
+pub(crate) struct ReleaseGate {
+    requested: Arc<tokio::sync::Notify>,
+    released: Arc<tokio::sync::Notify>,
+}
+
+impl ReleaseGate {
+    /// Asks for the release and waits for it, giving up after `budget` (the
+    /// gateway is reached through the tunnel, which may already be gone).
+    pub(crate) async fn release(&self, budget: std::time::Duration) {
+        self.requested.notify_one();
+        let _ = tokio::time::timeout(budget, self.released.notified()).await;
+    }
+
+    /// Resolves when a release has been asked for.
+    async fn requested(&self) {
+        self.requested.notified().await;
+    }
+
+    /// Reports the release as done.
+    fn ack(&self) {
+        self.released.notify_one();
+    }
+}
+
+/// Releases the live mapping (if any) and answers the handle waiting on it.
+///
+/// The external-port channel is deliberately NOT cleared: the caller is
+/// stopping and has already retired the port it published, so announcing a
+/// change here would fire its down hook a second time.
+async fn release_and_ack<P: ExternalPort>(current: Option<P>, gate: &ReleaseGate) {
+    if let Some(port) = current {
+        port.shutdown().await;
+    }
+    gate.ack();
 }
 
 /// Drives one forwarded port across tunnel rebuilds: when a forwarder appears
@@ -384,6 +458,7 @@ pub(crate) async fn supervise_forward<F, P, E, Fut>(
     external_tx: tokio::sync::watch::Sender<Option<u16>>,
     outcome_tx: tokio::sync::watch::Sender<Option<crate::portfollow::PortFollowOutcome>>,
     config: crate::portfollow::PortFollowConfig,
+    release: ReleaseGate,
     mut establish: E,
 ) where
     F: Clone,
@@ -482,6 +557,10 @@ pub(crate) async fn supervise_forward<F, P, E, Fut>(
                                 return;
                             }
                         }
+                        () = release.requested() => {
+                            release_and_ack(current.take(), &release).await;
+                            return;
+                        }
                     }
                     continue;
                 }
@@ -494,8 +573,16 @@ pub(crate) async fn supervise_forward<F, P, E, Fut>(
                 }
             }
         }
-        if forwarder_rx.changed().await.is_err() {
-            return;
+        tokio::select! {
+            changed = forwarder_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = release.requested() => {
+                release_and_ack(current.take(), &release).await;
+                return;
+            }
         }
     }
 }
