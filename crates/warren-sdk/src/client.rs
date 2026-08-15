@@ -1273,6 +1273,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         let socket_bypass = cfg.socket_bypass;
         self.spawn_supervised_packet(
             device,
+            cfg,
             move || {
                 let signing = signing.clone();
                 let exit = exit.clone();
@@ -1336,6 +1337,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         let rtt_cache = Arc::clone(&self.rtt_cache);
         self.spawn_supervised_packet(
             device,
+            cfg,
             move || {
                 let signing = signing.clone();
                 let exits = exits.clone();
@@ -1392,6 +1394,7 @@ impl<T: HttpTransport> WarrenClient<T> {
     async fn spawn_supervised_packet<D, F, Fut, DR>(
         &self,
         device: D,
+        cfg: &PacketDatapathConfig,
         connect: F,
         on_drain: DR,
     ) -> Result<SupervisedPacketHandle, SdkError>
@@ -1402,6 +1405,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             + Send,
         DR: Fn() + Send + 'static,
     {
+        let migration = packet_migration_policy(cfg);
         let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
         let (forwarder_tx, forwarder_rx) = tokio::sync::watch::channel(None);
         let (addressing_tx, addressing_rx) = tokio::sync::watch::channel(None);
@@ -1431,11 +1435,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                     // A moved default path migrates the live session and,
                     // failing that, redials at once.
                     network_watch: Some(crate::supervisor::NetworkWatch::system()),
-                    // The device captures no host route of the SDK's making;
-                    // when its own clients capture one, the carrier escapes by
-                    // socket (`PacketDatapathConfig::socket_bypass`), which the
-                    // rebind policy reapplies.
-                    migration: crate::supervisor::MigrationPolicy::default(),
+                    migration,
                 },
                 connect,
                 on_drain,
@@ -1574,6 +1574,24 @@ pub struct PacketDatapathConfig {
     /// datagrams (`SO_MARK` on Linux, `IP_BOUND_IF` on macOS, `IP_UNICAST_IF`
     /// on Windows). `None` for a device whose clients capture no route.
     pub socket_bypass: Option<SocketBypass>,
+}
+
+/// The escape a raw-IP datapath's migration rebind must reapply.
+///
+/// The initial dial marks its carrier socket from the same configuration
+/// (`establish_multihop_with_bypass`); the rebind that follows a network change
+/// binds a FRESH socket, and a device whose clients point their default route
+/// into it captures anything unmarked, which is the hairpin
+/// [`PacketDatapathConfig::socket_bypass`] exists to prevent. No
+/// `<exit>/32` escape: the SDK installs no host route on this path, the device
+/// owns its own routing.
+pub(crate) fn packet_migration_policy(
+    cfg: &PacketDatapathConfig,
+) -> crate::supervisor::MigrationPolicy {
+    crate::supervisor::MigrationPolicy {
+        bypass: cfg.socket_bypass,
+        carrier_host_route: None,
+    }
 }
 
 /// The failover candidates that can resolve DNS over the tunnel: with an

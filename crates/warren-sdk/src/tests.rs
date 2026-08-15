@@ -3499,6 +3499,34 @@ fn a_carrier_bypass_reaches_the_dial_the_datapath_will_make() {
     );
 }
 
+#[test]
+fn a_packet_datapath_reapplies_its_carrier_bypass_on_a_migration_rebind() {
+    // The dial is not the only socket: a network change rebinds a fresh one,
+    // and a device whose clients route everything into it captures that socket
+    // unless the same escape is reapplied. A plain rebind here hairpins the
+    // carrier into the tunnel it carries.
+    use crate::client::{PacketDatapathConfig, packet_migration_policy};
+    assert!(
+        matches!(
+            packet_migration_policy(&PacketDatapathConfig::default()).rebind_policy(),
+            warren_transport::RebindPolicy::Plain
+        ),
+        "a device whose clients capture nothing needs no escape"
+    );
+    let bypass = warren_transport::SocketBypass::Fwmark(0x7761_7272);
+    assert!(
+        matches!(
+            packet_migration_policy(&PacketDatapathConfig {
+                dns_override: false,
+                socket_bypass: Some(bypass),
+            })
+            .rebind_policy(),
+            warren_transport::RebindPolicy::Bypass(b) if b == bypass
+        ),
+        "the configured bypass survives the rebind"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_packet_datapath_refuses_a_dns_disabled_exit_without_an_override() {
     // Same fail-fast as the proxy datapath: an exit with no in-tunnel forwarder
