@@ -291,6 +291,20 @@ impl Responder {
         plan: PeerPlan,
         options: ResponderOptions,
     ) -> Result<Self, ConfError> {
+        Self::with_indexes(conf, plan, options, IndexGen::new())
+    }
+
+    /// Builds a responder over a given index sequence.
+    ///
+    /// # Errors
+    ///
+    /// The same refusals as [`Responder::new`].
+    pub fn with_indexes(
+        conf: &GatewayConf,
+        plan: PeerPlan,
+        options: ResponderOptions,
+        indexes: IndexGen,
+    ) -> Result<Self, ConfError> {
         conf.validate()?;
         conf.check_against(&plan)?;
         let public = x25519_dalek::PublicKey::from(*conf.key.public().as_bytes());
@@ -306,7 +320,7 @@ impl Responder {
                 options.per_source_burst,
                 options.sources_tracked,
             ),
-            indexes: IndexGen::new(),
+            indexes,
             plan,
             isolation: options.peer_isolation,
             gate: Gate::default(),
@@ -316,18 +330,17 @@ impl Responder {
             last_wall: None,
         };
         for peer in &conf.peers {
-            responder.insert_peer(peer);
+            responder.insert_peer(peer)?;
         }
         responder.rebuild_routes();
         Ok(responder)
     }
 
-    fn insert_peer(&mut self, conf: &PeerConf) {
-        let Some(index) = self.indexes.next() else {
-            // 16 million peers on one gateway is not a deployment, and reusing
-            // an index would demux a stranger's data packet onto a live peer.
-            return;
-        };
+    fn insert_peer(&mut self, conf: &PeerConf) -> Result<PeerId, ConfError> {
+        // Sixteen million peers on one gateway is not a deployment, but a
+        // silently absent peer is a device that never connects with nothing to
+        // read about why, so the refusal is explicit.
+        let index = self.indexes.next().ok_or(ConfError::TooManyPeers)?;
         let id = PeerId::new(index);
         let tunn = self.build_tunn(conf, index);
         self.by_pubkey.insert(*conf.public.as_bytes(), id);
@@ -345,6 +358,7 @@ impl Responder {
                 last_drop: None,
             },
         );
+        Ok(id)
     }
 
     fn build_tunn(&self, conf: &PeerConf, index: u32) -> Tunn {
@@ -1026,7 +1040,7 @@ impl Responder {
                     report.rebuilt.push(peer.label.clone());
                 }
                 None => {
-                    self.insert_peer(peer);
+                    self.insert_peer(peer)?;
                     report.added.push(peer.label.clone());
                 }
             }
@@ -1983,6 +1997,34 @@ mod tests {
             .find(|peer| peer.label == clients[0].label)
             .expect("the rebuilt peer");
         assert!(!rebuilt.has_session);
+    }
+
+    #[test]
+    fn refuses_a_peer_it_has_no_index_left_to_number() {
+        let mut indexes = IndexGen::from_seed(1, 0);
+        while indexes.next().is_some() {}
+
+        let key = GatewayKey::generate();
+        let secret = x25519::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let conf = GatewayConf {
+            key,
+            peers: vec![PeerConf {
+                label: PeerLabel::new("peer2").unwrap(),
+                public: PeerPublicKey::from_bytes(x25519::PublicKey::from(&secret).to_bytes()),
+                psk: None,
+                allowed: vec![IpNetwork::from_str("10.67.0.2/32").unwrap()],
+            }],
+        };
+        assert_eq!(
+            Responder::with_indexes(
+                &conf,
+                PeerPlan::default(),
+                ResponderOptions::default(),
+                indexes
+            )
+            .unwrap_err(),
+            ConfError::TooManyPeers
+        );
     }
 
     #[test]

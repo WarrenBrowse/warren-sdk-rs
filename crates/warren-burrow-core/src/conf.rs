@@ -66,6 +66,11 @@ pub enum ConfError {
     /// Two peers carry the same label.
     #[error("two peers share one label")]
     DuplicateLabel,
+    /// The gateway has no session index left to number a peer with. Reusing
+    /// one would demux a stranger's data packet onto a live peer, so the
+    /// configuration is refused instead.
+    #[error("more peers than the index space holds")]
+    TooManyPeers,
 }
 
 /// One peer as the gateway configuration declares it.
