@@ -21,7 +21,7 @@ netns ownership) is the sibling for the gluetun-style `network_mode:
 | `WARREN_MNEMONIC` / `WARREN_MNEMONIC_FILE` | required | the account recovery phrase; the file variant wins and is what containers should use |
 | `WARREN_SOCKS_LISTEN` | `127.0.0.1:1080` | SOCKS5 listener. The listeners are unauthenticated: bind non-loopback only inside an isolated netns/container |
 | `WARREN_HTTP_LISTEN` | off | HTTP CONNECT listener |
-| `WARREN_HEALTH_LISTEN` | `127.0.0.1:9999` | liveness endpoint: `/healthz` (200 only when Connected AND egress verified for the CURRENT epoch: a reconnect clears the proof until a fresh probe passes), `/state`, `/port`; `off`, `none` or empty disables it, and `warren-proxy healthcheck` then exits 0 |
+| `WARREN_HEALTH_LISTEN` | `127.0.0.1:9999` | liveness endpoint: `/healthz` (200 only when Connected AND egress verified for the CURRENT epoch: a reconnect clears the proof until a fresh probe passes), `/state`, `/port`; `off`, `none` or empty disables it, and `warren-proxy healthcheck` then exits 0, which also makes the image's `HEALTHCHECK` a no-op: the runtime can no longer tell a wedged daemon from a healthy one |
 | `WARREN_EXITS` | all exits | priority list of `cc` or `cc/city` (e.g. `de, se/stockholm`); failover tries them in order |
 | `WARREN_CIRCUIT` | `single` | `single` (direct to exit) or `multi` (entry relay then exit) |
 | `WARREN_DNS_SERVER` | exit forwarder | IPv4 resolver queried over the tunnel (needed for `dns_disabled` exits) |
@@ -31,18 +31,21 @@ netns ownership) is the sibling for the gluetun-style `network_mode:
 | `WARREN_PORT_FORWARD_INTERNAL_PORT` | off | enables NAT-PMP forwarding of a tunnel-side port |
 | `WARREN_PORT_FORWARD_PROTOCOL` | `tcp` | `tcp` or `udp`, one transport per daemon: TCP and UDP are two independent mappings, reachable on two public ports of which only one could be announced, and holding two of the exit's per-client forward slots |
 | `WARREN_PORT_FORWARD_TARGET` | `127.0.0.1:<internal>` | local socket inbound connections are relayed to |
-| `WARREN_PORT_FORWARD_UP_COMMAND` | | run via the platform shell on every grant, `{{PORT}}` substituted (the gluetun up-command shape). The recovery phrase and its file path are removed from the hook child's own environment, so a hook that dumps `env` cannot leak them; a hook is killed with everything it spawned once it outlives its 30 s budget |
+| `WARREN_PORT_FORWARD_UP_COMMAND` | | run via the platform shell on every grant, `{{PORT}}` substituted (the gluetun up-command shape). The recovery phrase and its file path are removed from the hook child's own environment, so a hook that dumps `env` cannot leak them; a hook that outlives its 30 s budget is killed, on unix with everything it spawned (it runs in its own process group), on Windows the shell alone, so its grandchildren survive |
 | `WARREN_PORT_FORWARD_DOWN_COMMAND` | | run when the port is replaced, when the grant is lost, and at shutdown |
-| `WARREN_PORT_FORWARD_STATUS_FILE` | | the granted public port, one decimal line, atomically rewritten; removed when the mapping goes away |
+| `WARREN_PORT_FORWARD_STATUS_FILE` | | the granted public port, one decimal line, atomically rewritten; removed when the mapping goes away and on every daemon exit. The image ships `/run/warren` writable by the runtime user: put the file there and share that directory with the container that reads it |
 
 Port forwarding runs on the exit's default per-client quota: this daemon
 presents no entitlement credential, so the account's fleet-wide slot count is
 not what bounds it. The engine implements the atomic TCP+UDP pair (one public
 port, one credential); the SDK forward path this daemon uses does not carry it
-yet, which is why `both` is refused. On `SIGTERM` the down command runs, the
-status file is removed, and the NAT-PMP mapping is released at the exit rather
-than left to lapse with its lease (the release is bounded: if the tunnel is
-already gone the daemon says so and exits, and the lease lapses on its own).
+yet, which is why `both` is refused. The down command runs and the status file
+is removed on every exit, a signal and a terminal refusal alike. The NAT-PMP
+mapping is released at the exit rather than left to lapse with its lease, and
+the release is bounded: the daemon logs which of the three outcomes it got (the
+mapping was deleted, no live mapping was left to delete, or the delete did not
+answer inside its budget), and on the last two the exit keeps the public port
+until the lease lapses.
 
 Exit codes: `0` clean signal shutdown, `1` configuration or startup failure,
 `2` a terminal control-plane refusal, printed with its cause (unauthorized
