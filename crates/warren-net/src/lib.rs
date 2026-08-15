@@ -27,6 +27,8 @@
 //! datapath config lives in the `warren-tun` crate).
 
 #[cfg(feature = "proxy")]
+pub mod device;
+#[cfg(feature = "proxy")]
 pub mod dns;
 pub mod error;
 pub mod killswitch;
@@ -40,7 +42,11 @@ pub mod proxy;
 pub mod sink;
 pub mod socks5;
 pub mod tun_sink;
+#[cfg(feature = "proxy")]
+pub mod udp;
 
+#[cfg(feature = "proxy")]
+pub use device::{EXIT_ID_LEN, EpochAddressing, EpochId, EpochPacketDevice, ExitId};
 #[cfg(feature = "proxy")]
 pub use dns::{DnsError, RecordType, encode_query, parse_response};
 pub use error::NetError;
@@ -63,6 +69,8 @@ pub use tun_sink::{
     PumpStats, TunBridge, TunPacketSink, forward_bidirectional, forward_bidirectional_with_stats,
     tun_channels,
 };
+#[cfg(feature = "proxy")]
+pub use udp::{BoxUdpFlow, BoxUdpFuture, DynUdpFlow, DynUdpOpener, UdpOpener};
 /// The NAT-PMP mapping protocol selector (TCP or UDP) and the gateway result
 /// code, re-exported from the wire codec so callers can name them (notably to
 /// classify a strict suggestion refusal) without depending on `warren-wire`
