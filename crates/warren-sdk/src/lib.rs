@@ -92,7 +92,8 @@ pub use portfollow::{
 pub use proxy::{ProxyForwarder, ProxyHandle, TunnelState};
 pub use store::{FileGenerationStore, FileServerKeyStore};
 pub use supervisor::{
-    EpochEnd, EpochEndCause, MetricsReader, SupervisedForwardedPort, SupervisedProxyHandle,
+    EpochEnd, EpochEndCause, MetricsReader, PortRelease, SupervisedForwardedPort,
+    SupervisedProxyHandle,
 };
 
 #[cfg(test)]

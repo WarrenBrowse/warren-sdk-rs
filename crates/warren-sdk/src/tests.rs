@@ -1058,15 +1058,69 @@ async fn supervise_forward_releases_the_mapping_when_asked_to_stop() {
     ext_rx.changed().await.unwrap();
     assert_eq!(*ext_rx.borrow(), Some(5000));
 
-    let acknowledged = gate.release(std::time::Duration::from_secs(5)).await;
+    let outcome = gate.release(std::time::Duration::from_secs(5)).await;
 
     assert!(
         released.load(Ordering::SeqCst),
         "the graceful stop must reach the mapping's own release, not just abort the task"
     );
-    assert!(
-        acknowledged,
-        "a release the task carried out must be reported as done, not as a timeout"
+    assert_eq!(
+        outcome,
+        crate::PortRelease::Deleted,
+        "a release the task carried out must be reported as a delete"
+    );
+    task.abort();
+}
+
+/// Once an epoch has ended the mapping handle is gone, and dropping it never
+/// deletes anything at the exit. Answering that stop as a release is what made
+/// the daemon announce a freed public port it had in fact stranded for the two
+/// hours the lease still runs.
+#[tokio::test]
+async fn a_stop_with_no_live_mapping_reports_that_nothing_was_released() {
+    use crate::supervisor::{ExternalPort, ReleaseGate, supervise_forward};
+
+    #[derive(Clone)]
+    struct FakeForwarder;
+
+    struct FakePort;
+    impl ExternalPort for FakePort {
+        fn external_port(&self) -> u16 {
+            5000
+        }
+        async fn shutdown(self) {
+            panic!("there is no mapping to delete on this path");
+        }
+    }
+
+    // No forwarder ever appears, so the loop never establishes a mapping: the
+    // shape of a stop asked for after the epoch that owned the port ended.
+    let (_fwd_tx, fwd_rx) = tokio::sync::watch::channel::<Option<FakeForwarder>>(None);
+    let gate = ReleaseGate::default();
+
+    let task = {
+        let gate = gate.clone();
+        tokio::spawn(async move {
+            supervise_forward(
+                fwd_rx,
+                tokio::sync::watch::channel(None).0,
+                tokio::sync::watch::channel(None).0,
+                crate::portfollow::PortFollowConfig::default(),
+                gate,
+                move |_f: FakeForwarder, _suggested: u16| async move {
+                    Ok::<_, SdkError>(FakePort)
+                },
+            )
+            .await;
+        })
+    };
+
+    let outcome = gate.release(std::time::Duration::from_secs(5)).await;
+
+    assert_eq!(
+        outcome,
+        crate::PortRelease::NoMapping,
+        "with no live mapping the stop must say so, not claim a release"
     );
     task.abort();
 }
@@ -1080,10 +1134,11 @@ async fn a_release_nobody_carries_out_gives_up_on_its_budget() {
     let gate = ReleaseGate::default();
     let started = std::time::Instant::now();
 
-    let acknowledged = gate.release(std::time::Duration::from_millis(50)).await;
+    let outcome = gate.release(std::time::Duration::from_millis(50)).await;
 
-    assert!(
-        !acknowledged,
+    assert_eq!(
+        outcome,
+        crate::PortRelease::TimedOut,
         "with nobody to carry the release out it must report the give-up, not a success"
     );
     assert!(

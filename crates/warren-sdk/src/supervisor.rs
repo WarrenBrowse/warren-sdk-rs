@@ -372,14 +372,14 @@ impl SupervisedForwardedPort {
         self.task.abort();
     }
 
-    /// Releases the forward at the exit, then tears it down. Returns whether
-    /// the release was carried out inside [`PORT_RELEASE_BUDGET`]; `false`
-    /// means the tunnel was already gone and the exit will reclaim the port
-    /// when the lease lapses.
-    pub async fn release_and_shutdown(self) -> bool {
-        let released = self.release.release(PORT_RELEASE_BUDGET).await;
+    /// Releases the forward at the exit, then tears it down, reporting what
+    /// actually happened to the public port ([`PortRelease`]). Only
+    /// [`PortRelease::Deleted`] frees it now; on the other outcomes the exit
+    /// holds the mapping until its lease lapses.
+    pub async fn release_and_shutdown(self) -> PortRelease {
+        let outcome = self.release.release(PORT_RELEASE_BUDGET).await;
         self.task.abort();
-        released
+        outcome
     }
 }
 
@@ -418,18 +418,29 @@ impl ExternalPort for ForwardedPort {
 #[derive(Clone, Default)]
 pub(crate) struct ReleaseGate {
     requested: Arc<tokio::sync::Notify>,
-    released: Arc<tokio::sync::Notify>,
+    answered: Arc<tokio::sync::Notify>,
+    /// Whether the answer deleted a mapping. An epoch that has already ended
+    /// leaves nothing to delete, and that answer arrives just as fast as a
+    /// real delete, so the flag is the only thing that tells them apart.
+    deleted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ReleaseGate {
     /// Asks for the release and waits for it, giving up after `budget` (the
     /// gateway is reached through the tunnel, which may already be gone).
-    /// Reports whether the release was actually carried out.
-    pub(crate) async fn release(&self, budget: std::time::Duration) -> bool {
+    pub(crate) async fn release(&self, budget: std::time::Duration) -> PortRelease {
         self.requested.notify_one();
-        tokio::time::timeout(budget, self.released.notified())
+        if tokio::time::timeout(budget, self.answered.notified())
             .await
-            .is_ok()
+            .is_err()
+        {
+            return PortRelease::TimedOut;
+        }
+        if self.deleted.load(std::sync::atomic::Ordering::SeqCst) {
+            PortRelease::Deleted
+        } else {
+            PortRelease::NoMapping
+        }
     }
 
     /// Resolves when a release has been asked for.
@@ -437,10 +448,28 @@ impl ReleaseGate {
         self.requested.notified().await;
     }
 
-    /// Reports the release as done.
-    fn ack(&self) {
-        self.released.notify_one();
+    /// Reports the release as done, `deleted` saying whether a live mapping
+    /// was removed at the exit. Stored before the notify, so the waiter it
+    /// wakes reads the answer that belongs to its own request.
+    fn ack(&self, deleted: bool) {
+        self.deleted
+            .store(deleted, std::sync::atomic::Ordering::SeqCst);
+        self.answered.notify_one();
     }
+}
+
+/// What a graceful stop did to a forwarded port's mapping at the exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PortRelease {
+    /// The mapping was deleted at the exit: the public port is free now.
+    Deleted,
+    /// There was no live mapping to delete, so the exit keeps the port bound
+    /// until the lease lapses (up to two hours).
+    NoMapping,
+    /// The delete did not complete inside its budget; the tunnel it travels
+    /// through is gone and the lease lapses on its own.
+    TimedOut,
 }
 
 /// Releases the live mapping (if any) and answers the handle waiting on it.
@@ -449,10 +478,15 @@ impl ReleaseGate {
 /// stopping and has already retired the port it published, so announcing a
 /// change here would fire its down hook a second time.
 async fn release_and_ack<P: ExternalPort>(current: Option<P>, gate: &ReleaseGate) {
-    if let Some(port) = current {
+    let deleted = if let Some(port) = current {
         port.shutdown().await;
-    }
-    gate.ack();
+        true
+    } else {
+        // Nothing to delete: the epoch that owned the mapping already ended and
+        // dropping a `ForwardedPort` deliberately leaves the lease standing.
+        false
+    };
+    gate.ack(deleted);
 }
 
 /// Drives one forwarded port across tunnel rebuilds: when a forwarder appears

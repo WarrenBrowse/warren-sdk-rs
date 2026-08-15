@@ -14,7 +14,8 @@ use warren_sdk::net::{MapProto, ProxyConfig};
 use warren_sdk::socks_egress::{FIRST_EGRESS_RECHECK, FIRST_EGRESS_VERIFY, verify_first_egress};
 use warren_sdk::transport::FatalCause;
 use warren_sdk::{
-    Circuit, ConnectionState, SupervisedForwardedPort, SupervisedProxyHandle, WarrenClient,
+    Circuit, ConnectionState, PortRelease, SupervisedForwardedPort, SupervisedProxyHandle,
+    WarrenClient,
 };
 
 use crate::config::{CircuitKind, Config, ForwardConfig, ForwardProto};
@@ -133,10 +134,17 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
     // hours, so a restart on another internal port or protocol would leave the
     // public port stranded that long.
     if let Some(forward) = forward {
-        if forward.release_and_shutdown().await {
-            log("forwarded port released at the exit");
-        } else {
-            log("the forwarded port release timed out, its lease will lapse");
+        match forward.release_and_shutdown().await {
+            PortRelease::Deleted => log("forwarded port released at the exit"),
+            PortRelease::NoMapping => {
+                log("no live mapping to release, its lease lapses at the exit");
+            }
+            PortRelease::TimedOut => {
+                log("the forwarded port release timed out, its lease will lapse");
+            }
+            // `PortRelease` is non-exhaustive: an outcome added upstream is
+            // still not a proven delete, so report the port as possibly held.
+            _ => log("the forwarded port release proved no delete, its lease may lapse"),
         }
     }
     handle.shutdown();
