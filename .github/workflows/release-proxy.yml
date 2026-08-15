@@ -30,6 +30,13 @@ permissions:
   contents: write
   packages: write
 
+# One publish per ref at a time: two runs of the same tag would race on the
+# GHCR tags and on `gh release create`. Never cancels a run in flight, which
+# would leave a half-published release behind.
+concurrency:
+  group: release-proxy-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -157,6 +164,11 @@ jobs:
             return 1
           }
           retry_flaky cargo build --locked --release -p warren-proxy --target "$CARGO_TARGET"
+          # The gate this pipeline had none of: a tag can be cut on any commit,
+          # so nothing else guarantees the code being packaged ever passed its
+          # tests. Release profile and same target as the build above, so it
+          # reuses what was just compiled instead of building a second time.
+          retry_flaky cargo test --locked --release -p warren-proxy --target "$CARGO_TARGET"
           if [ ! -x "$BIN" ]; then
             echo "cargo reported success but produced no binary at $BIN"; exit 1
           fi
@@ -203,7 +215,9 @@ jobs:
             name="warren-proxy${ENV_TAG}-${VERSION}-linux-$2-musl"
             tar -C "dist/$1" -czf "out/${name}.tar.gz" warren-proxy
           done
-          (cd out && sha256sum ./*.tar.gz > SHA256SUMS)
+          # No `./` prefix: `sha256sum -c` is run from wherever the assets were
+          # downloaded, and the prefix makes every entry a path that has to match.
+          (cd out && sha256sum -- *.tar.gz > SHA256SUMS)
           ls -l out
       # The image is pushed BEFORE the release is created. A release is the
       # announcement, and its notes point at the image: publishing it first and

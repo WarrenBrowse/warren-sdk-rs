@@ -6,9 +6,17 @@
 # which drops the per-arch static binaries under dist/<arch>/ first.
 
 FROM alpine:3.22
-RUN apk add --no-cache ca-certificates && adduser -D -H warren
+# curl, because the documented port-forward hook shape is a curl into an
+# application API (BusyBox wget cannot express it).
+RUN apk add --no-cache ca-certificates curl && adduser -D -H warren
 ARG TARGETARCH
 COPY dist/${TARGETARCH}/warren-proxy /usr/local/bin/warren-proxy
+
+# Links the GHCR package back to this repository, which is the only way to
+# reach the source from a private package page.
+LABEL org.opencontainers.image.source="https://github.com/WarrenBrowse/warren-sdk-rs" \
+      org.opencontainers.image.description="Headless Warren proxy daemon (SOCKS5 / HTTP CONNECT), unprivileged" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later"
 
 # Container defaults: listeners on the container interface (reachable by
 # compose neighbours; the image is expected to run on an internal network),
