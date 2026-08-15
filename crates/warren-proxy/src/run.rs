@@ -11,7 +11,7 @@ use tokio::sync::watch;
 use warren_sdk::discovery::VerifiedExit;
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::net::{MapProto, ProxyConfig};
-use warren_sdk::socks_egress::{FIRST_EGRESS_VERIFY, verify_first_egress};
+use warren_sdk::socks_egress::{FIRST_EGRESS_RECHECK, FIRST_EGRESS_VERIFY, verify_first_egress};
 use warren_sdk::transport::FatalCause;
 use warren_sdk::{
     Circuit, ConnectionState, SupervisedForwardedPort, SupervisedProxyHandle, WarrenClient,
@@ -108,6 +108,16 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
     egress_verified.store(true, Ordering::Relaxed);
     log("tunnel up, egress verified");
 
+    tokio::spawn(track_egress_across_epochs(
+        handle.watch_state(),
+        Arc::clone(&egress_verified),
+        move || async move {
+            verify_first_egress(probe_addr, FIRST_EGRESS_RECHECK)
+                .await
+                .is_ok()
+        },
+    ));
+
     let forward: Option<SupervisedForwardedPort> = config
         .forward
         .as_ref()
@@ -136,6 +146,43 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
     };
     handle.shutdown();
     Ok(code)
+}
+
+/// Keeps `/healthz` honest across reconnects.
+///
+/// The first-egress proof belongs to the epoch it was measured on, so leaving
+/// `Connected` clears it and the next `Connected` has to prove egress again
+/// before the endpoint reports 200. Without this an orchestrator routes traffic
+/// into a rebuilt tunnel nobody has probed, on the strength of the previous
+/// epoch's result.
+async fn track_egress_across_epochs<R, Fut>(
+    mut state_rx: watch::Receiver<ConnectionState>,
+    egress_verified: Arc<AtomicBool>,
+    mut recheck: R,
+) where
+    R: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    // The receiver arrives having seen the state its creator saw (tokio marks
+    // the current version at clone time), so this reacts to what happens NEXT
+    // without a spurious probe, and without a window where a transition raised
+    // before the first poll is lost.
+    loop {
+        if state_rx.changed().await.is_err() {
+            return;
+        }
+        if *state_rx.borrow_and_update() == ConnectionState::Connected {
+            let proven = recheck().await;
+            egress_verified.store(proven, Ordering::Relaxed);
+            if proven {
+                log("reconnected, egress verified");
+            } else {
+                eprintln!("warren-proxy: reconnected but egress is not proven, staying unhealthy");
+            }
+        } else {
+            egress_verified.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Fetches both signed views, cross-checks them, applies the user's filters.
@@ -525,6 +572,93 @@ mod tests {
             ],
             "the old port must be retired before the new one is announced"
         );
+    }
+
+    /// Polls a latch until it reads `want`, so the assertions do not race the
+    /// tracker task. Bounded, so a regression fails instead of hanging.
+    async fn wait_for(flag: &AtomicBool, want: bool, what: &str) {
+        for _ in 0..200u32 {
+            if flag.load(Ordering::Relaxed) == want {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("{what} (still {}) after 1 s", !want);
+    }
+
+    /// The egress proof belongs to the epoch it was measured on. Reporting 200
+    /// again on the strength of the previous epoch's probe is what makes an
+    /// orchestrator route traffic into a tunnel nobody has proven.
+    #[tokio::test]
+    async fn a_reconnect_clears_the_egress_proof_and_reproves_it() {
+        let (state_tx, state_rx) = watch::channel(ConnectionState::Connected);
+        let verified = Arc::new(AtomicBool::new(true));
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let task = tokio::spawn({
+            let verified = Arc::clone(&verified);
+            let probes = Arc::clone(&probes);
+            track_egress_across_epochs(state_rx, verified, move || {
+                let probes = Arc::clone(&probes);
+                async move {
+                    probes.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+            })
+        });
+
+        state_tx.send(ConnectionState::Reconnecting).unwrap();
+        wait_for(
+            &verified,
+            false,
+            "leaving Connected must clear the egress proof",
+        )
+        .await;
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            0,
+            "nothing to probe while the tunnel is down"
+        );
+
+        state_tx.send(ConnectionState::Connected).unwrap();
+        wait_for(
+            &verified,
+            true,
+            "a re-proven epoch must report healthy again",
+        )
+        .await;
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            1,
+            "the new epoch must be proven by its own probe"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_reconnected_epoch_that_does_not_egress_stays_unhealthy() {
+        let (state_tx, state_rx) = watch::channel(ConnectionState::Connected);
+        let verified = Arc::new(AtomicBool::new(true));
+
+        let task = tokio::spawn({
+            let verified = Arc::clone(&verified);
+            track_egress_across_epochs(state_rx, verified, || async { false })
+        });
+
+        state_tx.send(ConnectionState::Reconnecting).unwrap();
+        state_tx.send(ConnectionState::Connected).unwrap();
+        wait_for(
+            &verified,
+            false,
+            "an epoch whose egress probe fails must not report healthy",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !verified.load(Ordering::Relaxed),
+            "a failed recheck must leave the latch clear"
+        );
+        task.abort();
     }
 
     /// Exit 2 can only ever mean a terminal verdict: every transient failure
