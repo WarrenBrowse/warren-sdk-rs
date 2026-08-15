@@ -12,6 +12,7 @@ use warren_sdk::discovery::VerifiedExit;
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::net::{MapProto, ProxyConfig};
 use warren_sdk::socks_egress::{FIRST_EGRESS_VERIFY, verify_first_egress};
+use warren_sdk::transport::FatalCause;
 use warren_sdk::{
     Circuit, ConnectionState, SupervisedForwardedPort, SupervisedProxyHandle, WarrenClient,
 };
@@ -33,7 +34,9 @@ fn account_line(address: &str) -> String {
 }
 
 /// Runs the daemon until a signal or a terminal failure; returns the process
-/// exit code (0 clean shutdown, 1 startup failure, 2 the supervisor gave up).
+/// exit code (0 clean shutdown, 1 startup failure, 2 a terminal control-plane
+/// refusal). There is no code for "every candidate exit failed": a transient
+/// failure never stops the supervisor, it keeps rotating and retrying.
 ///
 /// # Errors
 ///
@@ -110,7 +113,21 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
         .as_ref()
         .map(|fwd| start_forward(&handle, fwd, port_tx));
 
-    let code = supervise(&handle, &config, &port_rx).await;
+    let code = match supervise(&handle).await {
+        Stop::Signal => {
+            log("signal received, shutting down");
+            // The live port comes from the watch channel the forward watcher
+            // publishes, never from the status file: the file is optional, and
+            // reading it there skipped the down hook for everyone who had not
+            // configured one.
+            run_shutdown_hook(&ShellHooks, config.forward.as_ref(), *port_rx.borrow()).await;
+            0
+        }
+        Stop::Fatal(cause) => {
+            eprintln!("warren-proxy: {}", fatal_line(cause));
+            2
+        }
+    };
     handle.shutdown();
     Ok(code)
 }
@@ -234,12 +251,17 @@ fn start_forward(
     forward
 }
 
+/// Why the daemon stopped running.
+enum Stop {
+    /// A signal asked it to stop.
+    Signal,
+    /// The supervisor stopped healing on a terminal verdict, with the cause it
+    /// published (`None` if the state went terminal without one).
+    Fatal(Option<FatalCause>),
+}
+
 /// Waits for a signal or a terminal supervisor failure.
-async fn supervise(
-    handle: &SupervisedProxyHandle,
-    config: &Config,
-    port_rx: &watch::Receiver<Option<u16>>,
-) -> i32 {
+async fn supervise(handle: &SupervisedProxyHandle) -> Stop {
     let mut state_rx = handle.watch_state();
     let failed = async {
         loop {
@@ -251,22 +273,31 @@ async fn supervise(
             }
         }
     };
-    let signals = wait_for_signal();
     tokio::select! {
-        () = failed => {
-            eprintln!("warren-proxy: the supervisor gave up (every candidate failed)");
-            2
-        }
-        () = signals => {
-            log("signal received, shutting down");
-            // The live port comes from the watch channel the forward watcher
-            // publishes, never from the status file: the file is optional, and
-            // reading it there skipped the down hook for everyone who had not
-            // configured one.
-            run_shutdown_hook(&ShellHooks, config.forward.as_ref(), *port_rx.borrow()).await;
-            0
-        }
+        () = failed => Stop::Fatal(handle.last_fatal()),
+        () = wait_for_signal() => Stop::Signal,
     }
+}
+
+/// The operator-facing line for a terminal verdict. Carries the cause and no
+/// identity material: the account is named nowhere, on any branch.
+fn fatal_line(cause: Option<FatalCause>) -> String {
+    let detail = match cause {
+        Some(FatalCause::NotAuthorized) => {
+            "the account is not authorized (no active subscription, or not enrolled at this exit)"
+        }
+        Some(FatalCause::DeviceLimit) => "the account already holds its maximum device count",
+        Some(FatalCause::Banned) => "the account is suspended",
+        Some(FatalCause::PolicyRefused) => {
+            "the exit applied a policy refusal, with no reason given"
+        }
+        // `FatalCause` is non-exhaustive: a cause added upstream is still a
+        // refusal, and saying so beats printing an opaque debug name.
+        Some(_) | None => "no reason was published",
+    };
+    format!(
+        "refused by the control plane: {detail}. Not retrying: no restart and no other exit resolves this"
+    )
 }
 
 /// Where a hook actually runs. Injected so the orchestration below (which hook
@@ -487,6 +518,41 @@ mod tests {
                 "up:58364:up {{PORT}}".to_owned(),
             ],
             "the old port must be retired before the new one is announced"
+        );
+    }
+
+    /// Exit 2 can only ever mean a terminal verdict: every transient failure
+    /// keeps healing with backoff and never reaches `Failed`. The operator
+    /// needs to read which refusal it was, because no restart fixes any of
+    /// them.
+    #[test]
+    fn the_terminal_verdict_names_the_refusal_it_stopped_on() {
+        let lines = [
+            (FatalCause::NotAuthorized, "not authorized"),
+            (FatalCause::DeviceLimit, "device"),
+            (FatalCause::Banned, "suspended"),
+            (FatalCause::PolicyRefused, "policy"),
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for (cause, needle) in lines {
+            let line = fatal_line(Some(cause));
+            assert!(
+                line.contains(needle),
+                "{cause:?} must be readable in the message, got: {line}"
+            );
+            assert!(
+                !line.contains("every candidate"),
+                "a fatal verdict is not an exhausted candidate list: {line}"
+            );
+            assert!(
+                !seen.contains(&line),
+                "each cause needs its own line: {line}"
+            );
+            seen.push(line);
+        }
+        assert!(
+            fatal_line(None).contains("refused"),
+            "without a published cause the refusal is still terminal"
         );
     }
 
