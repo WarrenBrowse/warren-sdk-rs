@@ -457,7 +457,6 @@ impl Responder {
                         tx_bytes: tx as u64,
                         ..peer.stats
                     },
-                    queued: 0,
                     allowed_ips: peer.allowed.clone(),
                     last_drop: peer.last_drop,
                 }
@@ -837,6 +836,12 @@ impl Responder {
             TunnResult::Done => None,
             _ => return Err(RouteError::Encapsulation),
         };
+        if !matches!(outcome, Some((_, 4))) {
+            // boringtun took the packet onto its own 256-deep queue behind a
+            // handshake and drops silently over that cap, so a peer whose
+            // endpoint never answers is only visible through this counter.
+            entry.stats.deferred += 1;
+        }
         match (outcome, endpoint) {
             (Some((len, 4)), Some(to)) => Ok(Encapsulated::Sent(to, &scratch.as_mut()[..len])),
             (Some((_, 4)), None) => {
@@ -1839,12 +1844,38 @@ mod tests {
             other => panic!("a peer with no endpoint was not deferred: {other:?}"),
         }
         assert_eq!(responder.stats().downlink_queued, 1);
+        assert_eq!(responder.snapshot()[0].stats.deferred, 1);
 
         handshake(&mut responder, &mut clients[0], now);
+        // What boringtun queued behind the handshake comes out of the flush
+        // loop, in its own order, before anything the caller sends next.
+        let queued = responder
+            .flush(peer, &mut scratch)
+            .expect("the queued packet");
+        assert_eq!(queued[0], 4);
+        let queued = queued.to_vec();
+        assert_eq!(clients[0].decapsulate(&queued), packet);
+        assert!(responder.flush(peer, &mut scratch).is_none());
+
         match responder.send_to_peer(peer, &packet, &mut scratch) {
             Ok(Encapsulated::Sent(to, datagram)) => {
                 assert_eq!(to, clients[0].addr);
                 assert_eq!(datagram[0], 4);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A peer whose tunnel was rebuilt keeps its endpoint, so the next
+        // downlink packet is deferred behind an initiation the gateway can
+        // actually send.
+        responder
+            .reset_peer(&clients[0].label)
+            .expect("a known peer");
+        match responder.send_to_peer(peer, &packet, &mut scratch) {
+            Ok(Encapsulated::Deferred { initiation }) => {
+                let (to, datagram) = initiation.expect("an initiation to send");
+                assert_eq!(to, clients[0].addr);
+                assert_eq!(datagram[0], 1, "a handshake initiation");
             }
             other => panic!("{other:?}"),
         }
@@ -1919,6 +1950,7 @@ mod tests {
         assert_eq!(report.added, vec![PeerLabel::new("peer4").unwrap()]);
         assert_eq!(report.removed, vec![clients[1].label.clone()]);
         assert!(report.rebuilt.is_empty());
+        assert_eq!(report.unchanged, 1);
 
         let status = responder.snapshot();
         assert_eq!(status.len(), 2);
@@ -1928,6 +1960,29 @@ mod tests {
             .expect("the untouched peer");
         assert!(kept.has_session, "an untouched peer lost its session");
         assert!(responder.peer_by_label(&clients[1].label).is_none());
+
+        // Changing what a peer is allowed to source rebuilds it: the old
+        // session would keep passing an address the new configuration refuses.
+        let mut peers = responder.peer_confs();
+        for peer in &mut peers {
+            if peer.label == clients[0].label {
+                peer.allowed = vec![IpNetwork::new(IpAddr::V4(clients[0].v4), 32).unwrap()];
+            }
+        }
+        let conf = GatewayConf {
+            key: responder.key().clone(),
+            peers,
+        };
+        let report = responder.reload(&conf).expect("a valid configuration");
+        assert_eq!(report.rebuilt, vec![clients[0].label.clone()]);
+        assert_eq!(report.unchanged, 1);
+        assert!(report.added.is_empty() && report.removed.is_empty());
+        let status = responder.snapshot();
+        let rebuilt = status
+            .iter()
+            .find(|peer| peer.label == clients[0].label)
+            .expect("the rebuilt peer");
+        assert!(!rebuilt.has_session);
     }
 
     #[test]

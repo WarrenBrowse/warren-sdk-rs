@@ -142,6 +142,9 @@ pub struct PeerStats {
     pub tx_bytes: u64,
     /// Handshakes completed with this peer.
     pub handshakes: u64,
+    /// Downlink packets handed to this peer while it had no session, which
+    /// boringtun queued behind a handshake and drops past 256.
+    pub deferred: u64,
     /// Datagrams and packets refused for this peer.
     pub drops: u64,
 }
@@ -163,8 +166,6 @@ pub struct PeerStatus {
     pub endpoint_seen: bool,
     /// What the peer has carried.
     pub stats: PeerStats,
-    /// Packets waiting for a session, which boringtun drops past 256.
-    pub queued: usize,
     /// The prefixes this peer is allowed to source from and is routed.
     pub allowed_ips: Vec<ip_network::IpNetwork>,
     /// Why the last refusal happened, which is what explains a peer that
