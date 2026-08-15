@@ -50,20 +50,26 @@ const KILL_GRACE: Duration = Duration::from_millis(500);
 /// own shell rather than being parsed here. Without this the whole feature is
 /// dead on Windows, where there is no `sh`.
 fn shell_command(resolved: &str) -> tokio::process::Command {
-    #[cfg(windows)]
+    // One predicate governs the whole feature (the shell, the process group and
+    // the killer below): a target with no unix process groups cannot be given
+    // one, and `cmd /C` is what the only such target Warren builds for wants.
+    #[cfg(not(unix))]
     let mut command = {
         let mut command = tokio::process::Command::new("cmd");
         command.arg("/C").arg(resolved);
         command
     };
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     let mut command = {
         let mut command = tokio::process::Command::new("sh");
         command.arg("-c").arg(resolved);
         // Own process group, so the timeout below can reach everything the
         // hook spawned. Without it a backgrounded child outlives the budget,
         // and in the container image (the daemon is PID 1, no init) it is
-        // never reaped either.
+        // never reaped either. The trade: the hook leaves the daemon's own
+        // group, so a Ctrl-C in a terminal or a `kill -TERM -<pgid>` no longer
+        // reaches it, and an up hook still running when a signal lands is
+        // orphaned rather than signalled (the down hook is awaited).
         command.process_group(0);
         command
     };
