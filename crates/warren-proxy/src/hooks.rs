@@ -31,22 +31,35 @@ pub fn substitute_port(command: &str, port: u16) -> String {
     command.replace("{{PORT}}", &port.to_string())
 }
 
+/// Secrets that must not reach a hook. A child inherits this process's
+/// environment, so an operator who passes the recovery phrase in
+/// `WARREN_MNEMONIC` would otherwise hand it to every hook command and to
+/// everything that command spawns, where it is readable in
+/// `/proc/<pid>/environ`. The daemon cannot scrub its own environment
+/// (`std::env::remove_var` is unsafe under edition 2024, and this workspace
+/// forbids unsafe), so the strip happens per child, which is where it matters.
+const SECRET_ENV: [&str; 2] = ["WARREN_MNEMONIC", "WARREN_MNEMONIC_FILE"];
+
 /// A hook is an operator-written command line, so it runs under the platform's
 /// own shell rather than being parsed here. Without this the whole feature is
 /// dead on Windows, where there is no `sh`.
 fn shell_command(resolved: &str) -> tokio::process::Command {
     #[cfg(windows)]
-    {
+    let mut command = {
         let mut command = tokio::process::Command::new("cmd");
         command.arg("/C").arg(resolved);
         command
-    }
+    };
     #[cfg(not(windows))]
-    {
+    let mut command = {
         let mut command = tokio::process::Command::new("sh");
         command.arg("-c").arg(resolved);
         command
+    };
+    for name in SECRET_ENV {
+        command.env_remove(name);
     }
+    command
 }
 
 /// Runs a hook command through the platform's shell under [`HOOK_TIMEOUT`].
@@ -148,6 +161,27 @@ pub(crate) mod tests {
             run_hook("exit {{PORT}}", 3, "up").await,
             HookOutcome::Failed,
             "the port must reach the shell: substituted to `exit 3` this must fail"
+        );
+    }
+
+    /// Asserted on the spawn configuration rather than by reading the child's
+    /// environment back, so it holds on every platform without a shell idiom.
+    #[test]
+    fn the_recovery_phrase_is_stripped_from_a_hook_child() {
+        let command = shell_command("anything");
+        let removed: Vec<String> = command
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            removed.contains(&"WARREN_MNEMONIC".to_owned()),
+            "a hook must never inherit the recovery phrase, removed: {removed:?}"
+        );
+        assert!(
+            removed.contains(&"WARREN_MNEMONIC_FILE".to_owned()),
+            "a hook must not be handed the secret's path either, removed: {removed:?}"
         );
     }
 
