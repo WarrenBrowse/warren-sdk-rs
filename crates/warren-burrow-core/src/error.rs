@@ -38,3 +38,21 @@ pub enum PacketError {
     #[error("not an ICMP error message")]
     NotAnIcmpError,
 }
+
+/// Errors of the gateway core's own configuration and allocation surface.
+///
+/// Displays name the rule that refused, never the value that broke it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum CoreError {
+    /// The port is not inside the space it was asked of: outside the dynamic
+    /// pool, or inside the range the gateway keeps for its own control plane.
+    #[error("port outside the allocatable pool")]
+    PortOutsidePool,
+    /// A live flow already holds the port.
+    #[error("port already in use")]
+    PortInUse,
+    /// The port is already pinned to a static forward.
+    #[error("port already reserved")]
+    PortAlreadyReserved,
+}

@@ -15,15 +15,20 @@
 pub mod error;
 pub mod icmp;
 pub mod ip;
+pub mod ports;
 
 #[cfg(test)]
 mod testpkt;
 
-pub use error::PacketError;
+pub use error::{CoreError, PacketError};
 pub use icmp::{
     ErrorQuote, build_echo_reply_v4, build_echo_reply_v6, build_unreachable_v4,
     build_unreachable_v6, parse_error_quote, recompute_icmp_checksum, rewrite_error_quote,
 };
+pub use ports::{
+    CONTROL_RANGE_END, CONTROL_RANGE_START, DYNAMIC_POOL_END, DYNAMIC_POOL_START, PortAllocator,
+};
+
 pub use ip::{
     IcmpHeader, IpHeader, Side, checksum_update, is_echo, is_icmp_error, parse_ip, parse_ip_quote,
     read_icmp, read_ports, rewrite_endpoint, tcp_flags,
