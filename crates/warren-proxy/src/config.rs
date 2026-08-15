@@ -33,10 +33,20 @@ pub struct ExitFilter {
 
 /// Transport to forward for [`ForwardConfig`].
 ///
-/// One transport per daemon. The exit allocates each proto independently: a
-/// NAT-PMP request with no explicit suggestion can never land on a port whose
-/// other proto slot is live, so asking for TCP and UDP would map two different
-/// public ports, of which the daemon can only ever announce one.
+/// One transport per daemon. TCP and UDP would be two independent mappings:
+/// the exit allocates each proto on its own public port (a NAT-PMP request
+/// with no explicit suggestion can never land on a port whose other proto slot
+/// is live), so the daemon could announce only one of the two, and the pair
+/// would hold two of the exit's per-client forward slots.
+///
+/// The engine implements the atomic TCP+UDP pair on ONE public port under ONE
+/// entitlement credential, which is what a BitTorrent client wants. The SDK
+/// forward path this daemon runs on does not carry that pair yet, so the
+/// limitation here is the SDK's and not the protocol's.
+///
+/// This daemon also presents no entitlement credential, so the exit applies
+/// its default per-client quota rather than the account's fleet-wide slot
+/// count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardProto {
     /// TCP only.
@@ -346,8 +356,8 @@ fn parse_forward(
         None | Some("tcp") => ForwardProto::Tcp,
         Some("udp") => ForwardProto::Udp,
         // `both` is refused rather than silently half-honoured: it maps two
-        // public ports (see [`ForwardProto`]), burns two of the account's five
-        // forward slots, and only the TCP one could be published.
+        // independent public ports (see [`ForwardProto`]), takes two of the
+        // exit's per-client slots, and only one of them could be published.
         Some(_) => {
             return Err(ConfigError::Invalid {
                 var: "WARREN_PORT_FORWARD_PROTOCOL",
@@ -643,9 +653,9 @@ mod tests {
         }
     }
 
-    /// The exit maps TCP and UDP on two different public ports, and the daemon
-    /// publishes one port, so accepting `both` announced a port whose UDP half
-    /// was dead. Refused at parse time rather than half-honoured.
+    /// Two independent mappings land on two different public ports and the
+    /// daemon publishes one, so accepting `both` announced a port whose UDP
+    /// half was dead. Refused at parse time rather than half-honoured.
     #[test]
     fn forward_protocol_both_is_refused() {
         let err = load(

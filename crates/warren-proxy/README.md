@@ -21,7 +21,7 @@ netns ownership) is the sibling for the gluetun-style `network_mode:
 | `WARREN_MNEMONIC` / `WARREN_MNEMONIC_FILE` | required | the account recovery phrase; the file variant wins and is what containers should use |
 | `WARREN_SOCKS_LISTEN` | `127.0.0.1:1080` | SOCKS5 listener. The listeners are unauthenticated: bind non-loopback only inside an isolated netns/container |
 | `WARREN_HTTP_LISTEN` | off | HTTP CONNECT listener |
-| `WARREN_HEALTH_LISTEN` | `127.0.0.1:9999` | liveness endpoint: `/healthz` (200 only when Connected AND first egress verified), `/state`, `/port`; `off` disables |
+| `WARREN_HEALTH_LISTEN` | `127.0.0.1:9999` | liveness endpoint: `/healthz` (200 only when Connected AND egress verified for the CURRENT epoch: a reconnect clears the proof until a fresh probe passes), `/state`, `/port`; `off`, `none` or empty disables it, and `warren-proxy healthcheck` then exits 0 |
 | `WARREN_EXITS` | all exits | priority list of `cc` or `cc/city` (e.g. `de, se/stockholm`); failover tries them in order |
 | `WARREN_CIRCUIT` | `single` | `single` (direct to exit) or `multi` (entry relay then exit) |
 | `WARREN_DNS_SERVER` | exit forwarder | IPv4 resolver queried over the tunnel (needed for `dns_disabled` exits) |
@@ -29,15 +29,26 @@ netns ownership) is the sibling for the gluetun-style `network_mode:
 | `WARREN_API_URL` | channel default | control-plane override (e.g. the beta host on a prod-built binary) |
 | `WARREN_SERVER_PUBKEY_HEX` | compiled pin | relay-list signing key override (bench/rotation) |
 | `WARREN_PORT_FORWARD_INTERNAL_PORT` | off | enables NAT-PMP forwarding of a tunnel-side port |
-| `WARREN_PORT_FORWARD_PROTOCOL` | `tcp` | `tcp` or `udp`, one transport per daemon: the exit picks each proto's public port independently, so a TCP+UDP pair would be reachable on two ports of which only one could be announced (and would burn two of the account's five forward slots) |
+| `WARREN_PORT_FORWARD_PROTOCOL` | `tcp` | `tcp` or `udp`, one transport per daemon: TCP and UDP are two independent mappings, reachable on two public ports of which only one could be announced, and holding two of the exit's per-client forward slots |
 | `WARREN_PORT_FORWARD_TARGET` | `127.0.0.1:<internal>` | local socket inbound connections are relayed to |
-| `WARREN_PORT_FORWARD_UP_COMMAND` | | run via the platform shell on every grant, `{{PORT}}` substituted (the gluetun up-command shape). The recovery phrase is stripped from the child's environment, so a hook and everything it spawns never see it |
-| `WARREN_PORT_FORWARD_DOWN_COMMAND` | | run when the port is replaced and at shutdown |
-| `WARREN_PORT_FORWARD_STATUS_FILE` | | the granted public port, one decimal line, atomically rewritten |
+| `WARREN_PORT_FORWARD_UP_COMMAND` | | run via the platform shell on every grant, `{{PORT}}` substituted (the gluetun up-command shape). The recovery phrase and its file path are removed from the hook child's own environment, so a hook that dumps `env` cannot leak them; a hook is killed with everything it spawned once it outlives its 30 s budget |
+| `WARREN_PORT_FORWARD_DOWN_COMMAND` | | run when the port is replaced, when the grant is lost, and at shutdown |
+| `WARREN_PORT_FORWARD_STATUS_FILE` | | the granted public port, one decimal line, atomically rewritten; removed when the mapping goes away |
+
+Port forwarding runs on the exit's default per-client quota: this daemon
+presents no entitlement credential, so the account's fleet-wide slot count is
+not what bounds it. The engine implements the atomic TCP+UDP pair (one public
+port, one credential); the SDK forward path this daemon uses does not carry it
+yet, which is why `both` is refused. On `SIGTERM` the down command runs and the
+NAT-PMP mapping is released at the exit rather than left to lapse with its
+lease.
 
 Exit codes: `0` clean signal shutdown, `1` configuration or startup failure,
-`2` the supervisor gave up (every candidate exit failed): let the service
-manager or container runtime restart on non-zero.
+`2` a terminal control-plane refusal, printed with its cause (unauthorized
+account, device cap, suspension, opaque policy refusal). There is no code for
+"every candidate exit failed": a transient failure never stops the supervisor,
+which keeps rotating exits and retrying, so `2` always means a refusal that no
+restart and no other exit resolves. Restart on `1`, stop on `2`.
 
 ## Nested-VPN caveats (validated 2026-08-15)
 
