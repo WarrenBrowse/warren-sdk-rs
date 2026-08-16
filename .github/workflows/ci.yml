@@ -7,6 +7,18 @@ name: CI
 # jobs that must PRODUCE x86_64 artifacts belong on the emulation runners;
 # this workflow has none.
 # Do not switch any job to a GitHub-hosted runner.
+#
+# No dependency-cache action here, and adding one back breaks other jobs. Two
+# runner instances share one host and therefore one CARGO_HOME, and
+# Swatinem/rust-cache's post step CLEANS that directory: on 2026-08-16 the
+# macOS clippy job logged "Cleaning cargo registry" then "Cleaning cargo/bin"
+# at 16:39:55Z, and the macOS test job on the sibling instance died ten seconds
+# later with `rustc ... (never executed): No such file or directory (os error
+# 2)`, then `could not parse/generate dep info`, then `cargo: command not
+# found`. That is the spawn flake that cost a rerun on nearly every push for two
+# days. These runners are persistent, so their CARGO_HOME is already warm and
+# the action bought nothing; its own saves were colliding anyway ("Unable to
+# reserve cache with key ..., another job").
 
 on:
   push:
@@ -97,13 +109,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-        # Persistent self-hosted runners already keep target/ across jobs;
-        # rust-cache's target prune drops .d dep-info and corrupts the restore
-        # (nextest "could not parse/generate dep info ... No such file"). Cache
-        # only the registry, let the runner's persistent target serve incremental.
-        with:
-          cache-targets: "false"
       # --locked refuses to mutate Cargo.lock (CI reproducibility: the frozen
       # golden vectors must resolve against the exact transitive crates).
       # --all-features also lints the privileged per-OS datapath behind the
@@ -137,13 +142,6 @@ jobs:
         with:
           token: ${{ secrets.ENGINE_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.89.0
-      - uses: Swatinem/rust-cache@v2
-        # Persistent self-hosted runners already keep target/ across jobs;
-        # rust-cache's target prune drops .d dep-info and corrupts the restore
-        # (nextest "could not parse/generate dep info ... No such file"). Cache
-        # only the registry, let the runner's persistent target serve incremental.
-        with:
-          cache-targets: "false"
       - name: install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
@@ -187,13 +185,6 @@ jobs:
         with:
           token: ${{ secrets.ENGINE_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.89.0
-      - uses: Swatinem/rust-cache@v2
-        # Persistent self-hosted runners already keep target/ across jobs;
-        # rust-cache's target prune drops .d dep-info and corrupts the restore
-        # (nextest "could not parse/generate dep info ... No such file"). Cache
-        # only the registry, let the runner's persistent target serve incremental.
-        with:
-          cache-targets: "false"
       # Build the cdylib and generate foreign bindings from it. This fails if the
       # uniffi scaffolding or any exported type/function regresses. --no-format
       # avoids a dependency on ktlint/swiftformat on the runner.
@@ -270,13 +261,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-        # Persistent self-hosted runners already keep target/ across jobs;
-        # rust-cache's target prune drops .d dep-info and corrupts the restore
-        # (nextest "could not parse/generate dep info ... No such file"). Cache
-        # only the registry, let the runner's persistent target serve incremental.
-        with:
-          cache-targets: "false"
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@v2
         with:
@@ -308,9 +292,6 @@ jobs:
         with:
           token: ${{ secrets.ENGINE_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.89.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: "false"
       # One thread, and no absolute packets-per-second floor here: these runners
       # are shared and measure a third of an idle machine, so the datapath case
       # asserts ratios between its own measurements instead. The design's
