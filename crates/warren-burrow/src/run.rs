@@ -176,12 +176,19 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
     let mut reload = warren_headless::signals::ReloadSignal::new()
         .context("installing the reload signal handler")?;
 
-    let stop = loop {
+    // Built once and held across every reload: rebuilding it would drop the
+    // signal listeners it owns, and a SIGTERM raised while none is registered
+    // neither stops the process nor waits for the next one. The scope ends the
+    // borrow it takes on the handle, which is shut down below.
+    let stop = {
         let stopping =
             warren_headless::forward::wait_for_stop(handle.watch_state(), || handle.last_fatal());
-        tokio::select! {
-            stop = stopping => break stop,
-            () = reload.recv() => reload_now(&env, &device),
+        tokio::pin!(stopping);
+        loop {
+            tokio::select! {
+                stop = &mut stopping => break stop,
+                () = reload.recv() => reload_now(&env, &device),
+            }
         }
     };
 
