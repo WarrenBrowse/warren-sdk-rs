@@ -151,6 +151,21 @@ forbid_debug_where_boringtun_lives() {
 
 forbid_debug_where_boringtun_lives "design E"
 
+# The gateway core is engine-clean on purpose: a later promotion into warrenguard
+# is meant to be a directory move, and the async shell owns every socket. Both
+# halves of that property are asserted, because either one alone leaks: a manifest
+# without tokio still allows `std::net`, and a clean grep still allows an async
+# dependency to be declared and then used from the shell side of a shared module.
+forbid_rs "design M" \
+  "warren-bolthole-core must open no socket (home of every socket: warren-bolthole)" \
+  'UdpSocket|TcpStream|TcpListener|socket2' \
+  "crates/warren-bolthole-core/src"
+
+sockdeps="$(grep -En '^(tokio|socket2|mio)\b' crates/warren-bolthole-core/Cargo.toml || true)"
+[ -n "$sockdeps" ] && report "design M" \
+  "warren-bolthole-core declares an async or socket dependency (it must stay engine-clean)" \
+  "$sockdeps"
+
 # Dependency direction: the client SDK never depends on the private backend
 # (warren-core) or the app (warren-app / mullvad-*). warrenguard + warren-contract
 # siblings are allowed.
