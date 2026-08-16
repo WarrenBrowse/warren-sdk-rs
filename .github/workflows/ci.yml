@@ -148,11 +148,30 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      # nextest retries flaky tests up to 2 times: the in-process quinn
-      # loopback tunnel tests can hit a quinn Drop/UDP-bind race on slower
-      # runners. The test job is the correctness gate; real exit validation
-      # is manual against warren-core (cf. CLAUDE.md).
-      - run: cargo nextest run --locked --workspace --all-targets --all-features --retries 2
+      # Two different retries, because they cover two different failures.
+      # nextest --retries 2 re-runs a TEST that ran and failed: the in-process
+      # quinn loopback tunnel tests can hit a quinn Drop/UDP-bind race on
+      # slower runners. The wrapper re-runs the whole command when cargo could
+      # not SPAWN rustc for a dependency, which happens before any test exists
+      # and which nextest therefore never sees; the classifier fails a real
+      # compile, lint or test failure on the first attempt
+      # (scripts/ci/run-with-runner-retry.sh). The test job is the correctness
+      # gate; real exit validation is manual against warren-core (cf. CLAUDE.md).
+      - name: run the test suite
+        run: >
+          bash scripts/ci/run-with-runner-retry.sh
+          cargo nextest run --locked --workspace --all-targets --all-features --retries 2
+
+  shell-gates:
+    name: shell gates
+    # The shell that CI and the release pipeline run has no compiler to catch
+    # it, so what it decides is pinned by tests of its own.
+    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: runner-retry classifier tests
+        run: bash scripts/ci/test-run-with-runner-retry.sh
 
   bindings:
     name: uniffi bindings
