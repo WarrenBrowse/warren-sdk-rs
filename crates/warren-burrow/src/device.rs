@@ -205,8 +205,11 @@ struct Inner {
     /// Which socket last heard from an endpoint, so an answer leaves by the
     /// address the peer is talking to.
     routes: Mutex<HashMap<SocketAddr, usize>>,
-    uplink_tx: mpsc::Sender<UplinkItem>,
-    uplink_rx: tokio::sync::Mutex<mpsc::Receiver<UplinkItem>>,
+    /// The queue of the epoch running now, replaced at every turnover: an
+    /// epoch that is over holds a receiver nobody feeds any more, so a pump
+    /// still parked on it can never keep the live epoch's packets waiting.
+    uplink_tx: Mutex<Option<mpsc::Sender<UplinkItem>>>,
+    uplink_depth: usize,
     /// Datagrams waiting for a socket. Queued rather than awaited, so a socket
     /// whose buffer is full never stops a reader from serving other peers.
     egress_tx: mpsc::Sender<(usize, SocketAddr, Vec<u8>)>,
@@ -260,7 +263,6 @@ impl GatewayDevice {
         // The responder is the one place that knows which peer owns which
         // address, and the NAT refuses any source outside that view.
         nat.set_ownership(responder.ownership());
-        let (uplink_tx, uplink_rx) = mpsc::channel(options.uplink_depth);
         let (egress_tx, egress_rx) = mpsc::channel(DEFAULT_EGRESS_DEPTH);
         Ok(Self {
             inner: Arc::new(Inner {
@@ -268,8 +270,8 @@ impl GatewayDevice {
                 nat: Mutex::new(nat),
                 sockets,
                 routes: Mutex::new(HashMap::new()),
-                uplink_tx,
-                uplink_rx: tokio::sync::Mutex::new(uplink_rx),
+                uplink_tx: Mutex::new(None),
+                uplink_depth: options.uplink_depth,
                 egress_tx,
                 egress_rx: tokio::sync::Mutex::new(egress_rx),
                 generation: AtomicU64::new(0),
@@ -541,6 +543,11 @@ impl EpochPacketDevice for GatewayDevice {
             self.inner.generation.store(generation, Ordering::Release);
         }
 
+        let (uplink_tx, uplink_rx) = mpsc::channel(self.inner.uplink_depth);
+        // Publishing it drops the previous epoch's sender, which is what wakes
+        // a pump still parked on that epoch's queue.
+        *self.inner.uplink_tx.lock() = Some(uplink_tx);
+
         let (control_tx, control_rx) = mpsc::channel(CONTROL_DEPTH);
         let demux = Arc::new(RawUdpDemux::new(control_tx));
         let control = GatewayControl::new(Arc::clone(&demux), addressing.ipv4, addressing.gateway);
@@ -551,6 +558,7 @@ impl EpochPacketDevice for GatewayDevice {
             demux,
             control: control.clone(),
             control_rx: tokio::sync::Mutex::new(control_rx),
+            uplink_rx: tokio::sync::Mutex::new(uplink_rx),
             scratch: Mutex::new(ScratchBuf::new()),
         };
         (sink, control)
@@ -562,16 +570,19 @@ impl EpochPacketDevice for GatewayDevice {
 /// A sink stamped with an older generation is inert toward the device: it
 /// drops and counts what it is handed, reports the epoch dead when read, and
 /// leaves the gate alone when it is dropped (it still closes its own epoch's
-/// control plane, which nothing else owns). The supervisor drops the previous
-/// epoch's pump before it starts the next one, but the property holds without
-/// that ordering, which is what keeps a slow teardown from closing the live
-/// epoch's gate.
+/// control plane and drains its own queue, which nothing else owns). The
+/// supervisor drops the previous epoch's pump before it starts the next one,
+/// but the property holds without that ordering: a pump still parked in
+/// [`PacketSink::recv_packet`] waits on this epoch's own queue, whose sender
+/// the turnover dropped, so it wakes to a dead epoch instead of holding
+/// anything the live one needs.
 pub struct GatewayEpochSink {
     inner: Arc<Inner>,
     generation: u64,
     demux: Arc<RawUdpDemux>,
     control: GatewayControl,
     control_rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    uplink_rx: tokio::sync::Mutex<mpsc::Receiver<UplinkItem>>,
     scratch: Mutex<ScratchBuf>,
 }
 
@@ -654,7 +665,7 @@ impl PacketSink for GatewayEpochSink {
                 return Err(NetError::EngineStopped);
             }
             let mut control_rx = self.control_rx.lock().await;
-            let mut uplink_rx = self.inner.uplink_rx.lock().await;
+            let mut uplink_rx = self.uplink_rx.lock().await;
             let item = tokio::select! {
                 // The control plane first when both are ready: a NAT-PMP
                 // renewal or an egress probe held behind a burst of peer
@@ -712,6 +723,16 @@ impl PacketSink for GatewayEpochSink {
 
 impl Drop for GatewayEpochSink {
     fn drop(&mut self) {
+        // What this epoch never carried dies with it: sending it under the
+        // next epoch's address is what the new exit refuses as a spoof.
+        if let Ok(mut uplink_rx) = self.uplink_rx.try_lock() {
+            while uplink_rx.try_recv().is_ok() {
+                self.inner
+                    .counters
+                    .uplink_stale_flushed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         // Its own control plane, always: it belongs to this epoch alone, and
         // closing it is what tells the port forwarder and the egress probe
         // that the tunnel they were exchanging over is gone. A later epoch
@@ -860,17 +881,19 @@ fn handle_datagram(
         Next::Uplink(peer, packet) => {
             note_route(inner, from, index);
             let generation = inner.generation.load(Ordering::Acquire);
+            let item = UplinkItem::Peer {
+                generation,
+                peer,
+                packet,
+            };
             // Never blocks the reader: a tunnel that has stopped draining must
-            // cost this gateway a counted drop, not every peer's liveness.
-            if inner
-                .uplink_tx
-                .try_send(UplinkItem::Peer {
-                    generation,
-                    peer,
-                    packet,
-                })
-                .is_err()
-            {
+            // cost this gateway a counted drop, not every peer's liveness. With
+            // no epoch there is nowhere to put it, which is the same drop.
+            let refused = match inner.uplink_tx.lock().as_ref() {
+                Some(tx) => tx.try_send(item).is_err(),
+                None => true,
+            };
+            if refused {
                 inner
                     .counters
                     .uplink_queue_full
@@ -1282,6 +1305,44 @@ mod tests {
             !stale_control.is_alive(),
             "its own epoch's control plane is what it ends, so a forwarder \
              exchanging over it learns the tunnel is gone"
+        );
+    }
+
+    /// The pump of an epoch that is over may still be parked in `recv_packet`
+    /// when the next one starts, and it must hold nothing the live epoch needs:
+    /// the queue it waits on is its own, and the turnover ends its wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sink_parked_in_recv_never_starves_the_epoch_that_replaces_it() {
+        let h = harness();
+        let (stale, _stale_control) = h.device.begin_epoch(addressing(1));
+        let parked = tokio::spawn(async move { stale.recv_packet().await });
+        // Long enough for the task to reach the wait rather than the assertions
+        // racing its first poll.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (live, live_control) = h.device.begin_epoch(addressing(2));
+        let flow = live_control
+            .open_udp()
+            .await
+            .expect("a live epoch opens flows");
+        flow.send_to(
+            bytes::Bytes::from_static(b"map"),
+            SocketAddr::new(GATEWAY_V4.into(), 5351),
+        )
+        .await
+        .expect("the uplink takes it");
+
+        let packet = tokio::time::timeout(Duration::from_secs(2), live.recv_packet())
+            .await
+            .expect("the live epoch's own control packet reaches its pump")
+            .expect("a live epoch");
+        assert!(!packet.is_empty());
+        assert!(
+            matches!(
+                parked.await.expect("the parked task"),
+                Err(NetError::EngineStopped)
+            ),
+            "and the pump of the epoch that ended learns it is over"
         );
     }
 
