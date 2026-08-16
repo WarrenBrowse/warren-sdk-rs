@@ -69,7 +69,7 @@ devices import a configuration whose `Endpoint` is that address.
 cd docs/burrow
 umask 077
 printf '%s\n' 'the twelve words of the account' > warren-mnemonic.txt
-chown 1000:1000 warren-mnemonic.txt        # the unprivileged user in the image
+sudo chown 1000:1000 warren-mnemonic.txt   # the image's unprivileged user; sudo unless you are already root
 export WARREN_LAN_IP=192.168.1.10          # this host's LAN address
 docker compose -f docker-compose.peer.yml up -d
 ```
@@ -108,7 +108,7 @@ with `VPN_SERVICE_PROVIDER=custom` and `VPN_TYPE=wireguard`, and every
 cd docs/burrow
 umask 077
 printf '%s\n' 'the twelve words of the account' > warren-mnemonic.txt
-chown 1000:1000 warren-mnemonic.txt        # the unprivileged user in the image
+sudo chown 1000:1000 warren-mnemonic.txt   # the image's unprivileged user; sudo unless you are already root
 
 # Generate the gateway and one peer named glue, before anything starts.
 docker compose -f docker-compose.gluetun.yml run --rm warren-burrow init --label glue
