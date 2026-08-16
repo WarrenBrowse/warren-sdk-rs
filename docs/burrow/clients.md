@@ -43,8 +43,8 @@ Four lines decide whether the import works:
 - **`MTU = 1280`** is what the gateway recommends by default
   (`WARREN_BURROW_CLIENT_MTU`); `/status` reports the live inner budget and the
   MTU that fits it. A client that ignores the line and probes for itself is
-  what `PersistentKeepalive` and the gateway's ICMP handling are there for, but
-  the honest fix for a stalled large transfer is to lower this value.
+  what `PersistentKeepalive` and the gateway's ICMP handling are there for, and
+  the fix for a stalled large transfer is to lower this value.
 - **`DNS = 10.66.0.1`** is the exit's resolver, on the far side of the tunnel.
   A client that has no DNS setting (a router, mostly) keeps its own resolver,
   which then answers outside the tunnel.
@@ -81,9 +81,9 @@ gets there.
    the ISP resolver leaks every lookup outside the tunnel; point it at
    `10.66.0.1`, or at a resolver reachable through the tunnel.
 
-Two costs to state plainly. The gateway is a LAN host, so every packet crosses
-the LAN twice and hairpins through the router, which is what a router-shaped
-deployment pays. And a router has no kill switch of its own: if the tunnel
+Two costs come with this shape. The gateway is a LAN host, so every packet
+crosses the LAN twice and hairpins through the router, which is what a
+router-shaped deployment pays. And a router has no kill switch of its own: if the tunnel
 stops, the router's default route is what decides whether its LAN falls back to
 the plain internet, so set that route deliberately.
 

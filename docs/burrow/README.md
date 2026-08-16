@@ -29,8 +29,9 @@ directory carries the deployment shapes and the per-device import paths.
 | a restricted namespace, CI, per-application egress, no capability to give | `warren-proxy` | SOCKS5 and HTTP CONNECT, unprivileged, one process |
 | a device that cannot run Warren at all, or a gluetun stack you will not replace | `warren-burrow` | a stock WireGuard client on the device, one gateway on the LAN, one Warren session for all of them |
 
-The gateway is the answer when the device is the constraint. When the host can
-run Warren itself, the two other components carry less machinery and give a
+Pick the gateway when the device is what constrains you: it is the only one of
+the three that asks nothing of the device beyond a stock WireGuard client. When
+the host can run Warren itself, the other two carry less machinery and give a
 stronger kill switch.
 
 ## Three things to know before handing anyone a configuration
