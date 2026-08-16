@@ -165,6 +165,12 @@ idle peer emitting only its 25 second keepalive, bounded by the protocol's 120
 second rekey interval. A peer looks dead until its timer fires, and its traffic
 is lost in the meantime.
 
+`WARREN_HEALTH_LISTEN=off` turns that endpoint off, and with it the container
+health gate: `warren-burrow healthcheck` has nothing to reach and exits 0 on
+every run, so docker reports the container healthy whatever the daemon is
+doing, and `condition: service_healthy` waits on nothing. Leave the endpoint on
+wherever a compose file gates anything on it.
+
 The daemon exits 0 on a clean signal, 1 on a configuration or startup failure,
 and 2 on a terminal control-plane refusal (an expired subscription, a rejected
 account). `restart: unless-stopped` is right for 1 and wrong for 2, and docker

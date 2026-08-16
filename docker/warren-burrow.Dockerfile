@@ -55,6 +55,12 @@ USER warren
 # is merely still dialling. Docker marks an unhealthy container and does not
 # restart it: pair `restart: unless-stopped` with the daemon's own exit codes
 # (1 restart, 2 stop), or watch it from outside.
+#
+# Setting WARREN_HEALTH_LISTEN to `off`, `none` or empty leaves this probe with
+# nothing to reach, and it then exits 0 without a daemon running at all: the
+# container reports healthy for as long as it exists, and a dependent gated on
+# `condition: service_healthy` starts against a gateway that may be dead.
+# Disabling the endpoint disables the container health gate with it.
 HEALTHCHECK --interval=60s --timeout=15s --start-period=120s --retries=2 \
   CMD ["/usr/local/bin/warren-burrow", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/warren-burrow"]

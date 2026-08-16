@@ -81,7 +81,7 @@ Shared with the other headless daemons:
 | `WARREN_CIRCUIT` | `single` | `single` (direct to exit) or `multi` (entry relay then exit) |
 | `WARREN_DNS_SERVER` | `10.66.0.1` | the resolver written into client configurations. Any other value also keeps `dns_disabled` exits in the rotation; `off` writes no `DNS` line |
 | `WARREN_CONNECT_TIMEOUT` | `90` | seconds allowed for the first `Connected`, and the budget the first egress proof is retried within |
-| `WARREN_HEALTH_LISTEN` | `127.0.0.1:9998` | liveness endpoint (the proxy's own default is 9999, so both run on one host); `off`, `none` or empty disables it, and `warren-burrow healthcheck` then exits 0 |
+| `WARREN_HEALTH_LISTEN` | `127.0.0.1:9998` | liveness endpoint (the proxy's own default is 9999, so both run on one host); `off`, `none` or empty disables it, and `warren-burrow healthcheck` then exits 0, which reports the container healthy for as long as it exists |
 | `WARREN_API_URL` | channel default | control-plane override |
 | `WARREN_SERVER_PUBKEY_HEX` | compiled pin | relay-list signing key override |
 | `WARREN_PORT_FORWARD_INTERNAL_PORT` | off | enables NAT-PMP forwarding of a tunnel-side port; refused inside `61000-61999`, which this gateway keeps for its own in-tunnel control plane |
