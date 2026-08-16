@@ -8,10 +8,11 @@
 use std::sync::Arc;
 
 use warren_burrow_core::{PeerStatus, V6State};
-use warren_headless::health::{ExtraRoutes, RouteReply};
+use warren_headless::health::{ExtraRoutes, Request, RouteReply};
 use warren_sdk::ConnectionState;
 use warren_sdk::EpochEnd;
 
+use crate::admin::Admin;
 use crate::device::{GatewayDevice, GatewaySnapshot, drop_class};
 
 /// What `/status` reads besides the device's own snapshot.
@@ -25,6 +26,8 @@ pub struct GatewayHealth {
     client_mtu: u16,
     max_client_mtu: u16,
     peers_route: bool,
+    /// The write surface, when this daemon serves one.
+    admin: Option<Arc<Admin>>,
 }
 
 impl std::fmt::Debug for GatewayHealth {
@@ -56,7 +59,15 @@ impl GatewayHealth {
             client_mtu,
             max_client_mtu,
             peers_route,
+            admin: None,
         }
+    }
+
+    /// The same routes, plus the admin surface guarded by its bearer token.
+    #[must_use]
+    pub fn with_admin(mut self, admin: Admin) -> Self {
+        self.admin = Some(Arc::new(admin));
+        self
     }
 
     /// Behind an [`Arc`], as the shared health view holds it.
@@ -154,8 +165,11 @@ impl GatewayHealth {
 }
 
 impl ExtraRoutes for GatewayHealth {
-    fn render(&self, path: &str) -> Option<RouteReply> {
-        match path {
+    fn render(&self, request: &Request<'_>) -> Option<RouteReply> {
+        if let Some(reply) = self.admin.as_ref().and_then(|admin| admin.render(request)) {
+            return Some(reply);
+        }
+        match request.path {
             "/status" => Some(RouteReply::json(200, self.status())),
             "/peers" if self.peers_route => Some(RouteReply::json(200, self.peers())),
             // Turned off on a shared host: the labels and per-device counters
@@ -290,6 +304,15 @@ mod tests {
     use crate::device::{GatewayDevice, GatewayOptions};
     use crate::socket::DatagramSocket;
 
+    /// What a browser or a probe sends: a plain read.
+    fn get(path: &str) -> Request<'_> {
+        Request {
+            method: "GET",
+            path,
+            authorization: None,
+        }
+    }
+
     async fn routes(peers_route: bool) -> GatewayHealth {
         let sockets: Vec<Arc<dyn DatagramSocket>> =
             crate::socket::bind_all(&["127.0.0.1:0".parse().unwrap()])
@@ -321,7 +344,7 @@ mod tests {
     #[tokio::test]
     async fn status_reports_the_epoch_the_budget_and_every_drop_class() {
         let health = routes(true).await;
-        let reply = health.render("/status").expect("the route is served");
+        let reply = health.render(&get("/status")).expect("the route is served");
         assert_eq!(reply.status, 200);
         assert_eq!(reply.content_type, "application/json");
         let body = reply.body;
@@ -344,7 +367,10 @@ mod tests {
     #[tokio::test]
     async fn the_peers_route_can_be_turned_off() {
         let health = routes(true).await;
-        let body = health.render("/peers").expect("served by default").body;
+        let body = health
+            .render(&get("/peers"))
+            .expect("served by default")
+            .body;
         assert!(body.contains("\"label\": \"livingroom-tv\""), "{body}");
         assert!(body.contains("\"session\": false"), "{body}");
         assert!(body.contains("\"endpoint_seen\": false"), "{body}");
@@ -355,7 +381,7 @@ mod tests {
 
         let health = routes(false).await;
         assert!(
-            health.render("/peers").is_none(),
+            health.render(&get("/peers")).is_none(),
             "with the route off the shared table answers 404"
         );
     }
@@ -365,8 +391,8 @@ mod tests {
     #[tokio::test]
     async fn no_route_renders_a_key_or_a_remote_address() {
         let health = routes(true).await;
-        let status = health.render("/status").unwrap().body;
-        let peers = health.render("/peers").unwrap().body;
+        let status = health.render(&get("/status")).unwrap().body;
+        let peers = health.render(&get("/peers")).unwrap().body;
         for body in [&status, &peers] {
             assert!(!body.contains("PrivateKey"), "{body}");
             assert!(!body.contains("127.0.0.1"), "{body}");
@@ -385,10 +411,101 @@ mod tests {
         );
     }
 
+    /// The subcommands reach these routes over the health listener, so the
+    /// token, the method and the path have to survive a real socket, and a
+    /// caller without the token must get nothing but a refusal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_admin_routes_answer_over_the_health_listener_and_only_with_the_token() {
+        let dir = std::env::temp_dir().join(format!(
+            "warren-burrow-health-admin-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let map: std::collections::HashMap<String, String> = [(
+            "WARREN_BURROW_STATE_DIR".to_owned(),
+            dir.display().to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let env = crate::config::load(
+            move |k| map.get(k).cloned(),
+            |_| Err(std::io::Error::other("no file")),
+            |_| None,
+            false,
+        )
+        .expect("a valid test environment");
+        let provisioned = crate::provision::init(&env, &crate::provision::InitOptions::default())
+            .expect("a provisioned gateway");
+        let token = crate::admin::write_token(&env).expect("a token");
+
+        let sockets: Vec<Arc<dyn DatagramSocket>> =
+            crate::socket::bind_all(&["127.0.0.1:0".parse().unwrap()])
+                .await
+                .unwrap();
+        let device = GatewayDevice::new(
+            &provisioned.conf,
+            env.plan,
+            &GatewayOptions::default(),
+            sockets,
+        )
+        .expect("a device");
+        let admin = crate::admin::Admin::new(
+            device.clone(),
+            env.conf_path.clone(),
+            env.plan,
+            token.clone(),
+        );
+        let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connected);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(None);
+        let (port_tx, port_rx) = tokio::sync::watch::channel(None);
+        let routes = GatewayHealth::new(
+            device,
+            state_rx.clone(),
+            epoch_rx,
+            port_rx.clone(),
+            1280,
+            1420,
+            true,
+        )
+        .with_admin(admin);
+        let view = warren_headless::health::HealthView::new(
+            state_rx,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            port_rx,
+        )
+        .with_routes(routes.shared());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(warren_headless::health::serve(listener, view));
+
+        let with_token = token.clone();
+        let reply = tokio::task::spawn_blocking(move || {
+            crate::admin::post(addr, "/admin/reload", &with_token)
+        })
+        .await
+        .unwrap()
+        .expect("the daemon answers");
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert!(reply.body.contains("\"unchanged\": 1"), "{}", reply.body);
+
+        let refused = tokio::task::spawn_blocking(move || {
+            crate::admin::post(addr, "/admin/reset-peer/peer2", "not the token")
+        })
+        .await
+        .unwrap()
+        .expect("the daemon answers");
+        assert_eq!(refused.status, 401, "{}", refused.body);
+
+        server.abort();
+        drop((state_tx, epoch_tx, port_tx));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn an_unknown_path_falls_through_to_the_shared_table() {
         let health = routes(true).await;
-        assert!(health.render("/healthz").is_none());
-        assert!(health.render("/nope").is_none());
+        assert!(health.render(&get("/healthz")).is_none());
+        assert!(health.render(&get("/nope")).is_none());
     }
 }

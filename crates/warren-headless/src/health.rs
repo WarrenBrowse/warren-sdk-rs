@@ -57,10 +57,25 @@ impl RouteReply {
     }
 }
 
+/// One request, as a daemon's own routes see it.
+///
+/// Enough to authenticate and to tell a read from a write, and nothing more:
+/// this responder exists to answer an orchestrator's probe, not to be an HTTP
+/// server.
+#[derive(Debug, Clone, Copy)]
+pub struct Request<'a> {
+    /// The method, as the client spelled it.
+    pub method: &'a str,
+    /// The path, with no query string.
+    pub path: &'a str,
+    /// The `authorization` header value, when one was sent.
+    pub authorization: Option<&'a str>,
+}
+
 /// The routes one daemon adds on top of the shared three.
 pub trait ExtraRoutes: Send + Sync + 'static {
-    /// Renders `path`, or `None` to fall through to the shared table.
-    fn render(&self, path: &str) -> Option<RouteReply>;
+    /// Renders the request, or `None` to fall through to the shared table.
+    fn render(&self, request: &Request<'_>) -> Option<RouteReply>;
 }
 
 /// Shared view the responder renders from.
@@ -163,16 +178,20 @@ async fn handle_connection(
     let Ok(Ok(n)) = tokio::time::timeout(read_timeout, stream.read(&mut buf)).await else {
         return;
     };
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let path = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/");
+    let raw = String::from_utf8_lossy(&buf[..n]);
+    let mut start = raw.lines().next().unwrap_or_default().split_whitespace();
+    let method = start.next().unwrap_or("GET");
+    let path = start.next().unwrap_or("/");
+    let path = path.split('?').next().unwrap_or(path);
+    let request = Request {
+        method,
+        path,
+        authorization: header(&raw, "authorization"),
+    };
     let reply = view
         .extra
         .as_ref()
-        .and_then(|extra| extra.render(path))
+        .and_then(|extra| extra.render(&request))
         .unwrap_or_else(|| {
             let (status, body) = render(
                 path,
@@ -182,11 +201,7 @@ async fn handle_connection(
             );
             RouteReply::text(status, body)
         });
-    let reason = match reply.status {
-        200 => "OK",
-        503 => "Service Unavailable",
-        _ => "Not Found",
-    };
+    let reason = reason(reply.status);
     let response = format!(
         "HTTP/1.1 {} {reason}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         reply.status,
@@ -196,6 +211,26 @@ async fn handle_connection(
     );
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.shutdown().await;
+}
+
+/// One header's value, matched without regard to case as HTTP requires.
+fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    request.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+/// The reason phrase of a status this responder answers with.
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        405 => "Method Not Allowed",
+        503 => "Service Unavailable",
+        _ => "Not Found",
+    }
 }
 
 /// Synchronous `/healthz` probe for the `healthcheck` subcommand (the
@@ -399,8 +434,17 @@ mod tests {
     struct OneRoute;
 
     impl ExtraRoutes for OneRoute {
-        fn render(&self, path: &str) -> Option<RouteReply> {
-            (path == "/status").then(|| RouteReply::json(200, "{\"gate\":\"open\"}".to_owned()))
+        fn render(&self, request: &Request<'_>) -> Option<RouteReply> {
+            match (request.method, request.path) {
+                ("GET", "/status") => Some(RouteReply::json(200, "{\"gate\":\"open\"}".to_owned())),
+                // A route that only a bearer opens, to pin that the responder
+                // hands the header and the method through.
+                ("POST", "/admin/reload") if request.authorization == Some("Bearer opensesame") => {
+                    Some(RouteReply::text(200, "reloaded\n".to_owned()))
+                }
+                (_, "/admin/reload") => Some(RouteReply::text(401, "unauthorized\n".to_owned())),
+                _ => None,
+            }
         }
     }
 
@@ -436,6 +480,52 @@ mod tests {
 
         let healthz = get("/healthz").await;
         assert!(healthz.ends_with("ok\n"), "got: {healthz}");
+        server.abort();
+    }
+
+    /// A route that authenticates needs the method and the bearer, and a
+    /// client is free to spell the header name in any case it likes.
+    #[tokio::test]
+    async fn a_daemon_route_sees_the_method_and_the_authorization_header() {
+        let (_state_tx, state_rx) = watch::channel(ConnectionState::Connected);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let view = view(state_rx, Arc::new(AtomicBool::new(true))).with_routes(Arc::new(OneRoute));
+        let server = tokio::spawn(serve(listener, view));
+
+        let send = |request: String| async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        };
+
+        let authorized = send(
+            "POST /admin/reload HTTP/1.1\r\nhost: x\r\nAuthorization: Bearer opensesame\r\n\r\n"
+                .to_owned(),
+        )
+        .await;
+        assert!(
+            authorized.starts_with("HTTP/1.1 200 OK"),
+            "got: {authorized}"
+        );
+
+        let bare = send("POST /admin/reload HTTP/1.1\r\nhost: x\r\n\r\n".to_owned()).await;
+        assert!(
+            bare.starts_with("HTTP/1.1 401 Unauthorized"),
+            "a request with no bearer must be refused, and named: {bare}"
+        );
+
+        let read_only = send(
+            "GET /admin/reload?after=now HTTP/1.1\r\nhost: x\r\nauthorization: Bearer opensesame\r\n\r\n"
+                .to_owned(),
+        )
+        .await;
+        assert!(
+            read_only.starts_with("HTTP/1.1 401"),
+            "the method reaches the route, and a query string is not part of the path: {read_only}"
+        );
         server.abort();
     }
 

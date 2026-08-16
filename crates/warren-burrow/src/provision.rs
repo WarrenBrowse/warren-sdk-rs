@@ -64,6 +64,12 @@ pub enum ProvisionError {
          WARREN_BURROW_ENDPOINT to the address peers reach this host at"
     )]
     LoopbackEndpoint,
+    /// No daemon has written an admin token, so there is nothing to talk to.
+    #[error(
+        "no running daemon left an admin token in the state directory: start the gateway, or \
+         apply the change at its next start"
+    )]
+    NoDaemonToken,
     /// A file could not be written.
     #[error("writing {path}")]
     Io {
@@ -87,7 +93,7 @@ pub struct Provisioned {
 }
 
 /// How a peer's client files are shaped.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerOptions {
     /// Prefixes the peer keeps reaching directly, outside the tunnel.
     pub lan_exclude: Vec<IpNetwork>,
@@ -97,7 +103,7 @@ pub struct PeerOptions {
 }
 
 /// How a first run or an explicit `init` is shaped.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InitOptions {
     /// How many peers to generate; the environment's own count when unset.
     pub peers: Option<u32>,
@@ -116,15 +122,44 @@ pub struct InitOptions {
 /// [`ProvisionError::Io`] when it cannot be read, [`ProvisionError::Conf`]
 /// when it does not parse or breaks a rule.
 pub fn load_conf(env: &GatewayEnv) -> Result<GatewayConf, ProvisionError> {
-    let text = Zeroizing::new(std::fs::read_to_string(&env.conf_path).map_err(|source| {
-        ProvisionError::Io {
-            path: env.conf_path.display().to_string(),
-            source,
-        }
-    })?);
+    load_conf_from(&env.conf_path, &env.plan)
+}
+
+/// Reads a gateway configuration and checks it against a peer plan.
+///
+/// # Errors
+///
+/// [`ProvisionError::Io`] when it cannot be read, [`ProvisionError::Conf`]
+/// when it does not parse or breaks a rule.
+pub fn load_conf_from(
+    path: &Path,
+    plan: &warren_burrow_core::PeerPlan,
+) -> Result<GatewayConf, ProvisionError> {
+    let text =
+        Zeroizing::new(
+            std::fs::read_to_string(path).map_err(|source| ProvisionError::Io {
+                path: path.display().to_string(),
+                source,
+            })?,
+        );
     let conf = parse_gateway_conf(&text)?;
-    conf.check_against(&env.plan)?;
+    conf.check_against(plan)?;
     Ok(conf)
+}
+
+/// Writes a file only its owner can read, replacing whatever was there.
+///
+/// The same discipline as the client credentials: the mode is set at creation
+/// and the file appears whole or not at all.
+///
+/// # Errors
+///
+/// [`ProvisionError::Io`] when it cannot be written.
+pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), ProvisionError> {
+    if let Some(parent) = path.parent() {
+        create_private_dir(parent)?;
+    }
+    write_private(path, bytes)
 }
 
 /// Whether a gateway configuration already exists.
@@ -269,6 +304,19 @@ pub fn show_qr(env: &GatewayEnv, label: &str) -> Result<Zeroizing<String>, Provi
 /// endpoint and none could be detected, [`ProvisionError::LoopbackEndpoint`]
 /// when detection returned an address no other device can reach.
 pub fn resolve_endpoint(env: &GatewayEnv) -> Result<SocketAddr, ProvisionError> {
+    resolve_endpoint_with(env, detect_local_address)
+}
+
+/// The same, with the detection injected so both refusals are testable without
+/// a network.
+///
+/// # Errors
+///
+/// See [`resolve_endpoint`].
+pub fn resolve_endpoint_with(
+    env: &GatewayEnv,
+    detect: impl FnOnce() -> Option<IpAddr>,
+) -> Result<SocketAddr, ProvisionError> {
     if let Some(endpoint) = env.endpoint {
         return Ok(endpoint);
     }
@@ -278,7 +326,7 @@ pub fn resolve_endpoint(env: &GatewayEnv) -> Result<SocketAddr, ProvisionError> 
         // the default asks for.
         return Ok(SocketAddr::from(([127, 0, 0, 1], port)));
     }
-    let detected = detect_local_address().ok_or(ProvisionError::EndpointUnknown)?;
+    let detected = detect().ok_or(ProvisionError::EndpointUnknown)?;
     if detected.is_loopback() {
         return Err(ProvisionError::LoopbackEndpoint);
     }
@@ -455,11 +503,18 @@ fn move_aside(env: &GatewayEnv) -> Result<(), ProvisionError> {
 }
 
 /// Whether the state directory holds anything but what this gateway writes.
+///
+/// The configuration's own name comes from the environment, so the file this
+/// gateway is about to write is never what makes its directory look occupied.
 fn state_dir_has_other_files(env: &GatewayEnv) -> Result<bool, ProvisionError> {
     let dir = &env.state_dir;
     if !dir.exists() {
         return Ok(false);
     }
+    let conf_name = env.conf_path.file_name().map_or_else(
+        || "burrow.conf".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     let entries = std::fs::read_dir(dir).map_err(|source| ProvisionError::Io {
         path: dir.display().to_string(),
         source,
@@ -467,7 +522,11 @@ fn state_dir_has_other_files(env: &GatewayEnv) -> Result<bool, ProvisionError> {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name != "clients" && name != "README.txt" && !name.starts_with("burrow.conf") {
+        let ours = name == "clients"
+            || name == "README.txt"
+            || name == crate::admin::TOKEN_FILE
+            || name.starts_with(conf_name.as_str());
+        if !ours {
             return Ok(true);
         }
     }
@@ -790,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn a_loopback_gateway_writes_a_loopback_endpoint_and_a_lan_one_refuses_it() {
+    fn a_loopback_gateway_writes_a_loopback_endpoint_and_an_explicit_one_is_kept() {
         let dir = temp_dir("endpoint");
         let env = env_for(&dir, &[]);
         assert_eq!(
@@ -804,6 +863,65 @@ mod tests {
             "192.168.1.10:51820".parse().unwrap(),
             "an explicit endpoint is never second-guessed"
         );
+    }
+
+    /// A LAN gateway hands its endpoint to devices that are not this host, so
+    /// a detection that finds nothing, or finds only loopback, refuses rather
+    /// than writing configurations that are dead on arrival.
+    #[test]
+    fn a_lan_gateway_refuses_an_endpoint_no_peer_could_reach() {
+        let dir = temp_dir("lan-endpoint");
+        let env = env_for(
+            &dir,
+            &[
+                ("WARREN_BURROW_LAN", "1"),
+                ("WARREN_BURROW_LISTEN", "0.0.0.0:51820"),
+            ],
+        );
+
+        assert!(matches!(
+            resolve_endpoint_with(&env, || None),
+            Err(ProvisionError::EndpointUnknown)
+        ));
+        assert!(matches!(
+            resolve_endpoint_with(&env, || Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))),
+            Err(ProvisionError::LoopbackEndpoint)
+        ));
+        assert_eq!(
+            resolve_endpoint_with(&env, || Some("192.168.1.10".parse().unwrap()))
+                .expect("a routable address is what peers reach this host at"),
+            "192.168.1.10:51820".parse().unwrap()
+        );
+    }
+
+    /// A state directory that holds only what this gateway writes is not
+    /// occupied by someone else, whatever the configuration file is called.
+    #[test]
+    fn the_files_this_gateway_writes_never_make_its_own_directory_look_busy() {
+        let dir = temp_dir("own-files");
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = env_for(
+            &dir,
+            &[(
+                "WARREN_BURROW_CONF",
+                &dir.join("gateway.conf").display().to_string(),
+            )],
+        );
+        std::fs::write(dir.join("admin.token"), b"a token from a previous run").unwrap();
+        std::fs::write(dir.join("README.txt"), b"the README").unwrap();
+
+        init(&env, &InitOptions::default()).expect("its own files do not occupy the directory");
+
+        std::fs::write(dir.join("someone-elses.db"), b"data").unwrap();
+        let env = env_for(&temp_dir("own-files-2"), &[]);
+        let _ = std::fs::create_dir_all(&env.state_dir);
+        std::fs::write(env.state_dir.join("someone-elses.db"), b"data").unwrap();
+        assert!(matches!(
+            init(&env, &InitOptions::default()),
+            Err(ProvisionError::StateDirNotEmpty)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&env.state_dir);
     }
 
     #[test]

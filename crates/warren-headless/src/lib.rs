@@ -36,7 +36,8 @@ pub use forward::{
 };
 pub use hardening::{disable_core_dumps, is_root};
 pub use health::{
-    ExtraRoutes, HealthView, RouteReply, probe_healthz, render, serve, track_egress_across_epochs,
+    ExtraRoutes, HealthView, Request, RouteReply, probe_healthz, render, serve,
+    track_egress_across_epochs,
 };
 pub use hooks::{
     HOOK_TIMEOUT, HookOutcome, clear_status_file, run_hook, run_hook_with_timeout, substitute_port,

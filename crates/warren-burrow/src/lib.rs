@@ -16,6 +16,7 @@
 //! implements the WireGuard protocol; it is not affiliated with, endorsed by
 //! or a product of the WireGuard project.
 
+pub mod admin;
 pub mod config;
 pub mod control;
 pub mod device;
@@ -24,6 +25,7 @@ pub mod provision;
 pub mod run;
 pub mod socket;
 
+pub use admin::Admin;
 pub use config::{GatewayConfigError, GatewayEnv};
 pub use control::GatewayControl;
 pub use device::{

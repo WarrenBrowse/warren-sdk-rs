@@ -22,6 +22,7 @@ use warren_sdk::{
     SupervisedPacketHandle, WarrenClient,
 };
 
+use crate::admin::{self, Admin};
 use crate::config::{GatewayEnv, MAX_CLIENT_MTU};
 use crate::device::{GatewayDevice, GatewayOptions};
 use crate::health::GatewayHealth;
@@ -110,7 +111,7 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
             .await
             .with_context(|| format!("binding the health endpoint on {listen}"))?;
         LOG.info(&format!("health endpoint on http://{listen}/healthz"));
-        let routes = GatewayHealth::new(
+        let mut routes = GatewayHealth::new(
             device.clone(),
             handle.watch_state(),
             handle.watch_epoch_end(),
@@ -119,6 +120,9 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
             MAX_CLIENT_MTU,
             env.health_peers,
         );
+        if let Some(admin) = admin_routes(&env, &device)? {
+            routes = routes.with_admin(admin);
+        }
         let view = HealthView::new(
             handle.watch_state(),
             Arc::clone(&egress_verified),
@@ -196,10 +200,40 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
             _ => LOG.info("the forwarded port release proved no delete, its lease may lapse"),
         }
     }
-    // Nothing may reach a peer once the daemon is on its way out.
+    // Nothing may reach a peer once the daemon is on its way out, and the
+    // token opens nothing once there is no listener to present it to.
     device.close_gate();
+    admin::forget_token(&env);
     handle.shutdown();
     Ok(code)
+}
+
+/// The admin surface, when this daemon may serve one.
+///
+/// It is served on a loopback health listener only: `reload` and `reset-peer`
+/// change what the gateway carries, and a write surface answering the network
+/// is not what a local gateway is for. A daemon that serves none leaves no
+/// token behind, so the subcommands say plainly that there is nothing to talk
+/// to.
+fn admin_routes(env: &GatewayEnv, device: &GatewayDevice) -> anyhow::Result<Option<Admin>> {
+    let loopback = env
+        .health_listen
+        .is_some_and(|listen| listen.ip().is_loopback());
+    if !loopback {
+        admin::forget_token(env);
+        LOG.info(
+            "admin routes are off: the health endpoint is not on loopback (reload with SIGHUP)",
+        );
+        return Ok(None);
+    }
+    let token = admin::write_token(env).context("writing the admin token")?;
+    LOG.info("admin routes on /admin/reload and /admin/reset-peer/LABEL");
+    Ok(Some(Admin::new(
+        device.clone(),
+        env.conf_path.clone(),
+        env.plan,
+        token,
+    )))
 }
 
 /// Generates the gateway and its peers when the state directory is empty, and
@@ -453,18 +487,15 @@ fn start_forward(
 /// Applies the configuration file as it now stands, keeping the session of
 /// every peer whose key material and allowed IPs did not change.
 fn reload_now(env: &GatewayEnv, device: &GatewayDevice) {
-    match provision::load_conf(env) {
-        Ok(conf) => match device.reload(&conf) {
-            Ok(report) => LOG.info(&format!(
-                "reloaded: {} added, {} removed, {} rebuilt, {} untouched",
-                report.added.len(),
-                report.removed.len(),
-                report.rebuilt.len(),
-                report.unchanged
-            )),
-            Err(err) => LOG.error(&format!("reload refused, nothing changed: {err}")),
-        },
-        Err(err) => LOG.error(&format!("reload could not read the configuration: {err}")),
+    match admin::reload(device, &env.conf_path, &env.plan) {
+        Ok(report) => LOG.info(&format!(
+            "reloaded: {} added, {} removed, {} rebuilt, {} untouched",
+            report.added.len(),
+            report.removed.len(),
+            report.rebuilt.len(),
+            report.unchanged
+        )),
+        Err(err) => LOG.error(&format!("reload refused, nothing changed: {err}")),
     }
 }
 

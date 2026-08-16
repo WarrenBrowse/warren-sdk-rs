@@ -5,16 +5,20 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use ip_network::IpNetwork;
+use warren_burrow::admin;
 use warren_burrow::config::GatewayEnv;
 use warren_burrow::provision::{self, InitOptions, PeerOptions};
 
 /// What the command line asked for.
+#[derive(Debug, PartialEq, Eq)]
 enum Command {
     Run,
     Init(InitOptions),
     AddPeer(String, PeerOptions),
     RemovePeer(String),
     Show(String, bool),
+    Reload,
+    ResetPeer(String),
     Healthcheck,
     Help,
 }
@@ -27,6 +31,8 @@ warren-burrow: a local gateway that carries stock WireGuard-protocol clients thr
     warren-burrow add-peer LABEL [OPTIONS]   add one peer and write its files
     warren-burrow remove-peer LABEL          revoke one peer
     warren-burrow show LABEL [--qr]          print a peer's client configuration
+    warren-burrow reload                     apply the configuration file to the running daemon
+    warren-burrow reset-peer LABEL           rebuild one peer's session (a device whose clock jumped)
     warren-burrow healthcheck                probe the running daemon's /healthz
 
 Options for init and add-peer:
@@ -90,14 +96,18 @@ fn main() -> ExitCode {
                 out.clients_dir.display()
             );
             println!("  warren-burrow show {label}");
+            apply_to_daemon(&env);
             Ok(())
         }),
         Command::RemovePeer(label) => provisioning(|| {
             provision::remove_peer(&env, &label)?;
-            println!("warren-burrow: {label} revoked; reload or restart the daemon to apply it");
+            println!("warren-burrow: {label} revoked");
+            apply_to_daemon(&env);
             Ok(())
         }),
         Command::Show(label, qr) => provisioning(|| show(&env, &label, qr)),
+        Command::Reload => admin_call(&env, "/admin/reload"),
+        Command::ResetPeer(label) => admin_call(&env, &format!("/admin/reset-peer/{label}")),
         Command::Healthcheck | Command::Help => unreachable!("handled above"),
     }
 }
@@ -151,6 +161,60 @@ fn show(env: &GatewayEnv, label: &str, qr: bool) -> Result<(), provision::Provis
     }
     print!("{}", *provision::show(env, label)?);
     Ok(())
+}
+
+/// Calls one admin route on the running daemon and reports what it answered.
+fn admin_call(env: &GatewayEnv, path: &str) -> ExitCode {
+    match admin_request(env, path) {
+        Ok(message) => {
+            print!("warren-burrow: {message}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("warren-burrow: {message}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Tells the running daemon to apply the file that was just edited, and says
+/// what happened either way: an operator who edited a credential needs to know
+/// whether it is live.
+fn apply_to_daemon(env: &GatewayEnv) {
+    match admin_request(env, "/admin/reload") {
+        Ok(message) => print!("warren-burrow: {message}"),
+        Err(message) => eprintln!("warren-burrow: {message}"),
+    }
+}
+
+/// One admin request, with the message an operator should read.
+fn admin_request(env: &GatewayEnv, path: &str) -> Result<String, String> {
+    let Some(addr) = health_target()? else {
+        return Err(format!(
+            "the health endpoint is off, so no admin route is served: {}",
+            RELOAD_WITHOUT_ENDPOINT
+        ));
+    };
+    let token = admin::read_token(env).map_err(|err| err.to_string())?;
+    let reply = admin::post(addr, path, &token)
+        .map_err(|_| "no daemon answered on the health endpoint".to_owned())?;
+    let body = reply.body.trim().to_owned();
+    if reply.status == 200 {
+        Ok(format!("{body}\n"))
+    } else {
+        Err(format!("the daemon refused it ({}): {body}", reply.status))
+    }
+}
+
+/// What an operator does when no admin route can be reached.
+#[cfg(unix)]
+const RELOAD_WITHOUT_ENDPOINT: &str = "send SIGHUP to the daemon instead";
+#[cfg(not(unix))]
+const RELOAD_WITHOUT_ENDPOINT: &str = "restart the daemon to apply it";
+
+fn health_target() -> Result<Option<std::net::SocketAddr>, String> {
+    warren_burrow::config::healthcheck_target(std::env::var("WARREN_HEALTH_LISTEN").ok())
+        .map_err(|err| err.to_string())
 }
 
 /// `warren-burrow healthcheck`: probe the running daemon and exit 0/1, so a
@@ -217,8 +281,25 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         return Ok(Command::Run);
     };
     match first {
-        "run" => Ok(Command::Run),
+        "run" => match rest.next() {
+            // The daemon takes its whole configuration from the environment,
+            // so an argument here is a misunderstanding worth naming rather
+            // than a flag to ignore.
+            Some(extra) => Err(format!("run takes no argument, got {extra}")),
+            None => Ok(Command::Run),
+        },
         "healthcheck" => Ok(Command::Healthcheck),
+        "reload" => match rest.next() {
+            Some(extra) => Err(format!("reload takes no argument, got {extra}")),
+            None => Ok(Command::Reload),
+        },
+        "reset-peer" => {
+            let label = rest.next().ok_or("reset-peer needs a label")?.to_owned();
+            match rest.next() {
+                Some(extra) => Err(format!("reset-peer takes one label, got {extra}")),
+                None => Ok(Command::ResetPeer(label)),
+            }
+        }
         "help" | "--help" | "-h" => Ok(Command::Help),
         "init" => Ok(Command::Init(parse_init(rest)?)),
         "add-peer" => {
@@ -227,7 +308,10 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         }
         "remove-peer" => {
             let label = rest.next().ok_or("remove-peer needs a label")?.to_owned();
-            Ok(Command::RemovePeer(label))
+            match rest.next() {
+                Some(extra) => Err(format!("remove-peer takes one label, got {extra}")),
+                None => Ok(Command::RemovePeer(label)),
+            }
         }
         "show" => {
             let mut label = None;
@@ -235,6 +319,9 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             for arg in rest {
                 match arg {
                     "--qr" => qr = true,
+                    other if label.is_some() => {
+                        return Err(format!("show takes one label, got {other}"));
+                    }
                     other => label = Some(other.to_owned()),
                 }
             }
@@ -283,4 +370,52 @@ fn parse_cidr<'a>(args: &mut impl Iterator<Item = &'a str>) -> Result<IpNetwork,
     let raw = args.next().ok_or("--lan-exclude needs a CIDR prefix")?;
     raw.parse()
         .map_err(|_| format!("{raw} is not a CIDR prefix"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Command, String> {
+        let owned: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        parse_command(&owned)
+    }
+
+    #[test]
+    fn no_argument_serves_and_the_write_subcommands_name_their_target() {
+        assert_eq!(parse(&[]).expect("the default"), Command::Run);
+        assert_eq!(parse(&["run"]).expect("explicit"), Command::Run);
+        assert_eq!(parse(&["reload"]).expect("a reload"), Command::Reload);
+        assert_eq!(
+            parse(&["reset-peer", "phone"]).expect("a reset"),
+            Command::ResetPeer("phone".to_owned())
+        );
+        assert_eq!(
+            parse(&["show", "phone", "--qr"]).expect("a show"),
+            Command::Show("phone".to_owned(), true)
+        );
+    }
+
+    /// An argument a subcommand does not take is a misunderstanding: the
+    /// daemon reads its whole configuration from the environment, so silently
+    /// ignoring one would run something other than what was asked.
+    #[test]
+    fn an_argument_a_subcommand_does_not_take_is_refused() {
+        for args in [
+            vec!["run", "--peers", "3"],
+            vec!["reload", "now"],
+            vec!["reset-peer", "phone", "again"],
+            vec!["remove-peer", "phone", "too"],
+            vec!["show", "phone", "tv"],
+            vec!["init", "--nope"],
+            vec!["add-peer", "phone", "--nope"],
+            vec!["fly"],
+            vec!["--nope"],
+        ] {
+            let err = parse(&args).expect_err("must name the argument at fault");
+            assert!(args.iter().any(|arg| err.contains(arg)), "{args:?}: {err}");
+        }
+        assert!(parse(&["reset-peer"]).is_err(), "a label is required");
+        assert!(parse(&["show", "--qr"]).is_err(), "a label is required");
+    }
 }
