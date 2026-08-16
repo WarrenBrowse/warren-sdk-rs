@@ -23,6 +23,15 @@ pub const HANDSHAKE_BURST_PER_IP: u32 = 10;
 /// How many source addresses are tracked per generation.
 pub const HANDSHAKE_SOURCES_TRACKED: usize = 4096;
 
+/// ICMP errors and echo replies the gateway generates per second, every peer
+/// together. A router bounds its own error generation (RFC 1812 section
+/// 4.3.2.8) because an error costs it more than the packet that caused it; here
+/// an answer costs a build plus a full AEAD seal, and a withdrawn IPv6 makes an
+/// answer the response to every packet of a dual-stack peer.
+pub const ANSWER_RATE_PER_SECOND: u32 = 1000;
+/// How many answers may be generated at once after a quiet period.
+pub const ANSWER_BURST: u32 = 1000;
+
 // Tokens are counted in thousandths so a refill can be computed from elapsed
 // milliseconds with integer arithmetic only.
 const SCALE: u64 = 1000;
@@ -31,6 +40,46 @@ const SCALE: u64 = 1000;
 struct Bucket {
     tokens: u64,
     last: Instant,
+}
+
+/// One token bucket, for a budget that belongs to the gateway rather than to a
+/// source address.
+#[derive(Debug)]
+pub struct TokenBucket {
+    rate: u64,
+    burst: u64,
+    tokens: u64,
+    last: Option<Instant>,
+}
+
+impl TokenBucket {
+    /// A full bucket that refills at `rate` a second and holds `burst`.
+    #[must_use]
+    pub fn new(rate: u32, burst: u32) -> Self {
+        Self {
+            rate: u64::from(rate),
+            burst: u64::from(burst) * SCALE,
+            tokens: u64::from(burst) * SCALE,
+            last: None,
+        }
+    }
+
+    /// Spends one token, or refuses.
+    pub fn admit(&mut self, now: Instant) -> bool {
+        let last = *self.last.get_or_insert(now);
+        let millis =
+            u64::try_from(now.saturating_duration_since(last).as_millis()).unwrap_or(u64::MAX);
+        let refill = millis.saturating_mul(self.rate);
+        if refill > 0 {
+            self.tokens = self.tokens.saturating_add(refill).min(self.burst);
+            self.last = Some(now);
+        }
+        if self.tokens < SCALE {
+            return false;
+        }
+        self.tokens -= SCALE;
+        true
+    }
 }
 
 /// One token bucket per source address, with a bounded number of buckets.
@@ -184,6 +233,19 @@ mod tests {
             admitted >= budget - 1 && admitted <= budget,
             "one second of arrivals admitted {admitted}"
         );
+    }
+
+    #[test]
+    fn a_gateway_wide_bucket_spends_its_burst_then_refills() {
+        let mut bucket = TokenBucket::new(4, 8);
+        let now = Instant::now();
+        for attempt in 1..=8 {
+            assert!(bucket.admit(now), "attempt {attempt}");
+        }
+        assert!(!bucket.admit(now));
+        // Four a second is one every 250 ms.
+        assert!(bucket.admit(now + Duration::from_millis(250)));
+        assert!(!bucket.admit(now + Duration::from_millis(250)));
     }
 
     #[test]

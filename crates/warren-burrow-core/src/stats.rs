@@ -153,6 +153,10 @@ pub struct ResponderSnapshot {
     pub downlink_queued: u64,
     /// Handshake initiations discarded because the peer has no known endpoint.
     pub downlink_initiation_dropped_no_endpoint: u64,
+    /// ICMP answers the gateway did not generate because it had spent its own
+    /// budget. The refusal itself is still counted under its class; this says
+    /// the peer was refused without being told.
+    pub answers_suppressed: u64,
     /// Peers rebuilt because the wall clock jumped under a monotonic clock
     /// that does not count suspend.
     pub clock_jump_resets: u64,
@@ -201,6 +205,11 @@ impl ResponderCounters {
     /// Counts one initiation discarded for want of an endpoint.
     pub fn initiation_without_endpoint(&mut self) {
         self.totals.downlink_initiation_dropped_no_endpoint += 1;
+    }
+
+    /// Counts one ICMP answer the gateway refused itself.
+    pub fn answer_suppressed(&mut self) {
+        self.totals.answers_suppressed += 1;
     }
 
     /// Counts one peer rebuilt after a wall-clock jump.

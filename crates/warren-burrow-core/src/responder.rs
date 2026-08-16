@@ -38,7 +38,8 @@ use crate::nat::Ownership;
 use crate::peer::{DropReason, PeerId, PeerLabel, PeerStats, PeerStatus};
 use crate::plan::{PeerPlan, is_tunnel_gateway, is_tunnel_pool};
 use crate::ratelimit::{
-    HANDSHAKE_BURST_PER_IP, HANDSHAKE_RATE_PER_IP, HANDSHAKE_SOURCES_TRACKED, HandshakeBuckets,
+    ANSWER_BURST, ANSWER_RATE_PER_SECOND, HANDSHAKE_BURST_PER_IP, HANDSHAKE_RATE_PER_IP,
+    HANDSHAKE_SOURCES_TRACKED, HandshakeBuckets, TokenBucket,
 };
 use crate::scratch::ScratchBuf;
 use crate::stats::{ResponderCounters, ResponderSnapshot};
@@ -202,6 +203,10 @@ pub struct ResponderOptions {
     pub per_source_burst: u32,
     /// How many source addresses the per-source limiter tracks.
     pub sources_tracked: usize,
+    /// ICMP answers the gateway may generate per second, every peer together.
+    pub answer_rate: u32,
+    /// How many it may generate at once after a quiet period.
+    pub answer_burst: u32,
 }
 
 impl Default for ResponderOptions {
@@ -212,6 +217,8 @@ impl Default for ResponderOptions {
             per_source_rate: HANDSHAKE_RATE_PER_IP,
             per_source_burst: HANDSHAKE_BURST_PER_IP,
             sources_tracked: HANDSHAKE_SOURCES_TRACKED,
+            answer_rate: ANSWER_RATE_PER_SECOND,
+            answer_burst: ANSWER_BURST,
         }
     }
 }
@@ -258,6 +265,10 @@ pub struct Responder {
     by_label: HashMap<PeerLabel, PeerId>,
     routes: IpNetworkTable<PeerId>,
     per_source: HandshakeBuckets,
+    // The gateway's own ICMP generation, bounded the way a router bounds its
+    // own: an answer costs a build and a full AEAD seal, and a withdrawn IPv6
+    // makes one the response to every packet a dual-stack peer sends.
+    answers: TokenBucket,
     indexes: IndexGen,
     plan: PeerPlan,
     isolation: bool,
@@ -320,6 +331,7 @@ impl Responder {
                 options.per_source_burst,
                 options.sources_tracked,
             ),
+            answers: TokenBucket::new(options.answer_rate, options.answer_burst),
             indexes,
             plan,
             isolation: options.peer_isolation,
@@ -580,13 +592,13 @@ impl Responder {
                 }
             }
             Packet::HandshakeResponse(ref response) => {
-                self.demux(src, datagram, response.receiver_idx, 2, scratch)
+                self.demux(src, datagram, response.receiver_idx, 2, now, scratch)
             }
             Packet::PacketCookieReply(ref cookie) => {
-                self.demux(src, datagram, cookie.receiver_idx, 3, scratch)
+                self.demux(src, datagram, cookie.receiver_idx, 3, now, scratch)
             }
             Packet::PacketData(ref data) => {
-                self.demux(src, datagram, data.receiver_idx, 4, scratch)
+                self.demux(src, datagram, data.receiver_idx, 4, now, scratch)
             }
         }
     }
@@ -597,6 +609,7 @@ impl Responder {
         datagram: &[u8],
         receiver_idx: u32,
         kind: u8,
+        now: Instant,
         scratch: &'a mut ScratchBuf,
     ) -> Inbound<'a> {
         // boringtun derives every session index of a peer from the peer index
@@ -646,12 +659,18 @@ impl Responder {
                 if let Some(peer) = self.peers.get_mut(&id) {
                     peer.stats.rx_bytes += len as u64;
                 }
-                self.deliver(id, len, scratch)
+                self.deliver(id, len, now, scratch)
             }
         }
     }
 
-    fn deliver<'a>(&mut self, id: PeerId, len: usize, scratch: &'a mut ScratchBuf) -> Inbound<'a> {
+    fn deliver<'a>(
+        &mut self,
+        id: PeerId,
+        len: usize,
+        now: Instant,
+        scratch: &'a mut ScratchBuf,
+    ) -> Inbound<'a> {
         let verdict = self.verdict(&scratch.as_mut()[..len]);
         match verdict {
             Verdict::Forward => {
@@ -669,6 +688,14 @@ impl Responder {
                 }
             }
             Verdict::Answer(reason) => {
+                if let Some(class) = reason.counted() {
+                    self.counters.dropped(class);
+                }
+                if !self.answers.admit(now) {
+                    // The refusal above stands; the peer is simply not told.
+                    self.counters.answer_suppressed();
+                    return Inbound::Consumed;
+                }
                 let built = match reason {
                     Answer::Echo => {
                         let request = &scratch.as_mut()[..len];
@@ -690,11 +717,12 @@ impl Responder {
                         build_unreachable_v6(&scratch.as_mut()[..len], self.plan.gateway_v6())
                     }
                 };
-                if let Some(class) = reason.counted() {
-                    self.counters.dropped(class);
-                }
                 let Some(packet) = built else {
-                    return Inbound::Dropped(self.note_for(id, DropReason::Malformed));
+                    // The offending packet is itself an ICMP error, and an
+                    // error never answers an error. Its refusal is already
+                    // counted under its own class; a second class here would
+                    // count one packet twice.
+                    return Inbound::Consumed;
                 };
                 match self.encapsulate_into(id, &packet, scratch) {
                     Some(out) => {
@@ -1243,6 +1271,16 @@ mod tests {
     }
 
     fn build(count: usize, isolation: bool) -> (Responder, Vec<Client>) {
+        build_with(
+            count,
+            ResponderOptions {
+                peer_isolation: isolation,
+                ..ResponderOptions::default()
+            },
+        )
+    }
+
+    fn build_with(count: usize, options: ResponderOptions) -> (Responder, Vec<Client>) {
         let gateway = GatewayKey::generate();
         let gateway_public = x25519::PublicKey::from(*gateway.public().as_bytes());
         let plan = PeerPlan::default();
@@ -1282,10 +1320,6 @@ mod tests {
         let conf = GatewayConf {
             key: gateway,
             peers,
-        };
-        let options = ResponderOptions {
-            peer_isolation: isolation,
-            ..ResponderOptions::default()
         };
         let mut responder = Responder::new(&conf, plan, options).expect("a valid configuration");
         responder.set_gate(true, 1);
@@ -1723,6 +1757,62 @@ mod tests {
         assert_eq!(header.dst, IpAddr::V4(clients[0].v4));
         assert_eq!(inner[header.l4_offset], ICMPV4_DEST_UNREACHABLE);
         assert_eq!(responder.stats().private_destination, 1);
+    }
+
+    #[test]
+    fn stops_answering_once_it_has_spent_its_own_icmp_budget() {
+        // Every router bounds the errors it generates itself. This one must
+        // too: with IPv6 withdrawn for the epoch, an answer is the response to
+        // every packet a dual-stack peer sends, and each one costs a build plus
+        // a full AEAD seal.
+        let (mut responder, mut clients) = build_with(
+            1,
+            ResponderOptions {
+                answer_rate: 0,
+                answer_burst: 2,
+                ..ResponderOptions::default()
+            },
+        );
+        let now = Instant::now();
+        handshake(&mut responder, &mut clients[0], now);
+
+        let mut scratch = ScratchBuf::new();
+        for attempt in 1..=2 {
+            let packet = testpkt::udp(
+                IpAddr::V4(clients[0].v4),
+                4000 + attempt,
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+                445,
+                b"smb",
+            );
+            let datagram = clients[0].encapsulate(&packet);
+            assert!(
+                matches!(
+                    responder.handle_datagram(clients[0].addr, &datagram, now, &mut scratch),
+                    Inbound::Reply(_)
+                ),
+                "answer {attempt} was not emitted"
+            );
+        }
+
+        let packet = testpkt::udp(
+            IpAddr::V4(clients[0].v4),
+            4003,
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+            445,
+            b"smb",
+        );
+        let datagram = clients[0].encapsulate(&packet);
+        assert!(matches!(
+            responder.handle_datagram(clients[0].addr, &datagram, now, &mut scratch),
+            Inbound::Consumed
+        ));
+        let stats = responder.stats();
+        assert_eq!(stats.answers_suppressed, 1);
+        assert_eq!(
+            stats.private_destination, 3,
+            "a refusal is counted whether or not the peer is told"
+        );
     }
 
     #[test]
