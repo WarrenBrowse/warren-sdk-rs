@@ -742,7 +742,11 @@ impl Responder {
         };
         if !is_unicast(dst) {
             // A router peer with a default route into the tunnel leaks mDNS
-            // and SSDP continuously; none of it may reach an exit.
+            // and SSDP continuously; none of it may reach an exit. Link-local
+            // is refused here rather than answered with an unreachable further
+            // down: this class is evaluated first on purpose, and a peer that
+            // floods a link-local range would otherwise buy an ICMP build and
+            // an AEAD seal per packet.
             return Verdict::Drop(DropReason::NonUnicast);
         }
         if self.plan.is_gateway(dst) {
