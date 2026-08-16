@@ -118,7 +118,11 @@ gateway private key, the peer public keys and the preshared keys live in
 - `/state`, `/port`: the supervised state, and the granted public port.
 - `/status`: JSON, the epoch, the gate, the live inner budget and the
   recommended client MTU, IPv6 availability, peer counts, NAT mappings and
-  every drop counter. No key, no address.
+  every drop counter. No key, no address. Two counters are easy to misread:
+  `spoofed_source` is a peer sourcing an address another peer owns, while the
+  MLD reports and router solicitations any peer's own link-local address emits
+  at interface bring-up are refused by the same rule under
+  `link_local_source`, so a `spoofed_source` that moves is worth reading.
 - `/peers`: per-peer labels and counters (`WARREN_BURROW_HEALTH_PEERS=0`
   removes it). Never a peer's remote address.
 - `POST /admin/reload`, `POST /admin/reset-peer/<label>`: served only when the

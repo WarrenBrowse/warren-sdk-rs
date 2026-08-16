@@ -660,8 +660,17 @@ impl Responder {
                     // The second wall behind cryptokey routing: the exit only
                     // ever sees the address this gateway rewrites onto the
                     // packet, so a peer sourcing another peer's address must be
-                    // refused here or nowhere.
-                    return Inbound::Dropped(self.note_for(id, DropReason::SpoofedSource));
+                    // refused here or nowhere. A link-local source is refused
+                    // by the same wall under its own class: every peer running
+                    // a tun link emits kernel autoconfiguration traffic from
+                    // one, and folding it into the spoof counter would report
+                    // an attack at every interface bring-up.
+                    let reason = if is_link_local(inner) {
+                        DropReason::LinkLocalSource
+                    } else {
+                        DropReason::SpoofedSource
+                    };
+                    return Inbound::Dropped(self.note_for(id, reason));
                 }
                 if !self.gate.open {
                     return Inbound::Dropped(self.note_for(id, DropReason::GateClosed));
@@ -1198,6 +1207,13 @@ fn is_v6_link_local(addr: Ipv6Addr) -> bool {
     (addr.segments()[0] & 0xffc0) == 0xfe80
 }
 
+fn is_link_local(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => is_v6_link_local(v6),
+    }
+}
+
 fn is_private(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => v4.is_private() || is_cgnat(v4),
@@ -1584,6 +1600,35 @@ mod tests {
             Inbound::Dropped(DropReason::SpoofedSource)
         ));
         assert_eq!(responder.stats().spoofed_source, 1);
+    }
+
+    #[test]
+    fn counts_a_peer_own_link_local_source_apart_from_a_stolen_address() {
+        let (mut responder, mut clients) = build(2, true);
+        let now = Instant::now();
+        handshake(&mut responder, &mut clients[0], now);
+
+        // A userspace peer's tun link gets a link-local address of its own, so
+        // the peer emits MLD reports and router solicitations from `fe80::`
+        // before it carries any traffic. That source belongs to no peer and is
+        // refused like any other, but counting it as a spoof puts an attack
+        // that never happened on the operator's health route.
+        let packet = testpkt::udp(
+            IpAddr::V6("fe80::1".parse().unwrap()),
+            546,
+            IpAddr::V6("ff02::16".parse().unwrap()),
+            547,
+            b"report",
+        );
+        let datagram = clients[0].encapsulate(&packet);
+        let mut scratch = ScratchBuf::new();
+        assert!(matches!(
+            responder.handle_datagram(clients[0].addr, &datagram, now, &mut scratch),
+            Inbound::Dropped(DropReason::LinkLocalSource)
+        ));
+        let stats = responder.stats();
+        assert_eq!(stats.link_local_source, 1);
+        assert_eq!(stats.spoofed_source, 0);
     }
 
     #[test]

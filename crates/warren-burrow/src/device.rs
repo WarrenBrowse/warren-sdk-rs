@@ -1063,6 +1063,7 @@ pub fn drop_class(reason: DropReason) -> &'static str {
         DropReason::UnknownIndex => "unknown_index",
         DropReason::Replay => "replay",
         DropReason::SpoofedSource => "spoofed_source",
+        DropReason::LinkLocalSource => "link_local_source",
         DropReason::GateClosed => "gate_closed",
         DropReason::SourceRateLimited => "source_rate_limited",
         DropReason::PeerIsolation => "peer_isolation",

@@ -112,6 +112,10 @@ pub enum DropReason {
     Replay,
     /// The decrypted packet's source is not an address the peer owns.
     SpoofedSource,
+    /// The decrypted packet's source is a link-local address, which no peer
+    /// ever owns: a peer's own kernel autoconfiguration traffic, refused like
+    /// any unowned source but counted apart from a stolen address.
+    LinkLocalSource,
     /// Multicast, broadcast, loopback, link-local or unspecified.
     NonUnicast,
     /// Addressed to the gateway itself and not an echo request.

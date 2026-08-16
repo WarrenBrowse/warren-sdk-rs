@@ -224,6 +224,7 @@ fn drop_counters(snapshot: &GatewaySnapshot) -> Vec<(&'static str, u64)> {
         ("auth_failed", r.auth_failed),
         ("replayed", r.replayed),
         ("spoofed_source", r.spoofed_source),
+        ("link_local_source", r.link_local_source),
         ("malformed", r.malformed),
         ("oversize", r.oversize),
         ("non_unicast", r.non_unicast),
@@ -358,6 +359,7 @@ mod tests {
         assert!(body.contains("\"peers_with_session\": 0"), "{body}");
         assert!(body.contains("\"granted_port\": 49587"), "{body}");
         assert!(body.contains("\"spoofed_source\": 0"), "{body}");
+        assert!(body.contains("\"link_local_source\": 0"), "{body}");
         assert!(body.contains("\"nat_source_not_owned\": 0"), "{body}");
         assert!(body.contains("\"stale_epoch_send\": 0"), "{body}");
     }

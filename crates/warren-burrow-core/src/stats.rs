@@ -127,6 +127,9 @@ pub struct ResponderSnapshot {
     pub replayed: u64,
     /// Decrypted packets whose source the sending peer does not own.
     pub spoofed_source: u64,
+    /// Decrypted packets sourced from a link-local address, which is a peer's
+    /// own kernel autoconfiguration traffic rather than a stolen address.
+    pub link_local_source: u64,
     /// Datagrams larger than a socket can deliver.
     pub oversize: u64,
     /// Datagrams that are not WireGuard, or whose mac1 did not verify.
@@ -232,6 +235,7 @@ impl ResponderCounters {
             DropReason::Auth => &mut self.totals.auth_failed,
             DropReason::Replay => &mut self.totals.replayed,
             DropReason::SpoofedSource => &mut self.totals.spoofed_source,
+            DropReason::LinkLocalSource => &mut self.totals.link_local_source,
             DropReason::NonUnicast => &mut self.totals.non_unicast,
             DropReason::SelfDestination => &mut self.totals.self_destination,
             DropReason::PeerIsolation => &mut self.totals.peer_isolation,
