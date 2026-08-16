@@ -332,6 +332,10 @@ struct Mapping {
     remotes: Vec<RemoteFlow>,
     last_seen: Instant,
     pinned: bool,
+    // Position in the owner's recency list. A pinned forward is never linked:
+    // it is not a candidate for eviction and does not count against the cap.
+    older: Option<MappingId>,
+    newer: Option<MappingId>,
 }
 
 impl Mapping {
@@ -351,6 +355,11 @@ pub struct Napt {
     v4: Option<Ipv4Addr>,
     v6: Option<Ipv6Addr>,
     mappings: HashMap<MappingId, Mapping>,
+    // Least-recently-used first, per peer and protocol: the eviction a peer at
+    // its cap pays has to be a constant, or one device holding its 4,096
+    // mappings turns every further flow of every peer into a walk of the whole
+    // table, on the packet path.
+    recency: HashMap<(PeerId, MapProto), (MappingId, MappingId)>,
     outbound: HashMap<(MapProto, IpAddr, u16), MappingId>,
     inbound: HashMap<(MapProto, bool, u16), MappingId>,
     peer_counts: HashMap<(PeerId, MapProto), usize>,
@@ -393,6 +402,7 @@ impl Napt {
             v4: None,
             v6: None,
             mappings: HashMap::new(),
+            recency: HashMap::new(),
             outbound: HashMap::new(),
             inbound: HashMap::new(),
             peer_counts: HashMap::new(),
@@ -496,6 +506,8 @@ impl Napt {
             remotes: Vec::new(),
             last_seen: now,
             pinned: true,
+            older: None,
+            newer: None,
         });
         Ok(id)
     }
@@ -874,7 +886,10 @@ impl Napt {
             remotes: Vec::new(),
             last_seen: now,
             pinned: false,
+            older: None,
+            newer: None,
         });
+        self.link_newest(id);
         *self.peer_counts.entry((peer, proto)).or_insert(0) += 1;
         let initial = match proto {
             MapProto::Tcp => self.config.tcp_syn,
@@ -909,6 +924,7 @@ impl Napt {
     }
 
     fn remove_mapping(&mut self, id: MappingId) {
+        self.unlink(id);
         let Some(mapping) = self.mappings.remove(&id) else {
             return;
         };
@@ -931,11 +947,97 @@ impl Napt {
     }
 
     fn oldest_of(&self, peer: PeerId, proto: MapProto) -> Option<MappingId> {
-        self.mappings
-            .iter()
-            .filter(|(_, m)| m.owner == peer && m.proto == proto && !m.pinned)
-            .min_by_key(|(id, m)| (m.last_seen, **id))
-            .map(|(id, _)| *id)
+        self.recency.get(&(peer, proto)).map(|(oldest, _)| *oldest)
+    }
+
+    /// Appends a mapping at the recent end of its owner's list.
+    fn link_newest(&mut self, id: MappingId) {
+        let Some(mapping) = self.mappings.get(&id) else {
+            return;
+        };
+        if mapping.pinned {
+            return;
+        }
+        let key = (mapping.owner, mapping.proto);
+        let previous = match self.recency.get_mut(&key) {
+            Some((_, newest)) => {
+                let previous = *newest;
+                *newest = id;
+                Some(previous)
+            }
+            None => {
+                self.recency.insert(key, (id, id));
+                None
+            }
+        };
+        if let Some(previous) = previous
+            && let Some(mapping) = self.mappings.get_mut(&previous)
+        {
+            mapping.newer = Some(id);
+        }
+        if let Some(mapping) = self.mappings.get_mut(&id) {
+            mapping.older = previous;
+            mapping.newer = None;
+        }
+    }
+
+    /// Takes a mapping out of its owner's list, leaving the list consistent.
+    fn unlink(&mut self, id: MappingId) {
+        let Some(mapping) = self.mappings.get_mut(&id) else {
+            return;
+        };
+        if mapping.pinned {
+            return;
+        }
+        let key = (mapping.owner, mapping.proto);
+        let older = mapping.older.take();
+        let newer = mapping.newer.take();
+        match older {
+            Some(older) => {
+                if let Some(mapping) = self.mappings.get_mut(&older) {
+                    mapping.newer = newer;
+                }
+            }
+            None => {
+                if let Some(entry) = self.recency.get_mut(&key) {
+                    match newer {
+                        Some(newer) => entry.0 = newer,
+                        None => {
+                            self.recency.remove(&key);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        match newer {
+            Some(newer) => {
+                if let Some(mapping) = self.mappings.get_mut(&newer) {
+                    mapping.older = older;
+                }
+            }
+            None => {
+                if let Some(entry) = self.recency.get_mut(&key)
+                    && let Some(older) = older
+                {
+                    entry.1 = older;
+                }
+            }
+        }
+    }
+
+    /// Moves a mapping to the recent end after a packet touched it.
+    fn touch_recency(&mut self, id: MappingId) {
+        let Some(mapping) = self.mappings.get(&id) else {
+            return;
+        };
+        // Already the most recent, which is every packet of a burst on one
+        // flow: nothing to relink.
+        if mapping.pinned || mapping.newer.is_none() {
+            return;
+        }
+        self.unlink(id);
+        self.link_newest(id);
     }
 
     fn flush_family(&mut self, v6: bool) {
@@ -990,6 +1092,7 @@ impl Napt {
                 mapping.remotes.push(flow);
             }
         }
+        self.touch_recency(id);
         if closed {
             self.expiry
                 .push(Reverse((now + self.config.tcp_closing, id)));
@@ -1045,6 +1148,7 @@ impl Napt {
             }
         }
         mapping.last_seen = now;
+        self.touch_recency(id);
         if closed {
             self.expiry
                 .push(Reverse((now + self.config.tcp_closing, id)));
@@ -1376,6 +1480,44 @@ mod tests {
             nat.translate_downlink(&mut to_evicted, now),
             Err(NatDrop::NoMapping),
             "peer A's own oldest mapping was the one evicted"
+        );
+    }
+
+    #[test]
+    fn a_flow_a_peer_keeps_using_outlives_one_it_opened_later() {
+        // The victim is the least recently used, not the first created: a
+        // recency list maintained only at creation would evict the long call
+        // and keep the flow that went quiet after one packet.
+        let mut nat = napt_with(small_pool(16, 3));
+        let now = Instant::now();
+        let mut ports = Vec::new();
+        for (offset, port) in [(0u64, 5000u16), (1, 5001), (2, 5002)] {
+            let mut packet = testpkt::udp(A4, port, REMOTE4, 53, b"q");
+            nat.translate_uplink(A, &mut packet, now + Duration::from_secs(offset))
+                .expect("uplink");
+            ports.push(read_ports(&packet, 20).expect("ports").0);
+        }
+
+        // The oldest flow speaks again, which puts the second one at the back.
+        let mut again = testpkt::udp(A4, 5000, REMOTE4, 53, b"q");
+        nat.translate_uplink(A, &mut again, now + Duration::from_secs(3))
+            .expect("uplink");
+
+        let mut fourth = testpkt::udp(A4, 5003, REMOTE4, 53, b"q");
+        nat.translate_uplink(A, &mut fourth, now + Duration::from_secs(4))
+            .expect("a peer at its cap makes room");
+
+        let mut to_first = testpkt::udp(REMOTE4, 53, ext4(), ports[0], b"a");
+        assert!(
+            nat.translate_downlink(&mut to_first, now + Duration::from_secs(4))
+                .is_ok(),
+            "the flow that kept speaking was evicted"
+        );
+        let mut to_second = testpkt::udp(REMOTE4, 53, ext4(), ports[1], b"a");
+        assert_eq!(
+            nat.translate_downlink(&mut to_second, now + Duration::from_secs(4)),
+            Err(NatDrop::NoMapping),
+            "the least recently used flow is the one that goes"
         );
     }
 
