@@ -31,6 +31,28 @@ use crate::provision::{self, InitOptions};
 /// Every operator-facing line this daemon writes carries its own name.
 pub const LOG: Log = Log("warren-burrow");
 
+/// The daemon's own background tasks, stopped when the guard is dropped.
+///
+/// [`run`] is public API: a caller that drops it must get its device, its
+/// sockets and its readers back, rather than a budget sampler holding them for
+/// the life of the process.
+#[derive(Debug, Default)]
+struct DaemonTasks(Vec<tokio::task::JoinHandle<()>>);
+
+impl DaemonTasks {
+    fn push(&mut self, task: tokio::task::JoinHandle<()>) {
+        self.0.push(task);
+    }
+}
+
+impl Drop for DaemonTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
 /// How long the gate waits for the tunnel's inner budget to reach the MTU the
 /// peers were configured with.
 ///
@@ -58,7 +80,16 @@ const FIRST_PROOF_RETRY: Duration = Duration::from_millis(500);
 /// cannot be reached, no matching exit) are returned; once the datapath is up,
 /// failures translate into the exit code.
 pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
-    let conf = ensure_provisioned(&env)?;
+    // Off the reactor: first run creates directories and fsyncs every
+    // credential it writes, which is tens of milliseconds of a blocked worker
+    // on a NAS spindle.
+    let (env, conf) = tokio::task::spawn_blocking(move || {
+        let conf = ensure_provisioned(&env);
+        (env, conf)
+    })
+    .await
+    .context("the provisioning task")?;
+    let conf = conf?;
     let identity = WarrenIdentity::from_mnemonic(env.require_mnemonic()?.trim())
         .context("the recovery phrase must be 12 or 24 BIP39 words")?;
     LOG.info(&warren_headless::account_line(&identity.address()));
@@ -69,9 +100,9 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
         LOG.info(&format!("peer listener on {addr}/udp"));
     }
     LOG.info(&format!(
-        "{} peer(s) configured, gateway public key {}",
+        "{} peer(s) configured, gateway key {}",
         conf.peers.len(),
-        device.public_key().to_base64()
+        key_fingerprint(&device)
     ));
 
     let mut builder = WarrenClient::builder()
@@ -108,6 +139,7 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
 
     let egress_verified = Arc::new(AtomicBool::new(false));
     let (port_tx, port_rx) = watch::channel(None::<u16>);
+    let mut tasks = DaemonTasks::default();
 
     if let Some(listen) = env.health_listen {
         let listener = tokio::net::TcpListener::bind(listen)
@@ -132,15 +164,15 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
             port_rx.clone(),
         )
         .with_routes(routes.shared());
-        tokio::spawn(warren_headless::health::serve(listener, view));
+        tasks.push(tokio::spawn(warren_headless::health::serve(listener, view)));
     }
 
     // The tunnel's own budget, read for the gate and published on `/status`.
-    tokio::spawn(sample_inner_budget(
+    tasks.push(tokio::spawn(sample_inner_budget(
         device.clone(),
         handle.metrics_reader(),
         BUDGET_POLL,
-    ));
+    )));
 
     // Cloned before the first proof: an epoch that ends and restarts while the
     // probe is running is invisible to a receiver cloned once it is over.
@@ -164,15 +196,15 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
     egress_verified.store(true, Ordering::Relaxed);
     LOG.info("tunnel up, egress verified, peers admitted");
 
-    tokio::spawn(track_gate_across_epochs(
+    tasks.push(tokio::spawn(track_gate_across_epochs(
         tracker_rx,
         device.clone(),
         Arc::clone(&egress_verified),
         env.client_mtu,
         probe,
-    ));
+    )));
 
-    let forward = start_forward(&env, &device, &handle, port_tx)?;
+    let forward = start_forward(&env, &device, &handle, port_tx, &mut tasks)?;
     let mut reload = warren_headless::signals::ReloadSignal::new()
         .context("installing the reload signal handler")?;
 
@@ -187,7 +219,7 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
         loop {
             tokio::select! {
                 stop = &mut stopping => break stop,
-                () = reload.recv() => reload_now(&env, &device),
+                () = reload.recv() => reload_now(&env, &device).await,
             }
         }
     };
@@ -224,6 +256,17 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
     admin::forget_token(&env);
     handle.shutdown();
     Ok(code)
+}
+
+/// The short prefix of the gateway's public key, for an operator matching a
+/// running daemon against a client configuration.
+///
+/// A headless daemon's stdout is the container log, so the key itself belongs
+/// to `warren-burrow show LABEL` and to nothing that is shipped anywhere.
+fn key_fingerprint(device: &GatewayDevice) -> String {
+    let key = device.public_key().to_base64();
+    let prefix: String = key.chars().take(8).collect();
+    format!("{prefix}...")
 }
 
 /// The admin surface, when this daemon may serve one.
@@ -468,6 +511,7 @@ fn start_forward(
     device: &GatewayDevice,
     handle: &SupervisedPacketHandle,
     port_tx: watch::Sender<Option<u16>>,
+    tasks: &mut DaemonTasks,
 ) -> anyhow::Result<Option<SupervisedForwardedPort>> {
     let Some(fwd) = env.forward.as_ref() else {
         return Ok(None);
@@ -490,7 +534,7 @@ fn start_forward(
 
     let mut external_rx = forward.watch_external_port();
     let fwd: ForwardConfig = fwd.clone();
-    tokio::spawn(async move {
+    tasks.push(tokio::spawn(async move {
         let mut last: Option<u16> = None;
         loop {
             let current = *external_rx.borrow_and_update();
@@ -512,14 +556,28 @@ fn start_forward(
                 return;
             }
         }
-    });
+    }));
     Ok(Some(forward))
 }
 
 /// Applies the configuration file as it now stands, keeping the session of
 /// every peer whose key material and allowed IPs did not change.
-fn reload_now(env: &GatewayEnv, device: &GatewayDevice) {
-    match admin::reload(device, &env.conf_path, &env.plan) {
+///
+/// The file work runs off the reactor: the readers and the pump are live while
+/// a reload runs, unlike at startup.
+async fn reload_now(env: &GatewayEnv, device: &GatewayDevice) {
+    let conf_path = env.conf_path.clone();
+    let plan = env.plan;
+    let device = device.clone();
+    let reloaded = tokio::task::spawn_blocking(move || admin::reload(&device, &conf_path, &plan))
+        .await
+        .unwrap_or_else(|err| {
+            Err(crate::provision::ProvisionError::Io {
+                path: "the reload task".to_owned(),
+                source: std::io::Error::other(err.to_string()),
+            })
+        });
+    match reloaded {
         Ok(report) => LOG.info(&format!(
             "reloaded: {} added, {} removed, {} rebuilt, {} untouched",
             report.added.len(),
@@ -742,6 +800,21 @@ mod tests {
         task.await.expect("the tracker ends with its publisher");
         assert!(!device.snapshot().gate_open);
         assert!(!verified.load(Ordering::Relaxed));
+    }
+
+    /// A headless daemon's stdout is the container log, shipped to whatever
+    /// aggregator the host runs. The gateway's public key names this gateway
+    /// to anyone who has a client configuration, so only its prefix goes there.
+    #[tokio::test]
+    async fn the_startup_line_carries_a_key_prefix_and_never_the_key() {
+        let device = empty_device().await;
+        let key = device.public_key().to_base64();
+
+        let line = key_fingerprint(&device);
+
+        assert!(!line.contains(&key), "the key reached a log: {line}");
+        assert!(line.starts_with(&key[..8]), "{line}");
+        assert!(line.ends_with("..."), "{line}");
     }
 
     /// A redial while the first proof is running is an ordinary supervisor
