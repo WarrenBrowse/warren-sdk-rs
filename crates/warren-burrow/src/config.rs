@@ -32,6 +32,10 @@ pub const DEFAULT_CLIENT_MTU: u16 = 1280;
 /// The largest MTU `/status` ever recommends: above it the tunnel budget stops
 /// being the binding constraint and the peer's own path becomes one.
 pub const MAX_CLIENT_MTU: u16 = 1420;
+/// The smallest MTU a peer configuration may carry: the IPv6 minimum, under
+/// which a stock host fragments rather than shrinking its packets, and this
+/// gateway drops fragments.
+pub const MIN_CLIENT_MTU: u16 = 1280;
 /// How long the tunnel has to reach `Connected` before startup gives up.
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 90;
 
@@ -86,6 +90,14 @@ pub enum GatewayConfigError {
          it delivers to a peer"
     )]
     ForwardTargetMissing,
+    /// The MTU written into client configurations is unusable.
+    #[error(
+        "WARREN_BURROW_CLIENT_MTU must be between {MIN_CLIENT_MTU} and {MAX_CLIENT_MTU}: under the \
+         IPv6 minimum a peer fragments rather than shrinking its packets and this gateway drops \
+         fragments, and above it the tunnel stops being the binding constraint while the peer's \
+         own path becomes one"
+    )]
+    ClientMtu,
     /// The state directory could not be resolved from the environment.
     #[error("could not resolve a state directory: set WARREN_BURROW_STATE_DIR")]
     NoStateDir,
@@ -260,6 +272,11 @@ pub fn load(
         }
     };
 
+    let client_mtu = parse_number(&get, "WARREN_BURROW_CLIENT_MTU", DEFAULT_CLIENT_MTU)?;
+    if !(MIN_CLIENT_MTU..=MAX_CLIENT_MTU).contains(&client_mtu) {
+        return Err(GatewayConfigError::ClientMtu);
+    }
+
     let forward = parse_gateway_forward(&get, &plan)?;
 
     Ok(GatewayEnv {
@@ -278,7 +295,7 @@ pub fn load(
         conf_path,
         plan,
         ipv6: parse_flag(&get, "WARREN_BURROW_IPV6", true)?,
-        client_mtu: parse_number(&get, "WARREN_BURROW_CLIENT_MTU", DEFAULT_CLIENT_MTU)?,
+        client_mtu,
         peer_isolation: parse_flag(&get, "WARREN_BURROW_PEER_ISOLATION", true)?,
         handshake_rate: parse_number(&get, "WARREN_BURROW_HANDSHAKE_RATE", DEFAULT_HANDSHAKE_RATE)?,
         health_listen,
@@ -765,6 +782,55 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    /// The value reaches the peers' own configurations, the gate's budget
+    /// target and the sink's payload cap, so a value no peer could use is a
+    /// refusal at load rather than a gateway that never opens its gate.
+    #[test]
+    fn a_client_mtu_outside_what_a_peer_can_use_is_refused() {
+        for mtu in ["0", "68", "1279", "1421", "9000"] {
+            let err = with(&[("WARREN_BURROW_CLIENT_MTU", mtu)])
+                .expect_err("{mtu} is not a usable client MTU");
+            assert!(matches!(err, GatewayConfigError::ClientMtu), "{mtu}: {err}");
+            let message = err.to_string();
+            assert!(
+                message.contains("1280") && message.contains("1420"),
+                "{message}"
+            );
+        }
+        for mtu in ["1280", "1380", "1420"] {
+            assert_eq!(
+                with(&[("WARREN_BURROW_CLIENT_MTU", mtu)])
+                    .expect("a usable MTU")
+                    .client_mtu,
+                mtu.parse::<u16>().expect("a number")
+            );
+        }
+        assert!(with(&[("WARREN_BURROW_CLIENT_MTU", "large")]).is_err());
+    }
+
+    /// The knobs an operator turns when the defaults do not fit their network.
+    #[test]
+    fn the_peer_plan_the_limiter_and_the_configuration_path_follow_their_knobs() {
+        let cfg = with(&[
+            ("WARREN_BURROW_CONF", "/etc/warren/gateway.conf"),
+            ("WARREN_BURROW_PEER_SUBNET", "192.168.9.0/24"),
+            ("WARREN_BURROW_PEER_SUBNET_V6", "fd00:dead:beef::/64"),
+            ("WARREN_BURROW_HANDSHAKE_RATE", "40"),
+        ])
+        .expect("every knob is usable");
+        assert_eq!(cfg.conf_path, PathBuf::from("/etc/warren/gateway.conf"));
+        assert_eq!(cfg.handshake_rate, 40);
+        assert_eq!(
+            cfg.plan.address_for(2).expect("the first peer"),
+            (
+                "192.168.9.2".parse().expect("a literal address"),
+                "fd00:dead:beef::2".parse().expect("a literal address")
+            )
+        );
+        assert!(with(&[("WARREN_BURROW_PEER_SUBNET_V6", "fd00:dead:beef::")]).is_err());
+        assert!(with(&[("WARREN_BURROW_HANDSHAKE_RATE", "many")]).is_err());
     }
 
     /// The subcommands that only write files never touch the network, so the
