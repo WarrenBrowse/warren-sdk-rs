@@ -30,6 +30,10 @@ pub const CONTROL_RANGE_END: u16 = 61999;
 /// Marks a port that is not in the free list.
 const TAKEN: u32 = u32::MAX;
 
+fn is_control(port: u16) -> bool {
+    (CONTROL_RANGE_START..=CONTROL_RANGE_END).contains(&port)
+}
+
 /// A free list over one contiguous range of external ports or identifiers.
 ///
 /// One instance per (protocol, address family): TCP and UDP each own their own
@@ -42,6 +46,11 @@ pub struct PortAllocator {
     /// Per port: its index in `free`, or [`TAKEN`].
     slot: Vec<u32>,
     reserved: Vec<bool>,
+    capacity: usize,
+    /// True for a port space, false for the identifier space: the control
+    /// range is a range of ports, and an ICMP identifier that happens to carry
+    /// the same number competes with nothing.
+    keeps_control_range: bool,
 }
 
 impl std::fmt::Debug for PortAllocator {
@@ -56,26 +65,51 @@ impl std::fmt::Debug for PortAllocator {
 }
 
 impl PortAllocator {
-    /// A free list over `range`.
+    /// A free list over `range`, with nothing held back.
     #[must_use]
     pub fn new(range: RangeInclusive<u16>) -> Self {
+        Self::build(range, false)
+    }
+
+    /// A free list of external ports over `range`.
+    ///
+    /// The control range is taken out of it whatever `range` is, so
+    /// "outside the pool" is a property of this type rather than of every
+    /// caller that assembles a configuration: a shell reading the pool from the
+    /// environment cannot hand a peer's flow the port the NAT-PMP client or the
+    /// egress probe is using.
+    #[must_use]
+    pub fn ports(range: RangeInclusive<u16>) -> Self {
+        Self::build(range, true)
+    }
+
+    fn build(range: RangeInclusive<u16>, keeps_control_range: bool) -> Self {
         let base = *range.start();
-        let free: Vec<u16> = range.clone().collect();
-        let len = free.len();
+        let span = range.clone().count();
+        let free: Vec<u16> = range
+            .filter(|port| !(keeps_control_range && is_control(*port)))
+            .collect();
+        let mut slot = vec![TAKEN; span];
+        for (at, port) in free.iter().enumerate() {
+            let offset = usize::from(port.saturating_sub(base));
+            if let Some(entry) = slot.get_mut(offset) {
+                *entry = u32::try_from(at).unwrap_or(TAKEN);
+            }
+        }
         Self {
             base,
+            capacity: free.len(),
             free,
-            slot: (0..len)
-                .map(|i| u32::try_from(i).unwrap_or(TAKEN))
-                .collect(),
-            reserved: vec![false; len],
+            slot,
+            reserved: vec![false; span],
+            keeps_control_range,
         }
     }
 
     /// The dynamic pool every translated flow draws from.
     #[must_use]
     pub fn dynamic_pool() -> Self {
-        Self::new(DYNAMIC_POOL_START..=DYNAMIC_POOL_END)
+        Self::ports(DYNAMIC_POOL_START..=DYNAMIC_POOL_END)
     }
 
     /// The ICMP echo identifier space, which is the whole non-zero 16-bit
@@ -85,11 +119,11 @@ impl PortAllocator {
         Self::new(1..=u16::MAX)
     }
 
-    /// How many ports this space holds, which is also the hard cap on live
+    /// How many ports this space hands out, which is also the hard cap on live
     /// mappings for that protocol and family.
     #[must_use]
     pub fn capacity(&self) -> usize {
-        self.slot.len()
+        self.capacity
     }
 
     /// How many ports are free right now.
@@ -114,6 +148,9 @@ impl PortAllocator {
     }
 
     fn index(&self, port: u16) -> Option<usize> {
+        if self.keeps_control_range && is_control(port) {
+            return None;
+        }
         let offset = usize::from(port.checked_sub(self.base)?);
         (offset < self.slot.len()).then_some(offset)
     }
@@ -268,6 +305,38 @@ mod tests {
         assert_eq!(pool.alloc(Some(40_000), &mut r), Some(40_000));
         let second = pool.alloc(Some(40_000), &mut r).expect("a pool port");
         assert_ne!(second, 40_000);
+    }
+
+    #[test]
+    fn never_hands_out_a_port_the_gateway_keeps_for_its_own_control_plane() {
+        // The reservation is a property of the allocator, not of the range a
+        // shell happens to configure: an environment-supplied pool that spans
+        // the control range must still never collide with the NAT-PMP client
+        // or the egress probe.
+        let mut ports = PortAllocator::ports(60_000..=62_000);
+        let mut rng = rng(11);
+        let mut handed = 0usize;
+        while let Some(port) = ports.alloc(None, &mut rng) {
+            assert!(
+                !is_control(port),
+                "the control range was handed out: {port}"
+            );
+            handed += 1;
+        }
+        assert_eq!(handed, 2_001 - 1_000);
+
+        let mut ports = PortAllocator::ports(60_000..=62_000);
+        assert_ne!(
+            ports.alloc(Some(CONTROL_RANGE_START), &mut rng),
+            Some(CONTROL_RANGE_START),
+            "port preservation escaped the control range"
+        );
+        assert!(!ports.contains(CONTROL_RANGE_START));
+        assert_eq!(
+            ports.reserve(CONTROL_RANGE_END),
+            Err(CoreError::PortOutsidePool),
+            "a pinned forward claimed a control port"
+        );
     }
 
     #[test]

@@ -263,7 +263,10 @@ impl std::fmt::Debug for Ownership {
 /// survive a pause in a call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NatConfig {
-    /// The dynamic external port pool, per protocol and family.
+    /// The dynamic external port pool, for TCP and UDP, per family. The range
+    /// the gateway keeps for its own control-plane flows is taken out of it by
+    /// the allocator whatever this says. ICMP echo identifiers are a separate
+    /// fixed space and ignore it.
     pub pool: RangeInclusive<u16>,
     /// How many mappings one peer may hold per protocol.
     pub per_peer_mappings: usize,
@@ -394,7 +397,7 @@ impl Napt {
     /// The same, with the port draw driven by a caller-supplied generator.
     #[must_use]
     pub fn with_rng(config: NatConfig, rng: StdRng) -> Self {
-        let pool = || PortAllocator::new(config.pool.clone());
+        let pool = || PortAllocator::ports(config.pool.clone());
         Self {
             ownership: Ownership::new(),
             exit: None,
