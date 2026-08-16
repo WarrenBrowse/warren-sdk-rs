@@ -288,8 +288,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "false"
-      # One thread: the datapath cases assert a packets-per-second floor, and
-      # three of them competing for the same core would measure the scheduler.
+      # One thread, and no absolute packets-per-second floor here: these runners
+      # are shared and measure a third of an idle machine, so the datapath case
+      # asserts ratios between its own measurements instead. The design's
+      # absolute floor is produced deliberately, with
+      # WARREN_BURROW_BENCH_FLOOR=1 on a quiet machine.
       - run: >
           cargo test --locked --release -p warren-burrow-core --
           --ignored --nocapture --test-threads=1

@@ -169,54 +169,61 @@ impl Bench {
     }
 }
 
-fn report(name: &str, packets: u32, elapsed: Duration) {
+/// Prints one measurement and returns it, asserting the design's absolute
+/// floor only when the caller asked for it.
+///
+/// The floor is a property of a quiet machine. On the shared CI runners the
+/// same code measures a third of what it measures idle, so an absolute
+/// assertion there would report the fleet's load as a datapath regression. CI
+/// runs the ratios below instead, which are machine-independent, and the number
+/// the design's gate wants is produced by a deliberate run:
+/// `WARREN_BURROW_BENCH_FLOOR=1 cargo test --release ... -- --ignored`.
+fn measured(name: &str, packets: u32, elapsed: Duration) -> f64 {
     let pps = f64::from(packets) / elapsed.as_secs_f64();
     println!("{name}: {pps:.0} packets per second ({packets} in {elapsed:?})");
-    if cfg!(debug_assertions) {
-        println!("  (debug build: the floor is not asserted)");
-        return;
+    if cfg!(debug_assertions) || std::env::var_os("WARREN_BURROW_BENCH_FLOOR").is_none() {
+        return pps;
     }
     assert!(
         pps >= FLOOR_PPS,
         "{name} carried {pps:.0} packets per second, under the {FLOOR_PPS:.0} floor"
     );
+    pps
 }
 
-#[test]
-#[ignore = "a measurement, run deliberately in release"]
-fn carries_the_floor_on_one_thread() {
+/// The ordinary path: several live flows, no peer near any cap.
+fn measure_plain() -> f64 {
     let mut bench = bench(NatConfig::default());
+    let now = Instant::now();
     // A handful of flows rather than one, so the tables are exercised and the
-    // mapping lookup is not served by a single hot line.
-    let datagrams: Vec<Vec<u8>> = (0..64)
+    // mapping lookup is not served by a single hot line. The warm-up datagrams
+    // are their own: a replayed counter is refused, as it should be.
+    let warmup: Vec<Vec<u8>> = (0..64)
         .map(|flow| bench.datagram(4000 + flow, Ipv4Addr::new(1, 1, 1, 1), 443))
         .collect();
-    let now = Instant::now();
-    for datagram in &datagrams {
+    let datagrams: Vec<Vec<u8>> = (0..ROUNDS)
+        .map(|round| {
+            bench.datagram(
+                4000 + u16::try_from(round % 64).expect("64 flows fit a port"),
+                Ipv4Addr::new(1, 1, 1, 1),
+                443,
+            )
+        })
+        .collect();
+    for datagram in &warmup {
         bench.carry(datagram, now);
-    }
-
-    let mut datagrams: Vec<Vec<u8>> = Vec::with_capacity(ROUNDS as usize);
-    for round in 0..ROUNDS {
-        datagrams.push(bench.datagram(
-            4000 + u16::try_from(round % 64).unwrap(),
-            Ipv4Addr::new(1, 1, 1, 1),
-            443,
-        ));
     }
     let started = Instant::now();
     for datagram in &datagrams {
         bench.carry(datagram, now);
     }
-    report("64 flows", ROUNDS, started.elapsed());
+    measured("64 flows", ROUNDS, started.elapsed())
 }
 
-#[test]
-#[ignore = "a measurement, run deliberately in release"]
-fn carries_the_floor_with_a_peer_at_its_mapping_cap() {
-    // The cap is what a torrent client or a scanner behind the gateway reaches
-    // on its own, and it is the state that turns every further new flow into an
-    // eviction. The default cap is used as it ships.
+/// A peer holding every mapping its cap allows, so each further packet opens a
+/// flow that has to evict one. This is what a torrent client or a scanner
+/// behind the gateway reaches on its own.
+fn measure_at_cap() -> f64 {
     let config = NatConfig::default();
     let cap = u16::try_from(config.per_peer_mappings).expect("a cap that fits a port number");
     let mut bench = bench(config);
@@ -225,13 +232,10 @@ fn carries_the_floor_with_a_peer_at_its_mapping_cap() {
         let datagram = bench.datagram(20_000 + flow, Ipv4Addr::new(1, 1, 1, 1), 443);
         bench.carry(&datagram, now);
     }
-
-    // Every packet below opens a flow the peer has no room for, so each one
-    // pays whatever eviction costs.
-    let datagrams: Vec<Vec<u8>> = (0..ROUNDS / 4)
+    let datagrams: Vec<Vec<u8>> = (0..ROUNDS)
         .map(|round| {
             bench.datagram(
-                30_000 + u16::try_from(round % 20_000).unwrap(),
+                30_000 + u16::try_from(round).expect("the rounds fit a port"),
                 Ipv4Addr::new(1, 1, 1, 1),
                 443,
             )
@@ -241,15 +245,14 @@ fn carries_the_floor_with_a_peer_at_its_mapping_cap() {
     for datagram in &datagrams {
         bench.carry(datagram, now);
     }
-    report("a peer at its cap", ROUNDS / 4, started.elapsed());
+    measured("a peer at its cap", ROUNDS, started.elapsed())
 }
 
-#[test]
-#[ignore = "a measurement, run deliberately in release"]
-fn carries_the_floor_with_a_mapping_holding_every_remote_it_tracks() {
-    // One source port talking to many remotes is a DNS resolver, a QUIC client
-    // migrating, or a peer under a scan. The mapping's remote list is walked
-    // per packet, so a full list is the worst case of the hot path itself.
+/// One source port talking to every remote a mapping tracks: a resolver behind
+/// the gateway, a QUIC client migrating, or a peer under a scan. The mapping's
+/// remote list is walked per packet, so a full list is the worst case of the
+/// hot path itself.
+fn measure_at_remote_cap() -> f64 {
     let mut bench = bench(NatConfig::default());
     let now = Instant::now();
     let remotes: Vec<Ipv4Addr> = (0..64).map(|n| Ipv4Addr::new(198, 51, 100, n)).collect();
@@ -257,15 +260,39 @@ fn carries_the_floor_with_a_mapping_holding_every_remote_it_tracks() {
         let datagram = bench.datagram(4000, *remote, 443);
         bench.carry(&datagram, now);
     }
-
     let datagrams: Vec<Vec<u8>> = (0..ROUNDS)
-        .map(|round| bench.datagram(4000, remotes[(round as usize) % remotes.len()], 443))
+        .map(|round| bench.datagram(4000, remotes[usize::try_from(round).unwrap_or(0) % 64], 443))
         .collect();
     let started = Instant::now();
     for datagram in &datagrams {
         bench.carry(datagram, now);
     }
-    report("a mapping at 64 remotes", ROUNDS, started.elapsed());
+    measured("a mapping at 64 remotes", ROUNDS, started.elapsed())
+}
+
+#[test]
+#[ignore = "a measurement, run deliberately in release"]
+fn the_worst_cases_stay_within_reach_of_the_ordinary_path() {
+    // Three measurements in one process on one machine, so the comparison is
+    // free of whatever else the host is doing. The ordinary path is the
+    // reference; the two worst cases are read against it.
+    let plain = measure_plain();
+    let at_cap = measure_at_cap();
+    let at_remote_cap = measure_at_remote_cap();
+
+    // Evicting a peer's oldest mapping used to walk the whole table, which put
+    // this ratio at 0.07 with the default cap of 4,096. Anything that
+    // reintroduces a per-packet scan lands far below the bound; scheduler noise
+    // on a loaded runner does not (0.34 measured on the busiest CI runner,
+    // 0.74 idle).
+    assert!(
+        at_cap >= plain * 0.15,
+        "a peer at its cap carried {at_cap:.0} against {plain:.0} for an uncontended peer"
+    );
+    assert!(
+        at_remote_cap >= plain * 0.4,
+        "a mapping at 64 remotes carried {at_remote_cap:.0} against {plain:.0}"
+    );
 }
 
 // A packet builder with a correct checksum, so the NAT's incremental update
