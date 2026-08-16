@@ -44,6 +44,10 @@ NAS, casting) unless its configuration was generated with an excluded prefix
 | a restricted namespace, CI, per-application egress | `warren-proxy` |
 | a device that cannot run Warren at all (a TV, a router, a console, a phone without the app), or a gluetun stack you will not replace | `warren-burrow` |
 
+Deployment shapes (a gateway for LAN devices, a gluetun stack) and the import
+path for each kind of device live in `docs/burrow/` at the root of this
+repository. What follows is the contract those examples are built on.
+
 ## Commands
 
 ```

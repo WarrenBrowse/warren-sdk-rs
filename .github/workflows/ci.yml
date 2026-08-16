@@ -172,6 +172,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: runner-retry classifier tests
         run: bash scripts/ci/test-run-with-runner-retry.sh
+      # The compose examples are copy-paste templates: whatever they get wrong,
+      # users deploy. Nothing else in this repo reads them.
+      - name: deployment example tests
+        run: sh docs/burrow/test-examples.sh
 
   bindings:
     name: uniffi bindings

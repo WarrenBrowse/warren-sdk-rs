@@ -1,0 +1,71 @@
+# One gateway on a LAN host (a NAS, a small server), serving devices that
+# cannot run Warren themselves: a TV, a router, a console behind that router, a
+# phone without the app. Each of them imports a client configuration this
+# gateway generated and points it at this host.
+#
+# Bring it up: docs/burrow/README.md, "A gateway for LAN devices", which sets
+# WARREN_LAN_IP and retrieves a peer's configuration.
+name: warren-burrow
+
+services:
+  warren-burrow:
+    image: ghcr.io/warrenbrowse/warren-burrow:beta
+    restart: unless-stopped
+    # No cap_add, no devices, no privileged: the gateway terminates its peers
+    # on a UDP socket and reaches the exit in userland.
+    #
+    # Host networking, because the peers are devices on the LAN rather than
+    # containers on this host: the gateway binds the host's own LAN address,
+    # and the peers' packets arrive with their real source address instead of
+    # docker's, which is what keeps one NAT and one endpoint per peer. On
+    # Docker Desktop and colima the host is a Linux VM, not this machine, so
+    # run this compose file on the Linux host that carries the LAN address.
+    network_mode: host
+    environment:
+      # Never the phrase itself: the file is mounted as a compose secret below,
+      # so it stays out of the compose file, out of `docker inspect` and out of
+      # the shell history.
+      WARREN_MNEMONIC_FILE: /run/secrets/warren_mnemonic
+      # The one decision that exposes the ordinary WireGuard hop, and on a LAN
+      # it is the point: the peers are on that LAN. Warren's QUIC transport and
+      # its obfuscation begin AT this gateway, so this port belongs on a
+      # network you trust and never on one a stranger routes to.
+      WARREN_BURROW_LAN: "1"
+      # One address, not 0.0.0.0: a host with a second interface (a WAN port, a
+      # management network, another VLAN) would otherwise answer there too.
+      # 51820/udp is bound on the host directly, so no port is published and no
+      # docker NAT sits between a peer and the gateway.
+      WARREN_BURROW_LISTEN: ${WARREN_LAN_IP:?set WARREN_LAN_IP to the LAN address this gateway binds}:51820
+      # What gets written into every generated client configuration as its
+      # Endpoint. A device reads it once, at import.
+      WARREN_BURROW_ENDPOINT: ${WARREN_LAN_IP}:51820
+      WARREN_CONNECT_TIMEOUT: "90"
+      # One per device that will import a configuration. `warren-burrow
+      # add-peer LABEL` adds one later without restarting anything.
+      WARREN_BURROW_PEERS: "4"
+      WARREN_EXITS: de, nl
+    secrets:
+      - warren_mnemonic
+    # The gateway key, the peer configurations and the admin token live here
+    # and nowhere else. Recreated without this volume, the gateway generates a
+    # new key and every configuration already imported on a device somebody has
+    # to walk to stops working.
+    volumes:
+      - warren-burrow-state:/var/lib/warren-burrow
+    healthcheck:
+      # The image already declares this; it is repeated here because the start
+      # period has to follow WARREN_CONNECT_TIMEOUT above.
+      test: ["CMD", "/usr/local/bin/warren-burrow", "healthcheck"]
+      interval: 60s
+      timeout: 15s
+      start_period: 120s
+      retries: 2
+
+volumes:
+  warren-burrow-state:
+
+secrets:
+  warren_mnemonic:
+    # A file holding the account's recovery phrase and nothing else, 0600,
+    # created next to this compose file and never committed.
+    file: ./warren-mnemonic.txt
