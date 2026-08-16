@@ -142,16 +142,19 @@ jobs:
             runner: [self-hosted, linux, x64, docker, warren]
             asset_os: linux-x86_64-musl
             # A wedged cargo under emulation prints nothing and waits forever;
-            # `timeout` is the only thing that ends it. GNU coreutils is a
+            # `timeout` is the only thing that ends it. Sized off the measured
+            # cold build of this lane, 40 minutes on the emulated pool, which a
+            # 40-minute limit killed one minute before it finished (the retry
+            # then took 2m20s on the warm directory). GNU coreutils is a
             # Linux-lane assumption: macOS has no `timeout`, and on Windows the
             # name resolves to a System32 tool that merely sleeps.
-            wedge_timeout: 40m
+            wedge_timeout: 70m
             persistent_target: "true"
           - lane: linux-aarch64-musl
             target: aarch64-unknown-linux-musl
             runner: [self-hosted, Linux, ARM64, macstudio-arm64]
             asset_os: linux-aarch64-musl
-            wedge_timeout: 40m
+            wedge_timeout: 70m
             persistent_target: "true"
           - lane: macos-aarch64
             target: aarch64-apple-darwin
@@ -174,9 +177,11 @@ jobs:
             # as an MSYS path it cannot resolve.
             persistent_target: "false"
     runs-on: ${{ matrix.runner }}
-    # Generous: the real anti-hang guard is the per-invocation timeout on the
-    # lanes that have one, and this ceiling on the lanes that do not.
-    timeout-minutes: 90
+    # Room for one retry of the slowest lane (a cold emulated x86_64 build is
+    # 40 minutes, and its wedge timeout is 70): the real anti-hang guard is
+    # that per-invocation timeout, and this ceiling covers the lanes without
+    # one. The four other lanes finish in under eight minutes.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-engine
