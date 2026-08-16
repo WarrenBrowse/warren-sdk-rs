@@ -138,6 +138,7 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
     // Cloned before the first proof: an epoch that ends and restarts while the
     // probe is running is invisible to a receiver cloned once it is over.
     let tracker_rx = handle.watch_state();
+    let probe = egress_probe(&device, handle.watch_addressing());
 
     wait_until_connected(&handle, env.connect_timeout)
         .await
@@ -151,9 +152,9 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
     tokio::spawn(track_gate_across_epochs(
         tracker_rx,
         device.clone(),
-        handle_reader(&handle),
         Arc::clone(&egress_verified),
         env.client_mtu,
+        probe,
     ));
 
     let forward = start_forward(&env, &device, &handle, port_tx)?;
@@ -255,16 +256,29 @@ async fn sample_inner_budget(
     }
 }
 
-/// Everything the gate driver needs from the supervised handle, detached so it
-/// can outlive the borrow.
-#[derive(Clone)]
-struct HandleReader {
+/// The probe the tracker runs on every arrival at `Connected`: a DNS query to
+/// the exit resolver over the epoch's own in-tunnel control plane.
+///
+/// An epoch that has no addressing or no control plane yet answers `false`,
+/// which is what keeps the gate shut instead of trusting a plane nobody proved.
+fn egress_probe(
+    device: &GatewayDevice,
     addressing_rx: watch::Receiver<Option<warren_sdk::net::EpochAddressing>>,
-}
-
-fn handle_reader(handle: &SupervisedPacketHandle) -> HandleReader {
-    HandleReader {
-        addressing_rx: handle.watch_addressing(),
+) -> impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + 'static {
+    let device = device.clone();
+    move || {
+        // Read before the future: a watch guard must never be held across an
+        // await, and the pair belongs to the epoch running at this instant.
+        let addressing = *addressing_rx.borrow();
+        let control = device.control();
+        Box::pin(async move {
+            let (Some(addressing), Some(control)) = (addressing, control) else {
+                return false;
+            };
+            verify_first_egress(&control, addressing.gateway, FIRST_EGRESS_RECHECK)
+                .await
+                .is_ok()
+        })
     }
 }
 
@@ -316,32 +330,31 @@ async fn wait_for_budget(device: &GatewayDevice, client_mtu: u16) {
 /// closes the gate at once (nothing authenticated may reach a peer over a
 /// black hole, or that peer's own liveness detector never fires), and every
 /// arrival at `Connected` proves itself again before a packet may leave.
-async fn track_gate_across_epochs(
+async fn track_gate_across_epochs<P, Fut>(
     mut state_rx: watch::Receiver<ConnectionState>,
     device: GatewayDevice,
-    reader: HandleReader,
     egress_verified: Arc<AtomicBool>,
     client_mtu: u16,
-) {
+    mut probe: P,
+) where
+    P: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
     loop {
         if state_rx.changed().await.is_err() {
+            // Nothing publishes epochs any more, so nothing can prove one.
+            shut(&device, &egress_verified);
             return;
         }
         if *state_rx.borrow_and_update() != ConnectionState::Connected {
-            device.close_gate();
-            egress_verified.store(false, Ordering::Relaxed);
+            shut(&device, &egress_verified);
             continue;
         }
+        // Read before the probe: an epoch that replaces this one while the
+        // probe runs is what `open_gate_for` refuses below.
         let generation = device.generation();
-        let addressing = *reader.addressing_rx.borrow();
-        let (Some(addressing), Some(control)) = (addressing, device.control()) else {
-            continue;
-        };
-        let proven = verify_first_egress(&control, addressing.gateway, FIRST_EGRESS_RECHECK)
-            .await
-            .is_ok();
-        if !proven {
-            egress_verified.store(false, Ordering::Relaxed);
+        if !probe().await {
+            shut(&device, &egress_verified);
             LOG.error("egress is not proven on this epoch, peers stay refused");
             continue;
         }
@@ -349,8 +362,19 @@ async fn track_gate_across_epochs(
         if device.open_gate_for(generation) {
             egress_verified.store(true, Ordering::Relaxed);
             LOG.info("egress re-verified for the current epoch, peers admitted");
+        } else {
+            // The epoch was replaced while it was being proven; the one that
+            // replaced it proves itself on its own arrival at Connected.
+            shut(&device, &egress_verified);
         }
     }
+}
+
+/// Fails the gateway closed: no peer hears anything but a cookie reply, and
+/// `/healthz` says so.
+fn shut(device: &GatewayDevice, egress_verified: &AtomicBool) {
+    device.close_gate();
+    egress_verified.store(false, Ordering::Relaxed);
 }
 
 async fn wait_until_connected(
@@ -451,6 +475,7 @@ mod tests {
 
     use crate::device::GatewayOptions;
     use warren_burrow_core::{GatewayKey, PeerPlan};
+    use warren_sdk::net::EpochPacketDevice as _;
 
     async fn empty_device() -> GatewayDevice {
         let sockets = crate::socket::bind_all(&["127.0.0.1:0".parse().unwrap()])
@@ -491,6 +516,170 @@ mod tests {
             started.elapsed() >= BUDGET_GRACE,
             "a narrow path waits the grace out"
         );
+    }
+
+    /// One epoch of the shape the supervisor hands the device.
+    fn addressing(generation: u64) -> warren_sdk::net::EpochAddressing {
+        warren_sdk::net::EpochAddressing {
+            epoch: warren_sdk::net::EpochId {
+                exit: warren_sdk::net::ExitId::from_bytes([3u8; 16]),
+                generation,
+            },
+            ipv4: std::net::Ipv4Addr::new(10, 66, 0, 2),
+            prefix: 16,
+            gateway: std::net::Ipv4Addr::new(10, 66, 0, 1),
+            ipv6: None,
+        }
+    }
+
+    /// Polls until `done`, so an assertion never races the tracker task.
+    /// Bounded, so a regression fails instead of hanging.
+    async fn wait_until(mut done: impl FnMut() -> bool, what: &str) {
+        for _ in 0..400u32 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("{what}");
+    }
+
+    /// A scripted probe: it counts its runs and answers what the test says.
+    fn scripted(
+        answer: &Arc<AtomicBool>,
+        runs: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + 'static {
+        let answer = Arc::clone(answer);
+        let runs = Arc::clone(runs);
+        move || {
+            let answer = Arc::clone(&answer);
+            let runs = Arc::clone(&runs);
+            Box::pin(async move {
+                runs.fetch_add(1, Ordering::Relaxed);
+                answer.load(Ordering::Relaxed)
+            })
+        }
+    }
+
+    /// The proof belongs to the epoch it was measured on: leaving `Connected`
+    /// shuts the gate at once, and the epoch that comes back proves itself
+    /// before a single packet may reach a peer again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconnect_closes_the_gate_and_the_new_epoch_proves_itself_before_it_reopens() {
+        let device = empty_device().await;
+        let (_sink, _control) = device.begin_epoch(addressing(1));
+        device.note_inner_budget(1414);
+        assert!(device.open_gate_for(1));
+        let (state_tx, state_rx) = watch::channel(ConnectionState::Connected);
+        let verified = Arc::new(AtomicBool::new(true));
+        let answer = Arc::new(AtomicBool::new(true));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let task = tokio::spawn(track_gate_across_epochs(
+            state_rx,
+            device.clone(),
+            Arc::clone(&verified),
+            1280,
+            scripted(&answer, &runs),
+        ));
+
+        state_tx.send(ConnectionState::Reconnecting).unwrap();
+        wait_until(
+            || !device.snapshot().gate_open,
+            "leaving Connected must close the gate at once",
+        )
+        .await;
+        assert!(!verified.load(Ordering::Relaxed));
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            0,
+            "there is nothing to prove while the tunnel is down"
+        );
+
+        // What the supervisor does on a redial: a fresh epoch, unproven.
+        let (_next, _control) = device.begin_epoch(addressing(2));
+        device.note_inner_budget(1414);
+        state_tx.send(ConnectionState::Connected).unwrap();
+
+        wait_until(
+            || device.snapshot().gate_open,
+            "a re-proven epoch admits peers again",
+        )
+        .await;
+        let snapshot = device.snapshot();
+        assert_eq!(
+            snapshot.gate_generation, 2,
+            "the gate belongs to the epoch that was proven"
+        );
+        assert!(verified.load(Ordering::Relaxed));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        task.abort();
+    }
+
+    /// A watch channel coalesces, so a `Reconnecting` raised and cleared
+    /// between two polls is invisible here. Every change that lands on
+    /// `Connected` is re-proven, and a proof that fails takes the gate with it
+    /// rather than leaving peers riding a tunnel that egresses nowhere.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_republished_epoch_whose_probe_fails_loses_the_gate() {
+        let device = empty_device().await;
+        let (_sink, _control) = device.begin_epoch(addressing(1));
+        device.note_inner_budget(1414);
+        assert!(device.open_gate_for(1));
+        let (state_tx, state_rx) = watch::channel(ConnectionState::Connected);
+        let verified = Arc::new(AtomicBool::new(true));
+        let answer = Arc::new(AtomicBool::new(false));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let task = tokio::spawn(track_gate_across_epochs(
+            state_rx,
+            device.clone(),
+            Arc::clone(&verified),
+            1280,
+            scripted(&answer, &runs),
+        ));
+
+        state_tx.send(ConnectionState::Connected).unwrap();
+
+        wait_until(
+            || !device.snapshot().gate_open,
+            "a state this task cannot interpret is re-proven, not trusted",
+        )
+        .await;
+        assert!(!verified.load(Ordering::Relaxed));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !device.snapshot().gate_open,
+            "a failed proof leaves the gate shut"
+        );
+        task.abort();
+    }
+
+    /// The supervisor going away leaves the daemon with no epoch to prove, and
+    /// a gate left open there would carry peer traffic into nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_supervisor_ending_shuts_the_gate() {
+        let device = empty_device().await;
+        let (_sink, _control) = device.begin_epoch(addressing(1));
+        assert!(device.open_gate_for(1));
+        let (state_tx, state_rx) = watch::channel(ConnectionState::Connected);
+        let verified = Arc::new(AtomicBool::new(true));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let task = tokio::spawn(track_gate_across_epochs(
+            state_rx,
+            device.clone(),
+            Arc::clone(&verified),
+            1280,
+            scripted(&Arc::new(AtomicBool::new(true)), &runs),
+        ));
+
+        drop(state_tx);
+
+        task.await.expect("the tracker ends with its publisher");
+        assert!(!device.snapshot().gate_open);
+        assert!(!verified.load(Ordering::Relaxed));
     }
 
     /// Nothing reaches a peer before an epoch has proven it egresses, and the
