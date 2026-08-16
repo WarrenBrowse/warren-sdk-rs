@@ -54,6 +54,19 @@ pub fn is_tunnel_pool(addr: IpAddr) -> bool {
     }
 }
 
+/// True while `net` meets the range an exit assigns from, in either
+/// direction.
+///
+/// A prefix that contains the pool claims every address inside it just as much
+/// as a prefix contained by the pool does, so both are a collision.
+#[must_use]
+pub fn overlaps_tunnel_pool(net: IpNetwork) -> bool {
+    match net {
+        IpNetwork::V4(v4) => overlaps_v4(v4, TUNNEL_POOL_V4),
+        IpNetwork::V6(v6) => overlaps_v6(v6, TUNNEL_POOL_V6),
+    }
+}
+
 /// True while `addr` is the exit's own gateway and resolver address.
 #[must_use]
 pub fn is_tunnel_gateway(addr: IpAddr) -> bool {

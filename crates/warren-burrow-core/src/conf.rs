@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
 
 use crate::keys::{GatewayKey, KeyError, PeerPublicKey, PresharedKey};
 use crate::peer::{LabelError, PeerLabel};
-use crate::plan::{PeerPlan, complement, is_tunnel_pool};
+use crate::plan::{PeerPlan, complement, overlaps_tunnel_pool};
 
 /// Why a configuration file was refused.
 ///
@@ -242,21 +242,32 @@ pub fn parse_gateway_conf(text: &str) -> Result<GatewayConf, ConfError> {
 }
 
 fn check_peers(peers: &[PeerConf]) -> Result<(), ConfError> {
-    for (position, peer) in peers.iter().enumerate() {
+    // Every rule below is a property of the peer, not of one of its networks,
+    // so none of them may be nested inside the walk over `allowed`: a peer
+    // that claims nothing would then be examined by nothing, and a duplicate
+    // key would demux two devices onto one session.
+    for peer in peers {
+        if peer.allowed.is_empty() {
+            return Err(ConfError::MissingAllowedIps);
+        }
         for network in &peer.allowed {
-            if is_tunnel_pool(network.network_address()) {
+            if overlaps_tunnel_pool(*network) {
                 return Err(ConfError::TunnelPoolAllowedIps);
             }
-            for other in peers.iter().skip(position + 1) {
-                if other.public == peer.public {
-                    return Err(ConfError::DuplicatePeerKey);
-                }
-                if other.label == peer.label {
-                    return Err(ConfError::DuplicateLabel);
-                }
-                // Cryptokey routing resolves an address by longest match, so
-                // an address covered by two peers has no owner the NAT and the
-                // router would agree on.
+        }
+    }
+    for (position, peer) in peers.iter().enumerate() {
+        for other in peers.iter().skip(position + 1) {
+            if other.public == peer.public {
+                return Err(ConfError::DuplicatePeerKey);
+            }
+            if other.label == peer.label {
+                return Err(ConfError::DuplicateLabel);
+            }
+            // Cryptokey routing resolves an address by longest match, so an
+            // address covered by two peers has no owner the NAT and the router
+            // would agree on.
+            for network in &peer.allowed {
                 if other
                     .allowed
                     .iter()
@@ -630,6 +641,74 @@ mod tests {
             parse_gateway_conf(&text).unwrap_err(),
             ConfError::TunnelPoolAllowedIps
         );
+    }
+
+    #[test]
+    fn refuses_every_prefix_that_meets_the_tunnel_pool() {
+        // A supernet of the pool claims every address inside it just as much
+        // as a host route does, and it is the shape that escaped the first
+        // check: the prefix's own base sits outside the pool.
+        for claim in [
+            "10.66.0.2/32",
+            "10.66.0.0/16",
+            "10.0.0.0/8",
+            "0.0.0.0/0",
+            "fdcc:f:1::/64",
+            "fdcc::/16",
+            "::/0",
+        ] {
+            let text = format!(
+                "[Interface]\nPrivateKey = {PEER_PRIVATE}\n\n\
+                 [Peer]\n# label = a\nPublicKey = {PEER_PUBLIC}\nAllowedIPs = {claim}\n"
+            );
+            assert_eq!(
+                parse_gateway_conf(&text).unwrap_err(),
+                ConfError::TunnelPoolAllowedIps,
+                "{claim} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_refuses_a_peer_built_in_memory_without_allowed_ips() {
+        let conf = GatewayConf {
+            key: GatewayKey::from_base64(PEER_PRIVATE).expect("a valid key"),
+            peers: vec![PeerConf {
+                label: PeerLabel::new("a").expect("a valid label"),
+                public: PeerPublicKey::from_base64(PEER_PUBLIC).expect("a valid key"),
+                psk: None,
+                allowed: Vec::new(),
+            }],
+        };
+        assert_eq!(conf.validate().unwrap_err(), ConfError::MissingAllowedIps);
+    }
+
+    #[test]
+    fn validate_refuses_two_peers_sharing_a_key_when_the_first_claims_nothing() {
+        // Every per-peer rule used to live inside the loop over the peer's own
+        // networks, so a peer with no network was never examined at all and
+        // the duplicate key demuxed both devices onto one session.
+        let conf = GatewayConf {
+            key: GatewayKey::from_base64(PEER_PRIVATE).expect("a valid key"),
+            peers: vec![
+                PeerConf {
+                    label: PeerLabel::new("a").expect("a valid label"),
+                    public: PeerPublicKey::from_base64(PEER_PUBLIC).expect("a valid key"),
+                    psk: None,
+                    allowed: Vec::new(),
+                },
+                PeerConf {
+                    label: PeerLabel::new("b").expect("a valid label"),
+                    public: PeerPublicKey::from_base64(PEER_PUBLIC).expect("a valid key"),
+                    psk: None,
+                    allowed: vec![IpNetwork::from_str("10.67.0.3/32").expect("a valid network")],
+                },
+            ],
+        };
+        assert!(matches!(
+            conf.validate().unwrap_err(),
+            ConfError::MissingAllowedIps | ConfError::DuplicatePeerKey
+        ));
     }
 
     #[test]
