@@ -168,10 +168,17 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
     }
 
     // The tunnel's own budget, read for the gate and published on `/status`.
+    let metrics = handle.metrics_reader();
     tasks.push(tokio::spawn(sample_inner_budget(
         device.clone(),
-        handle.metrics_reader(),
+        move || {
+            metrics
+                .read()
+                .and_then(|m| m.path)
+                .map(|path| path.max_inner_payload as usize)
+        },
         BUDGET_POLL,
+        handle.watch_state(),
     )));
 
     // Cloned before the first proof: an epoch that ends and restarts while the
@@ -337,16 +344,27 @@ async fn build_device(env: &GatewayEnv, conf: &GatewayConf) -> anyhow::Result<Ga
 
 /// Reads the live inner budget out of the supervised handle and hands it to
 /// the device, which is what withdraws IPv6 on a path under its minimum MTU.
+///
+/// It holds the device, so it ends with the supervisor that publishes the
+/// budget rather than keeping the sockets and the readers alive behind it.
 async fn sample_inner_budget(
     device: GatewayDevice,
-    metrics: warren_sdk::MetricsReader,
+    budget: impl Fn() -> Option<usize>,
     every: Duration,
+    mut state_rx: watch::Receiver<ConnectionState>,
 ) {
     loop {
-        if let Some(path) = metrics.read().and_then(|m| m.path) {
-            device.note_inner_budget(path.max_inner_payload as usize);
+        if let Some(budget) = budget() {
+            device.note_inner_budget(budget);
         }
-        tokio::time::sleep(every).await;
+        tokio::select! {
+            () = tokio::time::sleep(every) => {}
+            changed = state_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -800,6 +818,34 @@ mod tests {
         task.await.expect("the tracker ends with its publisher");
         assert!(!device.snapshot().gate_open);
         assert!(!verified.load(Ordering::Relaxed));
+    }
+
+    /// The sampler holds the device, so a supervisor that has ended must end
+    /// it too: `run` is public API, and a caller that drops it gets its
+    /// sockets and its readers back only if nothing is still holding them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_budget_sampler_publishes_and_ends_with_the_supervisor() {
+        let device = empty_device().await;
+        let (state_tx, state_rx) = watch::channel(ConnectionState::Connected);
+
+        let task = tokio::spawn(sample_inner_budget(
+            device.clone(),
+            || Some(1414),
+            Duration::from_millis(10),
+            state_rx,
+        ));
+
+        wait_until(
+            || device.inner_budget() == Some(1414),
+            "the tunnel's budget must reach the device",
+        )
+        .await;
+
+        drop(state_tx);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the sampler ends with its publisher")
+            .expect("the sampler task");
     }
 
     /// A headless daemon's stdout is the container log, shipped to whatever
