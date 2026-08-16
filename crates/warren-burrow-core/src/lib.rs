@@ -49,13 +49,14 @@ pub use peer::{DropReason, LabelError, PeerId, PeerLabel, PeerStats, PeerStatus}
 pub use plan::{
     DEFAULT_PEER_SUBNET_V4, DEFAULT_PEER_SUBNET_V6, PeerPlan, PlanError, TUNNEL_GATEWAY_V4,
     TUNNEL_GATEWAY_V6, TUNNEL_POOL_V4, TUNNEL_POOL_V6, complement, is_tunnel_gateway,
-    is_tunnel_pool,
+    is_tunnel_pool, overlaps_tunnel_pool,
 };
 pub use ports::{
     CONTROL_RANGE_END, CONTROL_RANGE_START, DYNAMIC_POOL_END, DYNAMIC_POOL_START, PortAllocator,
 };
 pub use ratelimit::{
-    HANDSHAKE_BURST_PER_IP, HANDSHAKE_RATE_PER_IP, HANDSHAKE_SOURCES_TRACKED, HandshakeBuckets,
+    ANSWER_BURST, ANSWER_RATE_PER_SECOND, HANDSHAKE_BURST_PER_IP, HANDSHAKE_RATE_PER_IP,
+    HANDSHAKE_SOURCES_TRACKED, HandshakeBuckets, TokenBucket,
 };
 pub use responder::{
     DEFAULT_HANDSHAKE_RATE, Encapsulated, Gate, Inbound, ReloadReport, Responder, ResponderOptions,
