@@ -186,11 +186,13 @@ jobs:
             # as an MSYS path it cannot resolve.
             persistent_target: "false"
     runs-on: ${{ matrix.runner }}
-    # Room for one retry of the slowest lane (a cold emulated x86_64 build is
-    # 40 minutes, and its wedge timeout is 70): the real anti-hang guard is
-    # that per-invocation timeout, and this ceiling covers the lanes without
-    # one. The four other lanes finish in under eight minutes.
-    timeout-minutes: 150
+    # Sized so the retry wrapper always outlives its own worst case and the
+    # failure carries its diagnosis rather than GitHub's: two invocations
+    # (build, test), each allowed two attempts of the 70-minute wedge timeout
+    # plus a 15-second back-off, is 280 minutes. A lane reaches that only when
+    # the runner is wedged four times over; the emulated x86_64 lane's real
+    # cold build is 43 minutes and the four others finish in under eight.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-engine
@@ -246,7 +248,14 @@ jobs:
           # attempt (scripts/ci/run-with-runner-retry.sh).
           cargo_ci() {
             if [ -n "$WEDGE_TIMEOUT" ]; then
-              bash scripts/ci/run-with-runner-retry.sh timeout -k 60s "$WEDGE_TIMEOUT" "$@"
+              # Two attempts on a lane whose retry can cost a full wedge
+              # timeout: three would put the job's own ceiling out of reach of
+              # any reasonable number, and a lane killed by that ceiling
+              # reports GitHub's message instead of the wrapper's diagnosis.
+              # The cheap signatures (a rustc that never spawned, a tool that
+              # vanished) fail in seconds and lose nothing by it.
+              WARREN_RETRY_ATTEMPTS=2 \
+                bash scripts/ci/run-with-runner-retry.sh timeout -k 60s "$WEDGE_TIMEOUT" "$@"
             else
               bash scripts/ci/run-with-runner-retry.sh "$@"
             fi
