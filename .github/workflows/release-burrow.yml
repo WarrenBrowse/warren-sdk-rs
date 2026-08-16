@@ -1,0 +1,383 @@
+# Release pipeline for the warren-burrow binary and its container image.
+#
+# Tag shapes (shared release-channel contract: one run publishes one channel):
+#   burrow-vX.Y.Z       prod  -> assets warren-burrow-<ver>-...,      image :<ver> + :latest
+#   burrow-beta-vX.Y.Z  beta  -> assets warren-burrow-beta-<ver>-..., image :beta-<ver> + :beta
+#
+# Artifacts: static musl binaries for linux x86_64 and aarch64, macOS arm64 and
+# x86_64, Windows x86_64, a published GitHub release with SHA256SUMS, and the
+# multi-arch image ghcr.io/warrenbrowse/warren-burrow.
+#
+# A tag publishes only when its commit is on main and that commit already has a
+# green CI run, so the release inherits the four gates.
+#
+# workflow_dispatch builds and packages every lane as run artifacts without
+# publishing anything (a dry run of the matrix).
+#
+# One difference from release-proxy.yml, and it is deliberate: the static check
+# is `readelf -d` (no NEEDED entry), not
+# `ldd BIN | grep -qvi 'not a dynamic executable|statically linked'`. ldd is the
+# dynamic loader, and the musl one answers a valid static binary with
+# `/lib/ld-musl-aarch64.so.1: BIN: Not a valid dynamic program`, which matches
+# neither accepted string and fails the release. Measured on the aarch64 gateway
+# binary built in rust:1.89-alpine during the live validation, then read with
+# `readelf -d` (no dynamic section) and `file` (statically linked) on the same
+# binary. A static-pie has a dynamic section but no NEEDED entry, a plain static
+# binary has no dynamic section at all, and a dynamically linked one lists
+# NEEDED, so the NEEDED test tells the three apart wherever the check runs.
+
+name: release-burrow
+
+on:
+  push:
+    tags:
+      - "burrow-v*"
+      - "burrow-beta-v*"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "prod | beta (dry run: build only, no publish)"
+        required: false
+        default: "beta"
+
+permissions:
+  # actions: read is what lets the resolve gate below read this commit's CI run.
+  actions: read
+  contents: write
+  packages: write
+
+# One publish per ref at a time: two runs of the same tag would race on the
+# GHCR tags and on `gh release create`. Never cancels a run in flight, which
+# would leave a half-published release behind.
+concurrency:
+  group: release-burrow-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  resolve:
+    name: Resolve channel and version
+    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    timeout-minutes: 10
+    outputs:
+      channel: ${{ steps.resolve.outputs.channel }}
+      version: ${{ steps.resolve.outputs.version }}
+      env_tag: ${{ steps.resolve.outputs.env_tag }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_CHANNEL: ${{ github.event.inputs.channel }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "push" ]; then
+            case "$REF_NAME" in
+              burrow-beta-v*) channel=beta; prefix="burrow-beta-v"; version="${REF_NAME#burrow-beta-v}" ;;
+              burrow-v*)      channel=prod; prefix="burrow-v";      version="${REF_NAME#burrow-v}" ;;
+              *) echo "unexpected tag $REF_NAME" >&2; exit 1 ;;
+            esac
+            # Version-truth guard (shared git-commits rule): refuse a tag that
+            # is not the strictly highest of ITS OWN series, reading the
+            # remote's tags rather than the clone's.
+            highest=$(git ls-remote --tags origin "refs/tags/${prefix}*" \
+              | sed "s|.*refs/tags/${prefix}||" | grep -v '\^{}' | sort -V | tail -1)
+            if [ "$highest" != "$version" ]; then
+              echo "refusing ${REF_NAME}: highest ${prefix}* on origin is ${prefix}${highest}" >&2
+              exit 1
+            fi
+            # A tag can be cut on any commit, so the release inherits the four
+            # gates instead of re-running one of them: the tagged commit has to
+            # be on main and to carry a CI run that concluded success.
+            git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "refusing ${REF_NAME}: its commit is not on main" >&2
+              exit 1
+            fi
+            runs=$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&status=success&per_page=1") \
+              || { echo "refusing ${REF_NAME}: the workflow-runs API is unreadable" >&2; exit 1; }
+            # total_count is the first field of the response, and jq is not on
+            # every runner pool.
+            green=$(printf '%s' "$runs" | tr -d ' \n' | sed -nE 's/^\{"total_count":([0-9]+).*/\1/p')
+            if [ "${green:-0}" -lt 1 ]; then
+              echo "refusing ${REF_NAME}: no successful CI run on its commit; wait for CI, then re-run this workflow" >&2
+              exit 1
+            fi
+            publish=true
+          else
+            channel="${INPUT_CHANNEL:-beta}"
+            version="0.0.0-dry"
+            publish=false
+          fi
+          env_tag=""
+          [ "$channel" = "beta" ] && env_tag="-beta"
+          {
+            echo "channel=$channel"
+            echo "version=$version"
+            echo "env_tag=$env_tag"
+            echo "publish=$publish"
+          } >>"$GITHUB_OUTPUT"
+          echo "building $channel $version (publish=$publish)"
+
+  build:
+    name: Build ${{ matrix.lane }}
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: linux-x86_64-musl
+            target: x86_64-unknown-linux-musl
+            runner: [self-hosted, linux, x64, docker, warren]
+            asset_os: linux-x86_64-musl
+            # A wedged cargo under emulation prints nothing and waits forever;
+            # `timeout` is the only thing that ends it. GNU coreutils is a
+            # Linux-lane assumption: macOS has no `timeout`, and on Windows the
+            # name resolves to a System32 tool that merely sleeps.
+            wedge_timeout: 40m
+            persistent_target: "true"
+          - lane: linux-aarch64-musl
+            target: aarch64-unknown-linux-musl
+            runner: [self-hosted, Linux, ARM64, macstudio-arm64]
+            asset_os: linux-aarch64-musl
+            wedge_timeout: 40m
+            persistent_target: "true"
+          - lane: macos-aarch64
+            target: aarch64-apple-darwin
+            runner: [self-hosted, macOS, ARM64]
+            asset_os: macos-aarch64
+            wedge_timeout: ""
+            persistent_target: "true"
+          - lane: macos-x86_64
+            target: x86_64-apple-darwin
+            runner: [self-hosted, macOS, ARM64]
+            asset_os: macos-x86_64
+            wedge_timeout: ""
+            persistent_target: "true"
+          - lane: windows-x86_64
+            target: x86_64-pc-windows-msvc
+            runner: [self-hosted, Windows, macstudio-win]
+            asset_os: windows-x86_64
+            wedge_timeout: ""
+            # Left at the workspace default: a bash-shaped $HOME reaches cargo
+            # as an MSYS path it cannot resolve.
+            persistent_target: "false"
+    runs-on: ${{ matrix.runner }}
+    # Generous: the real anti-hang guard is the per-invocation timeout on the
+    # lanes that have one, and this ceiling on the lanes that do not.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-engine
+        with:
+          token: ${{ secrets.ENGINE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v musl-gcc >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends musl-tools
+          fi
+      - name: Build, test and package
+        shell: bash
+        env:
+          WARREN_PRODUCT_ENV: ${{ needs.resolve.outputs.channel }}
+          CARGO_TARGET: ${{ matrix.target }}
+          ASSET_OS: ${{ matrix.asset_os }}
+          WEDGE_TIMEOUT: ${{ matrix.wedge_timeout }}
+          PERSISTENT_TARGET: ${{ matrix.persistent_target }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          ENV_TAG: ${{ needs.resolve.outputs.env_tag }}
+          # musl-gcc builds the C bits (ring, and boringtun's). Both vars are
+          # target-scoped, so the one not matching this matrix leg is inert.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: |
+          set -euo pipefail
+          if [ "$PERSISTENT_TARGET" = "true" ]; then
+            # Persistent cache outside _work (the runner GC wipes leaf target/
+            # dirs in _work between jobs).
+            export CARGO_TARGET_DIR="$HOME/warren-sdk-target"
+          fi
+          case "$CARGO_TARGET" in *windows*) EXE=".exe" ;; *) EXE="" ;; esac
+          BIN="${CARGO_TARGET_DIR:-target}/$CARGO_TARGET/release/warren-burrow$EXE"
+          # A persistent cache means the previous run's binary is sitting at
+          # $BIN: remove it, and no failure downstream can package a binary
+          # that was not compiled from this tag.
+          rm -f "$BIN"
+          # A rustc that cannot be SPAWNED, one killed mid-compile, and a
+          # wedged cargo are the three runner failures this pipeline sees; the
+          # classifier retries those and fails anything else on the first
+          # attempt (scripts/ci/run-with-runner-retry.sh).
+          cargo_ci() {
+            if [ -n "$WEDGE_TIMEOUT" ]; then
+              bash scripts/ci/run-with-runner-retry.sh timeout -k 60s "$WEDGE_TIMEOUT" "$@"
+            else
+              bash scripts/ci/run-with-runner-retry.sh "$@"
+            fi
+          }
+          cargo_ci cargo build --locked --release -p warren-burrow --target "$CARGO_TARGET"
+          # A tag can be cut on any commit, so nothing else in this pipeline
+          # guarantees the code being packaged passed its tests. Release
+          # profile and same target as the build above, so it reuses what was
+          # just compiled instead of building a second time. The core crate
+          # carries the responder and the NAT, so it is tested here too.
+          cargo_ci cargo test --locked --release -p warren-burrow -p warren-burrow-core --target "$CARGO_TARGET"
+          if [ ! -x "$BIN" ]; then
+            echo "cargo reported success but produced no binary at $BIN"; exit 1
+          fi
+          # Header of this file: ldd is not a static check, a NEEDED entry is.
+          case "$CARGO_TARGET" in
+            *-musl)
+              if command -v readelf >/dev/null 2>&1; then
+                if readelf -d "$BIN" | grep -q NEEDED; then
+                  echo "binary is dynamically linked:"; readelf -d "$BIN"; exit 1
+                fi
+              elif command -v file >/dev/null 2>&1; then
+                file -b "$BIN" | grep -qE 'static-pie linked|statically linked' || {
+                  echo "binary is not static: $(file -b "$BIN")"; exit 1
+                }
+              else
+                echo "no readelf and no file on this runner: cannot verify the binary is static"; exit 1
+              fi
+              ;;
+          esac
+          # The cross-built lanes are the ones that can silently produce the
+          # host's architecture, and an artifact nobody can start is worth
+          # catching here rather than on a user's machine. `--help` is the one
+          # subcommand that needs no state directory and no account.
+          "$BIN" --help >/dev/null
+          name="warren-burrow${ENV_TAG}-${VERSION}-${ASSET_OS}"
+          mkdir -p out staging
+          cp "$BIN" "staging/warren-burrow$EXE"
+          case "$CARGO_TARGET" in
+            *windows*)
+              # Compress-Archive ships with Windows PowerShell; `zip` does not
+              # exist on this runner.
+              powershell -NoProfile -Command \
+                "Compress-Archive -Path staging/warren-burrow.exe -DestinationPath out/${name}.zip -Force"
+              ;;
+            *)
+              tar -C staging -czf "out/${name}.tar.gz" warren-burrow
+              ;;
+          esac
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: warren-burrow-${{ matrix.lane }}
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release and image
+    needs: [resolve, build]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: [self-hosted, linux, x64, docker, warren]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          # Every lane packaged its own asset with its final name, so this job
+          # only collects them: no lane's packaging waits for the release to be
+          # cut to be exercised, and the dry run covers it too.
+          path: staging
+      - name: Collect assets and checksums
+        id: package
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          ENV_TAG: ${{ needs.resolve.outputs.env_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p out dist/amd64 dist/arm64
+          find staging -type f -exec mv {} out/ \;
+          # No `./` prefix: `sha256sum -c` is run from wherever the assets were
+          # downloaded, and the prefix makes every entry a path that has to
+          # match. Written outside `out` first, so the file can never end up
+          # listing itself.
+          (cd out && sha256sum -- *) > SHA256SUMS
+          mv SHA256SUMS out/
+          # The image is the same binaries the release ships, unpacked from the
+          # assets rather than rebuilt.
+          tar -C dist/amd64 -xzf "out/warren-burrow${ENV_TAG}-${VERSION}-linux-x86_64-musl.tar.gz"
+          tar -C dist/arm64 -xzf "out/warren-burrow${ENV_TAG}-${VERSION}-linux-aarch64-musl.tar.gz"
+          chmod 755 dist/amd64/warren-burrow dist/arm64/warren-burrow
+          ls -l out dist/amd64 dist/arm64
+      # The image is pushed BEFORE the release is created. A release is the
+      # announcement, and its notes point at the image: publishing it first and
+      # then failing on the push (a transient GHCR denial, a QEMU/buildx setup
+      # failure) left a visible release whose image 404s, and the rerun could
+      # not recover it because `gh release create` refuses an existing tag.
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up QEMU
+        # The arm64 layer of the image runs `apk add` under emulation on this
+        # x64 docker pool.
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build and push multi-arch image
+        env:
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANNEL" = "beta" ]; then
+            tags="-t ghcr.io/warrenbrowse/warren-burrow:beta-${VERSION} -t ghcr.io/warrenbrowse/warren-burrow:beta"
+          else
+            tags="-t ghcr.io/warrenbrowse/warren-burrow:${VERSION} -t ghcr.io/warrenbrowse/warren-burrow:latest"
+          fi
+          push_image() {
+            docker buildx build --push --platform linux/amd64,linux/arm64 \
+              -f docker/warren-burrow.Dockerfile $tags .
+          }
+          # GHCR's token exchange occasionally answers `denied` on the push
+          # (transient, documented in warren-core's docker.yml); a fresh login
+          # and one retry clears it. A real build error fails twice.
+          if ! push_image; then
+            echo "::warning::image push failed, re-logging in to GHCR and retrying once"
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+            push_image
+          fi
+      - name: Create published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          prerelease=""
+          [ "$CHANNEL" = "beta" ] && prerelease="--prerelease"
+          # Idempotent: a rerun after a partial publish re-uploads the assets
+          # instead of dying on "a release with that tag already exists".
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" out/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "warren-burrow ${CHANNEL} ${VERSION}" \
+              --notes "Local gateway that carries stock WireGuard-protocol clients through a Warren exit (${CHANNEL} channel). Env contract: crates/warren-burrow/README.md. Deployment examples: docs/burrow/. \"WireGuard\" is a registered trademark of Jason A. Donenfeld; this project is not affiliated with or endorsed by the WireGuard project." \
+              $prerelease
+          fi
