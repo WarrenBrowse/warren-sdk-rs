@@ -16,8 +16,9 @@
 #   plain    a spawn failure, a compiler killed mid-compile (a crash signature
 #            in the log), or a wedge (no output at all, only the exit code of
 #            whatever killed it). Retry the same command.
-#   clean    LNK1181, the windows-rs import lib briefly unopenable at link
-#            time. A `cargo clean` lands the retry on a fresh state.
+#   clean    a corrupt persistent target directory (dep-info gone), or LNK1181,
+#            the windows-rs import lib briefly unopenable at link time. Both
+#            need a `cargo clean` for the retry to land on a fresh state.
 #   nothing  everything else, which fails on the first attempt: a real compile
 #            error, lint or test failure must not cost three builds before it
 #            is reported, and must never be able to read as intermittent.
@@ -35,6 +36,15 @@ ATTEMPTS="${WARREN_RETRY_ATTEMPTS:-3}"
 # at all when the failure is the code's own.
 warren_flake_class() { # warren_flake_class <logfile> [exit-code]
 	if grep -q "LNK1181" "$1"; then
+		echo clean
+		return
+	fi
+	# The self-hosted runners keep target/ across jobs, so a job killed
+	# mid-write (a cancelled superseded run) or a cache restore that pruned the
+	# .d files leaves a tree cargo can no longer describe. Retrying in place
+	# hits the same missing file; only a clean recovers it. ci.yml's rust-cache
+	# step carries the same signature in its comment.
+	if grep -q "could not parse/generate dep info" "$1"; then
 		echo clean
 		return
 	fi

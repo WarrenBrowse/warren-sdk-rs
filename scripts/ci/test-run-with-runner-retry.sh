@@ -54,11 +54,26 @@ expect "the same spawn failure on macos, where the errno reads as a missing file
 
 Caused by:
   No such file or directory (os error 2)"
+# Run 31957766776, job "cargo test (macos)": the persistent target directory
+# of a self-hosted runner lost the .d dep-info files of what it holds, which
+# only a clean recovers.
+expect "a target directory whose dep-info is gone gets a clean" clean \
+	"error: could not parse/generate dep info at: /Users/axiom/actions-runner-2/_work/warren-sdk-rs/warren-sdk-rs/target/debug/deps/warren_burrow-0d4e.d
+
+Caused by:
+  No such file or directory (os error 2)"
 # The release lanes link windows-rs; the import lib is briefly unopenable
 # under a concurrent runner, and a clean lands on a fresh state.
 expect "the transient linker failure gets a clean first" clean \
 	"error: linking with \`link.exe\` failed: exit code: 1181
   = note: LINK : fatal error LNK1181: cannot open input file 'windows.0.52.0.lib'"
+# Same run, first attempt: the shared cargo bin directory was being rewritten
+# by another job, so the tool cargo was asked to spawn was half a file.
+expect "a tool that was being rewritten while cargo spawned it" plain \
+	"error: could not execute process \`/Users/axiom/.cargo/bin/cargo-nextest nextest run --locked\` (never executed)
+
+Caused by:
+  Malformed Mach-o file (os error 88)"
 # The release workflow's x86_64 lane builds under Rosetta, where a rustc dies
 # mid-compile on a random crate. The crash is in the log.
 expect "a rustc crash under emulation is a signature, not an exit code" plain \
