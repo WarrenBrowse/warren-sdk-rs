@@ -2248,6 +2248,9 @@ mod tests {
     }
 
     #[test]
+    // Twenty seconds of real sleeping, which is the whole crate's test time.
+    // It runs in its own CI lane rather than in front of every `cargo test`.
+    #[ignore = "sleeps through boringtun's own clock, run in the slow lane"]
     fn emits_a_passive_keepalive_only_once_the_gate_reopens() {
         // boringtun reads its own monotonic clock, so the only way to observe a
         // keepalive rule is to let the time pass. The gate rule this pins cost

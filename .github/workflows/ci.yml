@@ -268,3 +268,28 @@ jobs:
         # flakes. Plain `cargo llvm-cov` has no retries and turns those transient
         # timeouts into hard coverage failures.
         run: cargo llvm-cov nextest --workspace --locked --summary-only --retries 2
+
+  burrow-slow:
+    name: burrow-core slow lane
+    # The two kinds of test the default lane must not carry: one that sleeps
+    # through boringtun's own monotonic clock (twenty seconds of real time,
+    # which was the whole crate's test duration), and the datapath measurement
+    # that only means anything against an optimised build. Both are `#[ignore]`d
+    # so `cargo test` and the coverage run stay fast, and both still run on
+    # every push, here.
+    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-engine
+        with:
+          token: ${{ secrets.ENGINE_TOKEN }}
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+      # One thread: the datapath cases assert a packets-per-second floor, and
+      # three of them competing for the same core would measure the scheduler.
+      - run: >
+          cargo test --locked --release -p warren-burrow-core --
+          --ignored --nocapture --test-threads=1
