@@ -179,6 +179,12 @@ transfer; a spoofed inner source dropped and counted; the gate closing on
 tunnel loss and emitting nothing to peers until it healed; a NAT-PMP port
 forward reachable from a neutral vantage.
 
+The image these examples run was exercised as itself: the linux aarch64 musl
+binary the release lane builds, in the image `docker/warren-burrow.Dockerfile`
+produces, reached `healthy` against the DE exit in under twenty seconds, as
+uid 1000, with the state directory 0700 and the client files 0600 inside a
+named volume.
+
 The per-platform import paths in [`clients.md`](clients.md) come from each
 platform's documented behaviour. No GUI client (tvOS, iOS, Android, the Windows
 app, a router UI) was run against a gateway, so treat those sections as the
