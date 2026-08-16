@@ -5,6 +5,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::log::Log;
+
 /// How long a user hook may run before it is killed. The hook runs on the
 /// shutdown path and ahead of the next port change, so one that never returns
 /// would hold the daemon open past its signal and stall every later grant.
@@ -125,12 +127,13 @@ async fn kill_hook(child: &mut tokio::process::Child) {
 }
 
 /// Runs a hook command through the platform's shell under [`HOOK_TIMEOUT`].
-pub async fn run_hook(command: &str, port: u16, label: &str) -> HookOutcome {
-    run_hook_with_timeout(command, port, label, HOOK_TIMEOUT).await
+pub async fn run_hook(log: Log, command: &str, port: u16, label: &str) -> HookOutcome {
+    run_hook_with_timeout(log, command, port, label, HOOK_TIMEOUT).await
 }
 
 /// Runs a hook command through the platform's shell, killing it past `timeout`.
 pub async fn run_hook_with_timeout(
+    log: Log,
     command: &str,
     port: u16,
     label: &str,
@@ -140,28 +143,34 @@ pub async fn run_hook_with_timeout(
     let mut child = match shell_command(&resolved).spawn() {
         Ok(child) => child,
         Err(err) => {
-            eprintln!("warren-proxy: port-forward {label} command failed to spawn: {err}");
+            log.error(&format!(
+                "port-forward {label} command failed to spawn: {err}"
+            ));
             return HookOutcome::SpawnFailed;
         }
     };
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) if status.success() => {
-            println!("warren-proxy: port-forward {label} command ok (port {port})");
+            log.info(&format!("port-forward {label} command ok (port {port})"));
             HookOutcome::Succeeded
         }
         Ok(Ok(status)) => {
-            eprintln!("warren-proxy: port-forward {label} command exited with {status}");
+            log.error(&format!(
+                "port-forward {label} command exited with {status}"
+            ));
             HookOutcome::Failed
         }
         Ok(Err(err)) => {
-            eprintln!("warren-proxy: port-forward {label} command could not be waited on: {err}");
+            log.error(&format!(
+                "port-forward {label} command could not be waited on: {err}"
+            ));
             HookOutcome::SpawnFailed
         }
         Err(_) => {
             kill_hook(&mut child).await;
-            eprintln!(
-                "warren-proxy: port-forward {label} command exceeded {timeout:?} and was killed"
-            );
+            log.error(&format!(
+                "port-forward {label} command exceeded {timeout:?} and was killed"
+            ));
             HookOutcome::TimedOut
         }
     }
@@ -189,8 +198,10 @@ pub async fn clear_status_file(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
+
+    const LOG: Log = Log("warren-headless-test");
 
     #[test]
     fn substitutes_every_port_occurrence() {
@@ -225,12 +236,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_substituted_port_reaches_the_shell() {
         assert_eq!(
-            run_hook("exit {{PORT}}", 0, "up").await,
+            run_hook(LOG, "exit {{PORT}}", 0, "up").await,
             HookOutcome::Succeeded,
             "a hook substituted to `exit 0` must be reported as success"
         );
         assert_eq!(
-            run_hook("exit {{PORT}}", 3, "up").await,
+            run_hook(LOG, "exit {{PORT}}", 3, "up").await,
             HookOutcome::Failed,
             "the port must reach the shell: substituted to `exit 3` this must fail"
         );
@@ -259,12 +270,13 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_failing_hook_is_reported_and_does_not_panic() {
-        assert_eq!(run_hook("exit 3", 1, "up").await, HookOutcome::Failed);
+        assert_eq!(run_hook(LOG, "exit 3", 1, "up").await, HookOutcome::Failed);
     }
 
     #[tokio::test]
     async fn clearing_the_status_file_is_idempotent() {
-        let path = std::env::temp_dir().join(format!("warren-proxy-clear-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("warren-headless-clear-{}", std::process::id()));
         write_status_file(&path, 51820).await.expect("write");
         clear_status_file(&path).await.expect("first clear");
         assert!(!path.exists());
@@ -277,7 +289,8 @@ pub(crate) mod tests {
     async fn a_hanging_hook_is_killed_by_its_timeout() {
         let started = std::time::Instant::now();
         let outcome =
-            run_hook_with_timeout(never_returns(), 1, "down", Duration::from_millis(200)).await;
+            run_hook_with_timeout(LOG, never_returns(), 1, "down", Duration::from_millis(200))
+                .await;
         assert_eq!(
             outcome,
             HookOutcome::TimedOut,
@@ -297,7 +310,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_hooks_own_children_are_killed_with_it() {
         let marker =
-            std::env::temp_dir().join(format!("warren-proxy-orphan-{}", std::process::id()));
+            std::env::temp_dir().join(format!("warren-headless-orphan-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         // The descendant writes late enough that the kill (budget, then the
         // SIGTERM/SIGKILL grace) has room to finish first on a loaded or
@@ -307,7 +320,8 @@ pub(crate) mod tests {
             marker.display()
         );
 
-        let outcome = run_hook_with_timeout(&command, 1, "up", Duration::from_millis(200)).await;
+        let outcome =
+            run_hook_with_timeout(LOG, &command, 1, "up", Duration::from_millis(200)).await;
 
         assert_eq!(outcome, HookOutcome::TimedOut);
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -320,7 +334,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn status_file_is_written_atomically_with_parent_dirs() {
-        let dir = std::env::temp_dir().join(format!("warren-proxy-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("warren-headless-test-{}", std::process::id()));
         let path = dir.join("nested").join("forwarded_port");
         write_status_file(&path, 55555).await.expect("write");
         let content = tokio::fs::read_to_string(&path).await.expect("read back");

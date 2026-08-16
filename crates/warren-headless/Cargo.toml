@@ -1,0 +1,26 @@
+[package]
+name = "warren-headless"
+description = "Shared skeleton of the headless Warren daemons: env-first configuration, exit candidate selection, port-forward command hooks, the local health endpoint, signals and process hardening"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+warren-sdk = { path = "../warren-sdk" }
+tokio = { workspace = true, features = ["signal", "process", "fs"] }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+# Signalling a process GROUP: a hook is a shell line, so its own children are
+# what holds a port open past the budget, and `Child::kill` reaches the shell
+# alone. `killpg` is safe, and this workspace forbids unsafe. `resource` and
+# `process` carry the core-dump refusals of `hardening`.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["signal", "resource", "process"] }
+
+[lints]
+workspace = true

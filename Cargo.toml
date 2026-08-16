@@ -19,6 +19,7 @@ members = [
     "crates/warren-burrow-core",
     "crates/warren-sdk",
     "crates/warren-sdk-ffi",
+    "crates/warren-headless",
     "crates/warren-proxy",
     "crates/warren-multihop",
     "crates/warren-daita",

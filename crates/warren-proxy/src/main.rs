@@ -21,7 +21,7 @@ fn healthcheck() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match warren_proxy::health::probe_healthz(addr) {
+    match warren_headless::health::probe_healthz(addr) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => {
             eprintln!("warren-proxy: unhealthy");
@@ -38,6 +38,11 @@ fn healthcheck() -> ExitCode {
 async fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("healthcheck") {
         return healthcheck();
+    }
+    // Before the recovery phrase is read: a core dump taken after it is in
+    // memory carries it, and no zeroize-on-drop helps against that.
+    if !warren_headless::disable_core_dumps() {
+        eprintln!("warren-proxy: could not disable core dumps on this host");
     }
     let config =
         match warren_proxy::config::load(|k| std::env::var(k).ok(), |p| std::fs::read_to_string(p))

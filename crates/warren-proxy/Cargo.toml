@@ -15,16 +15,12 @@ path = "src/main.rs"
 
 [dependencies]
 warren-sdk = { path = "../warren-sdk" }
-tokio = { workspace = true, features = ["signal", "process", "fs"] }
+# The daemon skeleton both headless binaries share: env parsing, candidate
+# selection, hooks, the health endpoint, signals and process hardening.
+warren-headless = { path = "../warren-headless" }
+tokio = { workspace = true, features = ["signal"] }
 anyhow = "1"
-thiserror = { workspace = true }
 zeroize = { workspace = true }
-
-# Signalling a process GROUP: a hook is a shell line, so its own children are
-# what holds a port open past the budget, and `Child::kill` reaches the shell
-# alone. `killpg` is safe, and this workspace forbids unsafe.
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [lints]
 workspace = true

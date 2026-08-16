@@ -8,13 +8,15 @@
 //! and exit failures, publishes liveness over a tiny local HTTP endpoint, and
 //! forwards a tunnel-side port with gluetun-style up/down command hooks.
 //!
-//! The binary is a thin `main` over [`run::run`]; everything else is a
-//! library so the config, selection, hook and health logic stay unit-tested.
+//! The binary is a thin `main` over [`run::run`]; the daemon skeleton it
+//! shares with the local gateway (env parsing, candidate selection, hooks,
+//! health, signals) lives in [`warren_headless`], so the two cannot drift
+//! apart on a rule an operator depends on.
 
 pub mod config;
-pub mod health;
-pub mod hooks;
 pub mod run;
-pub mod select;
 
-pub use config::{CircuitKind, Config, ConfigError, ExitFilter, ForwardConfig, ForwardProto};
+pub use config::{Config, load};
+pub use warren_headless::env::{CircuitKind, ConfigError, ExitFilter};
+pub use warren_headless::forward::{ForwardConfig, ForwardProto};
+pub use warren_headless::health;

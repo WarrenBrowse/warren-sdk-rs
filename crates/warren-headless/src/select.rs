@@ -1,6 +1,6 @@
 //! Exit candidate ordering from the user's constraint list.
 
-use crate::config::ExitFilter;
+use crate::env::ExitFilter;
 
 /// Orders `exits` by the user's priority filters.
 ///

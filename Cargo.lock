@@ -3667,6 +3667,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "warren-headless"
+version = "0.0.1"
+dependencies = [
+ "nix 0.31.3",
+ "thiserror",
+ "tokio",
+ "warren-sdk",
+ "zeroize",
+]
+
+[[package]]
 name = "warren-identity"
 version = "0.0.1"
 dependencies = [
@@ -3724,9 +3735,8 @@ name = "warren-proxy"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "nix 0.31.3",
- "thiserror",
  "tokio",
+ "warren-headless",
  "warren-sdk",
  "zeroize",
 ]

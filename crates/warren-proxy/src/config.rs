@@ -3,76 +3,17 @@
 //! Every knob is an env var so the same binary configures identically under
 //! Docker, systemd, launchd or a plain shell. Parsing is pure (the reader is
 //! injected), so every rule here is unit-tested without touching the process
-//! environment.
+//! environment. The knobs shared with the other headless daemon live in
+//! [`warren_headless::env`]; what is here is the proxy's own.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use std::time::Duration;
 
+use warren_headless::env::{
+    self, CircuitKind, ConfigError, ExitFilter, is_off, parse_addr, parse_optional_addr,
+};
+use warren_headless::forward::{ForwardConfig, parse_forward};
 use zeroize::Zeroizing;
-
-/// Which circuit shape to dial for every candidate exit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CircuitKind {
-    /// Client to exit directly (the default: lowest latency).
-    Single,
-    /// Entry relay then exit (the entry never sees payload, the exit never
-    /// sees the client address).
-    Multi,
-}
-
-/// One exit constraint: a country code, optionally narrowed to a city.
-/// Compared case-insensitively against the verified directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExitFilter {
-    /// ISO 3166-1 alpha-2 country code, lowercased at parse time.
-    pub country: String,
-    /// City name, lowercased at parse time.
-    pub city: Option<String>,
-}
-
-/// Transport to forward for [`ForwardConfig`].
-///
-/// One transport per daemon. TCP and UDP would be two independent mappings:
-/// the exit allocates each proto on its own public port (a NAT-PMP request
-/// with no explicit suggestion can never land on a port whose other proto slot
-/// is live), so the daemon could announce only one of the two, and the pair
-/// would hold two of the exit's per-client forward slots.
-///
-/// The engine implements the atomic TCP+UDP pair on ONE public port under ONE
-/// entitlement credential, which is what a BitTorrent client wants. The SDK
-/// forward path this daemon runs on does not carry that pair yet: that is what
-/// refuses `both` here, and the protocol imposes no such limit.
-///
-/// This daemon also presents no entitlement credential, so the exit applies
-/// its default per-client quota rather than the account's fleet-wide slot
-/// count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForwardProto {
-    /// TCP only.
-    Tcp,
-    /// UDP only.
-    Udp,
-}
-
-/// Tunnel-side port forward: the exit maps a public port and inbound
-/// connections are relayed to `target` on the local host.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForwardConfig {
-    /// Transport(s) to map.
-    pub proto: ForwardProto,
-    /// Tunnel-side internal port requested from the exit.
-    pub internal_port: u16,
-    /// Local socket inbound connections are relayed to.
-    pub target: SocketAddr,
-    /// Command run (via `sh -c`) each time a public port is granted;
-    /// `{{PORT}}` is substituted.
-    pub up_command: Option<String>,
-    /// Command run when the granted port is replaced or on shutdown.
-    pub down_command: Option<String>,
-    /// File the granted public port is written to (one decimal line).
-    pub status_file: Option<PathBuf>,
-}
 
 /// Full daemon configuration, resolved from the environment.
 pub struct Config {
@@ -124,35 +65,10 @@ impl std::fmt::Debug for Config {
     }
 }
 
-/// Why the environment did not resolve to a runnable [`Config`].
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum ConfigError {
-    /// Neither `WARREN_MNEMONIC` nor a readable `WARREN_MNEMONIC_FILE` was
-    /// provided.
-    #[error("no mnemonic: set WARREN_MNEMONIC or WARREN_MNEMONIC_FILE")]
-    MissingMnemonic,
-    /// A `*_FILE` secret path could not be read.
-    #[error("could not read {var} path")]
-    UnreadableSecretFile {
-        /// The env var holding the path.
-        var: &'static str,
-        /// The underlying I/O error.
-        #[source]
-        source: std::io::Error,
-    },
-    /// A value did not parse as what the variable requires.
-    #[error("invalid {var}: expected {expected}")]
-    Invalid {
-        /// The env var at fault.
-        var: &'static str,
-        /// What a valid value looks like.
-        expected: &'static str,
-    },
-}
-
 const DEFAULT_SOCKS_LISTEN: &str = "127.0.0.1:1080";
-const DEFAULT_HEALTH_LISTEN: &str = "127.0.0.1:9999";
+/// The proxy's own health port. The gateway takes 9998, so both daemons run on
+/// one host without either operator changing anything.
+pub const DEFAULT_HEALTH_LISTEN: &str = "127.0.0.1:9999";
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 90;
 
 /// Resolves the configuration from an env reader and a file reader (both
@@ -166,21 +82,11 @@ pub fn load(
     get: impl Fn(&str) -> Option<String>,
     read_file: impl Fn(&std::path::Path) -> std::io::Result<String>,
 ) -> Result<Config, ConfigError> {
-    let mnemonic =
-        read_secret(&get, &read_file, "WARREN_MNEMONIC")?.ok_or(ConfigError::MissingMnemonic)?;
+    let mnemonic = env::read_secret(&get, &read_file, "WARREN_MNEMONIC")?
+        .ok_or(ConfigError::MissingMnemonic)?;
 
-    let circuit = match get("WARREN_CIRCUIT").as_deref() {
-        None | Some("single") => CircuitKind::Single,
-        Some("multi") => CircuitKind::Multi,
-        Some(_) => {
-            return Err(ConfigError::Invalid {
-                var: "WARREN_CIRCUIT",
-                expected: "single or multi",
-            });
-        }
-    };
-
-    let exit_filters = parse_exit_filters(get("WARREN_EXITS").as_deref().unwrap_or_default())?;
+    let circuit = env::parse_circuit(get("WARREN_CIRCUIT").as_deref())?;
+    let exit_filters = env::parse_exit_filters(get("WARREN_EXITS").as_deref().unwrap_or_default())?;
 
     let socks_listen = parse_addr(
         get("WARREN_SOCKS_LISTEN")
@@ -189,11 +95,8 @@ pub fn load(
         "WARREN_SOCKS_LISTEN",
     )?;
     let http_listen = parse_optional_addr(get("WARREN_HTTP_LISTEN"), "WARREN_HTTP_LISTEN")?;
-    let health_listen = match get("WARREN_HEALTH_LISTEN") {
-        Some(v) if is_off(&v) => None,
-        Some(v) => Some(parse_addr(&v, "WARREN_HEALTH_LISTEN")?),
-        None => Some(parse_addr(DEFAULT_HEALTH_LISTEN, "WARREN_HEALTH_LISTEN")?),
-    };
+    let health_listen =
+        env::parse_health_listen(get("WARREN_HEALTH_LISTEN"), DEFAULT_HEALTH_LISTEN)?;
 
     let dns_server = match get("WARREN_DNS_SERVER") {
         None => None,
@@ -204,15 +107,22 @@ pub fn load(
         })?),
     };
 
-    let connect_timeout = match get("WARREN_CONNECT_TIMEOUT") {
-        None => Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
-        Some(v) => Duration::from_secs(v.parse::<u64>().map_err(|_| ConfigError::Invalid {
-            var: "WARREN_CONNECT_TIMEOUT",
-            expected: "a number of seconds",
-        })?),
-    };
+    let connect_timeout =
+        env::parse_connect_timeout(get("WARREN_CONNECT_TIMEOUT"), DEFAULT_CONNECT_TIMEOUT_SECS)?;
 
-    let forward = parse_forward(&get)?;
+    // The proxy relays inbound connections itself, so an unset target means
+    // "the same port on this host", which is what a sibling container in the
+    // same network namespace expects.
+    let forward = parse_forward(&get)?.map(|fwd| ForwardConfig {
+        proto: fwd.proto,
+        internal_port: fwd.internal_port,
+        target: fwd
+            .target
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], fwd.internal_port))),
+        up_command: fwd.up_command,
+        down_command: fwd.down_command,
+        status_file: fwd.status_file,
+    });
 
     Ok(Config {
         mnemonic,
@@ -230,163 +140,24 @@ pub fn load(
     })
 }
 
-/// Reads `<var>` or `<var>_FILE` (the file wins), trimming trailing
-/// whitespace. Returns `Ok(None)` when neither is set.
-fn read_secret(
-    get: &impl Fn(&str) -> Option<String>,
-    read_file: &impl Fn(&std::path::Path) -> std::io::Result<String>,
-    var: &'static str,
-) -> Result<Option<Zeroizing<String>>, ConfigError> {
-    let file_var = format!("{var}_FILE");
-    if let Some(path) = get(&file_var).filter(|p| !p.is_empty()) {
-        let raw = read_file(std::path::Path::new(&path)).map_err(|source| {
-            ConfigError::UnreadableSecretFile {
-                var: "WARREN_MNEMONIC_FILE",
-                source,
-            }
-        })?;
-        // Both buffers zeroize on drop; `raw` drops here, right after the trim.
-        let raw = Zeroizing::new(raw);
-        let trimmed = Zeroizing::new(raw.trim().to_owned());
-        return Ok(Some(trimmed));
-    }
-    Ok(get(var)
-        .filter(|v| !v.trim().is_empty())
-        .map(|v| Zeroizing::new(v.trim().to_owned())))
-}
-
-/// Whether a value spells "this knob is deliberately disabled" (empty, `off`
-/// or `none`, in any case).
-#[must_use]
-pub fn is_off(v: &str) -> bool {
-    v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none")
-}
-
 /// What the `healthcheck` subcommand should probe, resolved from the raw
 /// `WARREN_HEALTH_LISTEN` value: `None` when the endpoint is disabled, so the
 /// probe reports the container healthy instead of hunting an address nobody
-/// bound. Shares [`is_off`] and the default with [`load`], which is the point:
-/// the two must never disagree.
+/// bound.
 ///
 /// # Errors
 ///
 /// [`ConfigError::Invalid`] when the value is neither an off spelling nor an
 /// `ip:port`.
 pub fn healthcheck_target(raw: Option<String>) -> Result<Option<SocketAddr>, ConfigError> {
-    match raw {
-        Some(v) if is_off(&v) => Ok(None),
-        Some(v) => Ok(Some(parse_addr(&v, "WARREN_HEALTH_LISTEN")?)),
-        None => Ok(Some(parse_addr(
-            DEFAULT_HEALTH_LISTEN,
-            "WARREN_HEALTH_LISTEN",
-        )?)),
-    }
-}
-
-fn parse_addr(v: &str, var: &'static str) -> Result<SocketAddr, ConfigError> {
-    v.parse().map_err(|_| ConfigError::Invalid {
-        var,
-        expected: "an ip:port socket address",
-    })
-}
-
-fn parse_optional_addr(
-    v: Option<String>,
-    var: &'static str,
-) -> Result<Option<SocketAddr>, ConfigError> {
-    match v {
-        None => Ok(None),
-        Some(v) if is_off(&v) => Ok(None),
-        Some(v) => Ok(Some(parse_addr(&v, var)?)),
-    }
-}
-
-/// Parses `WARREN_EXITS`: a comma-separated priority list of `cc` or
-/// `cc/city` items (e.g. `fi, se/stockholm`). Lowercased; empty items are
-/// rejected rather than silently dropped.
-fn parse_exit_filters(raw: &str) -> Result<Vec<ExitFilter>, ConfigError> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(Vec::new());
-    }
-    raw.split(',')
-        .map(|item| {
-            let item = item.trim().to_ascii_lowercase();
-            let (country, city) = match item.split_once('/') {
-                Some((c, city)) => (c.trim(), Some(city.trim())),
-                None => (item.as_str(), None),
-            };
-            if country.len() != 2 || !country.chars().all(|c| c.is_ascii_alphabetic()) {
-                return Err(ConfigError::Invalid {
-                    var: "WARREN_EXITS",
-                    expected: "comma-separated cc or cc/city items (ISO 3166-1 alpha-2)",
-                });
-            }
-            if matches!(city, Some(c) if c.is_empty()) {
-                return Err(ConfigError::Invalid {
-                    var: "WARREN_EXITS",
-                    expected: "a city after the slash (cc/city)",
-                });
-            }
-            Ok(ExitFilter {
-                country: country.to_owned(),
-                city: city.map(str::to_owned),
-            })
-        })
-        .collect()
-}
-
-fn parse_forward(
-    get: &impl Fn(&str) -> Option<String>,
-) -> Result<Option<ForwardConfig>, ConfigError> {
-    let Some(port_raw) = get("WARREN_PORT_FORWARD_INTERNAL_PORT").filter(|v| !v.is_empty()) else {
-        return Ok(None);
-    };
-    let internal_port =
-        port_raw
-            .parse::<u16>()
-            .ok()
-            .filter(|p| *p != 0)
-            .ok_or(ConfigError::Invalid {
-                var: "WARREN_PORT_FORWARD_INTERNAL_PORT",
-                expected: "a port number (1-65535)",
-            })?;
-
-    let proto = match get("WARREN_PORT_FORWARD_PROTOCOL").as_deref() {
-        None | Some("tcp") => ForwardProto::Tcp,
-        Some("udp") => ForwardProto::Udp,
-        // `both` is refused rather than silently half-honoured: it maps two
-        // independent public ports (see [`ForwardProto`]), takes two of the
-        // exit's per-client slots, and only one of them could be published.
-        Some(_) => {
-            return Err(ConfigError::Invalid {
-                var: "WARREN_PORT_FORWARD_PROTOCOL",
-                expected: "tcp or udp (one transport: the exit maps each proto on its own public port)",
-            });
-        }
-    };
-
-    let target = match get("WARREN_PORT_FORWARD_TARGET") {
-        None => SocketAddr::from(([127, 0, 0, 1], internal_port)),
-        Some(v) => parse_addr(&v, "WARREN_PORT_FORWARD_TARGET")?,
-    };
-
-    Ok(Some(ForwardConfig {
-        proto,
-        internal_port,
-        target,
-        up_command: get("WARREN_PORT_FORWARD_UP_COMMAND").filter(|v| !v.is_empty()),
-        down_command: get("WARREN_PORT_FORWARD_DOWN_COMMAND").filter(|v| !v.is_empty()),
-        status_file: get("WARREN_PORT_FORWARD_STATUS_FILE")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from),
-    }))
+    env::healthcheck_target(raw, DEFAULT_HEALTH_LISTEN)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use warren_headless::forward::ForwardProto;
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let map: HashMap<String, String> = pairs
