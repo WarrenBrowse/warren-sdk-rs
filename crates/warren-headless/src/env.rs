@@ -39,7 +39,13 @@ pub enum ConfigError {
     #[error("no mnemonic: set WARREN_MNEMONIC or WARREN_MNEMONIC_FILE")]
     MissingMnemonic,
     /// A `*_FILE` secret path could not be read.
-    #[error("could not read {var}_FILE path")]
+    ///
+    /// The class of the I/O error is part of the message: a container secret
+    /// the unprivileged user cannot read and a path that was never mounted are
+    /// the two failures an operator actually hits, and they need to be told
+    /// apart. The class carries no identity material; the path does, and stays
+    /// out.
+    #[error("could not read {var}_FILE path: {}", source.kind())]
     UnreadableSecretFile {
         /// The env var whose `_FILE` variant is at fault.
         var: &'static str,
@@ -281,7 +287,35 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(err.to_string(), "could not read WARREN_MNEMONIC_FILE path");
+        assert_eq!(
+            err.to_string(),
+            "could not read WARREN_MNEMONIC_FILE path: other error"
+        );
+    }
+
+    /// A compose secret written by root and left 0600 is one the container's
+    /// unprivileged user cannot read, and it is the trap the deployment docs
+    /// spend a paragraph on. Without the class in the message, that failure
+    /// and a path that was never mounted print the same line.
+    #[test]
+    fn the_unreadable_secret_error_names_the_io_error_class() {
+        for (kind, rendered) in [
+            (std::io::ErrorKind::NotFound, "entity not found"),
+            (std::io::ErrorKind::PermissionDenied, "permission denied"),
+        ] {
+            let read = move |_: &std::path::Path| Err(std::io::Error::from(kind));
+            let err = read_secret(
+                &env(&[("WARREN_MNEMONIC_FILE", "/run/secrets/warren_mnemonic")]),
+                &read,
+                "WARREN_MNEMONIC",
+            )
+            .expect_err("a broken secret file must refuse");
+            assert_eq!(
+                err.to_string(),
+                format!("could not read WARREN_MNEMONIC_FILE path: {rendered}"),
+                "{kind:?} must be distinguishable from the other classes"
+            );
+        }
     }
 
     #[test]
