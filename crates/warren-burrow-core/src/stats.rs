@@ -151,8 +151,10 @@ pub struct ResponderSnapshot {
     pub no_route: u64,
     /// Downlink packets boringtun queued for want of a session.
     pub downlink_queued: u64,
-    /// Handshake initiations discarded because the peer has no known endpoint.
-    pub downlink_initiation_dropped_no_endpoint: u64,
+    /// Datagrams for a peer discarded because it has no known endpoint,
+    /// whether the datagram was an encrypted packet or the handshake
+    /// initiation boringtun produced instead of one.
+    pub downlink_dropped_no_endpoint: u64,
     /// ICMP answers the gateway did not generate because it had spent its own
     /// budget. The refusal itself is still counted under its class; this says
     /// the peer was refused without being told.
@@ -202,9 +204,9 @@ impl ResponderCounters {
         self.totals.downlink_queued += 1;
     }
 
-    /// Counts one initiation discarded for want of an endpoint.
-    pub fn initiation_without_endpoint(&mut self) {
-        self.totals.downlink_initiation_dropped_no_endpoint += 1;
+    /// Counts one datagram discarded for want of an endpoint to send it to.
+    pub fn dropped_without_endpoint(&mut self) {
+        self.totals.downlink_dropped_no_endpoint += 1;
     }
 
     /// Counts one ICMP answer the gateway refused itself.

@@ -147,6 +147,11 @@ impl std::fmt::Debug for GatewayConf {
 
 /// Reads a gateway configuration file.
 ///
+/// `text` carries the gateway's private key and every peer's preshared key in
+/// clear, so the caller reads the file into a buffer it wipes (a
+/// [`Zeroizing`] `String`, which derefs to `&str`) rather than a plain `String`
+/// it drops. Everything this module renders back out is already zeroized.
+///
 /// # Errors
 ///
 /// A [`ConfError`] naming the rule that refused. Nothing is returned

@@ -22,9 +22,7 @@ pub(crate) fn ones_sum(seed: u64, data: &[u8]) -> u16 {
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    #[allow(clippy::cast_possible_truncation)]
-    let folded = sum as u16;
-    !folded
+    !u16::try_from(sum & 0xffff).expect("a folded ones-complement sum is 16 bits")
 }
 
 fn pseudo_v4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, l4_len: usize) -> u64 {
@@ -66,8 +64,7 @@ fn with_ip_header(src: IpAddr, dst: IpAddr, proto: u8, l4: &[u8]) -> Vec<u8> {
         (IpAddr::V4(s), IpAddr::V4(d)) => {
             let mut pkt = vec![0u8; 20 + l4.len()];
             pkt[0] = 0x45;
-            #[allow(clippy::cast_possible_truncation)]
-            let total = (20 + l4.len()) as u16;
+            let total = u16::try_from(20 + l4.len()).expect("a test packet fits an IP header");
             pkt[2..4].copy_from_slice(&total.to_be_bytes());
             pkt[8] = 64;
             pkt[9] = proto;
@@ -81,8 +78,7 @@ fn with_ip_header(src: IpAddr, dst: IpAddr, proto: u8, l4: &[u8]) -> Vec<u8> {
         (IpAddr::V6(s), IpAddr::V6(d)) => {
             let mut pkt = vec![0u8; 40 + l4.len()];
             pkt[0] = 0x60;
-            #[allow(clippy::cast_possible_truncation)]
-            let payload = l4.len() as u16;
+            let payload = u16::try_from(l4.len()).expect("a test packet fits an IP header");
             pkt[4..6].copy_from_slice(&payload.to_be_bytes());
             pkt[6] = proto;
             pkt[7] = 64;
@@ -100,8 +96,7 @@ pub(crate) fn udp(src: IpAddr, sport: u16, dst: IpAddr, dport: u16, payload: &[u
     let mut l4 = vec![0u8; 8 + payload.len()];
     l4[0..2].copy_from_slice(&sport.to_be_bytes());
     l4[2..4].copy_from_slice(&dport.to_be_bytes());
-    #[allow(clippy::cast_possible_truncation)]
-    let len = (8 + payload.len()) as u16;
+    let len = u16::try_from(8 + payload.len()).expect("a test packet fits a UDP header");
     l4[4..6].copy_from_slice(&len.to_be_bytes());
     l4[8..].copy_from_slice(payload);
     let ck = ones_sum(pseudo(src, dst, 17, l4.len()), &l4);

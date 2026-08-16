@@ -4,8 +4,10 @@
 //! Every function validates the whole operation against the length the header
 //! itself declares before it writes a byte, so a malformed or truncated
 //! datagram from a peer is a refusal and never a panic or a half-rewritten
-//! packet. Checksum arithmetic is the engine's ([`internet_checksum`],
-//! [`incremental_checksum_update`], [`icmpv6_pseudo_sum`]): the client pump
+//! packet. Checksum arithmetic is the engine's
+//! ([`warrenguard_transport_core::internet_checksum`],
+//! [`incremental_checksum_update`],
+//! [`warrenguard_transport_core::icmpv6_pseudo_sum`]): the client pump
 //! clamps and reflects on the same packets this NAT rewrites, and two homes for
 //! that arithmetic would eventually disagree.
 

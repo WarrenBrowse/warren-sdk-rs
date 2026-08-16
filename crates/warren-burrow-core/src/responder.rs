@@ -908,7 +908,7 @@ impl Responder {
             (Some((_, 4)), None) => {
                 // An encrypted packet with nowhere to go: the session exists but
                 // the peer has never been heard from.
-                self.counters.initiation_without_endpoint();
+                self.counters.dropped_without_endpoint();
                 Ok(Encapsulated::Deferred { initiation: None })
             }
             (Some((len, _)), Some(to)) => {
@@ -919,7 +919,7 @@ impl Responder {
             }
             (Some(_), None) => {
                 self.counters.downlink_queued();
-                self.counters.initiation_without_endpoint();
+                self.counters.dropped_without_endpoint();
                 Ok(Encapsulated::Deferred { initiation: None })
             }
             (None, _) => {
