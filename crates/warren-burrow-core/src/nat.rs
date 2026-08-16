@@ -486,7 +486,14 @@ impl Napt {
             .owner_of(dnat.target.ip())
             .ok_or(CoreError::TargetNotOwned)?;
         let v6 = dnat.target.is_ipv6();
-        self.allocator(dnat.proto, v6).reserve(dnat.external_port)?;
+        // Only a port the allocator hands out has to be taken away from it. A
+        // forward on a well-known port (an operator asking the exit to map 80
+        // or 8080) sits outside the dynamic pool, where no flow can ever be
+        // given it, so there is nothing to reserve and nothing to refuse.
+        let allocator = self.allocator(dnat.proto, v6);
+        if allocator.contains(dnat.external_port) {
+            allocator.reserve(dnat.external_port)?;
+        }
         if let Some(id) = self
             .outbound
             .get(&(dnat.proto, dnat.target.ip(), dnat.target.port()))
@@ -1634,17 +1641,39 @@ mod tests {
             ),
             Err(CoreError::TargetNotOwned)
         );
+    }
+
+    /// An operator asks the exit for the port their application already
+    /// answers on, and a well-known one sits outside the range this NAT hands
+    /// to flows. Nothing can shadow it there, so it needs no reservation and
+    /// must not be refused for want of one.
+    #[test]
+    fn pins_a_forward_on_a_port_outside_the_dynamic_pool() {
+        let mut nat = napt();
+        let now = Instant::now();
+        nat.add_static(
+            StaticDnat {
+                proto: MapProto::Udp,
+                external_port: 80,
+                target: SocketAddr::new(A4, 8080),
+            },
+            now,
+        )
+        .expect("a well-known port is a valid forward");
+
+        let mut inbound = testpkt::udp(OTHER4, 40_000, ext4(), 80, b"hi");
+        let translated = nat
+            .translate_downlink(&mut inbound, now)
+            .expect("the pinned entry delivers it");
+        assert_eq!(translated.peer, A);
+        assert_eq!(read_ports(&inbound, 20).expect("ports").1, 8080);
+
+        let mut reply = testpkt::udp(A4, 8080, OTHER4, 40_000, b"hi");
+        nat.translate_uplink(A, &mut reply, now).expect("uplink");
         assert_eq!(
-            nat.add_static(
-                StaticDnat {
-                    proto: MapProto::Udp,
-                    external_port: 80,
-                    target: SocketAddr::new(A4, 8080),
-                },
-                Instant::now()
-            ),
-            Err(CoreError::PortOutsidePool),
-            "a forward outside the pool cannot be reserved"
+            read_ports(&reply, 20).expect("ports").0,
+            80,
+            "a static forward is symmetric wherever its port sits"
         );
     }
 
