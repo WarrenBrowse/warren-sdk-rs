@@ -111,6 +111,23 @@ forbid_rs "doc49 t79" \
   'struct[[:space:]]+RttCache' \
   "crates"
 
+# The epoch identity (ExitId, EpochId, EXIT_ID_LEN) has two definitions on
+# purpose: warren-net is async and warren-burrow-core opens no socket, so the
+# gateway core cannot depend on it. What must not happen is the two drifting,
+# because the gateway device implements warren-net's per-epoch trait with
+# warren-burrow-core's type and the conversion between them is by field. Pin the
+# one thing whose divergence would be silent.
+for epoch_home in "crates/warren-net/src/device.rs" "crates/warren-burrow-core/src/nat.rs"; do
+  require_rs "design L/M" \
+    "the epoch identifier length must stay identical in both homes" \
+    'pub const EXIT_ID_LEN: usize = 16;' \
+    "$epoch_home"
+  require_rs "design L/M" \
+    "both epoch homes must keep the same ExitId shape (UNKNOWN, from_bytes, as_bytes)" \
+    'pub const fn from_bytes\(bytes: \[u8; EXIT_ID_LEN\]\) -> Self' \
+    "$epoch_home"
+done
+
 # Dependency direction: the client SDK never depends on the private backend
 # (warren-core) or the app (warren-app / mullvad-*). warrenguard + warren-contract
 # siblings are allowed.
