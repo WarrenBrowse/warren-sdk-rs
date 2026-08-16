@@ -69,6 +69,7 @@ devices import a configuration whose `Endpoint` is that address.
 cd docs/burrow
 umask 077
 printf '%s\n' 'the twelve words of the account' > warren-mnemonic.txt
+chown 1000:1000 warren-mnemonic.txt        # the unprivileged user in the image
 export WARREN_LAN_IP=192.168.1.10          # this host's LAN address
 docker compose -f docker-compose.peer.yml up -d
 ```
@@ -107,6 +108,7 @@ with `VPN_SERVICE_PROVIDER=custom` and `VPN_TYPE=wireguard`, and every
 cd docs/burrow
 umask 077
 printf '%s\n' 'the twelve words of the account' > warren-mnemonic.txt
+chown 1000:1000 warren-mnemonic.txt        # the unprivileged user in the image
 
 # Generate the gateway and one peer named glue, before anything starts.
 docker compose -f docker-compose.gluetun.yml run --rm warren-burrow init --label glue
@@ -117,6 +119,10 @@ docker compose -f docker-compose.gluetun.yml run --rm --entrypoint cat \
 
 docker compose -f docker-compose.gluetun.yml up -d
 ```
+
+Compose mounts the secret file with the ownership it has on the host, so a
+recovery phrase written by root and left 0600 is a file the gateway (uid 1000)
+cannot read, and it says so at startup. That is what the `chown` is for.
 
 `glue.gluetun.env` carries that peer's private key and preshared key: 0600, and
 never in version control. Do not hand-edit it; regenerate the peer instead. The

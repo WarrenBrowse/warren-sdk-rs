@@ -191,6 +191,14 @@ rule_client_has_tun_device() {
 	svc_block "$1" gluetun | grep -q '/dev/net/tun'
 }
 
+# Compose mounts a file secret with the ownership it has on the host and ignores
+# the uid/gid/mode keys outside swarm, so a recovery phrase written by root and
+# left 0600 is one the gateway (uid 1000) cannot read. The daemon says so at
+# startup, and the file that hands out the recipe has to hand out that line too.
+rule_secret_ownership_documented() {
+	grep -qE '^[[:space:]]*#.*chown 1000:1000' "$1"
+}
+
 # The gateway of a LAN device is reachable at a LAN address, and a compose file
 # that defaults an unset one to the empty string starts a daemon bound to
 # nothing anybody can reach.
@@ -221,6 +229,7 @@ for file in "$GLUETUN" "$PEER"; do
 	check "$name: the gateway's UDP port is not published, and the file says why" rule_udp_port_not_published "$file"
 	check "$name: the state directory is a named volume" rule_named_state_volume "$file"
 	check "$name: the health start period covers the connect timeout" rule_start_period_covers_connect_timeout "$file"
+	check "$name: the secret's ownership requirement is written down" rule_secret_ownership_documented "$file"
 done
 
 echo "the gluetun stack"
@@ -247,6 +256,8 @@ check_refuses "an anonymous state volume" \
 	"$GLUETUN" rule_named_state_volume
 check_refuses "a start period shorter than the connect timeout" \
 	's|start_period: 120s|start_period: 30s|' "$GLUETUN" rule_start_period_covers_connect_timeout
+check_refuses "the ownership recipe dropped from the secret" \
+	's|chown 1000:1000|chmod 600|' "$PEER" rule_secret_ownership_documented
 check_refuses "a client that starts as soon as the gateway exists" \
 	's|condition: service_healthy|condition: service_started|' "$GLUETUN" rule_dependents_wait_for_healthy
 check_refuses "an endpoint given as a service name" \

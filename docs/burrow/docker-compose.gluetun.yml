@@ -126,5 +126,10 @@ volumes:
 secrets:
   warren_mnemonic:
     # A file holding the account's recovery phrase and nothing else, 0600,
-    # created next to this compose file and never committed.
+    # created next to this compose file and never committed. Compose mounts it
+    # with the ownership it finds on the host and ignores the uid/gid/mode keys
+    # outside swarm, so it has to belong to the unprivileged user the image
+    # runs as, or the daemon cannot read it:
+    #   chown 1000:1000 warren-mnemonic.txt   # sudo unless you are already root
+    #   chmod 600 warren-mnemonic.txt
     file: ./warren-mnemonic.txt
