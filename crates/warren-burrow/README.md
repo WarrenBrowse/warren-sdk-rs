@@ -142,9 +142,11 @@ keeps its own session and its packets arrive under an index the new process
 does not know, counted as `unknown_index` and answered with nothing, which is
 what the protocol requires. Each peer rebuilds its session on its own timers,
 needing no reconfiguration and no restart, but it looks dead until they fire
-and traffic to it is lost in the meantime: about 15 seconds for a peer that has
-data to send, which is its liveness rule, and as long as a rekey interval (two
-minutes) for an idle peer whose persistent keepalives are all it emits.
+and traffic to it is lost in the meantime. Measured against the live network:
+17 seconds for a peer that has data to send, which is its liveness rule (a 10
+second keepalive timeout plus a 5 second rekey timeout), and 79 seconds for an
+idle peer emitting only its 25 second persistent keepalive, bounded by the
+protocol's 120 second rekey interval.
 
 `reload` adds new peers, removes deleted ones with their sessions, endpoints
 and NAT mappings (the revocation path for a lost device), rebuilds the peers

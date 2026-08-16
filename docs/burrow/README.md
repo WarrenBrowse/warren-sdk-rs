@@ -158,10 +158,12 @@ docker compose -f docker-compose.peer.yml exec warren-burrow \
 
 Restarting the gateway costs its peers a reconnection: their sessions do not
 survive it, and each peer rebuilds on its own timers, needing no
-reconfiguration. Measured against the live network: about 15 seconds for a peer
-with traffic to send, and as long as a rekey interval (two minutes) for an idle
-peer whose keepalives are all it emits. A peer looks dead until its timer
-fires, and its traffic is lost in the meantime.
+reconfiguration. Measured against the live network across two restarts: 17
+seconds for a peer with traffic to send, which is its own liveness rule (a 10
+second keepalive timeout plus a 5 second rekey timeout), and 79 seconds for an
+idle peer emitting only its 25 second keepalive, bounded by the protocol's 120
+second rekey interval. A peer looks dead until its timer fires, and its traffic
+is lost in the meantime.
 
 The daemon exits 0 on a clean signal, 1 on a configuration or startup failure,
 and 2 on a terminal control-plane refusal (an expired subscription, a rejected
