@@ -226,8 +226,13 @@ jobs:
           set -euo pipefail
           if [ "$PERSISTENT_TARGET" = "true" ]; then
             # Persistent cache outside _work (the runner GC wipes leaf target/
-            # dirs in _work between jobs).
-            export CARGO_TARGET_DIR="$HOME/warren-sdk-target"
+            # dirs in _work between jobs), one directory per target. Two runner
+            # instances on the macOS host share a $HOME (ci.yml's header
+            # records what that cost), so the two macOS lanes would otherwise
+            # share one directory: the retry wrapper's `cargo clean` would wipe
+            # a sibling lane's tree mid-build, and both lanes would serialise
+            # on one cargo lock.
+            export CARGO_TARGET_DIR="$HOME/warren-sdk-target-$CARGO_TARGET"
           fi
           case "$CARGO_TARGET" in *windows*) EXE=".exe" ;; *) EXE="" ;; esac
           BIN="${CARGO_TARGET_DIR:-target}/$CARGO_TARGET/release/warren-burrow$EXE"
