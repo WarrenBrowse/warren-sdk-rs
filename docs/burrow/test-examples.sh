@@ -39,6 +39,18 @@ svc_block() { # svc_block <file> <service>
 	' "$1"
 }
 
+# The services of a compose file: the two-space keys under `services:`, and not
+# the two-space keys of the top-level volumes, networks and secrets blocks.
+svc_names() { # svc_names <file>
+	awk '
+		/^services:[[:space:]]*$/ { insvc = 1; next }
+		/^[^[:space:]#]/ { insvc = 0 }
+		insvc && /^  [a-z][a-z0-9_-]*:[[:space:]]*$/ {
+			sub(/:[[:space:]]*$/, ""); sub(/^  /, ""); print
+		}
+	' "$1"
+}
+
 # The value of `key: value` inside a service block, quotes stripped.
 svc_value() { # svc_value <file> <service> <key>
 	svc_block "$1" "$2" | awk -v key="$3" '
@@ -106,6 +118,47 @@ rule_lan_is_opt_in() {
 rule_mnemonic_by_file() {
 	! grep -qE '^[[:space:]]+WARREN_MNEMONIC:' "$1" \
 		&& grep -qE '^[[:space:]]+WARREN_MNEMONIC_FILE:[[:space:]]*/' "$1"
+}
+
+# A secret compose does not mount into a service is a path that does not exist
+# inside it, and the service names that path in its own environment: the daemon
+# then fails at startup on a file it was told to read. Compose mounts a secret
+# only into the services that list it, and nothing warns when a `secrets:` block
+# is edited away from an environment that still points into /run/secrets.
+rule_secret_paths_are_mounted() {
+	for svc in $(svc_names "$1"); do
+		block="$(svc_block "$1" "$svc")"
+		referenced="$(printf '%s\n' "$block" | awk '
+			{
+				line = $0
+				while (match(line, /\/run\/secrets\/[A-Za-z0-9_.-]+/)) {
+					print substr(line, RSTART + 13, RLENGTH - 13)
+					line = substr(line, RSTART + RLENGTH)
+				}
+			}
+		' | sort -u)"
+		[ -n "$referenced" ] || continue
+		mounted="$(printf '%s\n' "$block" | awk '
+			/^[[:space:]]+secrets:[[:space:]]*$/ { inlist = 1; next }
+			inlist && /^[[:space:]]+[a-z_]+:/ { inlist = 0 }
+			inlist && /^[[:space:]]+- / { sub(/^[[:space:]]+-[[:space:]]*/, ""); print }
+		' | sort -u)"
+		# Not `name`: a shell function shares the caller's scope, and `name`
+		# is the file the check loop below is reporting on.
+		for secret in $referenced; do
+			printf '%s\n' "$mounted" | grep -qx "$secret" || return 1
+		done
+	done
+}
+
+# The gateway's peers are containers on the docker network or devices on the
+# LAN, never anything inside its own network namespace, so a loopback listen
+# address answers nobody. Nothing downstream catches it: the daemon starts, the
+# gate opens on its egress proof, the container reports healthy, and every peer
+# handshakes with silence until somebody reads a packet counter.
+rule_listen_is_not_loopback() {
+	svc_value "$1" warren-burrow WARREN_BURROW_LISTEN \
+		| grep -qvE '^(127\.|\[?::1\]?:|localhost:)'
 }
 
 # Publishing the gateway's UDP port puts the one hop that is plain WireGuard on
@@ -226,6 +279,8 @@ for file in "$GLUETUN" "$PEER"; do
 	check "$name: the gateway gets no capability and no device" rule_gateway_unprivileged "$file"
 	check "$name: LAN exposure is an explicit opt-in" rule_lan_is_opt_in "$file"
 	check "$name: the recovery phrase is a file path, never a literal" rule_mnemonic_by_file "$file"
+	check "$name: every secret an environment points at is mounted into that service" rule_secret_paths_are_mounted "$file"
+	check "$name: the gateway does not listen on loopback" rule_listen_is_not_loopback "$file"
 	check "$name: the gateway's UDP port is not published, and the file says why" rule_udp_port_not_published "$file"
 	check "$name: the state directory is a named volume" rule_named_state_volume "$file"
 	check "$name: the health start period covers the connect timeout" rule_start_period_covers_connect_timeout "$file"
@@ -249,6 +304,11 @@ check_refuses "LAN exposure left at the default" \
 check_refuses "the recovery phrase written into the file" \
 	's|WARREN_MNEMONIC_FILE: /run/secrets/warren_mnemonic|WARREN_MNEMONIC: twelve words go here|' \
 	"$GLUETUN" rule_mnemonic_by_file
+check_refuses "a secret the service no longer mounts" \
+	's|^      - warren_mnemonic$|      - some_other_secret|' "$GLUETUN" rule_secret_paths_are_mounted
+check_refuses "a gateway bound to loopback with LAN exposure still on" \
+	's|WARREN_BURROW_LISTEN: 0.0.0.0:51820|WARREN_BURROW_LISTEN: 127.0.0.1:51820|' \
+	"$GLUETUN" rule_listen_is_not_loopback
 check_refuses "the UDP port published to the host" \
 	's|^    healthcheck:$|    ports: ["51820:51820/udp"]|' "$GLUETUN" rule_udp_port_not_published
 check_refuses "an anonymous state volume" \
