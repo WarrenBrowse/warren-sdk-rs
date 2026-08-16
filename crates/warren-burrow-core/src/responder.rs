@@ -1236,6 +1236,7 @@ mod tests {
     struct Client {
         tunn: Tunn,
         label: PeerLabel,
+        public: PeerPublicKey,
         addr: SocketAddr,
         v4: Ipv4Addr,
         v6: Ipv6Addr,
@@ -1303,6 +1304,7 @@ mod tests {
                     None,
                 ),
                 label: label.clone(),
+                public,
                 addr: SocketAddr::from(([192, 168, 7, u8::try_from(index).unwrap()], 51820)),
                 v4,
                 v6,
@@ -2014,6 +2016,61 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn an_authenticated_cookie_reply_never_moves_the_endpoint() {
+        // The forged-cookie test only proves boringtun refuses a forgery. This
+        // one drives a cookie the gateway's own tunnel accepts, from an address
+        // the peer never used, because that is the packet an insider on the
+        // path can replay: it is sealed under public material and the mac1 of
+        // an initiation anyone can read off the wire.
+        let (mut responder, mut clients) = build(1, true);
+        let now = Instant::now();
+        handshake(&mut responder, &mut clients[0], now);
+        let peer = peer_of(&responder, &clients[0]);
+
+        // A cookie reply only authenticates against an initiation the gateway
+        // itself sent, so put it in the initiator role.
+        responder
+            .reset_peer(&clients[0].label)
+            .expect("a known peer");
+        let mut scratch = ScratchBuf::new();
+        let packet = testpkt::udp(
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            53,
+            IpAddr::V4(clients[0].v4),
+            4000,
+            b"answer",
+        );
+        let initiation = match responder.send_to_peer(peer, &packet, &mut scratch) {
+            Ok(Encapsulated::Deferred {
+                initiation: Some((_, datagram)),
+            }) => datagram.to_vec(),
+            other => panic!("the gateway sent no initiation: {other:?}"),
+        };
+
+        // The peer's side answers under load, which is the only thing that
+        // produces a cookie reply.
+        let limiter = RateLimiter::new(&x25519::PublicKey::from(*clients[0].public.as_bytes()), 0);
+        let mut buf = [0u8; 64];
+        let cookie = match limiter.verify_packet(Some(clients[0].addr.ip()), &initiation, &mut buf)
+        {
+            Err(TunnResult::WriteToNetwork(bytes)) => bytes.to_vec(),
+            other => panic!("the limiter demanded no cookie: {other:?}"),
+        };
+        assert_eq!(cookie[0], 3, "a cookie reply");
+
+        let elsewhere = SocketAddr::from(([203, 0, 113, 9], 51820));
+        assert!(matches!(
+            responder.handle_datagram(elsewhere, &cookie, now, &mut scratch),
+            Inbound::Consumed
+        ));
+        assert_eq!(
+            responder.endpoint(peer),
+            Some(clients[0].addr),
+            "a cookie reply moved the peer's endpoint"
+        );
     }
 
     #[test]
