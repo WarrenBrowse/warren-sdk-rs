@@ -236,7 +236,6 @@ async fn build_device(env: &GatewayEnv, conf: &GatewayConf) -> anyhow::Result<Ga
         nat: env.nat.clone(),
         client_mtu: env.client_mtu,
         ipv6: env.ipv6,
-        ..GatewayOptions::default()
     };
     GatewayDevice::new(conf, env.plan, &options, sockets).context("building the gateway device")
 }

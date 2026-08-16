@@ -44,6 +44,15 @@ const TICK_INTERVAL: Duration = Duration::from_millis(250);
 /// that stops growing rather than the host's.
 const DEFAULT_UPLINK_DEPTH: usize = 2048;
 
+/// How much memory the datagrams waiting for one socket may hold, for the same
+/// reason as [`UPLINK_BYTES_MAX`].
+const EGRESS_BYTES_MAX: usize = 2 * 1024 * 1024;
+
+/// How much memory the packets waiting for one epoch's tunnel may hold. A
+/// decrypted inner packet can be 64 KB, so a depth alone would let one peer
+/// pin that many times [`DEFAULT_UPLINK_DEPTH`].
+const UPLINK_BYTES_MAX: usize = 4 * 1024 * 1024;
+
 /// How many control datagrams of one epoch may wait. The control plane is
 /// request/response, so this is already a burst.
 const CONTROL_DEPTH: usize = 64;
@@ -93,8 +102,6 @@ pub struct GatewayOptions {
     pub client_mtu: u16,
     /// Whether the operator asked for IPv6 at all.
     pub ipv6: bool,
-    /// Depth of the uplink queue.
-    pub uplink_depth: usize,
 }
 
 impl Default for GatewayOptions {
@@ -104,7 +111,6 @@ impl Default for GatewayOptions {
             nat: NatConfig::default(),
             client_mtu: 1280,
             ipv6: true,
-            uplink_depth: DEFAULT_UPLINK_DEPTH,
         }
     }
 }
@@ -198,10 +204,11 @@ enum UplinkItem {
     },
 }
 
-/// One socket's outbound queue.
+/// One socket's outbound queue, bounded in bytes as well as in items.
 struct EgressLane {
     tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
     rx: tokio::sync::Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
+    queued: AtomicUsize,
 }
 
 impl EgressLane {
@@ -210,7 +217,53 @@ impl EgressLane {
         Self {
             tx,
             rx: tokio::sync::Mutex::new(rx),
+            queued: AtomicUsize::new(0),
         }
+    }
+
+    /// Queues one datagram, or reports the queue full.
+    fn try_send(&self, to: SocketAddr, datagram: Vec<u8>) -> bool {
+        let len = datagram.len();
+        if self.queued.load(Ordering::Relaxed).saturating_add(len) > EGRESS_BYTES_MAX {
+            return false;
+        }
+        self.queued.fetch_add(len, Ordering::Relaxed);
+        if self.tx.try_send((to, datagram)).is_err() {
+            self.queued.fetch_sub(len, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+}
+
+impl UplinkItem {
+    /// What holding it costs, which is what the queue is bounded on.
+    fn len(&self) -> usize {
+        match self {
+            Self::Peer { packet, .. } => packet.len(),
+        }
+    }
+}
+
+/// One epoch's uplink queue, bounded in bytes as well as in items.
+struct UplinkQueue {
+    tx: mpsc::Sender<UplinkItem>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl UplinkQueue {
+    /// Enqueues one packet, or reports the queue full.
+    fn try_send(&self, item: UplinkItem) -> bool {
+        let len = item.len();
+        if self.queued.load(Ordering::Relaxed).saturating_add(len) > UPLINK_BYTES_MAX {
+            return false;
+        }
+        self.queued.fetch_add(len, Ordering::Relaxed);
+        if self.tx.try_send(item).is_err() {
+            self.queued.fetch_sub(len, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 }
 
@@ -224,8 +277,7 @@ struct Inner {
     /// The queue of the epoch running now, replaced at every turnover: an
     /// epoch that is over holds a receiver nobody feeds any more, so a pump
     /// still parked on it can never keep the live epoch's packets waiting.
-    uplink_tx: Mutex<Option<mpsc::Sender<UplinkItem>>>,
-    uplink_depth: usize,
+    uplink_tx: Mutex<Option<UplinkQueue>>,
     /// Datagrams waiting for each socket, one queue and one writer per socket.
     /// Queued rather than awaited, so a socket whose buffer is full never stops
     /// a reader from serving other peers, and never holds another socket's
@@ -288,7 +340,6 @@ impl GatewayDevice {
                 sockets,
                 routes: Mutex::new(HashMap::new()),
                 uplink_tx: Mutex::new(None),
-                uplink_depth: options.uplink_depth,
                 egress,
                 generation: AtomicU64::new(0),
                 inner_budget: AtomicUsize::new(0),
@@ -563,10 +614,14 @@ impl EpochPacketDevice for GatewayDevice {
             self.inner.generation.store(generation, Ordering::Release);
         }
 
-        let (uplink_tx, uplink_rx) = mpsc::channel(self.inner.uplink_depth);
+        let (uplink_tx, uplink_rx) = mpsc::channel(DEFAULT_UPLINK_DEPTH);
+        let queued = Arc::new(AtomicUsize::new(0));
         // Publishing it drops the previous epoch's sender, which is what wakes
         // a pump still parked on that epoch's queue.
-        *self.inner.uplink_tx.lock() = Some(uplink_tx);
+        *self.inner.uplink_tx.lock() = Some(UplinkQueue {
+            tx: uplink_tx,
+            queued: Arc::clone(&queued),
+        });
 
         let (control_tx, control_rx) = mpsc::channel(CONTROL_DEPTH);
         let demux = Arc::new(RawUdpDemux::new(control_tx));
@@ -579,6 +634,7 @@ impl EpochPacketDevice for GatewayDevice {
             control: control.clone(),
             control_rx: tokio::sync::Mutex::new(control_rx),
             uplink_rx: tokio::sync::Mutex::new(uplink_rx),
+            uplink_queued: queued,
             scratch: Mutex::new(ScratchBuf::new()),
         };
         (sink, control)
@@ -603,6 +659,8 @@ pub struct GatewayEpochSink {
     control: GatewayControl,
     control_rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     uplink_rx: tokio::sync::Mutex<mpsc::Receiver<UplinkItem>>,
+    /// Bytes this epoch's queue holds, released as the pump takes them.
+    uplink_queued: Arc<AtomicUsize>,
     scratch: Mutex<ScratchBuf>,
 }
 
@@ -703,14 +761,15 @@ impl PacketSink for GatewayEpochSink {
             };
             drop(uplink_rx);
             drop(control_rx);
-            let Some(UplinkItem::Peer {
+            let Some(item) = item else {
+                return Err(NetError::EngineStopped);
+            };
+            self.uplink_queued.fetch_sub(item.len(), Ordering::Relaxed);
+            let UplinkItem::Peer {
                 generation,
                 peer,
                 mut packet,
-            }) = item
-            else {
-                return Err(NetError::EngineStopped);
-            };
+            } = item;
             if generation != self.generation {
                 // Queued under a tunnel that is gone: sending it now would put
                 // the previous epoch's source address on the wire, which the
@@ -777,7 +836,7 @@ fn queue_datagram(inner: &Arc<Inner>, to: SocketAddr, datagram: Vec<u8>) {
     let queued = inner
         .egress
         .get(index)
-        .is_some_and(|lane| lane.tx.try_send((to, datagram)).is_ok());
+        .is_some_and(|lane| lane.try_send(to, datagram));
     if !queued {
         inner
             .counters
@@ -796,6 +855,7 @@ async fn write_egress(inner: Arc<Inner>, index: usize) {
         let Some((to, datagram)) = next else {
             return;
         };
+        lane.queued.fetch_sub(datagram.len(), Ordering::Relaxed);
         if socket.send_to(&datagram, to).await.is_err() {
             inner
                 .counters
@@ -914,7 +974,7 @@ fn handle_datagram(
             // cost this gateway a counted drop, not every peer's liveness. With
             // no epoch there is nowhere to put it, which is the same drop.
             let refused = match inner.uplink_tx.lock().as_ref() {
-                Some(tx) => tx.try_send(item).is_err(),
+                Some(queue) => !queue.try_send(item),
                 None => true,
             };
             if refused {
@@ -1208,7 +1268,7 @@ mod tests {
 
         /// Encapsulates one inner packet and hands it to the reader.
         async fn send_from_peer(&mut self, packet: &[u8]) {
-            let mut buf = vec![0u8; 4096];
+            let mut buf = vec![0u8; 70_000];
             let datagram = match self.client.encapsulate(packet, &mut buf) {
                 TunnResult::WriteToNetwork(bytes) => bytes.to_vec(),
                 other => panic!("{other:?}"),
@@ -1441,6 +1501,44 @@ mod tests {
             .expect("a live epoch");
         let header = parse_ip(&second).expect("an IP packet");
         assert_eq!(header.src, IpAddr::V4(ASSIGNED_V4));
+    }
+
+    /// A queue bounded in items alone lets one authenticated peer pin its depth
+    /// times the largest inner packet, which is hundreds of megabytes on a NAS.
+    /// The bound that matters is the memory, so it is counted in bytes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jumbo_peer_packets_fill_the_uplink_queue_by_bytes_not_by_count() {
+        let mut h = harness();
+        // Nothing drains it: the sink is never read, exactly as a tunnel that
+        // has stopped taking packets.
+        let (_sink, _control) = h.device.begin_epoch(addressing(1));
+        assert!(h.device.open_gate_for(1));
+        h.handshake().await;
+
+        let jumbo = vec![0x7eu8; 60_000];
+        let packets = UPLINK_BYTES_MAX / jumbo.len() + 8;
+        assert!(
+            packets < DEFAULT_UPLINK_DEPTH,
+            "the queue must fill on bytes long before it fills on items"
+        );
+        for port in 0..packets {
+            h.send_from_peer(&udp(
+                IpAddr::V4(h.peer_v4),
+                u16::try_from(4000 + port).expect("a port"),
+                IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+                443,
+                &jumbo,
+            ))
+            .await;
+        }
+
+        for _ in 0..200u32 {
+            if h.device.snapshot().device.uplink_queue_full > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{packets} jumbo packets pinned more than the queue's byte budget");
     }
 
     /// A socket whose buffer is full holds its own answers and nobody else's:
