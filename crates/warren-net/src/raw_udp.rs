@@ -223,6 +223,29 @@ fn parse_udp(packet: &[u8]) -> Option<(SocketAddr, SocketAddr, &[u8])> {
     ))
 }
 
+/// Which remote a flow accepts datagrams from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RemoteFilter {
+    /// One address on one port, for a flow whose peer is known exactly.
+    Endpoint(SocketAddr),
+    /// One address on any port. An opener that serves several control
+    /// protocols at the same host (NAT-PMP on 5351, the resolver on 53) hands
+    /// out flows before it knows which one a caller will use, and the host is
+    /// what the pin is actually about: only the exit answers from the tunnel
+    /// gateway's address, while any other client of that exit can reach this
+    /// device on the control port.
+    Host(IpAddr),
+}
+
+impl RemoteFilter {
+    fn accepts(self, from: SocketAddr) -> bool {
+        match self {
+            Self::Endpoint(expected) => from == expected,
+            Self::Host(host) => from.ip() == host,
+        }
+    }
+}
+
 /// One flow's registration.
 struct Registration {
     /// The identity of the registration itself, so a superseded flow can tell
@@ -281,6 +304,18 @@ impl RawUdpDemux {
     /// re-registration after an epoch change means.
     #[must_use]
     pub fn register(&self, local: SocketAddr, expected_remote: SocketAddr) -> RawUdpFlow {
+        self.register_with(local, RemoteFilter::Endpoint(expected_remote))
+    }
+
+    /// [`Self::register`] with the remote pinned to a HOST rather than to one
+    /// of its ports, for an opener that hands the same flow to control clients
+    /// talking to different ports of the tunnel gateway.
+    #[must_use]
+    pub fn register_from_host(&self, local: SocketAddr, expected_host: IpAddr) -> RawUdpFlow {
+        self.register_with(local, RemoteFilter::Host(expected_host))
+    }
+
+    fn register_with(&self, local: SocketAddr, expected_remote: RemoteFilter) -> RawUdpFlow {
         let (tx, rx) = mpsc::channel(FLOW_INBOX_DEPTH);
         let token = self
             .next_token
@@ -349,7 +384,7 @@ impl RawUdpDemux {
 /// has already taken that port over.
 pub struct RawUdpFlow {
     local: SocketAddr,
-    expected_remote: SocketAddr,
+    expected_remote: RemoteFilter,
     /// Which registration on this port is this flow's own.
     token: u64,
     injector: mpsc::Sender<Vec<u8>>,
@@ -398,7 +433,7 @@ impl UdpFlow for RawUdpFlow {
     async fn recv_from(&mut self) -> Option<(Bytes, SocketAddr)> {
         loop {
             let (payload, from) = self.inbox.recv().await?;
-            if from == self.expected_remote {
+            if self.expected_remote.accepts(from) {
                 return Some((payload, from));
             }
             // Addressed to this port from somewhere else: the exit forwards
@@ -584,6 +619,40 @@ mod tests {
             "only the expected remote is delivered"
         );
         assert_eq!(from, addr(GATEWAY));
+    }
+
+    /// The gateway datapath opens one flow per control exchange without
+    /// knowing whether it will carry NAT-PMP or a DNS probe, so the pin is on
+    /// the exit's own address; another client of that same exit still cannot
+    /// answer for it.
+    #[tokio::test]
+    async fn a_host_pinned_flow_takes_every_port_of_that_host_and_nothing_else() {
+        let (demux, _uplink) = demux();
+        let mut flow = demux.register_from_host(addr(CLIENT), addr(GATEWAY).ip());
+
+        let stranger = build_udp_packet(addr("10.66.0.9:53"), addr(CLIENT), b"spoof")
+            .expect("a datagram from another tunnel client");
+        assert!(demux.deliver(&stranger));
+        let resolver =
+            build_udp_packet(addr("10.66.0.1:53"), addr(CLIENT), b"answer").expect("the resolver");
+        assert!(demux.deliver(&resolver));
+        let natpmp =
+            build_udp_packet(addr(GATEWAY), addr(CLIENT), b"granted").expect("the NAT-PMP server");
+        assert!(demux.deliver(&natpmp));
+
+        let (payload, from) = flow.recv_from().await.expect("a datagram arrives");
+        assert_eq!(
+            payload,
+            Bytes::from_static(b"answer"),
+            "a stranger on the same port must not answer for the gateway"
+        );
+        assert_eq!(from, addr("10.66.0.1:53"));
+        let (payload, _) = flow.recv_from().await.expect("the second answer arrives");
+        assert_eq!(
+            payload,
+            Bytes::from_static(b"granted"),
+            "the same flow serves both control ports of the gateway"
+        );
     }
 
     #[tokio::test]
