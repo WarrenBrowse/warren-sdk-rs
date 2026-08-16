@@ -621,6 +621,10 @@ async fn a_pinned_forward_delivers_an_inbound_packet_to_its_peer() {
 /// The gateway never writes a peer's packet anywhere except into the tunnel.
 /// A host service on the same machine is the nearest thing a peer could reach
 /// by mistake, and it must be unreachable however the packet is addressed.
+///
+/// The silence at that socket only means something while the datapath is
+/// demonstrably alive, so the same peer's traffic to the internet is asserted
+/// in the same test, and the counters say which rule refused each knock.
 #[tokio::test(flavor = "multi_thread")]
 async fn nothing_a_peer_sends_can_reach_the_host_stack() {
     let echo = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -653,5 +657,35 @@ async fn nothing_a_peer_sends_can_reach_the_host_stack() {
     assert!(
         heard.is_err(),
         "a peer packet reached a socket on the host's own stack"
+    );
+
+    let snapshot = lo.device.snapshot();
+    assert_eq!(
+        snapshot.responder.non_unicast, 1,
+        "the loopback destination is refused before anything is built for it"
+    );
+    assert_eq!(
+        snapshot.responder.pool_destination, 2,
+        "the tunnel's own addresses are the exit's, not this host's"
+    );
+
+    // The control: the same peer, on the same session, still egresses. Without
+    // it a severed datapath would pass this test.
+    lo.client
+        .send_inner(&udp(
+            IpAddr::V4(peer_v4),
+            4001,
+            IpAddr::V4(REMOTE),
+            53,
+            b"alive",
+        ))
+        .await;
+    let uplink = lo
+        .next_at_exit()
+        .await
+        .expect("the datapath carried the peer's traffic throughout");
+    assert_eq!(
+        parse_ip(&uplink).expect("an IP packet").src,
+        IpAddr::V4(ASSIGNED_V4)
     );
 }
