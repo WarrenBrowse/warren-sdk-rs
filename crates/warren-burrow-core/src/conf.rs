@@ -512,6 +512,16 @@ pub fn render_gluetun_env(conf: &ClientConf) -> Zeroizing<String> {
         );
         let _ = writeln!(out, "# in FIREWALL_OUTBOUND_SUBNETS.");
     }
+    // The keys above are in this file in clear, and gluetun repeats part of
+    // them into a log an operator may well ship somewhere.
+    let _ = writeln!(
+        out,
+        "# Leave LOG_LEVEL at info: at debug gluetun prints the head and the tail of the"
+    );
+    let _ = writeln!(
+        out,
+        "# private key and the preshared key above into its own log."
+    );
     out
 }
 
@@ -870,7 +880,9 @@ mod tests {
                  # DNS_UPSTREAM_PLAIN_ADDRESSES=10.66.0.1:53\n\
                  # gluetun then warns that the address is private and suggests FIREWALL_OUTBOUND_SUBNETS.\n\
                  # Ignore that advice: 10.66.0.1 lives on the far side of the tunnel and must not be\n\
-                 # in FIREWALL_OUTBOUND_SUBNETS.\n"
+                 # in FIREWALL_OUTBOUND_SUBNETS.\n\
+                 # Leave LOG_LEVEL at info: at debug gluetun prints the head and the tail of the\n\
+                 # private key and the preshared key above into its own log.\n"
             )
         );
     }

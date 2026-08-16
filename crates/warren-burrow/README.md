@@ -133,6 +133,14 @@ gateway private key, the peer public keys and the preshared keys live in
   `remove-peer` reload the running daemon themselves. On unix `SIGHUP` also
   reloads, and it is the only way when the health listener is off.
 
+Sessions do not survive a restart of the gateway. A peer that was connected
+keeps its own session and its packets arrive under an index the new process
+does not know, counted as `unknown_index` and answered with nothing, which is
+what the protocol requires. A stock client discovers this only when it next has
+data to send, so a peer looks dead until then and traffic to it is lost in the
+meantime; one packet from the peer rebuilds the session in a fraction of a
+second, with no reconfiguration and no client restart.
+
 `reload` adds new peers, removes deleted ones with their sessions, endpoints
 and NAT mappings (the revocation path for a lost device), rebuilds the peers
 whose key material or allowed IPs changed, and leaves every other session
