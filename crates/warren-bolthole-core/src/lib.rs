@@ -8,7 +8,7 @@
 //!
 //! This crate is pure packet logic. It opens no socket, spawns no task and
 //! reads no clock: the caller passes the current instant in, and the async
-//! shell around it (`warren-burrow`) owns the sockets, the tunnel and the
+//! shell around it (`warren-bolthole`) owns the sockets, the tunnel and the
 //! timers. That is what keeps the code portable to the engine later, and what
 //! makes every behaviour here testable without a network.
 

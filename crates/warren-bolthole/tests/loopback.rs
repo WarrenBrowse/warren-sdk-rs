@@ -16,8 +16,8 @@ use boringtun::x25519;
 use bytes::Bytes;
 use ip_network::IpNetwork;
 use tokio::sync::mpsc;
-use warren_burrow::device::{GatewayDevice, GatewayOptions, GatewayTasks};
-use warren_burrow_core::{
+use warren_bolthole::device::{GatewayDevice, GatewayOptions, GatewayTasks};
+use warren_bolthole_core::{
     GatewayConf, GatewayKey, MapProto, PeerConf, PeerLabel, PeerPlan, PeerPublicKey, PresharedKey,
     ResponderOptions, parse_error_quote, parse_ip, read_icmp, read_ports,
 };
@@ -257,7 +257,7 @@ async fn loopback_with(assigned: Ipv4Addr, budget: usize, start_epoch: bool) -> 
         }],
     };
 
-    let sockets = warren_burrow::socket::bind_all(&["127.0.0.1:0".parse().expect("literal")])
+    let sockets = warren_bolthole::socket::bind_all(&["127.0.0.1:0".parse().expect("literal")])
         .await
         .expect("loopback binds");
     let bound = sockets[0].local_addr().expect("a bound address");

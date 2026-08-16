@@ -60,8 +60,8 @@ portable in concept.
 | `warren-test-support` | test | Shared fake-exit harness (`spawn_fake_exit`, `spawn_fake_multihop_exit`) for cross-crate networking tests; dev-only, never a production dependency | done |
 | `warren-headless` | daemon | The skeleton both headless daemons share: env readers, exit-candidate selection, the health responder and its per-epoch egress tracker, port-forward hooks, signals, process hardening | done |
 | `warren-proxy` | daemon | SOCKS5 / HTTP CONNECT daemon over the supervised failover datapath, configured entirely from the environment | done |
-| `warren-burrow-core` | gateway | The gateway's packet logic with no socket and no clock: the WireGuard-protocol responder over boringtun, the NAPT onto the exit's assigned address, the peer plan, the configuration format | done |
-| `warren-burrow` | gateway | The async shell of the local gateway: sockets, epochs, the gate, provisioning, health and admin | done |
+| `warren-bolthole-core` | gateway | The gateway's packet logic with no socket and no clock: the WireGuard-protocol responder over boringtun, the NAPT onto the exit's assigned address, the peer plan, the configuration format | done |
+| `warren-bolthole` | gateway | The async shell of the local gateway: sockets, epochs, the gate, provisioning, health and admin | done |
 
 Every "done" crate is implemented in TDD with unit tests, golden vectors where a
 wire format is involved, and in-process end-to-end tests for the datapath. The

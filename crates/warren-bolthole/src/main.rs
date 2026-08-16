@@ -1,13 +1,13 @@
-//! `warren-burrow`: the Warren local gateway. The env contract is the table in
+//! `warren-bolthole`: the Warren local gateway. The env contract is the table in
 //! `README.md`, next to this crate's `Cargo.toml`.
 
 use std::path::Path;
 use std::process::ExitCode;
 
 use ip_network::IpNetwork;
-use warren_burrow::admin;
-use warren_burrow::config::GatewayEnv;
-use warren_burrow::provision::{self, InitOptions, PeerOptions};
+use warren_bolthole::admin;
+use warren_bolthole::config::GatewayEnv;
+use warren_bolthole::provision::{self, InitOptions, PeerOptions};
 
 /// What the command line asked for.
 #[derive(Debug, PartialEq, Eq)]
@@ -24,16 +24,16 @@ enum Command {
 }
 
 const USAGE: &str = "\
-warren-burrow: a local gateway that carries stock WireGuard-protocol clients through a Warren exit.
+warren-bolthole: a local gateway that carries stock WireGuard-protocol clients through a Warren exit.
 
-    warren-burrow [run]                      serve (the default; first run provisions)
-    warren-burrow init [OPTIONS]             generate the gateway and its peers
-    warren-burrow add-peer LABEL [OPTIONS]   add one peer and write its files
-    warren-burrow remove-peer LABEL          revoke one peer
-    warren-burrow show LABEL [--qr]          print a peer's client configuration
-    warren-burrow reload                     apply the configuration file to the running daemon
-    warren-burrow reset-peer LABEL           rebuild one peer's session (a device whose clock jumped)
-    warren-burrow healthcheck                probe the running daemon's /healthz
+    warren-bolthole [run]                      serve (the default; first run provisions)
+    warren-bolthole init [OPTIONS]             generate the gateway and its peers
+    warren-bolthole add-peer LABEL [OPTIONS]   add one peer and write its files
+    warren-bolthole remove-peer LABEL          revoke one peer
+    warren-bolthole show LABEL [--qr]          print a peer's client configuration
+    warren-bolthole reload                     apply the configuration file to the running daemon
+    warren-bolthole reset-peer LABEL           rebuild one peer's session (a device whose clock jumped)
+    warren-bolthole healthcheck                probe the running daemon's /healthz
 
 Options for init and add-peer:
     --peers N            how many peers init generates (init only)
@@ -51,7 +51,7 @@ fn main() -> ExitCode {
     let command = match parse_command(&args) {
         Ok(command) => command,
         Err(message) => {
-            eprintln!("warren-burrow: {message}");
+            eprintln!("warren-bolthole: {message}");
             return ExitCode::from(1);
         }
     };
@@ -66,12 +66,12 @@ fn main() -> ExitCode {
     // core dump carries all of it, and zeroize-on-drop does not help against a
     // dump taken while the process is alive.
     if !warren_headless::disable_core_dumps() {
-        eprintln!("warren-burrow: could not disable core dumps on this host");
+        eprintln!("warren-bolthole: could not disable core dumps on this host");
     }
     let env = match load_env() {
         Ok(env) => env,
         Err(message) => {
-            eprintln!("warren-burrow: {message}");
+            eprintln!("warren-bolthole: {message}");
             return ExitCode::from(1);
         }
     };
@@ -80,12 +80,12 @@ fn main() -> ExitCode {
         Command::Init(options) => provisioning(|| {
             let out = provision::init(&env, &options)?;
             println!(
-                "warren-burrow: {} peer(s) written to {}",
+                "warren-bolthole: {} peer(s) written to {}",
                 out.written.len(),
                 out.clients_dir.display()
             );
             for label in &out.written {
-                println!("  warren-burrow show {}", label.as_str());
+                println!("  warren-bolthole show {}", label.as_str());
             }
             apply_to_daemon(&env);
             Ok(())
@@ -93,21 +93,21 @@ fn main() -> ExitCode {
         Command::AddPeer(label, options) => provisioning(|| {
             let out = provision::add_peer(&env, &label, &options)?;
             println!(
-                "warren-burrow: peer written to {}",
+                "warren-bolthole: peer written to {}",
                 out.clients_dir.display()
             );
-            println!("  warren-burrow show {label}");
+            println!("  warren-bolthole show {label}");
             apply_to_daemon(&env);
             Ok(())
         }),
         Command::RemovePeer(label) => provisioning(|| {
             provision::remove_peer(&env, &label)?;
-            println!("warren-burrow: {label} revoked");
+            println!("warren-bolthole: {label} revoked");
             if !apply_to_daemon(&env) {
                 // A revoked device keeps its session until a daemon applies
                 // the file, so the operator has to be told when none did.
                 println!(
-                    "warren-burrow: a running daemon keeps that peer's session until it \
+                    "warren-bolthole: a running daemon keeps that peer's session until it \
                           reloads ({RELOAD_HINT}) or restarts"
                 );
             }
@@ -120,20 +120,20 @@ fn main() -> ExitCode {
     }
 }
 
-/// `warren-burrow run`, on its own runtime so the provisioning subcommands
+/// `warren-bolthole run`, on its own runtime so the provisioning subcommands
 /// start no reactor at all.
 fn run(env: GatewayEnv) -> ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(err) => {
-            eprintln!("warren-burrow: could not start the runtime: {err}");
+            eprintln!("warren-bolthole: could not start the runtime: {err}");
             return ExitCode::from(1);
         }
     };
-    match runtime.block_on(warren_burrow::run::run(env)) {
+    match runtime.block_on(warren_bolthole::run::run(env)) {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
         Err(err) => {
-            eprintln!("warren-burrow: {err:#}");
+            eprintln!("warren-bolthole: {err:#}");
             ExitCode::from(1)
         }
     }
@@ -143,7 +143,7 @@ fn provisioning(body: impl FnOnce() -> Result<(), provision::ProvisionError>) ->
     match body() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("warren-burrow: {err}");
+            eprintln!("warren-bolthole: {err}");
             ExitCode::from(1)
         }
     }
@@ -152,7 +152,7 @@ fn provisioning(body: impl FnOnce() -> Result<(), provision::ProvisionError>) ->
 fn show(env: &GatewayEnv, label: &str, qr: bool) -> Result<(), provision::ProvisionError> {
     if qr {
         println!(
-            "warren-burrow: this QR carries the peer's private key and preshared key. \
+            "warren-bolthole: this QR carries the peer's private key and preshared key. \
              Show it on a trusted screen only."
         );
         print!("{}", *provision::show_qr(env, label)?);
@@ -166,11 +166,11 @@ fn show(env: &GatewayEnv, label: &str, qr: bool) -> Result<(), provision::Provis
 fn admin_call(env: &GatewayEnv, path: &str) -> ExitCode {
     match admin_request(env, path) {
         Ok(message) => {
-            print!("warren-burrow: {message}");
+            print!("warren-bolthole: {message}");
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("warren-burrow: {message}");
+            eprintln!("warren-bolthole: {message}");
             ExitCode::from(1)
         }
     }
@@ -188,11 +188,11 @@ fn apply_to_daemon(env: &GatewayEnv) -> bool {
     }
     match admin_request(env, "/admin/reload") {
         Ok(message) => {
-            print!("warren-burrow: {message}");
+            print!("warren-bolthole: {message}");
             true
         }
         Err(message) => {
-            eprintln!("warren-burrow: {message}");
+            eprintln!("warren-bolthole: {message}");
             false
         }
     }
@@ -223,43 +223,43 @@ const RELOAD_HINT: &str = "SIGHUP";
 const RELOAD_HINT: &str = "a restart, the only way on this platform";
 
 fn health_target() -> Result<Option<std::net::SocketAddr>, String> {
-    warren_burrow::config::healthcheck_target(std::env::var("WARREN_HEALTH_LISTEN").ok())
+    warren_bolthole::config::healthcheck_target(std::env::var("WARREN_HEALTH_LISTEN").ok())
         .map_err(|err| err.to_string())
 }
 
-/// `warren-burrow healthcheck`: probe the running daemon and exit 0/1, so a
+/// `warren-bolthole healthcheck`: probe the running daemon and exit 0/1, so a
 /// container HEALTHCHECK needs no shell and no wget.
 fn healthcheck() -> ExitCode {
-    let addr =
-        match warren_burrow::config::healthcheck_target(std::env::var("WARREN_HEALTH_LISTEN").ok())
-        {
-            // The operator turned the endpoint off, so there is nothing to assert
-            // and reporting unhealthy would be reporting on their own choice.
-            Ok(None) => {
-                println!("warren-burrow: health endpoint disabled, nothing to probe");
-                return ExitCode::SUCCESS;
-            }
-            Ok(Some(addr)) => addr,
-            Err(err) => {
-                eprintln!("warren-burrow: {err}");
-                return ExitCode::from(1);
-            }
-        };
+    let addr = match warren_bolthole::config::healthcheck_target(
+        std::env::var("WARREN_HEALTH_LISTEN").ok(),
+    ) {
+        // The operator turned the endpoint off, so there is nothing to assert
+        // and reporting unhealthy would be reporting on their own choice.
+        Ok(None) => {
+            println!("warren-bolthole: health endpoint disabled, nothing to probe");
+            return ExitCode::SUCCESS;
+        }
+        Ok(Some(addr)) => addr,
+        Err(err) => {
+            eprintln!("warren-bolthole: {err}");
+            return ExitCode::from(1);
+        }
+    };
     match warren_headless::health::probe_healthz(addr) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => {
-            eprintln!("warren-burrow: unhealthy");
+            eprintln!("warren-bolthole: unhealthy");
             ExitCode::from(1)
         }
         Err(err) => {
-            eprintln!("warren-burrow: health endpoint unreachable: {err}");
+            eprintln!("warren-bolthole: health endpoint unreachable: {err}");
             ExitCode::from(1)
         }
     }
 }
 
 fn load_env() -> Result<GatewayEnv, String> {
-    warren_burrow::config::load(
+    warren_bolthole::config::load(
         |k| std::env::var(k).ok(),
         |p: &Path| std::fs::read_to_string(p),
         file_mode,

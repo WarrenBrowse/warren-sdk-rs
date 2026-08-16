@@ -1,5 +1,5 @@
 [package]
-name = "warren-burrow"
+name = "warren-bolthole"
 description = "Local WireGuard-protocol gateway: terminates stock WireGuard-protocol clients on the LAN and carries their traffic through a Warren exit, with the peers' packets translated onto the single address the exit assigned"
 version.workspace = true
 edition.workspace = true
@@ -10,11 +10,11 @@ authors.workspace = true
 publish = false
 
 [[bin]]
-name = "warren-burrow"
+name = "warren-bolthole"
 path = "src/main.rs"
 
 [dependencies]
-warren-burrow-core = { path = "../warren-burrow-core" }
+warren-bolthole-core = { path = "../warren-bolthole-core" }
 warren-headless = { path = "../warren-headless" }
 warren-sdk = { path = "../warren-sdk" }
 bytes = { workspace = true }

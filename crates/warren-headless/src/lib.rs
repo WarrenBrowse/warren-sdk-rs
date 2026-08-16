@@ -1,6 +1,6 @@
 //! The shared skeleton of Warren's headless daemons.
 //!
-//! `warren-proxy` and `warren-burrow` are the same daemon around two different
+//! `warren-proxy` and `warren-bolthole` are the same daemon around two different
 //! datapaths: both read their whole configuration from the environment, both
 //! resolve exit candidates from the two signed views, both publish liveness on
 //! a tiny local HTTP endpoint gated on proven egress, both drive a tunnel-side

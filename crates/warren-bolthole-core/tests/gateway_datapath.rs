@@ -14,7 +14,7 @@ use std::time::Instant;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519;
 use ip_network::IpNetwork;
-use warren_burrow_core::{
+use warren_bolthole_core::{
     EpochId, ExitId, GatewayConf, GatewayKey, Inbound, Napt, NatConfig, PeerConf, PeerLabel,
     PeerPlan, PeerPublicKey, PresharedKey, Responder, ResponderOptions, ScratchBuf, parse_ip,
     read_ports,
@@ -160,7 +160,7 @@ impl Gateway {
                 .responder
                 .encapsulate_to(translated.destination, &out, &mut self.scratch)
             {
-                Ok(warren_burrow_core::Encapsulated::Sent(to, bytes)) => {
+                Ok(warren_bolthole_core::Encapsulated::Sent(to, bytes)) => {
                     assert_eq!(to, self.client_addr);
                     bytes.to_vec()
                 }

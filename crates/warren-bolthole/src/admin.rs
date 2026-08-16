@@ -11,7 +11,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use warren_burrow_core::{PeerLabel, PeerPlan, PresharedKey, ReloadReport};
+use warren_bolthole_core::{PeerLabel, PeerPlan, PresharedKey, ReloadReport};
 use warren_headless::health::{Request, RouteReply};
 use zeroize::Zeroizing;
 
@@ -248,7 +248,7 @@ mod tests {
 
     fn env_for(dir: &Path) -> GatewayEnv {
         let map: HashMap<String, String> = [(
-            "WARREN_BURROW_STATE_DIR".to_owned(),
+            "WARREN_BOLTHOLE_STATE_DIR".to_owned(),
             dir.display().to_string(),
         )]
         .into_iter()
@@ -264,7 +264,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "warren-burrow-admin-{}-{name}-{:?}",
+            "warren-bolthole-admin-{}-{name}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

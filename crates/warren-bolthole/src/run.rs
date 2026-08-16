@@ -10,7 +10,7 @@ use anyhow::Context as _;
 use tokio::sync::watch;
 // Two protocol enums meet here: the NAT's own, and the NAT-PMP client's. They
 // name the same two transports and belong to different layers.
-use warren_burrow_core::{GatewayConf, MapProto as NatProto, ResponderOptions};
+use warren_bolthole_core::{GatewayConf, MapProto as NatProto, ResponderOptions};
 use warren_headless::forward::{ForwardConfig, ForwardProto, ShellHooks};
 use warren_headless::health::HealthView;
 use warren_headless::log::Log;
@@ -29,7 +29,7 @@ use crate::health::GatewayHealth;
 use crate::provision::{self, InitOptions};
 
 /// Every operator-facing line this daemon writes carries its own name.
-pub const LOG: Log = Log("warren-burrow");
+pub const LOG: Log = Log("warren-bolthole");
 
 /// The daemon's own background tasks, stopped when the guard is dropped.
 ///
@@ -279,7 +279,7 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
 /// running daemon against a client configuration.
 ///
 /// A headless daemon's stdout is the container log, so the key itself belongs
-/// to `warren-burrow show LABEL` and to nothing that is shipped anywhere.
+/// to `warren-bolthole show LABEL` and to nothing that is shipped anywhere.
 fn key_fingerprint(device: &GatewayDevice) -> String {
     let key = device.public_key().to_base64();
     let prefix: String = key.chars().take(8).collect();
@@ -327,7 +327,7 @@ fn ensure_provisioned(env: &GatewayEnv) -> anyhow::Result<GatewayConf> {
             out.written.len(),
             out.clients_dir.display()
         ));
-        LOG.info(&format!("retrieve one with: warren-burrow show {first}"));
+        LOG.info(&format!("retrieve one with: warren-bolthole show {first}"));
         return Ok(out.conf);
     }
     provision::load_conf(env).context("reading the gateway configuration")
@@ -654,7 +654,7 @@ mod tests {
     use super::*;
 
     use crate::device::GatewayOptions;
-    use warren_burrow_core::{GatewayKey, PeerPlan};
+    use warren_bolthole_core::{GatewayKey, PeerPlan};
     use warren_sdk::net::EpochPacketDevice as _;
 
     async fn empty_device() -> GatewayDevice {

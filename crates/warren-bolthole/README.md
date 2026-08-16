@@ -1,6 +1,6 @@
-# warren-burrow
+# warren-bolthole
 
-warren-burrow implements the WireGuard protocol so that stock WireGuard clients
+warren-bolthole implements the WireGuard protocol so that stock WireGuard clients
 can use Warren. "WireGuard" is a registered trademark of Jason A. Donenfeld;
 this project is not affiliated with or endorsed by the WireGuard project.
 
@@ -42,30 +42,30 @@ NAS, casting) unless its configuration was generated with an excluded prefix
 |---|---|
 | a host that can hold `NET_ADMIN` and `/dev/net/tun` | the `warren-vpn` container |
 | a restricted namespace, CI, per-application egress | `warren-proxy` |
-| a device that cannot run Warren at all (a TV, a router, a console, a phone without the app), or a gluetun stack you will not replace | `warren-burrow` |
+| a device that cannot run Warren at all (a TV, a router, a console, a phone without the app), or a gluetun stack you will not replace | `warren-bolthole` |
 
 Deployment shapes (a gateway for LAN devices, a gluetun stack) and the import
-path for each kind of device live in `docs/burrow/` at the root of this
+path for each kind of device live in `docs/bolthole/` at the root of this
 repository. What follows is the contract those examples are built on.
 
 ## Commands
 
 ```
-warren-burrow [run]                      serve (the default; first run provisions)
-warren-burrow init [OPTIONS]             generate the gateway and its peers
-warren-burrow add-peer LABEL [OPTIONS]   add one peer and write its files
-warren-burrow remove-peer LABEL          revoke one peer
-warren-burrow show LABEL [--qr]          print a peer's client configuration
-warren-burrow reload                     apply the configuration file to the running daemon
-warren-burrow reset-peer LABEL           rebuild one peer's session (a device whose clock jumped)
-warren-burrow healthcheck                probe the running daemon's /healthz
+warren-bolthole [run]                      serve (the default; first run provisions)
+warren-bolthole init [OPTIONS]             generate the gateway and its peers
+warren-bolthole add-peer LABEL [OPTIONS]   add one peer and write its files
+warren-bolthole remove-peer LABEL          revoke one peer
+warren-bolthole show LABEL [--qr]          print a peer's client configuration
+warren-bolthole reload                     apply the configuration file to the running daemon
+warren-bolthole reset-peer LABEL           rebuild one peer's session (a device whose clock jumped)
+warren-bolthole healthcheck                probe the running daemon's /healthz
 ```
 
 Options for `init` and `add-peer`: `--peers N`, `--label NAME`,
 `--lan-exclude CIDR`, `--no-v6`, `--force`.
 
 The first `run` on an empty state directory generates the gateway key and
-`WARREN_BURROW_PEERS` peers, writes their files and says how to retrieve one. A
+`WARREN_BOLTHOLE_PEERS` peers, writes their files and says how to retrieve one. A
 state directory that holds something else is refused rather than written into.
 The files under `clients/` ARE the credentials: each carries a peer's private
 key and preshared key, and they are kept nowhere else.
@@ -81,7 +81,7 @@ Shared with the other headless daemons:
 | `WARREN_CIRCUIT` | `single` | `single` (direct to exit) or `multi` (entry relay then exit) |
 | `WARREN_DNS_SERVER` | `10.66.0.1` | the resolver written into client configurations. Any other value also keeps `dns_disabled` exits in the rotation; `off` writes no `DNS` line |
 | `WARREN_CONNECT_TIMEOUT` | `90` | seconds allowed for the first `Connected`, and the budget the first egress proof is retried within |
-| `WARREN_HEALTH_LISTEN` | `127.0.0.1:9998` | liveness endpoint (the proxy's own default is 9999, so both run on one host); `off`, `none` or empty disables it, and `warren-burrow healthcheck` then exits 0, which reports the container healthy for as long as it exists |
+| `WARREN_HEALTH_LISTEN` | `127.0.0.1:9998` | liveness endpoint (the proxy's own default is 9999, so both run on one host); `off`, `none` or empty disables it, and `warren-bolthole healthcheck` then exits 0, which reports the container healthy for as long as it exists |
 | `WARREN_API_URL` | channel default | control-plane override |
 | `WARREN_SERVER_PUBKEY_HEX` | compiled pin | relay-list signing key override |
 | `WARREN_PORT_FORWARD_INTERNAL_PORT` | off | enables NAT-PMP forwarding of a tunnel-side port; refused inside `61000-61999`, which this gateway keeps for its own in-tunnel control plane |
@@ -93,26 +93,26 @@ The gateway's own:
 
 | variable | default | meaning |
 |---|---|---|
-| `WARREN_BURROW_LISTEN` | `127.0.0.1:51820` | comma-separated UDP binds, one socket per entry |
-| `WARREN_BURROW_LAN` | `0` | must be `1` to bind anything but loopback. The refusal states who can then reach the gateway, and where the obfuscation boundary is |
-| `WARREN_BURROW_ENDPOINT` | detected on a LAN gateway, `127.0.0.1:<port>` otherwise | the `Endpoint` written into client configurations. Detection uses the primary address of the default-route interface (a connected UDP socket, no packet sent) and refuses a loopback result on a LAN gateway |
-| `WARREN_BURROW_PEERS` | `1` | how many peers a first run generates |
-| `WARREN_BURROW_STATE_DIR` | `/var/lib/warren-burrow` as root, else `$XDG_STATE_HOME/warren-burrow`, `~/Library/Application Support/warren-burrow` or `%LOCALAPPDATA%\warren-burrow` | where the configuration, the client files and the admin token live; created `0700`, every file `0600` |
-| `WARREN_BURROW_CONF` | `<state>/burrow.conf` | the gateway-side configuration; refused unless it is mode 0600 on unix |
-| `WARREN_BURROW_PEER_SUBNET` | `10.67.0.0/24` | the peers' addresses; refused if it overlaps the tunnel pool `10.66.0.0/16` |
-| `WARREN_BURROW_PEER_SUBNET_V6` | `fd77:6172:7265::/64` | the same for IPv6 |
-| `WARREN_BURROW_IPV6` | `1` | ask the exit for an IPv6 assignment. IPv6 is opportunistic: it follows the exit and the path budget, and is withdrawn with a fast unreachable under the IPv6 minimum MTU rather than black-holed |
-| `WARREN_BURROW_CLIENT_MTU` | `1280` | the `MTU` line written into client configurations; refused outside 1280 to 1420 |
-| `WARREN_BURROW_PEER_ISOLATION` | `1` | drop peer-to-peer traffic |
-| `WARREN_BURROW_HANDSHAKE_RATE` | `200` | threshold of the shared cookie limiter |
-| `WARREN_BURROW_HEALTH_PEERS` | `1` | `0` removes the `/peers` route on a shared host |
-| `WARREN_BURROW_FWMARK` (Linux) / `WARREN_BURROW_BIND_IF` (macOS, Windows) | unset | carrier-socket bypass, the supported recipe for a peer on the gateway host itself |
-| `WARREN_BURROW_NAT_UDP_TIMEOUT`, `_UDP_INITIAL_TIMEOUT`, `_TCP_TIMEOUT`, `_TCP_SYN_TIMEOUT`, `_TCP_CLOSING_TIMEOUT`, `_ICMP_TIMEOUT` | RFC-derived | NAT expiry, in seconds |
-| `WARREN_BURROW_NAT_PER_PEER_MAPPINGS`, `_PER_PEER_IDENTIFIERS` | | per-peer caps, so one peer cannot exhaust the shared table |
+| `WARREN_BOLTHOLE_LISTEN` | `127.0.0.1:51820` | comma-separated UDP binds, one socket per entry |
+| `WARREN_BOLTHOLE_LAN` | `0` | must be `1` to bind anything but loopback. The refusal states who can then reach the gateway, and where the obfuscation boundary is |
+| `WARREN_BOLTHOLE_ENDPOINT` | detected on a LAN gateway, `127.0.0.1:<port>` otherwise | the `Endpoint` written into client configurations. Detection uses the primary address of the default-route interface (a connected UDP socket, no packet sent) and refuses a loopback result on a LAN gateway |
+| `WARREN_BOLTHOLE_PEERS` | `1` | how many peers a first run generates |
+| `WARREN_BOLTHOLE_STATE_DIR` | `/var/lib/warren-bolthole` as root, else `$XDG_STATE_HOME/warren-bolthole`, `~/Library/Application Support/warren-bolthole` or `%LOCALAPPDATA%\warren-bolthole` | where the configuration, the client files and the admin token live; created `0700`, every file `0600` |
+| `WARREN_BOLTHOLE_CONF` | `<state>/bolthole.conf` | the gateway-side configuration; refused unless it is mode 0600 on unix |
+| `WARREN_BOLTHOLE_PEER_SUBNET` | `10.67.0.0/24` | the peers' addresses; refused if it overlaps the tunnel pool `10.66.0.0/16` |
+| `WARREN_BOLTHOLE_PEER_SUBNET_V6` | `fd77:6172:7265::/64` | the same for IPv6 |
+| `WARREN_BOLTHOLE_IPV6` | `1` | ask the exit for an IPv6 assignment. IPv6 is opportunistic: it follows the exit and the path budget, and is withdrawn with a fast unreachable under the IPv6 minimum MTU rather than black-holed |
+| `WARREN_BOLTHOLE_CLIENT_MTU` | `1280` | the `MTU` line written into client configurations; refused outside 1280 to 1420 |
+| `WARREN_BOLTHOLE_PEER_ISOLATION` | `1` | drop peer-to-peer traffic |
+| `WARREN_BOLTHOLE_HANDSHAKE_RATE` | `200` | threshold of the shared cookie limiter |
+| `WARREN_BOLTHOLE_HEALTH_PEERS` | `1` | `0` removes the `/peers` route on a shared host |
+| `WARREN_BOLTHOLE_FWMARK` (Linux) / `WARREN_BOLTHOLE_BIND_IF` (macOS, Windows) | unset | carrier-socket bypass, the supported recipe for a peer on the gateway host itself |
+| `WARREN_BOLTHOLE_NAT_UDP_TIMEOUT`, `_UDP_INITIAL_TIMEOUT`, `_TCP_TIMEOUT`, `_TCP_SYN_TIMEOUT`, `_TCP_CLOSING_TIMEOUT`, `_ICMP_TIMEOUT` | RFC-derived | NAT expiry, in seconds |
+| `WARREN_BOLTHOLE_NAT_PER_PEER_MAPPINGS`, `_PER_PEER_IDENTIFIERS` | | per-peer caps, so one peer cannot exhaust the shared table |
 
 Key material is never on argv, never in the environment and never logged: the
 gateway private key, the peer public keys and the preshared keys live in
-`burrow.conf` alone, and the startup line carries an 8-character key prefix.
+`bolthole.conf` alone, and the startup line carries an 8-character key prefix.
 
 ## Health and admin
 
@@ -127,13 +127,13 @@ gateway private key, the peer public keys and the preshared keys live in
   MLD reports and router solicitations any peer's own link-local address emits
   at interface bring-up are refused by the same rule under
   `link_local_source`, so a `spoofed_source` that moves is worth reading.
-- `/peers`: per-peer labels and counters (`WARREN_BURROW_HEALTH_PEERS=0`
+- `/peers`: per-peer labels and counters (`WARREN_BOLTHOLE_HEALTH_PEERS=0`
   removes it). Never a peer's remote address.
 - `POST /admin/reload`, `POST /admin/reset-peer/<label>`: served only when the
   health listener is on a loopback address, behind
   `Authorization: Bearer <token>` where the token is `<state>/admin.token`,
-  written 0600 and regenerated at every start. `warren-burrow reload` and
-  `warren-burrow reset-peer LABEL` are the callers; `add-peer` and
+  written 0600 and regenerated at every start. `warren-bolthole reload` and
+  `warren-bolthole reset-peer LABEL` are the callers; `add-peer` and
   `remove-peer` reload the running daemon themselves. On unix `SIGHUP` also
   reloads, and it is the only way when the health listener is off.
 

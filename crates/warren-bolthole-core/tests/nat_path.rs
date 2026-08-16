@@ -11,7 +11,7 @@
 //! cases are `#[ignore]`d and the operator runs them deliberately.
 //!
 //! ```text
-//! cargo test -p warren-burrow-core --release --test nat_path -- --ignored --nocapture
+//! cargo test -p warren-bolthole-core --release --test nat_path -- --ignored --nocapture
 //! ```
 //!
 //! A debug build measures the borrow checks and the unelided copies, not the
@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519;
 use ip_network::IpNetwork;
-use warren_burrow_core::{
+use warren_bolthole_core::{
     EpochId, ExitId, GatewayConf, GatewayKey, Inbound, Napt, NatConfig, PeerConf, PeerLabel,
     PeerPlan, PeerPublicKey, PresharedKey, Responder, ResponderOptions, ScratchBuf,
 };
@@ -177,11 +177,11 @@ impl Bench {
 /// assertion there would report the fleet's load as a datapath regression. CI
 /// runs the ratios below instead, which are machine-independent, and the number
 /// the design's gate wants is produced by a deliberate run:
-/// `WARREN_BURROW_BENCH_FLOOR=1 cargo test --release ... -- --ignored`.
+/// `WARREN_BOLTHOLE_BENCH_FLOOR=1 cargo test --release ... -- --ignored`.
 fn measured(name: &str, packets: u32, elapsed: Duration) -> f64 {
     let pps = f64::from(packets) / elapsed.as_secs_f64();
     println!("{name}: {pps:.0} packets per second ({packets} in {elapsed:?})");
-    if cfg!(debug_assertions) || std::env::var_os("WARREN_BURROW_BENCH_FLOOR").is_none() {
+    if cfg!(debug_assertions) || std::env::var_os("WARREN_BOLTHOLE_BENCH_FLOOR").is_none() {
         return pps;
     }
     assert!(

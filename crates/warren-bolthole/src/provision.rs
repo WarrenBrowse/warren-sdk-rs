@@ -12,7 +12,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use ip_network::IpNetwork;
-use warren_burrow_core::{
+use warren_bolthole_core::{
     ClientConf, ConfError, GatewayConf, GatewayKey, LabelError, PeerConf, PeerLabel, PlanError,
     PresharedKey, parse_gateway_conf, render_client_conf, render_gateway_conf, render_gluetun_env,
 };
@@ -32,7 +32,7 @@ pub enum ProvisionError {
     /// The state directory holds something else, and is never clobbered.
     #[error(
         "the state directory is not empty and holds no gateway configuration: refusing to write \
-         into it. Point WARREN_BURROW_STATE_DIR somewhere else, or empty it"
+         into it. Point WARREN_BOLTHOLE_STATE_DIR somewhere else, or empty it"
     )]
     StateDirNotEmpty,
     /// A configuration is already there.
@@ -55,13 +55,13 @@ pub enum ProvisionError {
     Conf(#[from] ConfError),
     /// No endpoint could be written into the client configurations.
     #[error(
-        "could not detect an address peers can reach this gateway at: set WARREN_BURROW_ENDPOINT"
+        "could not detect an address peers can reach this gateway at: set WARREN_BOLTHOLE_ENDPOINT"
     )]
     EndpointUnknown,
     /// A LAN gateway was about to hand out an endpoint nobody can reach.
     #[error(
-        "the detected endpoint is a loopback address while WARREN_BURROW_LAN=1: set \
-         WARREN_BURROW_ENDPOINT to the address peers reach this host at"
+        "the detected endpoint is a loopback address while WARREN_BOLTHOLE_LAN=1: set \
+         WARREN_BOLTHOLE_ENDPOINT to the address peers reach this host at"
     )]
     LoopbackEndpoint,
     /// No daemon has written an admin token, so there is nothing to talk to.
@@ -133,7 +133,7 @@ pub fn load_conf(env: &GatewayEnv) -> Result<GatewayConf, ProvisionError> {
 /// when it does not parse or breaks a rule.
 pub fn load_conf_from(
     path: &Path,
-    plan: &warren_burrow_core::PeerPlan,
+    plan: &warren_bolthole_core::PeerPlan,
 ) -> Result<GatewayConf, ProvisionError> {
     let text =
         Zeroizing::new(
@@ -355,7 +355,7 @@ fn build_peer(
     env: &GatewayEnv,
     label: &PeerLabel,
     index: u32,
-    gateway_public: warren_burrow_core::PeerPublicKey,
+    gateway_public: warren_bolthole_core::PeerPublicKey,
     endpoint: SocketAddr,
     options: &PeerOptions,
 ) -> Result<GeneratedPeer, ProvisionError> {
@@ -439,11 +439,11 @@ fn write_readme(env: &GatewayEnv, written: &[PeerLabel]) -> Result<(), Provision
          its preshared key, and they are kept nowhere else: whoever holds one can join this \n\
          gateway. Retrieve one with:\n\
          \n\
-             warren-burrow show {first}\n\
+             warren-bolthole show {first}\n\
          \n\
          In a container:\n\
          \n\
-             docker exec <container> warren-burrow show {first}\n\
+             docker exec <container> warren-bolthole show {first}\n\
          \n\
          Three things to know about what this gateway is.\n\
          \n\
@@ -511,7 +511,7 @@ fn state_dir_has_other_files(env: &GatewayEnv) -> Result<bool, ProvisionError> {
         return Ok(false);
     }
     let conf_name = env.conf_path.file_name().map_or_else(
-        || "burrow.conf".to_owned(),
+        || "bolthole.conf".to_owned(),
         |n| n.to_string_lossy().into_owned(),
     );
     let entries = std::fs::read_dir(dir).map_err(|source| ProvisionError::Io {
@@ -585,7 +585,7 @@ mod tests {
         let mut all: Vec<(String, String)> = vec![
             ("WARREN_MNEMONIC".to_owned(), "m".to_owned()),
             (
-                "WARREN_BURROW_STATE_DIR".to_owned(),
+                "WARREN_BOLTHOLE_STATE_DIR".to_owned(),
                 dir.display().to_string(),
             ),
         ];
@@ -606,7 +606,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "warren-burrow-{}-{name}-{:?}",
+            "warren-bolthole-{}-{name}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -625,7 +625,7 @@ mod tests {
     #[test]
     fn a_first_run_writes_every_file_private_and_atomically() {
         let dir = temp_dir("first-run");
-        let env = env_for(&dir, &[("WARREN_BURROW_PEERS", "2")]);
+        let env = env_for(&dir, &[("WARREN_BOLTHOLE_PEERS", "2")]);
 
         let out = init(&env, &InitOptions::default()).expect("an empty state dir provisions");
 
@@ -656,7 +656,7 @@ mod tests {
             assert_eq!(mode_of(&dir), 0o700, "the state directory is private too");
         }
         let readme = std::fs::read_to_string(dir.join("README.txt")).expect("a README");
-        assert!(readme.contains("warren-burrow show peer2"), "{readme}");
+        assert!(readme.contains("warren-bolthole show peer2"), "{readme}");
         assert!(readme.contains("ARE the credentials"), "{readme}");
         assert!(
             readme.contains("obfuscation begin AT this gateway"),
@@ -718,7 +718,7 @@ mod tests {
             .filter(|name| name.contains(".bak-"))
             .collect();
         assert!(
-            backups.iter().any(|n| n.starts_with("burrow.")),
+            backups.iter().any(|n| n.starts_with("bolthole.")),
             "the previous configuration must be kept, not destroyed: {backups:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -792,7 +792,7 @@ mod tests {
     #[test]
     fn an_excluded_lan_and_a_v4_only_host_shape_the_client_lines() {
         let dir = temp_dir("shaped");
-        let env = env_for(&dir, &[("WARREN_BURROW_PEERS", "1")]);
+        let env = env_for(&dir, &[("WARREN_BOLTHOLE_PEERS", "1")]);
         init(
             &env,
             &InitOptions {
@@ -856,7 +856,7 @@ mod tests {
             "127.0.0.1:51820".parse().unwrap()
         );
 
-        let explicit = env_for(&dir, &[("WARREN_BURROW_ENDPOINT", "192.168.1.10:51820")]);
+        let explicit = env_for(&dir, &[("WARREN_BOLTHOLE_ENDPOINT", "192.168.1.10:51820")]);
         assert_eq!(
             resolve_endpoint(&explicit).unwrap(),
             "192.168.1.10:51820".parse().unwrap(),
@@ -873,8 +873,8 @@ mod tests {
         let env = env_for(
             &dir,
             &[
-                ("WARREN_BURROW_LAN", "1"),
-                ("WARREN_BURROW_LISTEN", "0.0.0.0:51820"),
+                ("WARREN_BOLTHOLE_LAN", "1"),
+                ("WARREN_BOLTHOLE_LISTEN", "0.0.0.0:51820"),
             ],
         );
 
@@ -902,7 +902,7 @@ mod tests {
         let env = env_for(
             &dir,
             &[(
-                "WARREN_BURROW_CONF",
+                "WARREN_BOLTHOLE_CONF",
                 &dir.join("gateway.conf").display().to_string(),
             )],
         );
@@ -949,7 +949,7 @@ mod tests {
     #[test]
     fn a_written_configuration_parses_back_into_the_same_peers() {
         let dir = temp_dir("round-trip");
-        let env = env_for(&dir, &[("WARREN_BURROW_PEERS", "3")]);
+        let env = env_for(&dir, &[("WARREN_BOLTHOLE_PEERS", "3")]);
         let written = init(&env, &InitOptions::default()).expect("the first run");
 
         let read = load_conf(&env).expect("the file parses");

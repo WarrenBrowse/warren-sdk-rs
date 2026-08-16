@@ -8,7 +8,7 @@
 //! the tunnel (the exit refuses any other source), and carries it over the
 //! same supervised, self-healing datapath the SDK gives every other client.
 //!
-//! What runs where: [`warren_burrow_core`] is the packet logic, with no socket
+//! What runs where: [`warren_bolthole_core`] is the packet logic, with no socket
 //! and no clock of its own; this crate is the async shell that owns the
 //! sockets, the tunnel and the timers.
 //!

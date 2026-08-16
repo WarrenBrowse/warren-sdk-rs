@@ -3603,7 +3603,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "warren-burrow"
+name = "warren-bolthole"
 version = "0.0.1"
 dependencies = [
  "anyhow",
@@ -3615,14 +3615,14 @@ dependencies = [
  "rand 0.8.6",
  "thiserror",
  "tokio",
- "warren-burrow-core",
+ "warren-bolthole-core",
  "warren-headless",
  "warren-sdk",
  "zeroize",
 ]
 
 [[package]]
-name = "warren-burrow-core"
+name = "warren-bolthole-core"
 version = "0.0.1"
 dependencies = [
  "base64",

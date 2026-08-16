@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use warren_burrow_core::{
+use warren_bolthole_core::{
     ConfError, CoreError, DropReason, Encapsulated, GatewayConf, Inbound, MapProto, Napt,
     NatConfig, PeerId, PeerLabel, PeerPlan, PeerPublicKey, PeerStatus, ReloadReport, Responder,
     ResponderOptions, ScratchBuf, StaticDnat, UnknownPeer, V6State,
@@ -184,9 +184,9 @@ pub struct GatewaySnapshot {
     /// How many NAT mappings are live.
     pub nat_mappings: usize,
     /// The responder's counters.
-    pub responder: warren_burrow_core::ResponderSnapshot,
+    pub responder: warren_bolthole_core::ResponderSnapshot,
     /// The NAT's counters.
-    pub nat: warren_burrow_core::Snapshot,
+    pub nat: warren_bolthole_core::Snapshot,
     /// The shell's own counters.
     pub device: DeviceSnapshot,
 }
@@ -585,8 +585,10 @@ impl EpochPacketDevice for GatewayDevice {
         {
             let mut nat = self.inner.nat.lock();
             nat.set_external(
-                warren_burrow_core::EpochId {
-                    exit: warren_burrow_core::ExitId::from_bytes(*addressing.epoch.exit.as_bytes()),
+                warren_bolthole_core::EpochId {
+                    exit: warren_bolthole_core::ExitId::from_bytes(
+                        *addressing.epoch.exit.as_bytes(),
+                    ),
                     generation,
                 },
                 addressing.ipv4,
@@ -1090,7 +1092,7 @@ mod tests {
     use boringtun::noise::{Tunn, TunnResult};
     use boringtun::x25519;
     use ip_network::IpNetwork;
-    use warren_burrow_core::{
+    use warren_bolthole_core::{
         GatewayKey, PeerConf, PeerPublicKey, PresharedKey, PresharedKey as Psk, parse_ip,
         read_ports,
     };

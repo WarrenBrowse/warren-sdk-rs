@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use warren_burrow_core::{PeerStatus, V6State};
+use warren_bolthole_core::{PeerStatus, V6State};
 use warren_headless::health::{ExtraRoutes, Request, RouteReply};
 use warren_sdk::ConnectionState;
 use warren_sdk::EpochEnd;
@@ -298,7 +298,7 @@ mod tests {
     use std::sync::Arc;
 
     use ip_network::IpNetwork;
-    use warren_burrow_core::{
+    use warren_bolthole_core::{
         GatewayConf, GatewayKey, PeerConf, PeerLabel, PeerPlan, PeerPublicKey, PresharedKey,
     };
 
@@ -419,13 +419,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_admin_routes_answer_over_the_health_listener_and_only_with_the_token() {
         let dir = std::env::temp_dir().join(format!(
-            "warren-burrow-health-admin-{}-{:?}",
+            "warren-bolthole-health-admin-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let map: std::collections::HashMap<String, String> = [(
-            "WARREN_BURROW_STATE_DIR".to_owned(),
+            "WARREN_BOLTHOLE_STATE_DIR".to_owned(),
             dir.display().to_string(),
         )]
         .into_iter()

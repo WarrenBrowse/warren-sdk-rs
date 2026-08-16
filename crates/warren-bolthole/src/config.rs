@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ip_network::IpNetwork;
-use warren_burrow_core::{
+use warren_bolthole_core::{
     CONTROL_RANGE_END, CONTROL_RANGE_START, DEFAULT_HANDSHAKE_RATE, NatConfig, PeerPlan,
     TUNNEL_GATEWAY_V4,
 };
@@ -48,7 +48,7 @@ pub enum GatewayConfigError {
     Env(#[from] ConfigError),
     /// A non-loopback bind was asked for without the explicit opt-in.
     #[error(
-        "WARREN_BURROW_LISTEN binds an address other than loopback: set WARREN_BURROW_LAN=1 to accept it. \
+        "WARREN_BOLTHOLE_LISTEN binds an address other than loopback: set WARREN_BOLTHOLE_LAN=1 to accept it. \
          A LAN-bound gateway is reachable by every device on that network, and any of them holding a client \
          configuration rides this account's Warren session: one assigned address at the exit, one abuse \
          identity, one device slot, shared bandwidth and no per-peer accounting. \
@@ -65,10 +65,10 @@ pub enum GatewayConfigError {
     ConfPermissions,
     /// The peer address plan is unusable.
     #[error("invalid peer subnet")]
-    Plan(#[from] warren_burrow_core::PlanError),
+    Plan(#[from] warren_bolthole_core::PlanError),
     /// An explicit endpoint that no peer on the LAN could ever reach.
     #[error(
-        "WARREN_BURROW_ENDPOINT is a loopback address while WARREN_BURROW_LAN=1: no other device can \
+        "WARREN_BOLTHOLE_ENDPOINT is a loopback address while WARREN_BOLTHOLE_LAN=1: no other device can \
          reach it, so every client configuration written with it would be dead on arrival"
     )]
     LoopbackEndpoint,
@@ -92,14 +92,14 @@ pub enum GatewayConfigError {
     ForwardTargetMissing,
     /// The MTU written into client configurations is unusable.
     #[error(
-        "WARREN_BURROW_CLIENT_MTU must be between {MIN_CLIENT_MTU} and {MAX_CLIENT_MTU}: under the \
+        "WARREN_BOLTHOLE_CLIENT_MTU must be between {MIN_CLIENT_MTU} and {MAX_CLIENT_MTU}: under the \
          IPv6 minimum a peer fragments rather than shrinking its packets and this gateway drops \
          fragments, and above it the tunnel stops being the binding constraint while the peer's \
          own path becomes one"
     )]
     ClientMtu,
     /// The state directory could not be resolved from the environment.
-    #[error("could not resolve a state directory: set WARREN_BURROW_STATE_DIR")]
+    #[error("could not resolve a state directory: set WARREN_BOLTHOLE_STATE_DIR")]
     NoStateDir,
 }
 
@@ -219,25 +219,25 @@ pub fn load(
     let connect_timeout =
         env::parse_connect_timeout(get("WARREN_CONNECT_TIMEOUT"), DEFAULT_CONNECT_TIMEOUT_SECS)?;
 
-    let lan = parse_flag(&get, "WARREN_BURROW_LAN", false)?;
-    let listen = parse_listen(get("WARREN_BURROW_LISTEN"))?;
+    let lan = parse_flag(&get, "WARREN_BOLTHOLE_LAN", false)?;
+    let listen = parse_listen(get("WARREN_BOLTHOLE_LISTEN"))?;
     if !lan && listen.iter().any(|a| !a.ip().is_loopback()) {
         return Err(GatewayConfigError::LanNotAllowed);
     }
 
     let endpoint =
-        env::parse_optional_addr(get("WARREN_BURROW_ENDPOINT"), "WARREN_BURROW_ENDPOINT")?;
+        env::parse_optional_addr(get("WARREN_BOLTHOLE_ENDPOINT"), "WARREN_BOLTHOLE_ENDPOINT")?;
     if lan && endpoint.is_some_and(|e| e.ip().is_loopback()) {
         return Err(GatewayConfigError::LoopbackEndpoint);
     }
 
-    let state_dir = match get("WARREN_BURROW_STATE_DIR").filter(|v| !v.is_empty()) {
+    let state_dir = match get("WARREN_BOLTHOLE_STATE_DIR").filter(|v| !v.is_empty()) {
         Some(dir) => PathBuf::from(dir),
         None => default_state_dir(&get, is_root)?,
     };
-    let conf_path = match get("WARREN_BURROW_CONF").filter(|v| !v.is_empty()) {
+    let conf_path = match get("WARREN_BOLTHOLE_CONF").filter(|v| !v.is_empty()) {
         Some(path) => PathBuf::from(path),
-        None => state_dir.join("burrow.conf"),
+        None => state_dir.join("bolthole.conf"),
     };
     // A file nobody has written yet has no mode to refuse; a first run creates
     // it 0600 itself.
@@ -249,8 +249,12 @@ pub fn load(
     }
 
     let plan = PeerPlan::new(
-        parse_network(&get, "WARREN_BURROW_PEER_SUBNET", "10.67.0.0/24")?,
-        parse_network(&get, "WARREN_BURROW_PEER_SUBNET_V6", "fd77:6172:7265::/64")?,
+        parse_network(&get, "WARREN_BOLTHOLE_PEER_SUBNET", "10.67.0.0/24")?,
+        parse_network(
+            &get,
+            "WARREN_BOLTHOLE_PEER_SUBNET_V6",
+            "fd77:6172:7265::/64",
+        )?,
     )?;
 
     let health_listen =
@@ -272,7 +276,7 @@ pub fn load(
         }
     };
 
-    let client_mtu = parse_number(&get, "WARREN_BURROW_CLIENT_MTU", DEFAULT_CLIENT_MTU)?;
+    let client_mtu = parse_number(&get, "WARREN_BOLTHOLE_CLIENT_MTU", DEFAULT_CLIENT_MTU)?;
     if !(MIN_CLIENT_MTU..=MAX_CLIENT_MTU).contains(&client_mtu) {
         return Err(GatewayConfigError::ClientMtu);
     }
@@ -290,16 +294,20 @@ pub fn load(
         listen,
         lan,
         endpoint,
-        peers: parse_number(&get, "WARREN_BURROW_PEERS", 1)?,
+        peers: parse_number(&get, "WARREN_BOLTHOLE_PEERS", 1)?,
         state_dir,
         conf_path,
         plan,
-        ipv6: parse_flag(&get, "WARREN_BURROW_IPV6", true)?,
+        ipv6: parse_flag(&get, "WARREN_BOLTHOLE_IPV6", true)?,
         client_mtu,
-        peer_isolation: parse_flag(&get, "WARREN_BURROW_PEER_ISOLATION", true)?,
-        handshake_rate: parse_number(&get, "WARREN_BURROW_HANDSHAKE_RATE", DEFAULT_HANDSHAKE_RATE)?,
+        peer_isolation: parse_flag(&get, "WARREN_BOLTHOLE_PEER_ISOLATION", true)?,
+        handshake_rate: parse_number(
+            &get,
+            "WARREN_BOLTHOLE_HANDSHAKE_RATE",
+            DEFAULT_HANDSHAKE_RATE,
+        )?,
         health_listen,
-        health_peers: parse_flag(&get, "WARREN_BURROW_HEALTH_PEERS", true)?,
+        health_peers: parse_flag(&get, "WARREN_BOLTHOLE_HEALTH_PEERS", true)?,
         dns_server,
         dns_override,
         forward,
@@ -323,7 +331,7 @@ fn parse_listen(raw: Option<String>) -> Result<Vec<SocketAddr>, ConfigError> {
     let raw = raw.filter(|v| !v.trim().is_empty());
     let raw = raw.as_deref().unwrap_or(DEFAULT_LISTEN);
     raw.split(',')
-        .map(|item| env::parse_addr(item.trim(), "WARREN_BURROW_LISTEN"))
+        .map(|item| env::parse_addr(item.trim(), "WARREN_BOLTHOLE_LISTEN"))
         .collect()
 }
 
@@ -391,20 +399,28 @@ fn parse_nat(get: &impl Fn(&str) -> Option<String>) -> Result<NatConfig, ConfigE
     Ok(NatConfig {
         per_peer_mappings: parse_number(
             get,
-            "WARREN_BURROW_NAT_PER_PEER_MAPPINGS",
+            "WARREN_BOLTHOLE_NAT_PER_PEER_MAPPINGS",
             d.per_peer_mappings,
         )?,
         per_peer_identifiers: parse_number(
             get,
-            "WARREN_BURROW_NAT_PER_PEER_IDENTIFIERS",
+            "WARREN_BOLTHOLE_NAT_PER_PEER_IDENTIFIERS",
             d.per_peer_identifiers,
         )?,
-        udp_initial: parse_seconds(get, "WARREN_BURROW_NAT_UDP_INITIAL_TIMEOUT", d.udp_initial)?,
-        udp_established: parse_seconds(get, "WARREN_BURROW_NAT_UDP_TIMEOUT", d.udp_established)?,
-        tcp_syn: parse_seconds(get, "WARREN_BURROW_NAT_TCP_SYN_TIMEOUT", d.tcp_syn)?,
-        tcp_established: parse_seconds(get, "WARREN_BURROW_NAT_TCP_TIMEOUT", d.tcp_established)?,
-        tcp_closing: parse_seconds(get, "WARREN_BURROW_NAT_TCP_CLOSING_TIMEOUT", d.tcp_closing)?,
-        icmp: parse_seconds(get, "WARREN_BURROW_NAT_ICMP_TIMEOUT", d.icmp)?,
+        udp_initial: parse_seconds(
+            get,
+            "WARREN_BOLTHOLE_NAT_UDP_INITIAL_TIMEOUT",
+            d.udp_initial,
+        )?,
+        udp_established: parse_seconds(get, "WARREN_BOLTHOLE_NAT_UDP_TIMEOUT", d.udp_established)?,
+        tcp_syn: parse_seconds(get, "WARREN_BOLTHOLE_NAT_TCP_SYN_TIMEOUT", d.tcp_syn)?,
+        tcp_established: parse_seconds(get, "WARREN_BOLTHOLE_NAT_TCP_TIMEOUT", d.tcp_established)?,
+        tcp_closing: parse_seconds(
+            get,
+            "WARREN_BOLTHOLE_NAT_TCP_CLOSING_TIMEOUT",
+            d.tcp_closing,
+        )?,
+        icmp: parse_seconds(get, "WARREN_BOLTHOLE_NAT_ICMP_TIMEOUT", d.icmp)?,
         ..d
     })
 }
@@ -414,16 +430,16 @@ fn parse_nat(get: &impl Fn(&str) -> Option<String>) -> Result<NatConfig, ConfigE
 fn parse_bypass(
     get: &impl Fn(&str) -> Option<String>,
 ) -> Result<Option<SocketBypass>, ConfigError> {
-    if let Some(mark) = get("WARREN_BURROW_FWMARK").filter(|v| !v.is_empty()) {
+    if let Some(mark) = get("WARREN_BOLTHOLE_FWMARK").filter(|v| !v.is_empty()) {
         let mark = parse_u32(&mark).ok_or(ConfigError::Invalid {
-            var: "WARREN_BURROW_FWMARK",
+            var: "WARREN_BOLTHOLE_FWMARK",
             expected: "a firewall mark (decimal, or 0x-prefixed hex)",
         })?;
         return Ok(Some(SocketBypass::Fwmark(mark)));
     }
-    if let Some(index) = get("WARREN_BURROW_BIND_IF").filter(|v| !v.is_empty()) {
+    if let Some(index) = get("WARREN_BOLTHOLE_BIND_IF").filter(|v| !v.is_empty()) {
         let index = index.parse::<u32>().map_err(|_| ConfigError::Invalid {
-            var: "WARREN_BURROW_BIND_IF",
+            var: "WARREN_BOLTHOLE_BIND_IF",
             expected: "an interface index",
         })?;
         return Ok(Some(if cfg!(windows) {
@@ -476,16 +492,16 @@ fn default_state_dir(
     is_root: bool,
 ) -> Result<PathBuf, GatewayConfigError> {
     if cfg!(unix) && is_root {
-        return Ok(PathBuf::from("/var/lib/warren-burrow"));
+        return Ok(PathBuf::from("/var/lib/warren-bolthole"));
     }
     if cfg!(windows) {
         return get("LOCALAPPDATA")
             .filter(|v| !v.is_empty())
-            .map(|dir| PathBuf::from(dir).join("warren-burrow"))
+            .map(|dir| PathBuf::from(dir).join("warren-bolthole"))
             .ok_or(GatewayConfigError::NoStateDir);
     }
     if let Some(xdg) = get("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(xdg).join("warren-burrow"));
+        return Ok(PathBuf::from(xdg).join("warren-bolthole"));
     }
     let home = get("HOME")
         .filter(|v| !v.is_empty())
@@ -494,9 +510,9 @@ fn default_state_dir(
     Ok(if cfg!(target_os = "macos") {
         home.join("Library")
             .join("Application Support")
-            .join("warren-burrow")
+            .join("warren-bolthole")
     } else {
-        home.join(".local").join("state").join("warren-burrow")
+        home.join(".local").join("state").join("warren-bolthole")
     })
 }
 
@@ -526,7 +542,7 @@ mod tests {
     fn with(pairs: &[(&str, &str)]) -> Result<GatewayEnv, GatewayConfigError> {
         let mut all = vec![
             ("WARREN_MNEMONIC", "abandon ability able"),
-            ("WARREN_BURROW_STATE_DIR", "/tmp/burrow-state"),
+            ("WARREN_BOLTHOLE_STATE_DIR", "/tmp/bolthole-state"),
         ];
         all.extend_from_slice(pairs);
         load(env(&all), no_file, no_mode, false)
@@ -555,7 +571,7 @@ mod tests {
         assert!(!cfg.dns_override, "the default resolver is the exit's own");
         assert_eq!(
             cfg.conf_path,
-            PathBuf::from("/tmp/burrow-state/burrow.conf")
+            PathBuf::from("/tmp/bolthole-state/bolthole.conf")
         );
         assert_eq!(cfg.plan, PeerPlan::default());
         assert!(cfg.forward.is_none());
@@ -567,7 +583,7 @@ mod tests {
     /// in the refusal, because the refusal is where an operator reads them.
     #[test]
     fn a_lan_bind_is_refused_until_the_operator_opts_in() {
-        let err = with(&[("WARREN_BURROW_LISTEN", "0.0.0.0:51820")])
+        let err = with(&[("WARREN_BOLTHOLE_LISTEN", "0.0.0.0:51820")])
             .expect_err("a non-loopback bind must refuse");
         let message = err.to_string();
         assert!(matches!(err, GatewayConfigError::LanNotAllowed));
@@ -581,8 +597,8 @@ mod tests {
         );
 
         let cfg = with(&[
-            ("WARREN_BURROW_LISTEN", "0.0.0.0:51820"),
-            ("WARREN_BURROW_LAN", "1"),
+            ("WARREN_BOLTHOLE_LISTEN", "0.0.0.0:51820"),
+            ("WARREN_BOLTHOLE_LAN", "1"),
         ])
         .expect("the opt-in accepts it");
         assert!(cfg.lan);
@@ -591,8 +607,8 @@ mod tests {
     #[test]
     fn several_binds_become_several_sockets() {
         let cfg = with(&[
-            ("WARREN_BURROW_LISTEN", "127.0.0.1:51820, 127.0.0.2:51821"),
-            ("WARREN_BURROW_LAN", "0"),
+            ("WARREN_BOLTHOLE_LISTEN", "127.0.0.1:51820, 127.0.0.2:51821"),
+            ("WARREN_BOLTHOLE_LAN", "0"),
         ])
         .expect("two loopback binds need no opt-in");
         assert_eq!(
@@ -603,9 +619,9 @@ mod tests {
             ]
         );
         assert!(matches!(
-            with(&[("WARREN_BURROW_LISTEN", "51820")]),
+            with(&[("WARREN_BOLTHOLE_LISTEN", "51820")]),
             Err(GatewayConfigError::Env(ConfigError::Invalid {
-                var: "WARREN_BURROW_LISTEN",
+                var: "WARREN_BOLTHOLE_LISTEN",
                 ..
             }))
         ));
@@ -620,7 +636,7 @@ mod tests {
         let err = load(
             env(&[
                 ("WARREN_MNEMONIC", "m"),
-                ("WARREN_BURROW_STATE_DIR", "/tmp/burrow-state"),
+                ("WARREN_BOLTHOLE_STATE_DIR", "/tmp/bolthole-state"),
             ]),
             no_file,
             readable,
@@ -633,7 +649,7 @@ mod tests {
         load(
             env(&[
                 ("WARREN_MNEMONIC", "m"),
-                ("WARREN_BURROW_STATE_DIR", "/tmp/burrow-state"),
+                ("WARREN_BOLTHOLE_STATE_DIR", "/tmp/bolthole-state"),
             ]),
             no_file,
             private,
@@ -647,21 +663,21 @@ mod tests {
     #[test]
     fn a_peer_subnet_that_meets_the_tunnel_pool_is_refused() {
         for subnet in ["10.66.0.0/24", "10.66.0.0/16", "10.0.0.0/8"] {
-            let err = with(&[("WARREN_BURROW_PEER_SUBNET", subnet)])
+            let err = with(&[("WARREN_BOLTHOLE_PEER_SUBNET", subnet)])
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("peer subnet"), "{subnet}: {err}");
         }
-        with(&[("WARREN_BURROW_PEER_SUBNET", "192.168.9.0/24")])
+        with(&[("WARREN_BOLTHOLE_PEER_SUBNET", "192.168.9.0/24")])
             .expect("a subnet clear of the pool is accepted");
     }
 
     #[test]
     fn a_loopback_endpoint_on_a_lan_gateway_is_refused() {
         let err = with(&[
-            ("WARREN_BURROW_LAN", "1"),
-            ("WARREN_BURROW_LISTEN", "0.0.0.0:51820"),
-            ("WARREN_BURROW_ENDPOINT", "127.0.0.1:51820"),
+            ("WARREN_BOLTHOLE_LAN", "1"),
+            ("WARREN_BOLTHOLE_LISTEN", "0.0.0.0:51820"),
+            ("WARREN_BOLTHOLE_ENDPOINT", "127.0.0.1:51820"),
         ])
         .expect_err("no other device could reach that endpoint");
         assert!(matches!(err, GatewayConfigError::LoopbackEndpoint));
@@ -728,27 +744,27 @@ mod tests {
 
     #[test]
     fn the_carrier_escape_is_spelled_per_platform() {
-        let cfg = with(&[("WARREN_BURROW_FWMARK", "0x1234")]).unwrap();
+        let cfg = with(&[("WARREN_BOLTHOLE_FWMARK", "0x1234")]).unwrap();
         assert_eq!(cfg.socket_bypass, Some(SocketBypass::Fwmark(0x1234)));
-        let cfg = with(&[("WARREN_BURROW_FWMARK", "4660")]).unwrap();
+        let cfg = with(&[("WARREN_BOLTHOLE_FWMARK", "4660")]).unwrap();
         assert_eq!(cfg.socket_bypass, Some(SocketBypass::Fwmark(4660)));
-        let cfg = with(&[("WARREN_BURROW_BIND_IF", "7")]).unwrap();
+        let cfg = with(&[("WARREN_BOLTHOLE_BIND_IF", "7")]).unwrap();
         let expected = if cfg!(windows) {
             SocketBypass::UnicastIf(7)
         } else {
             SocketBypass::BoundIf(7)
         };
         assert_eq!(cfg.socket_bypass, Some(expected));
-        assert!(with(&[("WARREN_BURROW_FWMARK", "mark")]).is_err());
-        assert!(with(&[("WARREN_BURROW_BIND_IF", "eth0")]).is_err());
+        assert!(with(&[("WARREN_BOLTHOLE_FWMARK", "mark")]).is_err());
+        assert!(with(&[("WARREN_BOLTHOLE_BIND_IF", "eth0")]).is_err());
     }
 
     #[test]
     fn the_nat_timeouts_are_operator_tunable_and_refuse_junk() {
         let cfg = with(&[
-            ("WARREN_BURROW_NAT_UDP_TIMEOUT", "45"),
-            ("WARREN_BURROW_NAT_TCP_TIMEOUT", "600"),
-            ("WARREN_BURROW_NAT_PER_PEER_MAPPINGS", "128"),
+            ("WARREN_BOLTHOLE_NAT_UDP_TIMEOUT", "45"),
+            ("WARREN_BOLTHOLE_NAT_TCP_TIMEOUT", "600"),
+            ("WARREN_BOLTHOLE_NAT_PER_PEER_MAPPINGS", "128"),
         ])
         .unwrap();
         assert_eq!(cfg.nat.udp_established, Duration::from_secs(45));
@@ -759,26 +775,26 @@ mod tests {
             NatConfig::default().udp_initial,
             "an untouched knob keeps the RFC floor"
         );
-        assert!(with(&[("WARREN_BURROW_NAT_ICMP_TIMEOUT", "a while")]).is_err());
+        assert!(with(&[("WARREN_BOLTHOLE_NAT_ICMP_TIMEOUT", "a while")]).is_err());
     }
 
     #[test]
     fn flags_take_1_and_0_and_refuse_anything_else() {
-        assert!(!with(&[("WARREN_BURROW_IPV6", "0")]).unwrap().ipv6);
+        assert!(!with(&[("WARREN_BOLTHOLE_IPV6", "0")]).unwrap().ipv6);
         assert!(
-            !with(&[("WARREN_BURROW_PEER_ISOLATION", "false")])
+            !with(&[("WARREN_BOLTHOLE_PEER_ISOLATION", "false")])
                 .unwrap()
                 .peer_isolation
         );
         assert!(
-            !with(&[("WARREN_BURROW_HEALTH_PEERS", "0")])
+            !with(&[("WARREN_BOLTHOLE_HEALTH_PEERS", "0")])
                 .unwrap()
                 .health_peers
         );
         assert!(matches!(
-            with(&[("WARREN_BURROW_IPV6", "yes")]),
+            with(&[("WARREN_BOLTHOLE_IPV6", "yes")]),
             Err(GatewayConfigError::Env(ConfigError::Invalid {
-                var: "WARREN_BURROW_IPV6",
+                var: "WARREN_BOLTHOLE_IPV6",
                 ..
             }))
         ));
@@ -790,7 +806,7 @@ mod tests {
     #[test]
     fn a_client_mtu_outside_what_a_peer_can_use_is_refused() {
         for mtu in ["0", "68", "1279", "1421", "9000"] {
-            let err = with(&[("WARREN_BURROW_CLIENT_MTU", mtu)])
+            let err = with(&[("WARREN_BOLTHOLE_CLIENT_MTU", mtu)])
                 .expect_err("{mtu} is not a usable client MTU");
             assert!(matches!(err, GatewayConfigError::ClientMtu), "{mtu}: {err}");
             let message = err.to_string();
@@ -801,23 +817,23 @@ mod tests {
         }
         for mtu in ["1280", "1380", "1420"] {
             assert_eq!(
-                with(&[("WARREN_BURROW_CLIENT_MTU", mtu)])
+                with(&[("WARREN_BOLTHOLE_CLIENT_MTU", mtu)])
                     .expect("a usable MTU")
                     .client_mtu,
                 mtu.parse::<u16>().expect("a number")
             );
         }
-        assert!(with(&[("WARREN_BURROW_CLIENT_MTU", "large")]).is_err());
+        assert!(with(&[("WARREN_BOLTHOLE_CLIENT_MTU", "large")]).is_err());
     }
 
     /// The knobs an operator turns when the defaults do not fit their network.
     #[test]
     fn the_peer_plan_the_limiter_and_the_configuration_path_follow_their_knobs() {
         let cfg = with(&[
-            ("WARREN_BURROW_CONF", "/etc/warren/gateway.conf"),
-            ("WARREN_BURROW_PEER_SUBNET", "192.168.9.0/24"),
-            ("WARREN_BURROW_PEER_SUBNET_V6", "fd00:dead:beef::/64"),
-            ("WARREN_BURROW_HANDSHAKE_RATE", "40"),
+            ("WARREN_BOLTHOLE_CONF", "/etc/warren/gateway.conf"),
+            ("WARREN_BOLTHOLE_PEER_SUBNET", "192.168.9.0/24"),
+            ("WARREN_BOLTHOLE_PEER_SUBNET_V6", "fd00:dead:beef::/64"),
+            ("WARREN_BOLTHOLE_HANDSHAKE_RATE", "40"),
         ])
         .expect("every knob is usable");
         assert_eq!(cfg.conf_path, PathBuf::from("/etc/warren/gateway.conf"));
@@ -829,8 +845,8 @@ mod tests {
                 "fd00:dead:beef::2".parse().expect("a literal address")
             )
         );
-        assert!(with(&[("WARREN_BURROW_PEER_SUBNET_V6", "fd00:dead:beef::")]).is_err());
-        assert!(with(&[("WARREN_BURROW_HANDSHAKE_RATE", "many")]).is_err());
+        assert!(with(&[("WARREN_BOLTHOLE_PEER_SUBNET_V6", "fd00:dead:beef::")]).is_err());
+        assert!(with(&[("WARREN_BOLTHOLE_HANDSHAKE_RATE", "many")]).is_err());
     }
 
     /// The subcommands that only write files never touch the network, so the
@@ -838,7 +854,7 @@ mod tests {
     #[test]
     fn the_recovery_phrase_is_required_only_where_a_tunnel_is_dialed() {
         let cfg = load(
-            env(&[("WARREN_BURROW_STATE_DIR", "/tmp/burrow-state")]),
+            env(&[("WARREN_BOLTHOLE_STATE_DIR", "/tmp/bolthole-state")]),
             no_file,
             no_mode,
             false,
@@ -861,10 +877,10 @@ mod tests {
     fn a_service_running_as_root_keeps_its_state_under_var_lib() {
         let cfg = load(env(&[("WARREN_MNEMONIC", "m")]), no_file, no_mode, true)
             .expect("root needs no HOME");
-        assert_eq!(cfg.state_dir, PathBuf::from("/var/lib/warren-burrow"));
+        assert_eq!(cfg.state_dir, PathBuf::from("/var/lib/warren-bolthole"));
         assert_eq!(
             cfg.clients_dir(),
-            PathBuf::from("/var/lib/warren-burrow/clients")
+            PathBuf::from("/var/lib/warren-bolthole/clients")
         );
     }
 
@@ -881,7 +897,10 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(cfg.state_dir, PathBuf::from("/home/u/.state/warren-burrow"));
+        assert_eq!(
+            cfg.state_dir,
+            PathBuf::from("/home/u/.state/warren-bolthole")
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -896,7 +915,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.state_dir,
-            PathBuf::from("/Users/u/Library/Application Support/warren-burrow")
+            PathBuf::from("/Users/u/Library/Application Support/warren-bolthole")
         );
     }
 

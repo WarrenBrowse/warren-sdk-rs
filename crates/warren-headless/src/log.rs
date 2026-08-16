@@ -4,7 +4,7 @@
 //! binary's own name and nothing that identifies the account, a peer or a
 //! remote address.
 
-/// The name a daemon prefixes its lines with (`warren-proxy`, `warren-burrow`).
+/// The name a daemon prefixes its lines with (`warren-proxy`, `warren-bolthole`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Log(pub &'static str);
 

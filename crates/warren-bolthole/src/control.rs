@@ -10,7 +10,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use warren_burrow_core::{CONTROL_RANGE_END, CONTROL_RANGE_START};
+use warren_bolthole_core::{CONTROL_RANGE_END, CONTROL_RANGE_START};
 use warren_sdk::net::{NetError, RawUdpDemux, RawUdpFlow, UdpOpener};
 
 /// One epoch's control plane.

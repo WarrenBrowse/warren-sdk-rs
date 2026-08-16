@@ -58,7 +58,7 @@ Caused by:
 # of a self-hosted runner lost the .d dep-info files of what it holds, which
 # only a clean recovers.
 expect "a target directory whose dep-info is gone gets a clean" clean \
-	"error: could not parse/generate dep info at: /Users/axiom/actions-runner-2/_work/warren-sdk-rs/warren-sdk-rs/target/debug/deps/warren_burrow-0d4e.d
+	"error: could not parse/generate dep info at: /Users/axiom/actions-runner-2/_work/warren-sdk-rs/warren-sdk-rs/target/debug/deps/warren_bolthole-0d4e.d
 
 Caused by:
   No such file or directory (os error 2)"
@@ -91,12 +91,12 @@ expect "the same, with only the exit code to go on" plain "" 127
 expect "a build killed from outside leaves no signature to grep" plain "" 137
 expect "a build the timeout wrapper fired on" plain "" 124
 expect "a wedge that did manage to print something still retries" plain \
-	"   Compiling warren-burrow-core v0.0.1" 137
+	"   Compiling warren-bolthole-core v0.0.1" 137
 
 echo "real failures (must NOT retry)"
 expect "a compile error is the code's own" "" \
 	"error[E0308]: mismatched types
-  --> crates/warren-burrow/src/run.rs:42:5"
+  --> crates/warren-bolthole/src/run.rs:42:5"
 # Run 31922805535, job "cargo clippy (windows)": a real lint failure that came
 # in the same burst of runs as the spawn flakes.
 expect "a lint failure is the code's own" "" \
@@ -104,13 +104,13 @@ expect "a lint failure is the code's own" "" \
   --> crates\\warren-headless\\src\\hardening.rs:57:9
 error: could not compile \`warren-headless\` (lib test) due to 1 previous error"
 expect "a failing test is not a flake" "" \
-	"        FAIL [   0.031s] warren-burrow-core conf::tests::refuses_overlapping_subnet
+	"        FAIL [   0.031s] warren-bolthole-core conf::tests::refuses_overlapping_subnet
 Summary [   4.512s] 812 tests run: 811 passed, 1 failed"
 # The macOS spawn failure carries this errno, so the errno alone must not be
 # the anchor: a file a test genuinely needs and cannot find reports it too, and
 # retrying that hides a real regression behind three identical failures.
 expect "the macos errno without the spawn marker is a real failure" "" \
-	"thread 'provision::tests::writes_client_files' panicked at crates/warren-burrow/src/provision.rs:120:
+	"thread 'provision::tests::writes_client_files' panicked at crates/warren-bolthole/src/provision.rs:120:
   No such file or directory (os error 2)"
 expect "an empty log retries nothing" "" ""
 

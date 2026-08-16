@@ -112,12 +112,12 @@ forbid_rs "doc49 t79" \
   "crates"
 
 # The epoch identity (ExitId, EpochId, EXIT_ID_LEN) has two definitions on
-# purpose: warren-net is async and warren-burrow-core opens no socket, so the
+# purpose: warren-net is async and warren-bolthole-core opens no socket, so the
 # gateway core cannot depend on it. What must not happen is the two drifting,
 # because the gateway device implements warren-net's per-epoch trait with
-# warren-burrow-core's type and the conversion between them is by field. Pin the
+# warren-bolthole-core's type and the conversion between them is by field. Pin the
 # one thing whose divergence would be silent.
-for epoch_home in "crates/warren-net/src/device.rs" "crates/warren-burrow-core/src/nat.rs"; do
+for epoch_home in "crates/warren-net/src/device.rs" "crates/warren-bolthole-core/src/nat.rs"; do
   require_rs "design L/M" \
     "the epoch identifier length must stay identical in both homes" \
     'pub const EXIT_ID_LEN: usize = 16;' \
@@ -137,7 +137,7 @@ done
 # TunnResult reaches no log), and `anti-refrag:allow` remains the escape hatch.
 forbid_debug_where_boringtun_lives() {
   doc="$1"
-  for file in $(grep -rl 'boringtun' crates/warren-burrow-core/src crates/warren-burrow/src 2>/dev/null); do
+  for file in $(grep -rl 'boringtun' crates/warren-bolthole-core/src crates/warren-bolthole/src 2>/dev/null); do
     cut="$(grep -n '#\[cfg(test)\]' "$file" | head -1 | cut -d: -f1)"
     [ -n "$cut" ] || cut=999999
     out="$(head -n "$((cut - 1))" "$file" \
