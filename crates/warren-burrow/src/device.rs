@@ -48,7 +48,7 @@ const DEFAULT_UPLINK_DEPTH: usize = 2048;
 /// request/response, so this is already a burst.
 const CONTROL_DEPTH: usize = 64;
 
-/// How many datagrams may wait for the peer-facing sockets. A socket whose
+/// How many datagrams may wait for one peer-facing socket. A socket whose
 /// buffer is full makes a send await, and the readers must keep reading while
 /// that happens: this queue is what separates the two.
 const DEFAULT_EGRESS_DEPTH: usize = 1024;
@@ -198,6 +198,22 @@ enum UplinkItem {
     },
 }
 
+/// One socket's outbound queue.
+struct EgressLane {
+    tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    rx: tokio::sync::Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
+}
+
+impl EgressLane {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel(DEFAULT_EGRESS_DEPTH);
+        Self {
+            tx,
+            rx: tokio::sync::Mutex::new(rx),
+        }
+    }
+}
+
 struct Inner {
     responder: Mutex<Responder>,
     nat: Mutex<Napt>,
@@ -210,10 +226,11 @@ struct Inner {
     /// still parked on it can never keep the live epoch's packets waiting.
     uplink_tx: Mutex<Option<mpsc::Sender<UplinkItem>>>,
     uplink_depth: usize,
-    /// Datagrams waiting for a socket. Queued rather than awaited, so a socket
-    /// whose buffer is full never stops a reader from serving other peers.
-    egress_tx: mpsc::Sender<(usize, SocketAddr, Vec<u8>)>,
-    egress_rx: tokio::sync::Mutex<mpsc::Receiver<(usize, SocketAddr, Vec<u8>)>>,
+    /// Datagrams waiting for each socket, one queue and one writer per socket.
+    /// Queued rather than awaited, so a socket whose buffer is full never stops
+    /// a reader from serving other peers, and never holds another socket's
+    /// answers behind its own.
+    egress: Vec<EgressLane>,
     /// Bumped by every epoch, and never reused: a sink stamped with an older
     /// value belongs to a tunnel that is gone.
     generation: AtomicU64,
@@ -263,7 +280,7 @@ impl GatewayDevice {
         // The responder is the one place that knows which peer owns which
         // address, and the NAT refuses any source outside that view.
         nat.set_ownership(responder.ownership());
-        let (egress_tx, egress_rx) = mpsc::channel(DEFAULT_EGRESS_DEPTH);
+        let egress = sockets.iter().map(|_| EgressLane::new()).collect();
         Ok(Self {
             inner: Arc::new(Inner {
                 responder: Mutex::new(responder),
@@ -272,8 +289,7 @@ impl GatewayDevice {
                 routes: Mutex::new(HashMap::new()),
                 uplink_tx: Mutex::new(None),
                 uplink_depth: options.uplink_depth,
-                egress_tx,
-                egress_rx: tokio::sync::Mutex::new(egress_rx),
+                egress,
                 generation: AtomicU64::new(0),
                 inner_budget: AtomicUsize::new(0),
                 ipv6_requested: options.ipv6,
@@ -288,15 +304,19 @@ impl GatewayDevice {
     /// stops them when it is dropped.
     #[must_use]
     pub fn spawn(&self) -> GatewayTasks {
-        let mut tasks = Vec::with_capacity(self.inner.sockets.len() + 2);
+        let mut tasks = Vec::with_capacity(self.inner.sockets.len() * 2 + 1);
         for index in 0..self.inner.sockets.len() {
             let inner = Arc::clone(&self.inner);
             tasks.push(tokio::spawn(async move { read_socket(inner, index).await }));
         }
         let inner = Arc::clone(&self.inner);
         tasks.push(tokio::spawn(async move { run_timer(inner).await }));
-        let inner = Arc::clone(&self.inner);
-        tasks.push(tokio::spawn(async move { write_egress(inner).await }));
+        for index in 0..self.inner.sockets.len() {
+            let inner = Arc::clone(&self.inner);
+            tasks.push(tokio::spawn(
+                async move { write_egress(inner, index).await },
+            ));
+        }
         GatewayTasks { tasks }
     }
 
@@ -754,7 +774,11 @@ impl Drop for GatewayEpochSink {
 /// serves. A queue that fills drops, which is what a congested link does.
 fn queue_datagram(inner: &Arc<Inner>, to: SocketAddr, datagram: Vec<u8>) {
     let index = socket_for(inner, to);
-    if inner.egress_tx.try_send((index, to, datagram)).is_err() {
+    let queued = inner
+        .egress
+        .get(index)
+        .is_some_and(|lane| lane.tx.try_send((to, datagram)).is_ok());
+    if !queued {
         inner
             .counters
             .egress_queue_full
@@ -762,15 +786,15 @@ fn queue_datagram(inner: &Arc<Inner>, to: SocketAddr, datagram: Vec<u8>) {
     }
 }
 
-/// Drains the egress queue into the sockets.
-async fn write_egress(inner: Arc<Inner>) {
+/// Drains one socket's queue into that socket.
+async fn write_egress(inner: Arc<Inner>, index: usize) {
+    let (Some(lane), Some(socket)) = (inner.egress.get(index), inner.sockets.get(index)) else {
+        return;
+    };
     loop {
-        let next = inner.egress_rx.lock().await.recv().await;
-        let Some((index, to, datagram)) = next else {
+        let next = lane.rx.lock().await.recv().await;
+        let Some((to, datagram)) = next else {
             return;
-        };
-        let Some(socket) = inner.sockets.get(index) else {
-            continue;
         };
         if socket.send_to(&datagram, to).await.is_err() {
             inner
@@ -1067,12 +1091,16 @@ mod tests {
         _tasks: GatewayTasks,
         client: Tunn,
         peer_v4: Ipv4Addr,
-        inbound: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-        sent: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>,
-        socket: Arc<FakeSocket>,
+        inbound: Vec<mpsc::Sender<(Vec<u8>, SocketAddr)>>,
+        sent: Vec<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>,
+        sockets: Vec<Arc<FakeSocket>>,
     }
 
     fn harness() -> Harness {
+        harness_with(1)
+    }
+
+    fn harness_with(socket_count: usize) -> Harness {
         let key = GatewayKey::generate();
         let gateway_public = x25519::PublicKey::from(*key.public().as_bytes());
         let plan = PeerPlan::default();
@@ -1100,19 +1128,31 @@ mod tests {
                 ],
             }],
         };
-        let (inbound_tx, inbound_rx) = mpsc::channel(64);
-        let (sent_tx, sent_rx) = mpsc::unbounded_channel();
-        let socket = Arc::new(FakeSocket {
-            inbound: tokio::sync::Mutex::new(inbound_rx),
-            sent: sent_tx,
-            stall: AtomicBool::new(false),
-            local: "127.0.0.1:51820".parse().expect("a literal address"),
-        });
+        let mut inbound = Vec::with_capacity(socket_count);
+        let mut sent = Vec::with_capacity(socket_count);
+        let mut sockets = Vec::with_capacity(socket_count);
+        for index in 0..socket_count {
+            let (inbound_tx, inbound_rx) = mpsc::channel(64);
+            let (sent_tx, sent_rx) = mpsc::unbounded_channel();
+            sockets.push(Arc::new(FakeSocket {
+                inbound: tokio::sync::Mutex::new(inbound_rx),
+                sent: sent_tx,
+                stall: AtomicBool::new(false),
+                local: format!("127.0.0.{}:51820", index + 1)
+                    .parse()
+                    .expect("a literal address"),
+            }));
+            inbound.push(inbound_tx);
+            sent.push(sent_rx);
+        }
         let device = GatewayDevice::new(
             &conf,
             plan,
             &GatewayOptions::default(),
-            vec![Arc::clone(&socket) as Arc<dyn DatagramSocket>],
+            sockets
+                .iter()
+                .map(|s| Arc::clone(s) as Arc<dyn DatagramSocket>)
+                .collect(),
         )
         .expect("a valid configuration");
         let tasks = device.spawn();
@@ -1121,9 +1161,9 @@ mod tests {
             _tasks: tasks,
             client,
             peer_v4,
-            inbound: inbound_tx,
-            sent: sent_rx,
-            socket,
+            inbound,
+            sent,
+            sockets,
         }
     }
 
@@ -1148,7 +1188,7 @@ mod tests {
                 TunnResult::WriteToNetwork(bytes) => bytes.to_vec(),
                 other => panic!("{other:?}"),
             };
-            self.inbound
+            self.inbound[0]
                 .send((initiation, PEER_ADDR.parse().expect("a literal address")))
                 .await
                 .expect("the reader takes it");
@@ -1157,7 +1197,7 @@ mod tests {
             match self.client.decapsulate(None, &response, &mut buf) {
                 TunnResult::WriteToNetwork(keepalive) => {
                     let keepalive = keepalive.to_vec();
-                    self.inbound
+                    self.inbound[0]
                         .send((keepalive, PEER_ADDR.parse().expect("a literal address")))
                         .await
                         .expect("the reader takes it");
@@ -1173,14 +1213,14 @@ mod tests {
                 TunnResult::WriteToNetwork(bytes) => bytes.to_vec(),
                 other => panic!("{other:?}"),
             };
-            self.inbound
+            self.inbound[0]
                 .send((datagram, PEER_ADDR.parse().expect("a literal address")))
                 .await
                 .expect("the reader takes it");
         }
 
         async fn next_sent(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
-            tokio::time::timeout(Duration::from_secs(2), self.sent.recv())
+            tokio::time::timeout(Duration::from_secs(2), self.sent[0].recv())
                 .await
                 .ok()
                 .flatten()
@@ -1371,7 +1411,7 @@ mod tests {
         h.handshake().await;
 
         // From here on nothing the gateway sends ever completes.
-        h.socket.stall.store(true, Ordering::Relaxed);
+        h.sockets[0].stall.store(true, Ordering::Relaxed);
         // A datagram that makes the gateway answer, so the writer is stuck.
         h.send_from_peer(&udp(
             IpAddr::V4(h.peer_v4),
@@ -1401,6 +1441,50 @@ mod tests {
             .expect("a live epoch");
         let header = parse_ip(&second).expect("an IP packet");
         assert_eq!(header.src, IpAddr::V4(ASSIGNED_V4));
+    }
+
+    /// A socket whose buffer is full holds its own answers and nobody else's:
+    /// the queue and the writer belong to the socket, so a peer talking to one
+    /// listen address never waits on a peer talking to another.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stalled_socket_does_not_hold_another_sockets_answers() {
+        let mut h = harness_with(2);
+        let (_sink, _control) = h.device.begin_epoch(addressing(1));
+        assert!(h.device.open_gate_for(1));
+        h.sockets[0].stall.store(true, Ordering::Relaxed);
+
+        let first: SocketAddr = "192.168.7.2:51820".parse().expect("a literal address");
+        let second: SocketAddr = "192.168.7.3:51820".parse().expect("a literal address");
+        let mut buf = vec![0u8; 2048];
+        let initiation = match h.client.format_handshake_initiation(&mut buf, true) {
+            TunnResult::WriteToNetwork(bytes) => bytes.to_vec(),
+            other => panic!("{other:?}"),
+        };
+        h.inbound[0]
+            .send((initiation, first))
+            .await
+            .expect("the first reader takes it");
+
+        let mut buf = vec![0u8; 2048];
+        let initiation = match h.client.format_handshake_initiation(&mut buf, true) {
+            TunnResult::WriteToNetwork(bytes) => bytes.to_vec(),
+            other => panic!("{other:?}"),
+        };
+        h.inbound[1]
+            .send((initiation, second))
+            .await
+            .expect("the second reader takes it");
+
+        let (to, answer) = tokio::time::timeout(Duration::from_secs(2), h.sent[1].recv())
+            .await
+            .expect("the second socket answers while the first is stalled")
+            .expect("a datagram");
+        assert_eq!(to, second);
+        assert!(!answer.is_empty());
+        assert!(
+            h.sent[0].try_recv().is_err(),
+            "the stalled socket is still holding its own answer"
+        );
     }
 
     /// A queued packet belongs to the tunnel it was decrypted under: sending
