@@ -92,6 +92,11 @@ services:
       WIREGUARD_ENDPOINT_PORT: "51820"
       HTTPPROXY: "on"
       TZ: Europe/Paris
+      # gluetun's startup check dials cloudflare.com:443 six seconds in, which
+      # needs a name resolved before its own DoT server is up. On a host whose
+      # egress drops outbound UDP/53 that can never pass and gluetun
+      # restart-loops its VPN; IP literals break the chicken and egg:
+      #   HEALTH_TARGET_ADDRESSES: "1.1.1.1:443,8.8.8.8:443"
     networks:
       lab:
         ipv4_address: 172.30.0.20
