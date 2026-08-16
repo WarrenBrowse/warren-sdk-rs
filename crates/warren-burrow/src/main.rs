@@ -103,7 +103,14 @@ fn main() -> ExitCode {
         Command::RemovePeer(label) => provisioning(|| {
             provision::remove_peer(&env, &label)?;
             println!("warren-burrow: {label} revoked");
-            apply_to_daemon(&env);
+            if !apply_to_daemon(&env) {
+                // A revoked device keeps its session until a daemon applies
+                // the file, so the operator has to be told when none did.
+                println!(
+                    "warren-burrow: a running daemon keeps that peer's session until it \
+                          reloads ({RELOAD_HINT}) or restarts"
+                );
+            }
             Ok(())
         }),
         Command::Show(label, qr) => provisioning(|| show(&env, &label, qr)),
@@ -170,18 +177,24 @@ fn admin_call(env: &GatewayEnv, path: &str) -> ExitCode {
 }
 
 /// Tells the running daemon to apply the file that was just edited, and says
-/// what happened either way: an operator who edited a credential needs to know
-/// whether it is live.
-fn apply_to_daemon(env: &GatewayEnv) {
+/// what happened: an operator who edited a credential needs to know whether it
+/// is live. Answers whether a daemon took it.
+fn apply_to_daemon(env: &GatewayEnv) -> bool {
     // No token means no daemon has ever run against this state directory,
     // which is the ordinary case right after a first `init`: there is nothing
     // to tell and nothing to reload.
     if admin::read_token(env).is_err() {
-        return;
+        return false;
     }
     match admin_request(env, "/admin/reload") {
-        Ok(message) => print!("warren-burrow: {message}"),
-        Err(message) => eprintln!("warren-burrow: {message}"),
+        Ok(message) => {
+            print!("warren-burrow: {message}");
+            true
+        }
+        Err(message) => {
+            eprintln!("warren-burrow: {message}");
+            false
+        }
     }
 }
 
@@ -189,8 +202,7 @@ fn apply_to_daemon(env: &GatewayEnv) {
 fn admin_request(env: &GatewayEnv, path: &str) -> Result<String, String> {
     let Some(addr) = health_target()? else {
         return Err(format!(
-            "the health endpoint is off, so no admin route is served: {}",
-            RELOAD_WITHOUT_ENDPOINT
+            "the health endpoint is off, so no admin route is served: reload with {RELOAD_HINT}"
         ));
     };
     let token = admin::read_token(env).map_err(|err| err.to_string())?;
@@ -206,9 +218,9 @@ fn admin_request(env: &GatewayEnv, path: &str) -> Result<String, String> {
 
 /// What an operator does when no admin route can be reached.
 #[cfg(unix)]
-const RELOAD_WITHOUT_ENDPOINT: &str = "send SIGHUP to the daemon instead";
+const RELOAD_HINT: &str = "SIGHUP";
 #[cfg(not(unix))]
-const RELOAD_WITHOUT_ENDPOINT: &str = "restart the daemon to apply it";
+const RELOAD_HINT: &str = "a restart, the only way on this platform";
 
 fn health_target() -> Result<Option<std::net::SocketAddr>, String> {
     warren_burrow::config::healthcheck_target(std::env::var("WARREN_HEALTH_LISTEN").ok())
