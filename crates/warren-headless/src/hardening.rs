@@ -34,9 +34,36 @@ pub fn disable_core_dumps() -> bool {
     }
 }
 
+/// Whether this process runs as root.
+///
+/// A daemon started as a system service keeps its state under a system path,
+/// and a daemon started by a user keeps it under that user's own private
+/// directory: the two are not interchangeable, and the process is the only
+/// thing that knows which one it is.
+#[must_use]
+pub fn is_root() -> bool {
+    #[cfg(unix)]
+    {
+        nix::unistd::Uid::effective().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test suite never runs as root on a developer machine or on a CI
+    /// runner, and the answer decides where a daemon writes its keys, so a
+    /// reading that is merely plausible is not enough.
+    #[cfg(unix)]
+    #[test]
+    fn root_is_read_from_the_effective_uid() {
+        assert_eq!(is_root(), nix::unistd::geteuid().is_root());
+    }
 
     /// Asserts the limit the kernel now holds rather than the call's own
     /// return: what matters is that a dump cannot be written afterwards.

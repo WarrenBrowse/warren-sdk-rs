@@ -20,7 +20,7 @@ zeroize = { workspace = true }
 # alone. `killpg` is safe, and this workspace forbids unsafe. `resource` and
 # `process` carry the core-dump refusals of `hardening`.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["signal", "resource", "process"] }
+nix = { version = "0.31", default-features = false, features = ["signal", "resource", "process", "user"] }
 
 [lints]
 workspace = true

@@ -449,6 +449,16 @@ impl Responder {
         self.v6
     }
 
+    /// Every live peer, in index order.
+    ///
+    /// The caller drains each one's queue after a handshake (boringtun holds
+    /// what it could not encrypt yet behind the session it was waiting for),
+    /// which is the one thing that cannot be done from a label.
+    #[must_use]
+    pub fn peer_ids(&self) -> Vec<PeerId> {
+        self.peers.keys().copied().collect()
+    }
+
     /// The peer an operator label names.
     #[must_use]
     pub fn peer_by_label(&self, label: &PeerLabel) -> Option<PeerId> {
@@ -2306,6 +2316,35 @@ mod tests {
 
         let status = format!("{:?}", responder.snapshot());
         assert!(!status.contains("192.168.7"), "{status}");
+    }
+
+    /// The shell drains a peer's queue after every handshake, and a label
+    /// cannot name a peer that has not connected yet, so the identifiers have
+    /// to be enumerable on their own.
+    #[test]
+    fn every_live_peer_is_enumerable_and_a_removed_one_is_gone() {
+        let (mut responder, clients) = build(2, true);
+        let ids = responder.peer_ids();
+        assert_eq!(ids.len(), 2);
+        for client in &clients {
+            let id = responder
+                .peer_by_label(&client.label)
+                .expect("a configured peer");
+            assert!(ids.contains(&id), "every peer must be enumerated");
+        }
+
+        let mut peers = responder.peer_confs();
+        peers.remove(0);
+        let conf = GatewayConf {
+            key: responder.key().clone(),
+            peers,
+        };
+        responder.reload(&conf).expect("a valid configuration");
+        assert_eq!(
+            responder.peer_ids().len(),
+            1,
+            "a removed peer must not be drained any more"
+        );
     }
 
     #[test]

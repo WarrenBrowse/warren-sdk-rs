@@ -34,7 +34,7 @@ pub use forward::{
     ForwardConfig, ForwardEnv, ForwardProto, HookSink, ShellHooks, Stop, apply_port_change,
     conclude, fatal_line, parse_forward, retire_forward_state, wait_for_stop,
 };
-pub use hardening::disable_core_dumps;
+pub use hardening::{disable_core_dumps, is_root};
 pub use health::{
     ExtraRoutes, HealthView, RouteReply, probe_healthz, render, serve, track_egress_across_epochs,
 };

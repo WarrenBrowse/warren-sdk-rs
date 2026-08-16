@@ -1,0 +1,48 @@
+[package]
+name = "warren-burrow"
+description = "Local WireGuard-protocol gateway: terminates stock WireGuard-protocol clients on the LAN and carries their traffic through a Warren exit, with the peers' packets translated onto the single address the exit assigned"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "warren-burrow"
+path = "src/main.rs"
+
+[dependencies]
+warren-burrow-core = { path = "../warren-burrow-core" }
+warren-headless = { path = "../warren-headless" }
+warren-sdk = { path = "../warren-sdk" }
+bytes = { workspace = true }
+ip_network = "0.4.1"
+# Non-poisoning mutexes: an unauthenticated datagram must never be able to
+# leave the responder or the NAT unusable for every peer through a panic in
+# one packet's handling.
+parking_lot = "0.12"
+rand = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["signal", "process", "fs"] }
+anyhow = "1"
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+# A terminal QR of a client configuration, for a phone or a TV. Optional: it
+# is a convenience of the `show` subcommand, and an image-free renderer is the
+# only part of it a headless host ever wants.
+qrcode = { version = "0.14", default-features = false, optional = true }
+
+[features]
+qr = ["dep:qrcode"]
+
+[dev-dependencies]
+# The stock client of the integration test: the only way to prove the gateway
+# against the protocol rather than against its own idea of the protocol.
+boringtun = { version = "=0.7.1", default-features = false }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
