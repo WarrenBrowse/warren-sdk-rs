@@ -128,6 +128,29 @@ for epoch_home in "crates/warren-net/src/device.rs" "crates/warren-burrow-core/s
     "$epoch_home"
 done
 
+# boringtun's `HalfHandshake`, `Packet` and `TunnResult` derive Debug, and what
+# they render is a peer's static public key or a decrypted packet. No-log
+# discipline forbids either reaching a log, so no production line of a file that
+# holds one of those values may format anything with `{:?}`: the rule is on the
+# file rather than on the type, because a grep cannot tell what a binding holds.
+# Inline `#[cfg(test)]` modules are cut off first (a test panic that renders a
+# TunnResult reaches no log), and `anti-refrag:allow` remains the escape hatch.
+forbid_debug_where_boringtun_lives() {
+  doc="$1"
+  for file in $(grep -rl 'boringtun' crates/warren-burrow-core/src crates/warren-burrow/src 2>/dev/null); do
+    cut="$(grep -n '#\[cfg(test)\]' "$file" | head -1 | cut -d: -f1)"
+    [ -n "$cut" ] || cut=999999
+    out="$(head -n "$((cut - 1))" "$file" \
+          | grep -nE '\{[A-Za-z_.]*:#?\?\}' \
+          | grep -v 'anti-refrag:allow' || true)"
+    [ -n "$out" ] && report "$doc" \
+      "Debug formatting in $file, which holds boringtun values (a key or a decrypted packet)" \
+      "$out"
+  done
+}
+
+forbid_debug_where_boringtun_lives "design E"
+
 # Dependency direction: the client SDK never depends on the private backend
 # (warren-core) or the app (warren-app / mullvad-*). warrenguard + warren-contract
 # siblings are allowed.
