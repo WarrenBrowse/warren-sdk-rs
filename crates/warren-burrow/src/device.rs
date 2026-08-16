@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
@@ -163,6 +163,10 @@ pub struct GatewaySnapshot {
     pub generation: u64,
     /// Whether the gateway may emit anything toward a peer.
     pub gate_open: bool,
+    /// The epoch the gate belongs to. Read under the same lock as the two
+    /// fields above, so an open gate on a foreign epoch is observable rather
+    /// than an artefact of three separate reads.
+    pub gate_generation: u64,
     /// Whether the epoch can carry IPv6.
     pub ipv6: V6State,
     /// The live inner budget, when a tunnel has reported one.
@@ -210,7 +214,6 @@ struct Inner {
     /// Bumped by every epoch, and never reused: a sink stamped with an older
     /// value belongs to a tunnel that is gone.
     generation: AtomicU64,
-    gate_open: AtomicBool,
     /// The largest inner packet the current tunnel carries, 0 until a tunnel
     /// reports one.
     inner_budget: AtomicUsize,
@@ -235,7 +238,6 @@ impl std::fmt::Debug for GatewayDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GatewayDevice")
             .field("generation", &self.inner.generation.load(Ordering::Relaxed))
-            .field("gate_open", &self.inner.gate_open.load(Ordering::Relaxed))
             .field("sockets", &self.inner.sockets.len())
             .finish()
     }
@@ -271,7 +273,6 @@ impl GatewayDevice {
                 egress_tx,
                 egress_rx: tokio::sync::Mutex::new(egress_rx),
                 generation: AtomicU64::new(0),
-                gate_open: AtomicBool::new(false),
                 inner_budget: AtomicUsize::new(0),
                 ipv6_requested: options.ipv6,
                 client_mtu: options.client_mtu,
@@ -315,16 +316,15 @@ impl GatewayDevice {
             return false;
         }
         responder.set_gate(true, generation);
-        self.inner.gate_open.store(true, Ordering::Release);
         true
     }
 
     /// Closes the gate: nothing but a stateless cookie reply leaves the
     /// gateway afterwards.
     pub fn close_gate(&self) {
+        let mut responder = self.inner.responder.lock();
         let generation = self.inner.generation.load(Ordering::Acquire);
-        self.inner.responder.lock().set_gate(false, generation);
-        self.inner.gate_open.store(false, Ordering::Release);
+        responder.set_gate(false, generation);
     }
 
     /// Records the largest inner packet the tunnel currently carries.
@@ -409,17 +409,27 @@ impl GatewayDevice {
     /// One reading of everything a health route renders.
     #[must_use]
     pub fn snapshot(&self) -> GatewaySnapshot {
-        let (peers, responder_stats, ipv6) = {
+        // The epoch and the gate are read under one lock: they are written
+        // under it too, and reading them apart would show a gate open on an
+        // epoch that had already been replaced.
+        let (peers, responder_stats, ipv6, gate, generation) = {
             let responder = self.inner.responder.lock();
-            (responder.snapshot(), responder.stats(), responder.ipv6())
+            (
+                responder.snapshot(),
+                responder.stats(),
+                responder.ipv6(),
+                responder.gate(),
+                self.inner.generation.load(Ordering::Acquire),
+            )
         };
         let (nat_stats, nat_mappings) = {
             let nat = self.inner.nat.lock();
             (nat.stats(), nat.mapping_count())
         };
         GatewaySnapshot {
-            generation: self.generation(),
-            gate_open: self.inner.gate_open.load(Ordering::Acquire),
+            generation,
+            gate_open: gate.open,
+            gate_generation: gate.generation,
             ipv6,
             inner_budget: self.inner_budget(),
             peers_with_session: peers.iter().filter(|p| p.has_session).count(),
@@ -510,22 +520,26 @@ impl EpochPacketDevice for GatewayDevice {
                 addressing.ipv6_address(),
             );
         }
-        {
-            // Closed until the daemon has proven this epoch egresses: an
-            // authenticated packet toward a peer over a black hole feeds that
-            // peer's own liveness detector and hides the outage from it.
-            let mut responder = self.inner.responder.lock();
-            responder.set_gate(false, generation);
-        }
-        self.inner.gate_open.store(false, Ordering::Release);
-        self.inner.inner_budget.store(0, Ordering::Relaxed);
-        self.inner.generation.store(generation, Ordering::Release);
         let ipv6 = if self.inner.ipv6_requested && addressing.ipv6_address().is_some() {
             V6State::Available
         } else {
             V6State::NoAssignment
         };
-        self.inner.responder.lock().set_ipv6(ipv6);
+        {
+            // Closed until the daemon has proven this epoch egresses: an
+            // authenticated packet toward a peer over a black hole feeds that
+            // peer's own liveness detector and hides the outage from it.
+            //
+            // The epoch is published under this same lock, because that is the
+            // lock `open_gate_for` compares against it: published outside, a
+            // proof finishing in the window would find the previous epoch
+            // still current and open the gate on this one, unproven.
+            let mut responder = self.inner.responder.lock();
+            responder.set_gate(false, generation);
+            responder.set_ipv6(ipv6);
+            self.inner.inner_budget.store(0, Ordering::Relaxed);
+            self.inner.generation.store(generation, Ordering::Release);
+        }
 
         let (control_tx, control_rx) = mpsc::channel(CONTROL_DEPTH);
         let demux = Arc::new(RawUdpDemux::new(control_tx));
@@ -708,7 +722,6 @@ impl Drop for GatewayEpochSink {
             // it here would take down a tunnel that is working.
             return;
         }
-        self.inner.gate_open.store(false, Ordering::Release);
         self.inner.responder.lock().set_gate(false, self.generation);
     }
 }
@@ -964,6 +977,7 @@ mod tests {
     use super::*;
 
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::atomic::AtomicBool;
 
     use boringtun::noise::{Tunn, TunnResult};
     use boringtun::x25519;
@@ -1379,6 +1393,38 @@ mod tests {
             "the packet from the dead epoch must not be what came out"
         );
         assert_eq!(h.device.snapshot().device.uplink_stale_flushed, 1);
+    }
+
+    /// The epoch is published under the lock the gate is opened under. A proof
+    /// that finishes while the next epoch is being installed would otherwise
+    /// open the gate on a tunnel nobody proved, and the responder consults the
+    /// gate alone: a peer's traffic would ride an unproven epoch until it ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_proof_racing_the_next_epoch_never_opens_the_gate_on_it() {
+        let h = harness();
+        let device = h.device.clone();
+        let installer = std::thread::spawn(move || {
+            for generation in 2..=20_000 {
+                let _epoch = device.begin_epoch(addressing(generation));
+            }
+        });
+
+        let mut opened = 0u64;
+        while !installer.is_finished() {
+            let generation = h.device.generation();
+            if h.device.open_gate_for(generation) {
+                opened += 1;
+                let snapshot = h.device.snapshot();
+                assert!(
+                    !snapshot.gate_open || snapshot.gate_generation == snapshot.generation,
+                    "the gate is open for epoch {} while the device serves {}",
+                    snapshot.gate_generation,
+                    snapshot.generation
+                );
+            }
+        }
+        installer.join().expect("the installer thread");
+        assert!(opened > 0, "the probe never opened the gate at all");
     }
 
     /// IPv6 follows the path: under its minimum MTU a Packet Too Big makes a
