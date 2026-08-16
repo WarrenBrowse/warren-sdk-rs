@@ -45,6 +45,9 @@ const BUDGET_GRACE: Duration = Duration::from_secs(2);
 /// How often the tunnel's live inner budget is read.
 const BUDGET_POLL: Duration = Duration::from_millis(250);
 
+/// How long to wait before proving the first epoch again.
+const FIRST_PROOF_RETRY: Duration = Duration::from_millis(500);
+
 /// Runs the gateway until a signal or a terminal failure; returns the process
 /// exit code (0 clean shutdown, 1 startup failure, 2 a terminal control-plane
 /// refusal).
@@ -142,12 +145,20 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
     // Cloned before the first proof: an epoch that ends and restarts while the
     // probe is running is invisible to a receiver cloned once it is over.
     let tracker_rx = handle.watch_state();
-    let probe = egress_probe(&device, handle.watch_addressing());
+    let probe = egress_probe(&device, handle.watch_addressing(), FIRST_EGRESS_RECHECK);
+    let mut first_probe = egress_probe(&device, handle.watch_addressing(), FIRST_EGRESS_VERIFY);
 
     wait_until_connected(&handle, env.connect_timeout)
         .await
         .context("the tunnel never reached Connected")?;
-    if !open_gate_for_current_epoch(&device, &handle, env.client_mtu, FIRST_EGRESS_VERIFY).await {
+    if !open_first_gate(
+        &device,
+        env.client_mtu,
+        env.connect_timeout,
+        &mut first_probe,
+    )
+    .await
+    {
         anyhow::bail!("first egress verification failed: the gateway will not carry peer traffic");
     }
     egress_verified.store(true, Ordering::Relaxed);
@@ -297,6 +308,7 @@ async fn sample_inner_budget(
 fn egress_probe(
     device: &GatewayDevice,
     addressing_rx: watch::Receiver<Option<warren_sdk::net::EpochAddressing>>,
+    options: warren_sdk::socks_egress::FirstEgressVerify,
 ) -> impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + 'static {
     let device = device.clone();
     move || {
@@ -308,38 +320,58 @@ fn egress_probe(
             let (Some(addressing), Some(control)) = (addressing, control) else {
                 return false;
             };
-            verify_first_egress(&control, addressing.gateway, FIRST_EGRESS_RECHECK)
+            verify_first_egress(&control, addressing.gateway, options)
                 .await
                 .is_ok()
         })
     }
 }
 
-/// Proves the current epoch egresses and opens the gate for it.
+/// Proves the epoch running now and opens the gate for it.
 ///
 /// Fails closed on every path: an epoch replaced while the probe was running
-/// leaves the gate shut, and the next `Connected` proves itself.
-async fn open_gate_for_current_epoch(
-    device: &GatewayDevice,
-    handle: &SupervisedPacketHandle,
-    client_mtu: u16,
-    options: warren_sdk::socks_egress::FirstEgressVerify,
-) -> bool {
+/// leaves the gate shut, because the generation read before the probe is the
+/// one the gate is opened for.
+async fn prove_and_open<P, Fut>(device: &GatewayDevice, client_mtu: u16, probe: &mut P) -> bool
+where
+    P: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
     let generation = device.generation();
-    let Some(addressing) = handle.addressing() else {
-        return false;
-    };
-    let Some(control) = device.control() else {
-        return false;
-    };
-    if verify_first_egress(&control, addressing.gateway, options)
-        .await
-        .is_err()
-    {
+    if !probe().await {
         return false;
     }
     wait_for_budget(device, client_mtu).await;
     device.open_gate_for(generation)
+}
+
+/// Proves the first epoch, retrying until it works or the budget runs out.
+///
+/// An epoch that ends while its proof is running (a drain advisory, a path
+/// move, an egress-dead conviction) is an ordinary event that the tracker
+/// answers by proving the next one. At startup it must not be the difference
+/// between a running daemon and a restart loop, so the same thing happens here.
+async fn open_first_gate<P, Fut>(
+    device: &GatewayDevice,
+    client_mtu: u16,
+    budget: Duration,
+    probe: &mut P,
+) -> bool
+where
+    P: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if prove_and_open(device, client_mtu, probe).await {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        LOG.info("the first epoch is not proven yet, trying again");
+        tokio::time::sleep(FIRST_PROOF_RETRY).await;
+    }
 }
 
 /// Waits for the tunnel's inner budget to reach the MTU the peers use, or for
@@ -383,22 +415,15 @@ async fn track_gate_across_epochs<P, Fut>(
             shut(&device, &egress_verified);
             continue;
         }
-        // Read before the probe: an epoch that replaces this one while the
-        // probe runs is what `open_gate_for` refuses below.
-        let generation = device.generation();
-        if !probe().await {
-            shut(&device, &egress_verified);
-            LOG.error("egress is not proven on this epoch, peers stay refused");
-            continue;
-        }
-        wait_for_budget(&device, client_mtu).await;
-        if device.open_gate_for(generation) {
+        if prove_and_open(&device, client_mtu, &mut probe).await {
             egress_verified.store(true, Ordering::Relaxed);
             LOG.info("egress re-verified for the current epoch, peers admitted");
         } else {
-            // The epoch was replaced while it was being proven; the one that
-            // replaced it proves itself on its own arrival at Connected.
+            // Either the probe failed, or the epoch was replaced while it was
+            // being proven; the one that replaced it proves itself on its own
+            // arrival at Connected.
             shut(&device, &egress_verified);
+            LOG.error("egress is not proven on this epoch, peers stay refused");
         }
     }
 }
@@ -710,6 +735,48 @@ mod tests {
         task.await.expect("the tracker ends with its publisher");
         assert!(!device.snapshot().gate_open);
         assert!(!verified.load(Ordering::Relaxed));
+    }
+
+    /// A redial while the first proof is running is an ordinary supervisor
+    /// event, and the daemon answers it by proving the epoch that replaced the
+    /// one it was measuring, not by exiting into a restart loop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_proof_is_retried_rather_than_fatal() {
+        let device = empty_device().await;
+        let (_sink, _control) = device.begin_epoch(addressing(1));
+        device.note_inner_budget(1414);
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut probe = {
+            let runs = Arc::clone(&runs);
+            move || {
+                let runs = Arc::clone(&runs);
+                // The first two attempts land on an epoch that is already gone.
+                async move { runs.fetch_add(1, Ordering::Relaxed) >= 2 }
+            }
+        };
+
+        let opened = open_first_gate(&device, 1280, Duration::from_secs(30), &mut probe).await;
+
+        assert!(opened, "the third attempt proved the epoch");
+        assert!(device.snapshot().gate_open);
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+    }
+
+    /// A tunnel that never proves anything is a startup failure, not an
+    /// endless retry: the operator hears about it and the gate stays shut.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_proof_that_never_lands_gives_up_on_its_budget() {
+        let device = empty_device().await;
+        let (_sink, _control) = device.begin_epoch(addressing(1));
+        device.note_inner_budget(1414);
+        let mut probe = || async { false };
+
+        let started = std::time::Instant::now();
+        let opened = open_first_gate(&device, 1280, Duration::from_millis(600), &mut probe).await;
+
+        assert!(!opened);
+        assert!(started.elapsed() >= Duration::from_millis(600));
+        assert!(!device.snapshot().gate_open, "and nothing may reach a peer");
     }
 
     /// Nothing reaches a peer before an epoch has proven it egresses, and the
