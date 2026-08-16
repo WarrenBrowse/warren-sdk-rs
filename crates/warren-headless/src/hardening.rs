@@ -56,6 +56,16 @@ pub fn is_root() -> bool {
 mod tests {
     use super::*;
 
+    /// Windows writes a crash dump only where the operator configured one, and
+    /// a process cannot revoke that from inside. Reporting success there would
+    /// tell an operator their secrets are safe from a dump when they are not.
+    #[cfg(not(unix))]
+    #[test]
+    fn a_platform_that_cannot_revoke_crash_dumps_says_so() {
+        assert!(!disable_core_dumps());
+        assert!(!is_root(), "there is no root to be on this platform");
+    }
+
     /// A test suite never runs as root on a developer machine or on a CI
     /// runner, and the answer decides where a daemon writes its keys, so a
     /// reading that is merely plausible is not enough.
