@@ -415,3 +415,28 @@ jobs:
               --notes "Local gateway that carries stock WireGuard-protocol clients through a Warren exit (${CHANNEL} channel). Env contract: crates/warren-bolthole/README.md. Deployment examples: docs/bolthole/. \"WireGuard\" is a registered trademark of Jason A. Donenfeld; this project is not affiliated with or endorsed by the WireGuard project." \
               $prerelease
           fi
+      - name: Check the image is reachable without a GitHub account
+        env:
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -uo pipefail
+          image=warrenbrowse/warren-bolthole
+          if [ "$CHANNEL" = "beta" ]; then ref="beta-${VERSION}"; else ref="${VERSION}"; fi
+          # A GHCR package is created private, and no REST endpoint flips it:
+          # the only way is the package settings page. So the release says so
+          # itself rather than leaving every documented `docker run` broken for
+          # everyone outside the org until somebody notices.
+          token=$(curl -fsSL "https://ghcr.io/token?scope=repository:${image}:pull&service=ghcr.io" \
+            | sed -nE 's/.*"token":"([^"]+)".*/\1/p') || token=""
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/${image}/manifests/${ref}")
+          if [ "$code" = "200" ]; then
+            echo "anonymous pull of ghcr.io/${image}:${ref} answers 200"
+          else
+            msg="ghcr.io/${image} is not public (anonymous manifest read answered ${code}), so every documented docker run and compose file fails for anyone outside the org. Fix: https://github.com/orgs/WarrenBrowse/packages/container/warren-bolthole/settings, Danger Zone, Change visibility, Public."
+            echo "::warning::${msg}"
+            echo "$msg" >>"$GITHUB_STEP_SUMMARY"
+          fi
