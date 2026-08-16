@@ -78,6 +78,13 @@ Caused by:
 # mid-compile on a random crate. The crash is in the log.
 expect "a rustc crash under emulation is a signature, not an exit code" plain \
 	"error: rustc interrupted by SIGSEGV, printing backtrace"
+# Run 31958663710, job "cargo test (macos)": `cargo` itself was gone between
+# one attempt and the next, because another job on the same runner was
+# reinstalling the toolchain into the shared CARGO_HOME. The shell's own 127
+# comes with it.
+expect "the toolchain binary vanished between two attempts" plain \
+	"scripts/ci/run-with-runner-retry.sh: line 85: cargo: command not found" 127
+expect "the same, with only the exit code to go on" plain "" 127
 # A wedged cargo (a zombie rustc holding its jobserver token) prints nothing
 # at all, so the exit code of the watchdog or the timeout wrapper is the only
 # evidence there is.

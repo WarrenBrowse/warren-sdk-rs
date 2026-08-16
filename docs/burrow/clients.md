@@ -83,9 +83,9 @@ gets there.
 
 Two costs come with this shape. The gateway is a LAN host, so every packet
 crosses the LAN twice and hairpins through the router, which is what a
-router-shaped deployment pays. And a router has no kill switch of its own: if the tunnel
-stops, the router's default route is what decides whether its LAN falls back to
-the plain internet, so set that route deliberately.
+router-shaped deployment pays. And a router has no kill switch of its own: if
+the tunnel stops, the router's default route is what decides whether its LAN
+falls back to the plain internet, so set that route deliberately.
 
 ## Apple TV (tvOS 17 and later)
 

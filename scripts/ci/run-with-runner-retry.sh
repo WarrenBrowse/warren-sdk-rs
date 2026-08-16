@@ -13,9 +13,11 @@
 #
 # Three classes:
 #
-#   plain    a spawn failure, a compiler killed mid-compile (a crash signature
-#            in the log), or a wedge (no output at all, only the exit code of
-#            whatever killed it). Retry the same command.
+#   plain    a spawn failure, a tool that vanished mid-step (the runners share
+#            one CARGO_HOME, so a concurrent job reinstalling the toolchain
+#            unlinks the binary this one is using), a compiler killed
+#            mid-compile, or a wedge with nothing but an exit code. Retry the
+#            same command after a pause.
 #   clean    a corrupt persistent target directory (dep-info gone), or LNK1181,
 #            the windows-rs import lib briefly unopenable at link time. Both
 #            need a `cargo clean` for the retry to land on a fresh state.
@@ -58,12 +60,21 @@ warren_flake_class() { # warren_flake_class <logfile> [exit-code]
 		echo plain
 		return
 	fi
-	# The only evidence a wedge leaves. A crashed rustc that became a zombie
-	# never returns its GNU jobserver token, so cargo waits at 0 % CPU printing
-	# nothing; there is no signature to grep, only the exit code of the
-	# `timeout` wrapper (124) or of whatever SIGKILLed the subtree (137).
+	# A tool that ran a second ago and is gone now: the runners share one
+	# CARGO_HOME between jobs, so a concurrent `rustup`/`cargo install` step
+	# unlinks and rewrites the very binary this command needs. The shell's own
+	# 127 says the same thing when nothing was printed. A tool that is really
+	# absent fails all three attempts in seconds, which costs nothing.
+	if grep -q "command not found" "$1"; then
+		echo plain
+		return
+	fi
+	# The remaining evidence is an exit code. A wedge leaves nothing else: a
+	# crashed rustc that became a zombie never returns its GNU jobserver token,
+	# so cargo waits at 0 % CPU printing nothing until the `timeout` wrapper
+	# (124) or whatever SIGKILLs the subtree (137) ends it.
 	case "${2:-}" in
-		124 | 137) echo plain ;;
+		124 | 137 | 127) echo plain ;;
 	esac
 }
 
@@ -99,7 +110,13 @@ while :; do
 		exit "$rc"
 	fi
 
-	echo "::warning title=warren-sdk-rs CI::runner flake ('$class' class) on attempt $attempt/$ATTEMPTS; retrying"
+	# Back off before retrying. Every signature here is a race with another job
+	# on the same runner rewriting a shared directory, and the first retry of
+	# this wrapper went out 16 ms after the failure, straight back into the
+	# window it was trying to escape.
+	delay=$((attempt * 15))
+	echo "::warning title=warren-sdk-rs CI::runner flake ('$class' class) on attempt $attempt/$ATTEMPTS; retrying in ${delay}s"
+	sleep "$delay"
 	if [ "$class" = clean ]; then
 		cargo clean || true
 	fi

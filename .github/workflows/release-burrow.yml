@@ -299,7 +299,6 @@ jobs:
           # cut to be exercised, and the dry run covers it too.
           path: staging
       - name: Collect assets and checksums
-        id: package
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
           ENV_TAG: ${{ needs.resolve.outputs.env_tag }}
