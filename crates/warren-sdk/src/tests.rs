@@ -2035,7 +2035,10 @@ async fn supervisor_emits_structured_migration_events_on_drain() {
         .await;
     });
 
-    let migrating = tokio::time::timeout(
+    // A watch channel coalesces, so the first value this observer sees is
+    // whichever one was last published: asserting that it is `Migrating` would
+    // be asserting that the reconnect is slower than this poll.
+    let first = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         migration_rx.wait_for(|e| e.is_some()),
     )
@@ -2044,13 +2047,16 @@ async fn supervisor_emits_structured_migration_events_on_drain() {
     .expect("watch alive")
     .expect("event");
     assert_eq!(
-        migrating,
-        MigrationEvent {
-            deadline_unix_secs: 1,
-            reason_code: 0,
-            outcome: MigrationOutcome::Migrating,
-        },
+        (first.deadline_unix_secs, first.reason_code),
+        (1, 0),
         "the event exposes the drain advisory's fields"
+    );
+    assert!(
+        matches!(
+            first.outcome,
+            MigrationOutcome::Migrating | MigrationOutcome::Completed
+        ),
+        "a drain advisory opens a migration, it never cancels one: {first:?}"
     );
 
     let completed = tokio::time::timeout(
@@ -2065,10 +2071,14 @@ async fn supervisor_emits_structured_migration_events_on_drain() {
             )
         }),
     )
-    .await;
-    assert!(
-        completed.is_ok(),
-        "the post-drain reconnect emits a Completed migration event"
+    .await
+    .expect("the post-drain reconnect emits a Completed migration event")
+    .expect("watch alive")
+    .expect("event");
+    assert_eq!(
+        (completed.deadline_unix_secs, completed.reason_code),
+        (1, 0),
+        "and it still carries the advisory the migration answered"
     );
     task.abort();
 }
