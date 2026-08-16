@@ -150,6 +150,13 @@ const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// file descriptors) costs a slow retry loop instead of a burnt core.
 const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How long a failed egress recheck waits before asking the same epoch again,
+/// and the cap it backs off to. An epoch that never ends publishes no further
+/// state change, so without this one transient failure latches the endpoint
+/// unhealthy for the life of the process.
+const EGRESS_RECHECK_RETRY_MIN: std::time::Duration = std::time::Duration::from_millis(250);
+const EGRESS_RECHECK_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Serves the health endpoint until the task is dropped.
 pub async fn serve(listener: tokio::net::TcpListener, view: HealthView) {
     loop {
@@ -271,12 +278,30 @@ pub async fn track_egress_across_epochs<R, Fut>(
     // A change raised since this receiver was cloned is still pending on the
     // first poll (tokio marks the version at clone time), which is what makes
     // cloning it before the first egress probe enough to cover that probe.
+    let mut retry_in = None;
     loop {
-        if state_rx.changed().await.is_err() {
-            return;
+        match retry_in {
+            None => {
+                if state_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+            Some(delay) => {
+                // A retry that ignored the state would prove an epoch that has
+                // already been replaced, so whichever comes first wins.
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    changed = state_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
         }
         if *state_rx.borrow_and_update() != ConnectionState::Connected {
             egress_verified.store(false, Ordering::Relaxed);
+            retry_in = None;
             continue;
         }
         // Every change that lands on Connected is re-proven, including a
@@ -288,9 +313,23 @@ pub async fn track_egress_across_epochs<R, Fut>(
         egress_verified.store(proven, Ordering::Relaxed);
         if proven {
             log.info("egress re-verified for the current epoch");
+            retry_in = None;
         } else {
-            log.error("egress is not proven on this epoch, staying unhealthy");
+            if retry_in.is_none() {
+                log.error("egress is not proven on this epoch, staying unhealthy");
+            }
+            retry_in = Some(next_recheck_delay(retry_in));
         }
+    }
+}
+
+/// Backs a recheck off from [`EGRESS_RECHECK_RETRY_MIN`] to
+/// [`EGRESS_RECHECK_RETRY_MAX`], so a transient failure is answered in a
+/// quarter of a second while a long outage costs one probe every five.
+fn next_recheck_delay(current: Option<std::time::Duration>) -> std::time::Duration {
+    match current {
+        None => EGRESS_RECHECK_RETRY_MIN,
+        Some(delay) => delay.saturating_mul(2).min(EGRESS_RECHECK_RETRY_MAX),
     }
 }
 
@@ -539,6 +578,39 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("{what} (still {}) after 1 s", !want);
+    }
+
+    /// A recheck that fails once on an epoch that never leaves `Connected`
+    /// must not latch the endpoint at 503 for the life of the process: a
+    /// healthy tunnel publishes no further state change, so a tracker that
+    /// only re-proves on a transition never asks again.
+    #[tokio::test]
+    async fn a_recheck_that_fails_once_is_retried_on_the_same_epoch() {
+        let (state_tx, state_rx) = watch::channel(ConnectionState::Connected);
+        let verified = Arc::new(AtomicBool::new(true));
+        let answer = Arc::new(AtomicBool::new(false));
+
+        let task = tokio::spawn({
+            let verified = Arc::clone(&verified);
+            let answer = Arc::clone(&answer);
+            track_egress_across_epochs(LOG, state_rx, verified, move || {
+                let answer = Arc::clone(&answer);
+                async move { answer.load(Ordering::Relaxed) }
+            })
+        });
+
+        state_tx.send(ConnectionState::Connected).unwrap();
+        wait_for(&verified, false, "a failed recheck must clear the latch").await;
+
+        // The transient is over, and the epoch it happened on is still running.
+        answer.store(true, Ordering::Relaxed);
+        wait_for(
+            &verified,
+            true,
+            "the retry must re-prove the epoch that never ended",
+        )
+        .await;
+        task.abort();
     }
 
     /// The egress proof belongs to the epoch it was measured on. Reporting 200

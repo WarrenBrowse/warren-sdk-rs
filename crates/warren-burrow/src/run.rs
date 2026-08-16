@@ -70,6 +70,13 @@ const BUDGET_POLL: Duration = Duration::from_millis(250);
 /// How long to wait before proving the first epoch again.
 const FIRST_PROOF_RETRY: Duration = Duration::from_millis(500);
 
+/// How long a failed re-proof waits before asking the same epoch again, and
+/// the cap it backs off to. A supervisor that still calls the tunnel
+/// `Connected` publishes nothing further, so without this the gate a transient
+/// probe failure shut would stay shut for the life of the process.
+const REPROOF_RETRY_MIN: Duration = FIRST_PROOF_RETRY;
+const REPROOF_RETRY_MAX: Duration = Duration::from_secs(5);
+
 /// Runs the gateway until a signal or a terminal failure; returns the process
 /// exit code (0 clean shutdown, 1 startup failure, 2 a terminal control-plane
 /// refusal).
@@ -474,26 +481,60 @@ async fn track_gate_across_epochs<P, Fut>(
     P: FnMut() -> Fut,
     Fut: Future<Output = bool>,
 {
+    let mut retry_in = None;
     loop {
-        if state_rx.changed().await.is_err() {
-            // Nothing publishes epochs any more, so nothing can prove one.
-            shut(&device, &egress_verified);
-            return;
+        match retry_in {
+            None => {
+                if state_rx.changed().await.is_err() {
+                    // Nothing publishes epochs any more, so nothing can prove one.
+                    shut(&device, &egress_verified);
+                    return;
+                }
+            }
+            Some(delay) => {
+                // A retry that ignored the state would prove an epoch that has
+                // already been replaced, so whichever comes first wins.
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    changed = state_rx.changed() => {
+                        if changed.is_err() {
+                            shut(&device, &egress_verified);
+                            return;
+                        }
+                    }
+                }
+            }
         }
         if *state_rx.borrow_and_update() != ConnectionState::Connected {
             shut(&device, &egress_verified);
+            retry_in = None;
             continue;
         }
         if prove_and_open(&device, client_mtu, &mut probe).await {
             egress_verified.store(true, Ordering::Relaxed);
             LOG.info("egress re-verified for the current epoch, peers admitted");
+            retry_in = None;
         } else {
             // Either the probe failed, or the epoch was replaced while it was
             // being proven; the one that replaced it proves itself on its own
-            // arrival at Connected.
+            // arrival at Connected, and an epoch that never ends is proven
+            // again by the retry below.
             shut(&device, &egress_verified);
-            LOG.error("egress is not proven on this epoch, peers stay refused");
+            if retry_in.is_none() {
+                LOG.error("egress is not proven on this epoch, peers stay refused");
+            }
+            retry_in = Some(next_reproof_delay(retry_in));
         }
+    }
+}
+
+/// Backs a re-proof off from [`REPROOF_RETRY_MIN`] to [`REPROOF_RETRY_MAX`], so
+/// a transient failure is answered in half a second while a long outage costs
+/// one probe every five.
+fn next_reproof_delay(current: Option<Duration>) -> Duration {
+    match current {
+        None => REPROOF_RETRY_MIN,
+        Some(delay) => delay.saturating_mul(2).min(REPROOF_RETRY_MAX),
     }
 }
 
@@ -791,6 +832,53 @@ mod tests {
         assert!(
             !device.snapshot().gate_open,
             "a failed proof leaves the gate shut"
+        );
+        task.abort();
+    }
+
+    /// A probe that fails once on an epoch the supervisor never leaves must not
+    /// cost the gate for good. Nothing publishes a state change on a tunnel
+    /// that stays up, so a tracker that only re-proves on a transition refuses
+    /// every peer until the daemon is restarted, while `/status` still says
+    /// `Connected`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_that_fails_once_on_a_live_epoch_is_retried_until_it_passes() {
+        let device = empty_device().await;
+        let (_sink, _control) = device.begin_epoch(addressing(1));
+        device.note_inner_budget(1414);
+        assert!(device.open_gate_for(1));
+        let (state_tx, state_rx) = watch::channel(ConnectionState::Connected);
+        let verified = Arc::new(AtomicBool::new(true));
+        let answer = Arc::new(AtomicBool::new(false));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let task = tokio::spawn(track_gate_across_epochs(
+            state_rx,
+            device.clone(),
+            Arc::clone(&verified),
+            1280,
+            scripted(&answer, &runs),
+        ));
+
+        state_tx.send(ConnectionState::Connected).unwrap();
+        wait_until(
+            || !device.snapshot().gate_open,
+            "a failed proof shuts the gate",
+        )
+        .await;
+
+        // The transient is over and no state change announces it: the epoch
+        // never ended.
+        answer.store(true, Ordering::Relaxed);
+        wait_until(
+            || device.snapshot().gate_open,
+            "the retry must reopen the gate on the epoch that is still running",
+        )
+        .await;
+        assert!(verified.load(Ordering::Relaxed));
+        assert!(
+            runs.load(Ordering::Relaxed) >= 2,
+            "the probe must have been asked again"
         );
         task.abort();
     }
