@@ -140,6 +140,9 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
     let egress_verified = Arc::new(AtomicBool::new(false));
     let (port_tx, port_rx) = watch::channel(None::<u16>);
     let mut tasks = DaemonTasks::default();
+    // Resolved whatever the listener is: a daemon that serves no admin surface
+    // must leave no token behind for the subcommands to present.
+    let admin = admin_routes(&env, &device)?;
 
     if let Some(listen) = env.health_listen {
         let listener = tokio::net::TcpListener::bind(listen)
@@ -155,7 +158,7 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
             MAX_CLIENT_MTU,
             env.health_peers,
         );
-        if let Some(admin) = admin_routes(&env, &device)? {
+        if let Some(admin) = admin {
             routes = routes.with_admin(admin);
         }
         let view = HealthView::new(
@@ -289,9 +292,7 @@ fn admin_routes(env: &GatewayEnv, device: &GatewayDevice) -> anyhow::Result<Opti
         .is_some_and(|listen| listen.ip().is_loopback());
     if !loopback {
         admin::forget_token(env);
-        LOG.info(
-            "admin routes are off: the health endpoint is not on loopback (reload with SIGHUP)",
-        );
+        LOG.info("admin routes are off: the health endpoint is off or not on loopback");
         return Ok(None);
     }
     let token = admin::write_token(env).context("writing the admin token")?;

@@ -87,6 +87,7 @@ fn main() -> ExitCode {
             for label in &out.written {
                 println!("  warren-burrow show {}", label.as_str());
             }
+            apply_to_daemon(&env);
             Ok(())
         }),
         Command::AddPeer(label, options) => provisioning(|| {
@@ -172,6 +173,12 @@ fn admin_call(env: &GatewayEnv, path: &str) -> ExitCode {
 /// what happened either way: an operator who edited a credential needs to know
 /// whether it is live.
 fn apply_to_daemon(env: &GatewayEnv) {
+    // No token means no daemon has ever run against this state directory,
+    // which is the ordinary case right after a first `init`: there is nothing
+    // to tell and nothing to reload.
+    if admin::read_token(env).is_err() {
+        return;
+    }
     match admin_request(env, "/admin/reload") {
         Ok(message) => print!("warren-burrow: {message}"),
         Err(message) => eprintln!("warren-burrow: {message}"),
