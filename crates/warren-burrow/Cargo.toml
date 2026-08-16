@@ -28,13 +28,12 @@ anyhow = "1"
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 
-# A terminal QR of a client configuration, for a phone or a TV. Optional: it
-# is a convenience of the `show` subcommand, and an image-free renderer is the
-# only part of it a headless host ever wants.
-qrcode = { version = "0.14", default-features = false, optional = true }
-
-[features]
-qr = ["dep:qrcode"]
+# A terminal QR of a client configuration, for a phone or a TV. A plain
+# dependency, not an optional one: `cargo deny` scans the default features, so
+# a feature-gated renderer would ship in the release binaries without ever
+# having been through the licence and advisory gate. Default features off: the
+# image renderers are what a headless host never wants.
+qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 # The stock client of the integration test: the only way to prove the gateway

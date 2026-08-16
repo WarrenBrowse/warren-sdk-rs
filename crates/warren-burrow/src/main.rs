@@ -143,21 +143,12 @@ fn provisioning(body: impl FnOnce() -> Result<(), provision::ProvisionError>) ->
 
 fn show(env: &GatewayEnv, label: &str, qr: bool) -> Result<(), provision::ProvisionError> {
     if qr {
-        #[cfg(feature = "qr")]
-        {
-            println!(
-                "warren-burrow: this QR carries the peer's private key and preshared key. \
-                 Show it on a trusted screen only."
-            );
-            print!("{}", *provision::show_qr(env, label)?);
-            return Ok(());
-        }
-        #[cfg(not(feature = "qr"))]
-        {
-            eprintln!(
-                "warren-burrow: this build carries no QR renderer (build with --features qr)"
-            );
-        }
+        println!(
+            "warren-burrow: this QR carries the peer's private key and preshared key. \
+             Show it on a trusted screen only."
+        );
+        print!("{}", *provision::show_qr(env, label)?);
+        return Ok(());
     }
     print!("{}", *provision::show(env, label)?);
     Ok(())

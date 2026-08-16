@@ -285,7 +285,6 @@ pub fn show(env: &GatewayEnv, label: &str) -> Result<Zeroizing<String>, Provisio
 /// # Errors
 ///
 /// [`ProvisionError::UnknownPeer`] when no file carries that label.
-#[cfg(feature = "qr")]
 pub fn show_qr(env: &GatewayEnv, label: &str) -> Result<Zeroizing<String>, ProvisionError> {
     let conf = show(env, label)?;
     let code = qrcode::QrCode::new(conf.as_bytes()).map_err(|_| ProvisionError::UnknownPeer)?;
@@ -922,6 +921,29 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&env.state_dir);
+    }
+
+    /// The QR is the same credential in another shape, for a phone or a TV, so
+    /// it is rendered from the file that was written and refuses a label no
+    /// peer carries, exactly as `show` does.
+    #[test]
+    fn a_qr_is_rendered_from_the_configuration_that_was_written() {
+        let dir = temp_dir("qr");
+        let env = env_for(&dir, &[]);
+        init(&env, &InitOptions::default()).expect("the first run");
+
+        let qr = show_qr(&env, "peer2").expect("a renderable configuration");
+
+        assert!(
+            qr.lines().count() > 10,
+            "a dense unicode QR is many rows: {}",
+            qr.lines().count()
+        );
+        assert!(matches!(
+            show_qr(&env, "nobody"),
+            Err(ProvisionError::UnknownPeer)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

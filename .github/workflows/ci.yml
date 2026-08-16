@@ -222,9 +222,9 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      # cargo-deny evaluates the full dependency graph (all features, all target
-      # cfgs) by default, so feature-gated deps behind `tun`/`killswitch` are
-      # already in the license/advisory graph once they are declared.
+      # cargo-deny evaluates the default feature set: a dependency reachable
+      # only behind an optional feature escapes this gate entirely, which is
+      # why the workspace declares its shipped dependencies plainly.
       - run: cargo deny check
 
   coverage:
