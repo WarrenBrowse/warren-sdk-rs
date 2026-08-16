@@ -136,10 +136,11 @@ gateway private key, the peer public keys and the preshared keys live in
 Sessions do not survive a restart of the gateway. A peer that was connected
 keeps its own session and its packets arrive under an index the new process
 does not know, counted as `unknown_index` and answered with nothing, which is
-what the protocol requires. A stock client discovers this only when it next has
-data to send, so a peer looks dead until then and traffic to it is lost in the
-meantime; one packet from the peer rebuilds the session in a fraction of a
-second, with no reconfiguration and no client restart.
+what the protocol requires. Each peer rebuilds its session on its own timers,
+needing no reconfiguration and no restart, but it looks dead until they fire
+and traffic to it is lost in the meantime: about 15 seconds for a peer that has
+data to send, which is its liveness rule, and as long as a rekey interval (two
+minutes) for an idle peer whose persistent keepalives are all it emits.
 
 `reload` adds new peers, removes deleted ones with their sessions, endpoints
 and NAT mappings (the revocation path for a lost device), rebuilds the peers
