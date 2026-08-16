@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1
-# Minimal warren-burrow image: one static musl binary on Alpine, no root, no
+# Minimal warren-bolthole image: one static musl binary on Alpine, no root, no
 # NET_ADMIN, no TUN, no capability of any kind. The gateway terminates stock
 # WireGuard-protocol peers on a UDP socket and carries their packets through a
 # Warren exit in userland, so it needs nothing the kernel would have to grant:
 # a compose file that adds `cap_add` or maps /dev/net/tun for THIS container is
 # adding privilege the gateway never asks for. Built by
-# .github/workflows/release-burrow.yml, which drops the per-arch static
+# .github/workflows/release-bolthole.yml, which drops the per-arch static
 # binaries under dist/<arch>/ first.
 
 # Pinned by digest, not by tag alone: the same tag is rebuilt under a new
@@ -18,11 +18,11 @@ FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc
 # in the image.
 RUN apk add --no-cache ca-certificates curl \
     && adduser -D -H warren \
-    && mkdir -p /var/lib/warren-burrow \
-    && chown warren:warren /var/lib/warren-burrow \
-    && chmod 700 /var/lib/warren-burrow
+    && mkdir -p /var/lib/warren-bolthole \
+    && chown warren:warren /var/lib/warren-bolthole \
+    && chmod 700 /var/lib/warren-bolthole
 ARG TARGETARCH
-COPY dist/${TARGETARCH}/warren-burrow /usr/local/bin/warren-burrow
+COPY dist/${TARGETARCH}/warren-bolthole /usr/local/bin/warren-bolthole
 
 # Links the GHCR package back to this repository, which is the only way to
 # reach the source from a private package page.
@@ -30,22 +30,22 @@ LABEL org.opencontainers.image.source="https://github.com/WarrenBrowse/warren-sd
       org.opencontainers.image.description="Local gateway carrying stock WireGuard-protocol clients through a Warren exit, unprivileged" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later"
 
-# Container defaults. WARREN_BURROW_LAN is deliberately NOT set here: binding
+# Container defaults. WARREN_BOLTHOLE_LAN is deliberately NOT set here: binding
 # anything but loopback exposes the one hop of the path that is ordinary
 # WireGuard rather than Warren's QUIC transport, so it stays an explicit
-# decision the operator makes per deployment (`-e WARREN_BURROW_LAN=1`), and
+# decision the operator makes per deployment (`-e WARREN_BOLTHOLE_LAN=1`), and
 # until they do the daemon refuses this listen address and says why. The health
 # endpoint stays on loopback for the HEALTHCHECK below; the state directory is
 # named explicitly because the /var/lib default only applies to a root process.
-ENV WARREN_BURROW_LISTEN=0.0.0.0:51820 \
+ENV WARREN_BOLTHOLE_LISTEN=0.0.0.0:51820 \
     WARREN_HEALTH_LISTEN=127.0.0.1:9998 \
-    WARREN_BURROW_STATE_DIR=/var/lib/warren-burrow
+    WARREN_BOLTHOLE_STATE_DIR=/var/lib/warren-bolthole
 
 # The peers' private keys and preshared keys live here and are kept nowhere
 # else: a container recreated without a named volume mounted on this path
 # generates a new gateway key and invalidates every client configuration
 # already imported on a TV, a router or a phone.
-VOLUME ["/var/lib/warren-burrow"]
+VOLUME ["/var/lib/warren-bolthole"]
 
 EXPOSE 51820/udp
 USER warren
@@ -62,5 +62,5 @@ USER warren
 # `condition: service_healthy` starts against a gateway that may be dead.
 # Disabling the endpoint disables the container health gate with it.
 HEALTHCHECK --interval=60s --timeout=15s --start-period=120s --retries=2 \
-  CMD ["/usr/local/bin/warren-burrow", "healthcheck"]
-ENTRYPOINT ["/usr/local/bin/warren-burrow"]
+  CMD ["/usr/local/bin/warren-bolthole", "healthcheck"]
+ENTRYPOINT ["/usr/local/bin/warren-bolthole"]

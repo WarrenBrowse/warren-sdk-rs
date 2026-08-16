@@ -1,12 +1,12 @@
-# Release pipeline for the warren-burrow binary and its container image.
+# Release pipeline for the warren-bolthole binary and its container image.
 #
 # Tag shapes (shared release-channel contract: one run publishes one channel):
-#   burrow-vX.Y.Z       prod  -> assets warren-burrow-<ver>-...,      image :<ver> + :latest
-#   burrow-beta-vX.Y.Z  beta  -> assets warren-burrow-beta-<ver>-..., image :beta-<ver> + :beta
+#   bolthole-vX.Y.Z       prod  -> assets warren-bolthole-<ver>-...,      image :<ver> + :latest
+#   bolthole-beta-vX.Y.Z  beta  -> assets warren-bolthole-beta-<ver>-..., image :beta-<ver> + :beta
 #
 # Artifacts: static musl binaries for linux x86_64 and aarch64, macOS arm64 and
 # x86_64, Windows x86_64, a published GitHub release with SHA256SUMS, and the
-# multi-arch image ghcr.io/warrenbrowse/warren-burrow.
+# multi-arch image ghcr.io/warrenbrowse/warren-bolthole.
 #
 # A tag publishes only when its commit is on main and that commit already has a
 # green CI run, so the release inherits the four gates.
@@ -25,13 +25,13 @@
 # binary has no dynamic section at all, and a dynamically linked one lists
 # NEEDED, so the NEEDED test tells the three apart wherever the check runs.
 
-name: release-burrow
+name: release-bolthole
 
 on:
   push:
     tags:
-      - "burrow-v*"
-      - "burrow-beta-v*"
+      - "bolthole-v*"
+      - "bolthole-beta-v*"
   workflow_dispatch:
     inputs:
       channel:
@@ -49,7 +49,7 @@ permissions:
 # GHCR tags and on `gh release create`. Never cancels a run in flight, which
 # would leave a half-published release behind.
 concurrency:
-  group: release-burrow-${{ github.ref }}
+  group: release-bolthole-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -81,8 +81,8 @@ jobs:
           set -euo pipefail
           if [ "$EVENT" = "push" ]; then
             case "$REF_NAME" in
-              burrow-beta-v*) channel=beta; prefix="burrow-beta-v"; version="${REF_NAME#burrow-beta-v}" ;;
-              burrow-v*)      channel=prod; prefix="burrow-v";      version="${REF_NAME#burrow-v}" ;;
+              bolthole-beta-v*) channel=beta; prefix="bolthole-beta-v"; version="${REF_NAME#bolthole-beta-v}" ;;
+              bolthole-v*)      channel=prod; prefix="bolthole-v";      version="${REF_NAME#bolthole-v}" ;;
               *) echo "unexpected tag $REF_NAME" >&2; exit 1 ;;
             esac
             # Version-truth guard (shared git-commits rule): refuse a tag that
@@ -236,7 +236,7 @@ jobs:
             export CARGO_TARGET_DIR="$HOME/warren-sdk-target-$CARGO_TARGET"
           fi
           case "$CARGO_TARGET" in *windows*) EXE=".exe" ;; *) EXE="" ;; esac
-          BIN="${CARGO_TARGET_DIR:-target}/$CARGO_TARGET/release/warren-burrow$EXE"
+          BIN="${CARGO_TARGET_DIR:-target}/$CARGO_TARGET/release/warren-bolthole$EXE"
           # A persistent cache means the previous run's binary is sitting at
           # $BIN: remove it, and no failure downstream can package a binary
           # that was not compiled from this tag.
@@ -259,13 +259,13 @@ jobs:
               bash scripts/ci/run-with-runner-retry.sh "$@"
             fi
           }
-          cargo_ci cargo build --locked --release -p warren-burrow --target "$CARGO_TARGET"
+          cargo_ci cargo build --locked --release -p warren-bolthole --target "$CARGO_TARGET"
           # A tag can be cut on any commit, so nothing else in this pipeline
           # guarantees the code being packaged passed its tests. Release
           # profile and same target as the build above, so it reuses what was
           # just compiled instead of building a second time. The core crate
           # carries the responder and the NAT, so it is tested here too.
-          cargo_ci cargo test --locked --release -p warren-burrow -p warren-burrow-core --target "$CARGO_TARGET"
+          cargo_ci cargo test --locked --release -p warren-bolthole -p warren-bolthole-core --target "$CARGO_TARGET"
           if [ ! -x "$BIN" ]; then
             echo "cargo reported success but produced no binary at $BIN"; exit 1
           fi
@@ -290,24 +290,24 @@ jobs:
           # catching here rather than on a user's machine. `--help` is the one
           # subcommand that needs no state directory and no account.
           "$BIN" --help >/dev/null
-          name="warren-burrow${ENV_TAG}-${VERSION}-${ASSET_OS}"
+          name="warren-bolthole${ENV_TAG}-${VERSION}-${ASSET_OS}"
           mkdir -p out staging
-          cp "$BIN" "staging/warren-burrow$EXE"
+          cp "$BIN" "staging/warren-bolthole$EXE"
           case "$CARGO_TARGET" in
             *windows*)
               # Compress-Archive ships with Windows PowerShell; `zip` does not
               # exist on this runner.
               powershell -NoProfile -Command \
-                "Compress-Archive -Path staging/warren-burrow.exe -DestinationPath out/${name}.zip -Force"
+                "Compress-Archive -Path staging/warren-bolthole.exe -DestinationPath out/${name}.zip -Force"
               ;;
             *)
-              tar -C staging -czf "out/${name}.tar.gz" warren-burrow
+              tar -C staging -czf "out/${name}.tar.gz" warren-bolthole
               ;;
           esac
           ls -l out
       - uses: actions/upload-artifact@v4
         with:
-          name: warren-burrow-${{ matrix.lane }}
+          name: warren-bolthole-${{ matrix.lane }}
           path: out/*
           if-no-files-found: error
 
@@ -341,9 +341,9 @@ jobs:
           mv SHA256SUMS out/
           # The image is the same binaries the release ships, unpacked from the
           # assets rather than rebuilt.
-          tar -C dist/amd64 -xzf "out/warren-burrow${ENV_TAG}-${VERSION}-linux-x86_64-musl.tar.gz"
-          tar -C dist/arm64 -xzf "out/warren-burrow${ENV_TAG}-${VERSION}-linux-aarch64-musl.tar.gz"
-          chmod 755 dist/amd64/warren-burrow dist/arm64/warren-burrow
+          tar -C dist/amd64 -xzf "out/warren-bolthole${ENV_TAG}-${VERSION}-linux-x86_64-musl.tar.gz"
+          tar -C dist/arm64 -xzf "out/warren-bolthole${ENV_TAG}-${VERSION}-linux-aarch64-musl.tar.gz"
+          chmod 755 dist/amd64/warren-bolthole dist/arm64/warren-bolthole
           ls -l out dist/amd64 dist/arm64
       # The image is pushed BEFORE the release is created. A release is the
       # announcement, and its notes point at the image: publishing it first and
@@ -370,13 +370,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$CHANNEL" = "beta" ]; then
-            tags="-t ghcr.io/warrenbrowse/warren-burrow:beta-${VERSION} -t ghcr.io/warrenbrowse/warren-burrow:beta"
+            tags="-t ghcr.io/warrenbrowse/warren-bolthole:beta-${VERSION} -t ghcr.io/warrenbrowse/warren-bolthole:beta"
           else
-            tags="-t ghcr.io/warrenbrowse/warren-burrow:${VERSION} -t ghcr.io/warrenbrowse/warren-burrow:latest"
+            tags="-t ghcr.io/warrenbrowse/warren-bolthole:${VERSION} -t ghcr.io/warrenbrowse/warren-bolthole:latest"
           fi
           push_image() {
             docker buildx build --push --platform linux/amd64,linux/arm64 \
-              -f docker/warren-burrow.Dockerfile $tags .
+              -f docker/warren-bolthole.Dockerfile $tags .
           }
           # GHCR's token exchange occasionally answers `denied` on the push
           # (transient, documented in warren-core's docker.yml); a fresh login
@@ -403,7 +403,7 @@ jobs:
           else
             gh release create "$TAG" out/* \
               --repo "$GITHUB_REPOSITORY" \
-              --title "warren-burrow ${CHANNEL} ${VERSION}" \
-              --notes "Local gateway that carries stock WireGuard-protocol clients through a Warren exit (${CHANNEL} channel). Env contract: crates/warren-burrow/README.md. Deployment examples: docs/burrow/. \"WireGuard\" is a registered trademark of Jason A. Donenfeld; this project is not affiliated with or endorsed by the WireGuard project." \
+              --title "warren-bolthole ${CHANNEL} ${VERSION}" \
+              --notes "Local gateway that carries stock WireGuard-protocol clients through a Warren exit (${CHANNEL} channel). Env contract: crates/warren-bolthole/README.md. Deployment examples: docs/bolthole/. \"WireGuard\" is a registered trademark of Jason A. Donenfeld; this project is not affiliated with or endorsed by the WireGuard project." \
               $prerelease
           fi
