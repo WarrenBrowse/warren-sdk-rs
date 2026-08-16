@@ -341,6 +341,10 @@ impl Responder {
         // silently absent peer is a device that never connects with nothing to
         // read about why, so the refusal is explicit.
         let index = self.indexes.next().ok_or(ConfError::TooManyPeers)?;
+        Ok(self.insert_peer_at(conf, index))
+    }
+
+    fn insert_peer_at(&mut self, conf: &PeerConf, index: u32) -> PeerId {
         let id = PeerId::new(index);
         let tunn = self.build_tunn(conf, index);
         self.by_pubkey.insert(*conf.public.as_bytes(), id);
@@ -358,7 +362,7 @@ impl Responder {
                 last_drop: None,
             },
         );
-        Ok(id)
+        id
     }
 
     fn build_tunn(&self, conf: &PeerConf, index: u32) -> Tunn {
@@ -372,6 +376,21 @@ impl Responder {
             index,
             Some(Arc::clone(&self.limiter)),
         )
+    }
+
+    // Both lookup maps are derived views of `peers`, so they are rebuilt from
+    // it rather than patched entry by entry: a reload that moves a key from one
+    // peer to another otherwise deletes the entry the earlier peer just wrote,
+    // and that peer is unknown to every later initiation.
+    fn rebuild_lookups(&mut self) {
+        let mut by_pubkey = HashMap::new();
+        let mut by_label = HashMap::new();
+        for (id, peer) in &self.peers {
+            by_pubkey.insert(*peer.public.as_bytes(), *id);
+            by_label.insert(peer.label.clone(), *id);
+        }
+        self.by_pubkey = by_pubkey;
+        self.by_label = by_label;
     }
 
     fn rebuild_routes(&mut self) {
@@ -994,6 +1013,20 @@ impl Responder {
         conf.validate()?;
         conf.check_against(&self.plan)?;
 
+        // Every index the new configuration needs is drawn before anything is
+        // mutated: an exhausted generator halfway through would leave the
+        // gateway carrying neither the old configuration nor the new one, and
+        // the documented contract is that a refused reload changes nothing.
+        let mut indexes = self.indexes.clone();
+        let mut fresh: Vec<u32> = Vec::new();
+        for peer in &conf.peers {
+            if !self.by_label.contains_key(&peer.label) {
+                fresh.push(indexes.next().ok_or(ConfError::TooManyPeers)?);
+            }
+        }
+        self.indexes = indexes;
+        let mut fresh = fresh.into_iter();
+
         let mut report = ReloadReport::default();
         let wanted: HashMap<PeerLabel, &PeerConf> = conf
             .peers
@@ -1008,9 +1041,7 @@ impl Responder {
             .map(|(id, peer)| (*id, peer.label.clone()))
             .collect();
         for (id, label) in gone {
-            if let Some(peer) = self.peers.remove(&id) {
-                self.by_pubkey.remove(peer.public.as_bytes());
-            }
+            self.peers.remove(&id);
             self.by_label.remove(&label);
             report.removed.push(label);
         }
@@ -1028,7 +1059,6 @@ impl Responder {
                     }
                     let tunn = self.build_tunn(peer, id.index());
                     if let Some(live) = self.peers.get_mut(&id) {
-                        self.by_pubkey.remove(live.public.as_bytes());
                         live.public = peer.public;
                         live.psk = peer.psk.clone();
                         live.allowed = peer.allowed.clone();
@@ -1036,15 +1066,16 @@ impl Responder {
                         live.endpoint = None;
                         live.last_drop = None;
                     }
-                    self.by_pubkey.insert(*peer.public.as_bytes(), id);
                     report.rebuilt.push(peer.label.clone());
                 }
                 None => {
-                    self.insert_peer(peer)?;
+                    let index = fresh.next().expect("one index was drawn per added peer");
+                    self.insert_peer_at(peer, index);
                     report.added.push(peer.label.clone());
                 }
             }
         }
+        self.rebuild_lookups();
         self.rebuild_routes();
         Ok(report)
     }
@@ -1933,6 +1964,35 @@ mod tests {
     }
 
     #[test]
+    fn reload_that_swaps_two_peers_key_material_keeps_both_reachable() {
+        let (mut responder, mut clients) = build(2, true);
+        let now = Instant::now();
+        handshake(&mut responder, &mut clients[0], now);
+        handshake(&mut responder, &mut clients[1], now);
+
+        // Two devices trade places in one edit. Removing a live key and
+        // inserting the new one peer by peer deletes the entry the previous
+        // peer just wrote, and the loser is unknown to every later initiation.
+        let mut peers = responder.peer_confs();
+        let public = peers[0].public;
+        peers[0].public = peers[1].public;
+        peers[1].public = public;
+        let psk = peers[0].psk.take();
+        peers[0].psk = peers[1].psk.take();
+        peers[1].psk = psk;
+        let conf = GatewayConf {
+            key: responder.key().clone(),
+            peers,
+        };
+
+        let report = responder.reload(&conf).expect("a valid configuration");
+        assert_eq!(report.rebuilt.len(), 2);
+
+        handshake(&mut responder, &mut clients[0], now);
+        handshake(&mut responder, &mut clients[1], now);
+    }
+
+    #[test]
     fn reload_adds_removes_and_leaves_an_untouched_peer_alone() {
         let (mut responder, mut clients) = build(2, true);
         let now = Instant::now();
@@ -1997,6 +2057,63 @@ mod tests {
             .find(|peer| peer.label == clients[0].label)
             .expect("the rebuilt peer");
         assert!(!rebuilt.has_session);
+    }
+
+    #[test]
+    fn a_reload_that_runs_out_of_indexes_leaves_the_gateway_untouched() {
+        // One index left, and a reload that wants three peers. Drawing them one
+        // at a time would rebuild the first peer and insert the second before
+        // the third refused, which is a configuration nobody wrote.
+        let mut indexes = IndexGen::from_seed(1, 0);
+        for _ in 0..(1u32 << 24) - 3 {
+            indexes.next().expect("still inside the period");
+        }
+
+        let key = GatewayKey::generate();
+        let live = PeerConf {
+            label: PeerLabel::new("peer2").unwrap(),
+            public: fresh_public(),
+            psk: None,
+            allowed: vec![IpNetwork::from_str("10.67.0.2/32").unwrap()],
+        };
+        let conf = GatewayConf {
+            key: key.clone(),
+            peers: vec![live],
+        };
+        let mut responder = Responder::with_indexes(
+            &conf,
+            PeerPlan::default(),
+            ResponderOptions::default(),
+            indexes,
+        )
+        .expect("the last index numbers the only peer");
+
+        let mut peers = responder.peer_confs();
+        peers[0]
+            .allowed
+            .push(IpNetwork::from_str("10.67.0.10/32").unwrap());
+        for (number, address) in [(3u8, "10.67.0.3/32"), (4, "10.67.0.4/32")] {
+            peers.push(PeerConf {
+                label: PeerLabel::new(&format!("peer{number}")).unwrap(),
+                public: fresh_public(),
+                psk: None,
+                allowed: vec![IpNetwork::from_str(address).unwrap()],
+            });
+        }
+        let wanted = GatewayConf { key, peers };
+
+        assert_eq!(
+            responder.reload(&wanted).unwrap_err(),
+            ConfError::TooManyPeers
+        );
+        let after = responder.peer_confs();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].allowed.len(), 1);
+    }
+
+    fn fresh_public() -> PeerPublicKey {
+        let secret = x25519::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        PeerPublicKey::from_bytes(x25519::PublicKey::from(&secret).to_bytes())
     }
 
     #[test]
