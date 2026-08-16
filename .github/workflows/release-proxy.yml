@@ -65,6 +65,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_CHANNEL: ${{ github.event.inputs.channel }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -76,12 +77,20 @@ jobs:
             esac
             # Version-truth guard (shared git-commits rule): refuse a tag that
             # is not the strictly highest of ITS OWN series, reading the
-            # remote's tags rather than the clone's.
-            highest=$(git ls-remote --tags origin "refs/tags/${prefix}*" \
-              | sed "s|.*refs/tags/${prefix}||" | grep -v '\^{}' | sort -V | tail -1)
-            if [ "$highest" != "$version" ]; then
-              echo "refusing ${REF_NAME}: highest ${prefix}* on origin is ${prefix}${highest}" >&2
-              exit 1
+            # remote's tags rather than the clone's. Exempt on a re-run of this
+            # same run: the publish job goes to the trouble of being idempotent
+            # so a partial publish can be finished, and by the time somebody
+            # re-runs it the next tag of the series may already exist, which
+            # would otherwise close the recovery path this pipeline built in.
+            if [ "${RUN_ATTEMPT:-1}" = "1" ]; then
+              highest=$(git ls-remote --tags origin "refs/tags/${prefix}*" \
+                | sed "s|.*refs/tags/${prefix}||" | grep -v '\^{}' | sort -V | tail -1)
+              if [ "$highest" != "$version" ]; then
+                echo "refusing ${REF_NAME}: highest ${prefix}* on origin is ${prefix}${highest}" >&2
+                exit 1
+              fi
+            else
+              echo "attempt ${RUN_ATTEMPT} of ${REF_NAME}: recovery re-run, not checking it is the highest ${prefix}*"
             fi
             # A tag can be cut on any commit, so the release inherits the four
             # gates instead of re-running one of them: the tagged commit has to
@@ -133,8 +142,13 @@ jobs:
             target: aarch64-unknown-linux-musl
             runner: [self-hosted, Linux, ARM64, macstudio-arm64]
     runs-on: ${{ matrix.runner }}
-    # Generous: the real anti-hang guard is the per-invocation timeout below.
-    timeout-minutes: 90
+    # Sized so the retry wrapper always outlives its own worst case and the
+    # failure carries its diagnosis rather than GitHub's: two invocations
+    # (build, test), each allowed two attempts of the 70-minute wedge timeout
+    # plus a 15-second back-off, is 280 minutes. A lane reaches that only when
+    # the runner is wedged four times over; the emulated x86_64 lane's real
+    # cold build of the sibling gateway binary was 43 minutes.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-engine
@@ -161,47 +175,55 @@ jobs:
         run: |
           set -euo pipefail
           # Persistent cache outside _work (the runner GC wipes leaf target/
-          # dirs in _work between jobs).
-          export CARGO_TARGET_DIR="$HOME/warren-sdk-target"
+          # dirs in _work between jobs), one directory per target: a shared one
+          # lets the retry wrapper's `cargo clean` wipe a sibling lane's tree
+          # mid-build wherever two lanes land on the same host, and serialises
+          # them on one cargo lock.
+          export CARGO_TARGET_DIR="$HOME/warren-sdk-target-$CARGO_TARGET"
           BIN="$CARGO_TARGET_DIR/$CARGO_TARGET/release/warren-proxy"
           # That cache is deliberately persistent, so the previous run's binary
           # is sitting at $BIN: remove it, and no failure downstream can package
           # a binary that was not compiled from this tag.
           rm -f "$BIN"
-          # retry_flaky (proven on the Rosetta pools): a rustc can die
-          # unreaped under emulation and cargo waits on its jobserver token
-          # forever; timeout SIGKILLs (rc 124/137) and the retry resumes on
-          # the warm target dir. A genuine failure fails the first pass.
-          retry_flaky() {
-            for attempt in 1 2 3; do
-              if timeout -k 60s 40m "$@" 2>&1 | tee /tmp/cargo-out.txt; then return 0; fi
-              # PIPESTATUS, never $?: an `if` whose condition failed and which
-              # has no else exits 0, so `$?` here reads that 0 and every real
-              # compile error would be reported as a success.
-              rc=${PIPESTATUS[0]}
-              if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
-                echo "::warning::cargo hung and was killed (attempt $attempt/3); retrying"
-              elif grep -q 'SIGSEGV\|signal: 11' /tmp/cargo-out.txt; then
-                echo "::warning::rustc crashed (attempt $attempt/3); retrying"
-              else
-                return "$rc"
-              fi
-            done
-            return 1
+          # A rustc that cannot be SPAWNED, one killed mid-compile, and a
+          # wedged cargo are the three runner failures this pipeline sees; the
+          # classifier retries those and fails anything else on the first
+          # attempt (scripts/ci/run-with-runner-retry.sh), which also backs off
+          # before retrying into the window it was trying to escape.
+          #
+          # 70m, not 40m: the emulated x86_64 pool needed 43 minutes for the
+          # sibling gateway's cold build and a 40-minute limit killed it one
+          # minute short. Two attempts, not three, because a retry here can
+          # cost a full wedge timeout and three would put this job's ceiling
+          # out of reach of any reasonable number.
+          cargo_ci() {
+            WARREN_RETRY_ATTEMPTS=2 \
+              bash scripts/ci/run-with-runner-retry.sh timeout -k 60s 70m "$@"
           }
-          retry_flaky cargo build --locked --release -p warren-proxy --target "$CARGO_TARGET"
+          cargo_ci cargo build --locked --release -p warren-proxy --target "$CARGO_TARGET"
           # A tag can be cut on any commit, so nothing else in this pipeline
           # guarantees the code being packaged passed its tests. Release profile
           # and same target as the build above, so it reuses what was just
           # compiled instead of building a second time.
-          retry_flaky cargo test --locked --release -p warren-proxy --target "$CARGO_TARGET"
+          cargo_ci cargo test --locked --release -p warren-proxy --target "$CARGO_TARGET"
           if [ ! -x "$BIN" ]; then
             echo "cargo reported success but produced no binary at $BIN"; exit 1
           fi
-          # Static check without `file`: a musl static binary is "not a
-          # dynamic executable" to ldd.
-          if ldd "$BIN" 2>&1 | grep -qvi 'not a dynamic executable\|statically linked'; then
-            echo "binary is dynamically linked:"; ldd "$BIN"; exit 1
+          # ldd is the dynamic loader, not a static check: the musl one answers
+          # a valid static binary with `Not a valid dynamic program`, which
+          # matches neither accepted string and fails the release. What tells
+          # the three shapes apart is the NEEDED entry, absent from a plain
+          # static binary and from a static-pie, present in a dynamic one.
+          if command -v readelf > /dev/null 2>&1; then
+            if readelf -d "$BIN" | grep -q NEEDED; then
+              echo "binary is dynamically linked:"; readelf -d "$BIN"; exit 1
+            fi
+          elif command -v file > /dev/null 2>&1; then
+            file -b "$BIN" | grep -qE 'static-pie linked|statically linked' || {
+              echo "binary is not static: $(file -b "$BIN")"; exit 1
+            }
+          else
+            echo "no readelf and no file on this runner: cannot verify the binary is static"; exit 1
           fi
           mkdir -p dist
           cp "$BIN" dist/warren-proxy

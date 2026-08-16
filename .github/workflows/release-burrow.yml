@@ -14,8 +14,7 @@
 # workflow_dispatch builds and packages every lane as run artifacts without
 # publishing anything (a dry run of the matrix).
 #
-# One difference from release-proxy.yml, and it is deliberate: the static check
-# is `readelf -d` (no NEEDED entry), not
+# The static check is `readelf -d` (no NEEDED entry), never
 # `ldd BIN | grep -qvi 'not a dynamic executable|statically linked'`. ldd is the
 # dynamic loader, and the musl one answers a valid static binary with
 # `/lib/ld-musl-aarch64.so.1: BIN: Not a valid dynamic program`, which matches
