@@ -81,11 +81,15 @@ impl HandshakeBuckets {
 
         let elapsed = now.saturating_duration_since(bucket.last);
         let millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-        bucket.tokens = bucket
-            .tokens
-            .saturating_add(millis.saturating_mul(rate))
-            .min(burst);
-        bucket.last = now;
+        let refill = millis.saturating_mul(rate);
+        if refill > 0 {
+            // The mark only moves once the elapsed time bought something. A
+            // source arriving faster than once a millisecond otherwise has its
+            // sub-millisecond remainder thrown away on every call, and never
+            // refills past the burst it started with.
+            bucket.tokens = bucket.tokens.saturating_add(refill).min(burst);
+            bucket.last = now;
+        }
 
         let admitted = bucket.tokens >= SCALE;
         if admitted {
@@ -157,6 +161,29 @@ mod tests {
             assert!(buckets.admit(ip(1), now + Duration::from_secs(3600)));
         }
         assert!(!buckets.admit(ip(1), now + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn refills_for_a_source_that_arrives_faster_than_once_a_millisecond() {
+        // A source retrying every 200 microseconds sees a whole-millisecond
+        // refill of zero on nearly every call. Advancing the bucket's mark
+        // anyway threw that remainder away and pinned the source at its
+        // initial burst forever, an effective rate of zero.
+        let mut buckets = HandshakeBuckets::new();
+        let start = Instant::now();
+        let mut admitted = 0u32;
+        for step in 0..=5_000u64 {
+            if buckets.admit(ip(1), start + Duration::from_micros(step * 200)) {
+                admitted += 1;
+            }
+        }
+        let budget = HANDSHAKE_BURST_PER_IP + HANDSHAKE_RATE_PER_IP;
+        // One token of tail: the last refill of the second lands after the
+        // last arrival of the second.
+        assert!(
+            admitted >= budget - 1 && admitted <= budget,
+            "one second of arrivals admitted {admitted}"
+        );
     }
 
     #[test]
