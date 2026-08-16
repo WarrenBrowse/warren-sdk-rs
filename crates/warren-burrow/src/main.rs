@@ -1,5 +1,5 @@
-//! `warren-burrow`: the Warren local gateway. See the crate docs
-//! ([`warren_burrow`]) and `README.md` for the env contract.
+//! `warren-burrow`: the Warren local gateway. The env contract is the table in
+//! `README.md`, next to this crate's `Cargo.toml`.
 
 use std::path::Path;
 use std::process::ExitCode;
