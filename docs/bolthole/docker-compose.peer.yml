@@ -3,13 +3,13 @@
 # phone without the app. Each of them imports a client configuration this
 # gateway generated and points it at this host.
 #
-# Bring it up: docs/burrow/README.md, "A gateway for LAN devices", which sets
+# Bring it up: docs/bolthole/README.md, "A gateway for LAN devices", which sets
 # WARREN_LAN_IP and retrieves a peer's configuration.
-name: warren-burrow
+name: warren-bolthole
 
 services:
-  warren-burrow:
-    image: ghcr.io/warrenbrowse/warren-burrow:beta
+  warren-bolthole:
+    image: ghcr.io/warrenbrowse/warren-bolthole:beta
     restart: unless-stopped
     # No cap_add, no devices, no privileged: the gateway terminates its peers
     # on a UDP socket and reaches the exit in userland.
@@ -30,19 +30,19 @@ services:
       # it is the point: the peers are on that LAN. Warren's QUIC transport and
       # its obfuscation begin AT this gateway, so this port belongs on a
       # network you trust and never on one a stranger routes to.
-      WARREN_BURROW_LAN: "1"
+      WARREN_BOLTHOLE_LAN: "1"
       # One address, not 0.0.0.0: a host with a second interface (a WAN port, a
       # management network, another VLAN) would otherwise answer there too.
       # 51820/udp is bound on the host directly, so no port is published and no
       # docker NAT sits between a peer and the gateway.
-      WARREN_BURROW_LISTEN: ${WARREN_LAN_IP:?set WARREN_LAN_IP to the LAN address this gateway binds}:51820
+      WARREN_BOLTHOLE_LISTEN: ${WARREN_LAN_IP:?set WARREN_LAN_IP to the LAN address this gateway binds}:51820
       # What gets written into every generated client configuration as its
       # Endpoint. A device reads it once, at import.
-      WARREN_BURROW_ENDPOINT: ${WARREN_LAN_IP}:51820
+      WARREN_BOLTHOLE_ENDPOINT: ${WARREN_LAN_IP}:51820
       WARREN_CONNECT_TIMEOUT: "90"
-      # One per device that will import a configuration. `warren-burrow
+      # One per device that will import a configuration. `warren-bolthole
       # add-peer LABEL` adds one later without restarting anything.
-      WARREN_BURROW_PEERS: "4"
+      WARREN_BOLTHOLE_PEERS: "4"
       WARREN_EXITS: de, nl
     secrets:
       - warren_mnemonic
@@ -51,18 +51,18 @@ services:
     # new key and every configuration already imported on a device somebody has
     # to walk to stops working.
     volumes:
-      - warren-burrow-state:/var/lib/warren-burrow
+      - warren-bolthole-state:/var/lib/warren-bolthole
     healthcheck:
       # The image already declares this; it is repeated here because the start
       # period has to follow WARREN_CONNECT_TIMEOUT above.
-      test: ["CMD", "/usr/local/bin/warren-burrow", "healthcheck"]
+      test: ["CMD", "/usr/local/bin/warren-bolthole", "healthcheck"]
       interval: 60s
       timeout: 15s
       start_period: 120s
       retries: 2
 
 volumes:
-  warren-burrow-state:
+  warren-bolthole-state:
 
 secrets:
   warren_mnemonic:

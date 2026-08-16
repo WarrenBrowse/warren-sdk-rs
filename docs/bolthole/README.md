@@ -1,6 +1,6 @@
-# Deploying warren-burrow
+# Deploying warren-bolthole
 
-warren-burrow implements the WireGuard protocol so that stock WireGuard clients
+warren-bolthole implements the WireGuard protocol so that stock WireGuard clients
 can use Warren. "WireGuard" is a registered trademark of Jason A. Donenfeld;
 this project is not affiliated with or endorsed by the WireGuard project.
 
@@ -11,7 +11,7 @@ stack you would rather not replace. Each of those devices runs its own stock
 WireGuard client and points it at the gateway.
 
 The env contract, the commands and the health surface are in
-[`crates/warren-burrow/README.md`](../../crates/warren-burrow/README.md). This
+[`crates/warren-bolthole/README.md`](../../crates/warren-bolthole/README.md). This
 directory carries the deployment shapes and the per-device import paths.
 
 | file | what it is |
@@ -27,7 +27,7 @@ directory carries the deployment shapes and the per-device import paths.
 |---|---|---|
 | a host that can hold `NET_ADMIN` and `/dev/net/tun` (docker, a NAS, Kubernetes) | the `warren-vpn` container | one crypto layer, one NAT, a kill switch tied to the death of the namespace, native-sidecar ordering under Kubernetes |
 | a restricted namespace, CI, per-application egress, no capability to give | `warren-proxy` | SOCKS5 and HTTP CONNECT, unprivileged, one process |
-| a device that cannot run Warren at all, or a gluetun stack you will not replace | `warren-burrow` | a stock WireGuard client on the device, one gateway on the LAN, one Warren session for all of them |
+| a device that cannot run Warren at all, or a gluetun stack you will not replace | `warren-bolthole` | a stock WireGuard client on the device, one gateway on the LAN, one Warren session for all of them |
 
 Pick the gateway when the device is what constrains you: it is the only one of
 the three that asks nothing of the device beyond a stock WireGuard client. When
@@ -51,7 +51,7 @@ gateway is ordinary WireGuard, recognisable to anyone inspecting the traffic.
 On a home network or a NAS that hop is local, which is the point. A gateway
 reachable across the internet gives up Warren's censorship resistance for that
 leg, which is why neither example publishes the gateway's UDP port and why the
-daemon refuses a non-loopback bind until `WARREN_BURROW_LAN=1` says otherwise.
+daemon refuses a non-loopback bind until `WARREN_BOLTHOLE_LAN=1` says otherwise.
 
 **The kill switch is the peer's own setting.** The gateway is fail-closed by
 construction: it never writes a peer's packet anywhere except into the tunnel,
@@ -66,7 +66,7 @@ setting where it has one; [`clients.md`](clients.md) names it per platform.
 devices import a configuration whose `Endpoint` is that address.
 
 ```sh
-cd docs/burrow
+cd docs/bolthole
 umask 077
 printf '%s\n' 'the twelve words of the account' > warren-mnemonic.txt
 sudo chown 1000:1000 warren-mnemonic.txt   # the image's unprivileged user; sudo unless you are already root
@@ -74,12 +74,12 @@ export WARREN_LAN_IP=192.168.1.10          # this host's LAN address
 docker compose -f docker-compose.peer.yml up -d
 ```
 
-The first run generates the gateway key and `WARREN_BURROW_PEERS`
+The first run generates the gateway key and `WARREN_BOLTHOLE_PEERS`
 configurations, named `peer2`, `peer3` and so on. Retrieve one:
 
 ```sh
-docker compose -f docker-compose.peer.yml exec warren-burrow warren-burrow show peer2
-docker compose -f docker-compose.peer.yml exec warren-burrow warren-burrow show peer2 --qr
+docker compose -f docker-compose.peer.yml exec warren-bolthole warren-bolthole show peer2
+docker compose -f docker-compose.peer.yml exec warren-bolthole warren-bolthole show peer2 --qr
 ```
 
 The text form is what a router or a desktop imports as a file; the QR is what a
@@ -90,8 +90,8 @@ shared drive. [`clients.md`](clients.md) takes it from there, per device.
 Adding a device later needs no restart:
 
 ```sh
-docker compose -f docker-compose.peer.yml exec warren-burrow warren-burrow add-peer livingroom-tv
-docker compose -f docker-compose.peer.yml exec warren-burrow warren-burrow remove-peer livingroom-tv
+docker compose -f docker-compose.peer.yml exec warren-bolthole warren-bolthole add-peer livingroom-tv
+docker compose -f docker-compose.peer.yml exec warren-bolthole warren-bolthole remove-peer livingroom-tv
 ```
 
 `add-peer` and `remove-peer` reload the running daemon themselves, and a
@@ -105,17 +105,17 @@ with `VPN_SERVICE_PROVIDER=custom` and `VPN_TYPE=wireguard`, and every
 `WIREGUARD_*` key it needs comes from a file the gateway generated.
 
 ```sh
-cd docs/burrow
+cd docs/bolthole
 umask 077
 printf '%s\n' 'the twelve words of the account' > warren-mnemonic.txt
 sudo chown 1000:1000 warren-mnemonic.txt   # the image's unprivileged user; sudo unless you are already root
 
 # Generate the gateway and one peer named glue, before anything starts.
-docker compose -f docker-compose.gluetun.yml run --rm warren-burrow init --label glue
+docker compose -f docker-compose.gluetun.yml run --rm warren-bolthole init --label glue
 
 # Take the generated env snippet out of the state volume, once.
 docker compose -f docker-compose.gluetun.yml run --rm --entrypoint cat \
-  warren-burrow /var/lib/warren-burrow/clients/glue.gluetun.env > glue.gluetun.env
+  warren-bolthole /var/lib/warren-bolthole/clients/glue.gluetun.env > glue.gluetun.env
 
 docker compose -f docker-compose.gluetun.yml up -d
 ```
@@ -152,7 +152,7 @@ and the recommended client MTU, the NAT mappings and every drop counter, with no
 key and no address in it. `/peers` carries per-peer labels and counters.
 
 ```sh
-docker compose -f docker-compose.peer.yml exec warren-burrow \
+docker compose -f docker-compose.peer.yml exec warren-bolthole \
   curl -s http://127.0.0.1:9998/status
 ```
 
@@ -166,7 +166,7 @@ second rekey interval. A peer looks dead until its timer fires, and its traffic
 is lost in the meantime.
 
 `WARREN_HEALTH_LISTEN=off` turns that endpoint off, and with it the container
-health gate: `warren-burrow healthcheck` has nothing to reach and exits 0 on
+health gate: `warren-bolthole healthcheck` has nothing to reach and exits 0 on
 every run, so docker reports the container healthy whatever the daemon is
 doing, and `condition: service_healthy` waits on nothing. Leave the endpoint on
 wherever a compose file gates anything on it.
@@ -188,7 +188,7 @@ tunnel loss and emitting nothing to peers until it healed; a NAT-PMP port
 forward reachable from a neutral vantage.
 
 The image these examples run was exercised as itself: the linux aarch64 musl
-binary the release lane builds, in the image `docker/warren-burrow.Dockerfile`
+binary the release lane builds, in the image `docker/warren-bolthole.Dockerfile`
 produces, reached `healthy` against the DE exit in under twenty seconds, as
 uid 1000, with the state directory 0700 and the client files 0600 inside a
 named volume.

@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 #
-# Structural tests for the compose examples in docs/burrow/.
+# Structural tests for the compose examples in docs/bolthole/.
 #
-#   sh docs/burrow/test-examples.sh
+#   sh docs/bolthole/test-examples.sh
 #
 # These files are copy-paste templates: whatever they get wrong, users deploy.
 # Every property pinned here is one whose absence either exposes the one hop of
@@ -104,13 +104,13 @@ check_refuses() { # check_refuses <description> <sed-expression> <file> <rule>
 # teaches an operator to hand privilege to the one container that never asks
 # for it.
 rule_gateway_unprivileged() {
-	! svc_block "$1" warren-burrow | grep -qE '^[[:space:]]+(cap_add|devices|privileged):'
+	! svc_block "$1" warren-bolthole | grep -qE '^[[:space:]]+(cap_add|devices|privileged):'
 }
 
 # Binding anything but loopback is the decision that exposes the ordinary
 # WireGuard hop, so it is made once, visibly, in the file the operator edits.
 rule_lan_is_opt_in() {
-	svc_block "$1" warren-burrow | grep -qE '^[[:space:]]+WARREN_BURROW_LAN:[[:space:]]*"1"'
+	svc_block "$1" warren-bolthole | grep -qE '^[[:space:]]+WARREN_BOLTHOLE_LAN:[[:space:]]*"1"'
 }
 
 # The recovery phrase reaches the daemon as a path to a file, never as a value
@@ -157,7 +157,7 @@ rule_secret_paths_are_mounted() {
 # gate opens on its egress proof, the container reports healthy, and every peer
 # handshakes with silence until somebody reads a packet counter.
 rule_listen_is_not_loopback() {
-	svc_value "$1" warren-burrow WARREN_BURROW_LISTEN \
+	svc_value "$1" warren-bolthole WARREN_BOLTHOLE_LISTEN \
 		| grep -qvE '^(127\.|\[?::1\]?:|localhost:)'
 }
 
@@ -178,8 +178,8 @@ rule_udp_port_not_published() {
 # gateway key and invalidates every configuration already imported on a device
 # somebody has to walk to.
 rule_named_state_volume() {
-	svc_block "$1" warren-burrow \
-		| grep -qE '^[[:space:]]+- [a-z][a-z0-9_-]*:/var/lib/warren-burrow'
+	svc_block "$1" warren-bolthole \
+		| grep -qE '^[[:space:]]+- [a-z][a-z0-9_-]*:/var/lib/warren-bolthole'
 }
 
 # The health gate opens only once an epoch has proven egress, and the first
@@ -187,7 +187,7 @@ rule_named_state_volume() {
 # shorter start period reports unhealthy on a gateway that is merely still
 # dialling, and everything that waits for it gives up.
 rule_start_period_covers_connect_timeout() {
-	start="$(svc_block "$1" warren-burrow | awk '
+	start="$(svc_block "$1" warren-bolthole | awk '
 		/^[[:space:]]+start_period:/ {
 			sub(/^[[:space:]]*start_period:[[:space:]]*/, "")
 			gsub(/[^0-9]/, "")
@@ -195,7 +195,7 @@ rule_start_period_covers_connect_timeout() {
 			exit
 		}
 	')"
-	connect="$(svc_value "$1" warren-burrow WARREN_CONNECT_TIMEOUT)"
+	connect="$(svc_value "$1" warren-bolthole WARREN_CONNECT_TIMEOUT)"
 	[ -n "$start" ] && [ -n "$connect" ] && [ "$start" -ge "$connect" ]
 }
 
@@ -207,7 +207,7 @@ rule_dependents_wait_for_healthy() {
 		/^  [^[:space:]#]/ { indeps = 0 }
 		indeps && /^    [a-z_]+:/ { indeps = 0 }
 		/^[[:space:]]+depends_on:/ { indeps = 1; next }
-		indeps && /warren-burrow:/ { seen = 1; next }
+		indeps && /warren-bolthole:/ { seen = 1; next }
 		indeps && seen && /condition:[[:space:]]*service_healthy/ { healthy++; seen = 0 }
 		indeps && seen && /^[[:space:]]+[a-z_-]+:/ { seen = 0 }
 		END { exit(healthy > 0 ? 0 : 1) }
@@ -220,7 +220,7 @@ rule_dependents_wait_for_healthy() {
 # docker in whatever order the containers happened to start.
 rule_literal_endpoint_matches_gateway() {
 	endpoint="$(svc_value "$1" gluetun WIREGUARD_ENDPOINT_IP)"
-	gateway="$(svc_block "$1" warren-burrow | awk '
+	gateway="$(svc_block "$1" warren-bolthole | awk '
 		/^[[:space:]]+ipv4_address:/ {
 			sub(/^[[:space:]]*ipv4_address:[[:space:]]*/, "")
 			gsub(/[^0-9.]/, "")
@@ -300,19 +300,19 @@ echo "each rule, against a file that breaks it"
 check_refuses "a gateway granted NET_ADMIN" \
 	's|^    restart: unless-stopped$|    cap_add: [NET_ADMIN]|' "$GLUETUN" rule_gateway_unprivileged
 check_refuses "LAN exposure left at the default" \
-	's|WARREN_BURROW_LAN: "1"|WARREN_BURROW_LAN: "0"|' "$GLUETUN" rule_lan_is_opt_in
+	's|WARREN_BOLTHOLE_LAN: "1"|WARREN_BOLTHOLE_LAN: "0"|' "$GLUETUN" rule_lan_is_opt_in
 check_refuses "the recovery phrase written into the file" \
 	's|WARREN_MNEMONIC_FILE: /run/secrets/warren_mnemonic|WARREN_MNEMONIC: twelve words go here|' \
 	"$GLUETUN" rule_mnemonic_by_file
 check_refuses "a secret the service no longer mounts" \
 	's|^      - warren_mnemonic$|      - some_other_secret|' "$GLUETUN" rule_secret_paths_are_mounted
 check_refuses "a gateway bound to loopback with LAN exposure still on" \
-	's|WARREN_BURROW_LISTEN: 0.0.0.0:51820|WARREN_BURROW_LISTEN: 127.0.0.1:51820|' \
+	's|WARREN_BOLTHOLE_LISTEN: 0.0.0.0:51820|WARREN_BOLTHOLE_LISTEN: 127.0.0.1:51820|' \
 	"$GLUETUN" rule_listen_is_not_loopback
 check_refuses "the UDP port published to the host" \
 	's|^    healthcheck:$|    ports: ["51820:51820/udp"]|' "$GLUETUN" rule_udp_port_not_published
 check_refuses "an anonymous state volume" \
-	's|- warren-burrow-state:/var/lib/warren-burrow|- /var/lib/warren-burrow|' \
+	's|- warren-bolthole-state:/var/lib/warren-bolthole|- /var/lib/warren-bolthole|' \
 	"$GLUETUN" rule_named_state_volume
 check_refuses "a start period shorter than the connect timeout" \
 	's|start_period: 120s|start_period: 30s|' "$GLUETUN" rule_start_period_covers_connect_timeout
@@ -321,7 +321,7 @@ check_refuses "the ownership recipe dropped from the secret" \
 check_refuses "a client that starts as soon as the gateway exists" \
 	's|condition: service_healthy|condition: service_started|' "$GLUETUN" rule_dependents_wait_for_healthy
 check_refuses "an endpoint given as a service name" \
-	's|WIREGUARD_ENDPOINT_IP: "172.30.0.10"|WIREGUARD_ENDPOINT_IP: "warren-burrow"|' \
+	's|WIREGUARD_ENDPOINT_IP: "172.30.0.10"|WIREGUARD_ENDPOINT_IP: "warren-bolthole"|' \
 	"$GLUETUN" rule_literal_endpoint_matches_gateway
 check_refuses "an endpoint that is not the gateway's address" \
 	's|WIREGUARD_ENDPOINT_IP: "172.30.0.10"|WIREGUARD_ENDPOINT_IP: "172.30.0.11"|' \
