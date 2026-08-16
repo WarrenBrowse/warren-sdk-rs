@@ -85,6 +85,14 @@ jobs:
               bolthole-v*)      channel=prod; prefix="bolthole-v";      version="${REF_NAME#bolthole-v}" ;;
               *) echo "unexpected tag $REF_NAME" >&2; exit 1 ;;
             esac
+            # The version `--version` prints is this crate's manifest version,
+            # so a tag that disagrees with it ships a binary that misnames the
+            # release it came from.
+            manifest=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && $1=="version"{gsub(/"/,"",$3); print $3; exit}' crates/warren-bolthole/Cargo.toml)
+            if [ "$manifest" != "$version" ]; then
+              echo "refusing ${REF_NAME}: crates/warren-bolthole/Cargo.toml says $manifest" >&2
+              exit 1
+            fi
             # Version-truth guard (shared git-commits rule): refuse a tag that
             # is not the strictly highest of ITS OWN series, reading the
             # remote's tags rather than the clone's. Exempt on a re-run of this

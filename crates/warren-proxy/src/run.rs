@@ -33,6 +33,9 @@ const LOG: Log = Log("warren-proxy");
 /// Startup errors (API unreachable, no matching exit, bind failure) are
 /// returned; after the datapath is up, failures translate into the exit code.
 pub async fn run(config: Config) -> anyhow::Result<i32> {
+    // First line of the container log: a support report that names a build is
+    // the only way to tell a fixed daemon from an old one still running.
+    LOG.info(&format!("version {}", env!("CARGO_PKG_VERSION")));
     let identity = WarrenIdentity::from_mnemonic(config.mnemonic.trim())
         .context("the recovery phrase must be 12 or 24 BIP39 words")?;
     LOG.info(&warren_headless::account_line(&identity.address()));

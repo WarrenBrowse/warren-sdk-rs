@@ -14,6 +14,18 @@ privileged full-VPN image (`ghcr.io/warrenbrowse/warren-vpn`, kill switch,
 netns ownership) is the sibling for the gluetun-style `network_mode:
 "service:..."` pattern.
 
+## Commands
+
+```
+warren-proxy                 serve (the default)
+warren-proxy healthcheck     probe the running daemon's /healthz
+warren-proxy --version       print the build this binary came from
+```
+
+An argument that is not one of these is refused: every other knob is an
+environment variable, so a flag the daemon does not know would otherwise be
+ignored while the operator believed it applied.
+
 ## Environment
 
 | variable | default | meaning |

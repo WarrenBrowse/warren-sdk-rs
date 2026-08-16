@@ -1,7 +1,10 @@
 [package]
 name = "warren-proxy"
 description = "Headless Warren proxy daemon: a supervised SOCKS5/HTTP CONNECT tunnel endpoint with env-first configuration for containers, servers and NAS boxes"
-version.workspace = true
+# Its own version series: this binary is released on its own tag
+# (`proxy-v*`), and the release pipeline refuses a tag whose version
+# differs from this line.
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

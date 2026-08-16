@@ -59,6 +59,7 @@ warren-bolthole show LABEL [--qr]          print a peer's client configuration
 warren-bolthole reload                     apply the configuration file to the running daemon
 warren-bolthole reset-peer LABEL           rebuild one peer's session (a device whose clock jumped)
 warren-bolthole healthcheck                probe the running daemon's /healthz
+warren-bolthole --version                  print the build this binary came from
 ```
 
 Options for `init` and `add-peer`: `--peers N`, `--label NAME`,

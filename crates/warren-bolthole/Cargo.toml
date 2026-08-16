@@ -1,7 +1,10 @@
 [package]
 name = "warren-bolthole"
 description = "Local WireGuard-protocol gateway: terminates stock WireGuard-protocol clients on the LAN and carries their traffic through a Warren exit, with the peers' packets translated onto the single address the exit assigned"
-version.workspace = true
+# Its own version series: this binary is released on its own tag
+# (`bolthole-v*`), and the release pipeline refuses a tag whose version
+# differs from this line.
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

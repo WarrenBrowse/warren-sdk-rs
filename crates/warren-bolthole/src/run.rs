@@ -87,6 +87,9 @@ const REPROOF_RETRY_MAX: Duration = Duration::from_secs(5);
 /// cannot be reached, no matching exit) are returned; once the datapath is up,
 /// failures translate into the exit code.
 pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
+    // First line of the container log: a support report that names a build is
+    // the only way to tell a fixed gateway from an old one still running.
+    LOG.info(&format!("version {}", env!("CARGO_PKG_VERSION")));
     // Off the reactor: first run creates directories and fsyncs every
     // credential it writes, which is tens of milliseconds of a blocked worker
     // on a NAS spindle.

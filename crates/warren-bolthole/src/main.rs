@@ -21,6 +21,7 @@ enum Command {
     ResetPeer(String),
     Healthcheck,
     Help,
+    Version,
 }
 
 const USAGE: &str = "\
@@ -34,6 +35,7 @@ warren-bolthole: a local gateway that carries stock WireGuard-protocol clients t
     warren-bolthole reload                     apply the configuration file to the running daemon
     warren-bolthole reset-peer LABEL           rebuild one peer's session (a device whose clock jumped)
     warren-bolthole healthcheck                probe the running daemon's /healthz
+    warren-bolthole --version                  print the build this binary came from
 
 Options for init and add-peer:
     --peers N            how many peers init generates (init only)
@@ -57,6 +59,10 @@ fn main() -> ExitCode {
     };
     if matches!(command, Command::Help) {
         print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    if matches!(command, Command::Version) {
+        println!("{}", version_line());
         return ExitCode::SUCCESS;
     }
     if matches!(command, Command::Healthcheck) {
@@ -116,7 +122,9 @@ fn main() -> ExitCode {
         Command::Show(label, qr) => provisioning(|| show(&env, &label, qr)),
         Command::Reload => admin_call(&env, "/admin/reload"),
         Command::ResetPeer(label) => admin_call(&env, &format!("/admin/reset-peer/{label}")),
-        Command::Healthcheck | Command::Help => unreachable!("handled above"),
+        Command::Healthcheck | Command::Help | Command::Version => {
+            unreachable!("handled above")
+        }
     }
 }
 
@@ -285,6 +293,13 @@ fn file_mode(path: &Path) -> Option<u32> {
 
 /// Parses the command line. Everything else is an environment variable, which
 /// is what makes one container image configure identically everywhere.
+/// What `--version` prints, and the first line the daemon logs. The release
+/// pipeline refuses a tag whose version differs from this crate's manifest, so
+/// this string names the release the binary came from.
+fn version_line() -> String {
+    format!("warren-bolthole {}", env!("CARGO_PKG_VERSION"))
+}
+
 fn parse_command(args: &[String]) -> Result<Command, String> {
     let mut rest = args.iter().map(String::as_str);
     let Some(first) = rest.next() else {
@@ -311,6 +326,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             }
         }
         "help" | "--help" | "-h" => Ok(Command::Help),
+        "version" | "--version" | "-V" => Ok(Command::Version),
         "init" => Ok(Command::Init(parse_init(rest)?)),
         "add-peer" => {
             let label = rest.next().ok_or("add-peer needs a label")?.to_owned();
@@ -389,6 +405,28 @@ mod tests {
     fn parse(args: &[&str]) -> Result<Command, String> {
         let owned: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
         parse_command(&owned)
+    }
+
+    /// A binary handed out as a release asset has to name its own build: the
+    /// version an operator reports is the only link between a running gateway
+    /// and the release that produced it.
+    #[test]
+    fn the_version_is_asked_for_by_flag_or_by_subcommand() {
+        assert_eq!(parse(&["--version"]).expect("long flag"), Command::Version);
+        assert_eq!(parse(&["-V"]).expect("short flag"), Command::Version);
+        assert_eq!(parse(&["version"]).expect("subcommand"), Command::Version);
+    }
+
+    #[test]
+    fn the_version_line_names_the_binary_then_a_semver_triple() {
+        let line = version_line();
+        let (name, version) = line.split_once(' ').expect("a name then a version");
+        assert_eq!(name, "warren-bolthole");
+        assert_eq!(version.split('.').count(), 3, "{version} is not a triple");
+        assert!(
+            version.split('.').all(|part| !part.is_empty()),
+            "{version} has an empty component"
+        );
     }
 
     #[test]
