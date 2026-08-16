@@ -76,6 +76,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_CHANNEL: ${{ github.event.inputs.channel }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -87,12 +88,20 @@ jobs:
             esac
             # Version-truth guard (shared git-commits rule): refuse a tag that
             # is not the strictly highest of ITS OWN series, reading the
-            # remote's tags rather than the clone's.
-            highest=$(git ls-remote --tags origin "refs/tags/${prefix}*" \
-              | sed "s|.*refs/tags/${prefix}||" | grep -v '\^{}' | sort -V | tail -1)
-            if [ "$highest" != "$version" ]; then
-              echo "refusing ${REF_NAME}: highest ${prefix}* on origin is ${prefix}${highest}" >&2
-              exit 1
+            # remote's tags rather than the clone's. Exempt on a re-run of this
+            # same run: the publish job goes to the trouble of being idempotent
+            # so a partial publish can be finished, and by the time somebody
+            # re-runs it the next tag of the series may already exist, which
+            # would otherwise close the recovery path this pipeline built in.
+            if [ "${RUN_ATTEMPT:-1}" = "1" ]; then
+              highest=$(git ls-remote --tags origin "refs/tags/${prefix}*" \
+                | sed "s|.*refs/tags/${prefix}||" | grep -v '\^{}' | sort -V | tail -1)
+              if [ "$highest" != "$version" ]; then
+                echo "refusing ${REF_NAME}: highest ${prefix}* on origin is ${prefix}${highest}" >&2
+                exit 1
+              fi
+            else
+              echo "attempt ${RUN_ATTEMPT} of ${REF_NAME}: recovery re-run, not checking it is the highest ${prefix}*"
             fi
             # A tag can be cut on any commit, so the release inherits the four
             # gates instead of re-running one of them: the tagged commit has to
