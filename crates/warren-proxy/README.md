@@ -41,6 +41,7 @@ ignored while the operator believed it applied.
 | `WARREN_API_URL` | channel default | control-plane override (e.g. the beta host on a prod-built binary) |
 | `WARREN_SERVER_PUBKEY_HEX` | compiled pin | relay-list signing key override (bench/rotation) |
 | `WARREN_PORT_FORWARD_INTERNAL_PORT` | off | enables NAT-PMP forwarding of a tunnel-side port |
+| `WARREN_PORT_FORWARD_PUBLIC_PORT` | the exit chooses | ask the exit for this public port instead of taking whatever it hands out, so a restart republishes the number your peers already have. The exit grants it while the same account still holds it or held it recently; on a conflict the mapping stays unset for that epoch rather than silently becoming another number |
 | `WARREN_PORT_FORWARD_PROTOCOL` | `tcp` | `tcp` or `udp`, one transport per daemon: TCP and UDP are two independent mappings, reachable on two public ports of which only one could be announced, and holding two of the exit's per-client forward slots |
 | `WARREN_PORT_FORWARD_TARGET` | `127.0.0.1:<internal>` | local socket inbound connections are relayed to |
 | `WARREN_PORT_FORWARD_UP_COMMAND` | | run via the platform shell on every grant, `{{PORT}}` substituted (the gluetun up-command shape). The recovery phrase and its file path are removed from the hook child's own environment, so a hook that dumps `env` cannot leak them; a hook that outlives its 30 s budget is killed, on unix with everything it spawned (it runs in its own process group), on Windows the shell alone, so its grandchildren survive |

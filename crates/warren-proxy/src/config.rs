@@ -122,6 +122,7 @@ pub fn load(
         up_command: fwd.up_command,
         down_command: fwd.down_command,
         status_file: fwd.status_file,
+        public_port: fwd.public_port,
     });
 
     Ok(Config {

@@ -87,6 +87,7 @@ Shared with the other headless daemons:
 | `WARREN_SERVER_PUBKEY_HEX` | compiled pin | relay-list signing key override |
 | `WARREN_PORT_FORWARD_INTERNAL_PORT` | off | enables NAT-PMP forwarding of a tunnel-side port; refused inside `61000-61999`, which this gateway keeps for its own in-tunnel control plane |
 | `WARREN_PORT_FORWARD_PROTOCOL` | `tcp` | `tcp` or `udp` |
+| `WARREN_PORT_FORWARD_PUBLIC_PORT` | the exit chooses | ask the exit for this public port, so a restart republishes the number the peers already have; on a conflict the mapping stays unset for that epoch instead of becoming another number |
 | `WARREN_PORT_FORWARD_TARGET` | required with a forward | the peer socket inbound traffic is delivered to; it must be an address inside the peer subnet, because delivery is by cryptokey routing and this gateway relays nothing itself |
 | `WARREN_PORT_FORWARD_UP_COMMAND` / `_DOWN_COMMAND` / `_STATUS_FILE` | | as in `warren-proxy`: `{{PORT}}` substituted, the recovery phrase stripped from the hook child's environment |
 

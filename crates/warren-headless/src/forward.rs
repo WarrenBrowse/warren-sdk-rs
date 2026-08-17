@@ -53,6 +53,9 @@ pub struct ForwardConfig {
     pub down_command: Option<String>,
     /// File the granted public port is written to (one decimal line).
     pub status_file: Option<PathBuf>,
+    /// The public port the exit is asked for, so a restart republishes the one
+    /// already handed out. `None` leaves the choice to the exit.
+    pub public_port: Option<u16>,
 }
 
 /// The `WARREN_PORT_FORWARD_*` family as the environment spells it, before a
@@ -72,6 +75,10 @@ pub struct ForwardEnv {
     pub down_command: Option<String>,
     /// File the granted public port is written to.
     pub status_file: Option<PathBuf>,
+    /// `WARREN_PORT_FORWARD_PUBLIC_PORT`: the public port to ask the exit for,
+    /// so a restart republishes the same one. `None` leaves the choice to the
+    /// exit.
+    pub public_port: Option<u16>,
 }
 
 /// Parses the `WARREN_PORT_FORWARD_*` family. `Ok(None)` when no internal port
@@ -111,6 +118,20 @@ pub fn parse_forward(
         }
     };
 
+    // A published port outlives the process that got it: peers, a DNS record
+    // or a bookmark keep pointing at it. Asking for it back by number is what
+    // makes a restart invisible from outside, and the exit grants it when the
+    // same account still holds it or held it recently.
+    let public_port = match get("WARREN_PORT_FORWARD_PUBLIC_PORT").filter(|v| !v.is_empty()) {
+        None => None,
+        Some(raw) => Some(raw.parse::<u16>().ok().filter(|p| *p != 0).ok_or(
+            ConfigError::Invalid {
+                var: "WARREN_PORT_FORWARD_PUBLIC_PORT",
+                expected: "a port number (1-65535); unset it to let the exit choose",
+            },
+        )?),
+    };
+
     let target = match get("WARREN_PORT_FORWARD_TARGET") {
         None => None,
         Some(v) => Some(crate::env::parse_addr(&v, "WARREN_PORT_FORWARD_TARGET")?),
@@ -125,6 +146,7 @@ pub fn parse_forward(
         status_file: get("WARREN_PORT_FORWARD_STATUS_FILE")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),
+        public_port,
     }))
 }
 
@@ -339,6 +361,7 @@ mod tests {
             up_command: Some("up {{PORT}}".to_owned()),
             down_command: Some("down {{PORT}}".to_owned()),
             status_file,
+            public_port: None,
         }
     }
 
@@ -356,6 +379,46 @@ mod tests {
         assert_eq!(parsed.target, None, "the daemon applies its own default");
         assert_eq!(parsed.up_command.as_deref(), Some("echo {{PORT}}"));
         assert_eq!(parsed.down_command, None);
+    }
+
+    /// An operator who publishes a public port (a torrent client's peers, a
+    /// DNS record, a friend's bookmark) needs the exit to hand back the SAME
+    /// port after a restart, not merely across one process's reconnects.
+    #[test]
+    fn a_pinned_public_port_is_read_and_bounded() {
+        let pinned = parse_forward(&env(&[
+            ("WARREN_PORT_FORWARD_INTERNAL_PORT", "56881"),
+            ("WARREN_PORT_FORWARD_PUBLIC_PORT", "51413"),
+        ]))
+        .expect("a valid forward")
+        .expect("forwarding on");
+        assert_eq!(pinned.public_port, Some(51413));
+
+        let default = parse_forward(&env(&[("WARREN_PORT_FORWARD_INTERNAL_PORT", "56881")]))
+            .expect("a valid forward")
+            .expect("forwarding on");
+        assert_eq!(
+            default.public_port, None,
+            "unset must leave the exit free to choose"
+        );
+
+        for raw in ["0", "70000", "not-a-port"] {
+            let err = parse_forward(&env(&[
+                ("WARREN_PORT_FORWARD_INTERNAL_PORT", "56881"),
+                ("WARREN_PORT_FORWARD_PUBLIC_PORT", raw),
+            ]))
+            .expect_err("refused");
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        var: "WARREN_PORT_FORWARD_PUBLIC_PORT",
+                        ..
+                    }
+                ),
+                "{raw} produced {err:?}"
+            );
+        }
     }
 
     #[test]

@@ -17,6 +17,7 @@ use warren_sdk::socks_egress::{FIRST_EGRESS_RECHECK, FIRST_EGRESS_VERIFY, verify
 use warren_sdk::{
     ConnectionState, PortRelease, SupervisedForwardedPort, SupervisedProxyHandle, WarrenClient,
 };
+use warren_sdk::{PortFollowConfig, PortFollowPolicy};
 
 use crate::config::Config;
 
@@ -195,6 +196,19 @@ fn probe_address(bound: SocketAddr) -> SocketAddr {
 /// One transport, one mapping, one published port: the exit picks each proto's
 /// public port independently, so a second leg would be reachable on a port the
 /// daemon never announces (see [`ForwardProto`]).
+/// The follow policy a forward runs under: pinned to the operator's published
+/// port when they named one, best-effort otherwise.
+fn follow(fwd: &ForwardConfig) -> PortFollowConfig {
+    match fwd.public_port {
+        Some(port) => PortFollowConfig {
+            policy: PortFollowPolicy::KeepPortOrStay,
+            pinned_external_port: Some(port),
+            ..PortFollowConfig::default()
+        },
+        None => PortFollowConfig::default(),
+    }
+}
+
 fn start_forward(
     handle: &SupervisedProxyHandle,
     fwd: &ForwardConfig,
@@ -204,11 +218,21 @@ fn start_forward(
         ForwardProto::Tcp => MapProto::Tcp,
         ForwardProto::Udp => MapProto::Udp,
     };
-    let forward = handle.forward_port(proto, fwd.internal_port, fwd.target);
-    LOG.info(&format!(
-        "port forward requested: internal {} -> {} ({:?})",
-        fwd.internal_port, fwd.target, fwd.proto
-    ));
+    let forward =
+        handle.forward_port_with_policy(proto, fwd.internal_port, fwd.target, follow(fwd));
+    match fwd.public_port {
+        // KeepPortOrStay, so a pinned port never degrades to another number
+        // behind the operator's back: whatever they published stays published,
+        // or the mapping stays unset and says so.
+        Some(port) => LOG.info(&format!(
+            "port forward requested: internal {} -> {} ({:?}), asking the exit for public {port}",
+            fwd.internal_port, fwd.target, fwd.proto
+        )),
+        None => LOG.info(&format!(
+            "port forward requested: internal {} -> {} ({:?})",
+            fwd.internal_port, fwd.target, fwd.proto
+        )),
+    }
 
     let mut external_rx = forward.watch_external_port();
     let fwd = fwd.clone();

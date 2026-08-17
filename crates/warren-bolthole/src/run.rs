@@ -589,11 +589,28 @@ fn start_forward(
     device
         .add_static_dnat(nat_proto, fwd.internal_port, fwd.target)
         .context("pinning the forwarded port to its peer")?;
-    let forward = handle.forward_port(map_proto, fwd.internal_port);
-    LOG.info(&format!(
-        "port forward requested: internal {} to a peer ({:?})",
-        fwd.internal_port, fwd.proto
-    ));
+    // KeepPortOrStay when the operator named a public port: whatever they
+    // published to their peers stays published, or the mapping stays unset and
+    // says so, rather than silently becoming another number.
+    let follow = match fwd.public_port {
+        Some(port) => warren_sdk::PortFollowConfig {
+            policy: warren_sdk::PortFollowPolicy::KeepPortOrStay,
+            pinned_external_port: Some(port),
+            ..warren_sdk::PortFollowConfig::default()
+        },
+        None => warren_sdk::PortFollowConfig::default(),
+    };
+    let forward = handle.forward_port_with_policy(map_proto, fwd.internal_port, follow);
+    match fwd.public_port {
+        Some(port) => LOG.info(&format!(
+            "port forward requested: internal {} to a peer ({:?}), asking the exit for public {port}",
+            fwd.internal_port, fwd.proto
+        )),
+        None => LOG.info(&format!(
+            "port forward requested: internal {} to a peer ({:?})",
+            fwd.internal_port, fwd.proto
+        )),
+    }
 
     let mut external_rx = forward.watch_external_port();
     let fwd: ForwardConfig = fwd.clone();
