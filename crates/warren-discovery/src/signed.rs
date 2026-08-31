@@ -131,6 +131,16 @@ mod tests {
             cover_domain: None,
             port_forward,
             tcp_fallback: None,
+            last_seen_unix: None,
+            stale: None,
+            name: None,
+            provider: None,
+            virt: None,
+            asn: None,
+            attestation_hex: None,
+            relay_descriptor: None,
+            exit_descriptor: None,
+            edge_cert_sha256: None,
         }
     }
 
