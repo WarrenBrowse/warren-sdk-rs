@@ -2,7 +2,7 @@
 //! crate so client and server hold one definition.
 
 pub use warren_contract::dto::{
-    CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
+    CampaignVoucherResponse, CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
     IncidentPubkeyMismatchRequest, IncidentReason, InitApplePaymentResponse, MobilePaymentResponse,
     PubkeyHex, PubkeySs58, RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest,
     SessionOpenRequest, SessionOpenResponse, SessionRejectReason, SubscriptionResponse,

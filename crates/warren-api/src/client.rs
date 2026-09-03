@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use warren_identity::WarrenIdentity;
 
 use crate::dto::{
-    CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
+    CampaignVoucherResponse, CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
     IncidentPubkeyMismatchRequest, InitApplePaymentResponse, MobilePaymentResponse,
     RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest, SessionOpenRequest,
     SessionOpenResponse, SubscriptionResponse, TokenIssueRequest, TokenIssueResponse,
@@ -179,6 +179,40 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     pub async fn subscription(&self) -> Result<SubscriptionResponse, ClientError> {
         let http = self.signed_request(Method::Get, "/v1/subscription", Vec::new())?;
         self.send_json(http).await
+    }
+
+    /// Signed `GET /v1/campaign/{campaign_id}/voucher`. Returns the code this
+    /// account was pre-assigned when the campaign was published, or `None` on
+    /// `404` (outside the cohort, or an unknown campaign).
+    ///
+    /// The offer itself rides a broadcast document that is byte-identical for
+    /// every caller, which is what keeps the server from learning who asks
+    /// about what; a per-account value cannot ride that document, so it comes
+    /// from here, behind the same wallet signature that guards
+    /// `/v1/subscription`. The call is a pure lookup server-side, so repeating
+    /// it is always safe and can never drain the pool.
+    ///
+    /// The returned code is a bearer token worth a month of service: it belongs
+    /// in the account's own UI and nowhere else, never in a log, an error or a
+    /// problem report.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`]. A `503` surfaces as
+    /// [`ClientError::ServerStatus`] rather than as `None`, so a transient
+    /// backend failure never reads as "you were never eligible".
+    pub async fn campaign_voucher(&self, campaign_id: &str) -> Result<Option<String>, ClientError> {
+        let path = format!("/v1/campaign/{campaign_id}/voucher");
+        let http = self.signed_request(Method::Get, &path, Vec::new())?;
+        match self.send(http).await {
+            Ok(resp) => {
+                let parsed: CampaignVoucherResponse =
+                    serde_json::from_slice(&resp.body).map_err(ClientError::ResponseJson)?;
+                Ok(Some(parsed.code))
+            }
+            Err(ClientError::ServerStatus { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Signed `GET /v1/check`. Reports the client's egress IP and whether it is
@@ -781,6 +815,59 @@ mod tests {
             .await
             .expect("404 must be Ok(None): an older API simply has no advisory");
         assert_eq!(body, None);
+    }
+
+    #[tokio::test]
+    async fn campaign_voucher_is_signed_and_returns_this_account_code() {
+        // The code is per-account, so the call MUST be signed: the
+        // broadcast announcement that carries the offer is byte-identical
+        // for every client and can never hold it.
+        let c = client(MockTransport::new(200, r#"{"code":"ABCDEFGHJKMNPQRS"}"#));
+
+        let code = c
+            .campaign_voucher("prod-launch")
+            .await
+            .expect("ok")
+            .expect("a cohort member gets a code");
+
+        assert_eq!(code, "ABCDEFGHJKMNPQRS");
+        let guard = c.transport.last.lock().unwrap();
+        let req = guard.as_ref().expect("request captured");
+        assert_eq!(
+            req.url,
+            "https://api.example.test/v1/campaign/prod-launch/voucher"
+        );
+        assert_eq!(req.method, Method::Get);
+        assert!(
+            header(req, HEADER_PUBKEY).is_some(),
+            "campaign_voucher must be wallet-signed"
+        );
+    }
+
+    #[tokio::test]
+    async fn campaign_voucher_maps_404_to_none() {
+        // Outside the cohort is a normal, quiet outcome: accounts created
+        // after publication are deliberately not in the offer.
+        let c = client(MockTransport::new(404, "not found"));
+
+        assert_eq!(
+            c.campaign_voucher("prod-launch")
+                .await
+                .expect("404 must be Ok(None), not an error"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn campaign_voucher_propagates_other_errors() {
+        let c = client(MockTransport::new(503, "unavailable"));
+
+        let err = c
+            .campaign_voucher("prod-launch")
+            .await
+            .expect_err("a 503 must not read as 'not in the cohort'");
+
+        assert!(matches!(err, ClientError::ServerStatus { status: 503, .. }));
     }
 
     #[tokio::test]

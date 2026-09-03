@@ -22,7 +22,7 @@ pub mod marked_transport;
 
 pub use client::{ClientError, WarrenApiClient};
 pub use dto::{
-    CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
+    CampaignVoucherResponse, CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
     IncidentPubkeyMismatchRequest, IncidentReason, InitApplePaymentResponse, MobilePaymentResponse,
     PubkeyHex, PubkeySs58, RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest,
     SessionOpenRequest, SessionOpenResponse, SessionRejectReason, SubscriptionResponse,
