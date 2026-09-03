@@ -37,6 +37,13 @@ pub use signed::{
 };
 /// Wire identity types (ExitId, WarrenPubkey) for building test fixtures.
 pub use warren_discovery_core::warren_types;
+/// The deterministic exit and entry picks promoted from the app daemon, so an
+/// embedding that ranks candidates itself (a geo pre-filter, a bindings layer)
+/// lands on the same node as the daemon on the same directory.
+pub use warren_discovery_core::{
+    Continent, EntryCandidate, ExitCandidate, continent_of_country, pick_entry, pick_exit,
+    prefer_client_continent,
+};
 pub use warren_discovery_core::{
     EntryPathQuality, LegQuality, PATH_QUALITY_DEGRADED_RTT_MS, PATH_QUALITY_VERSION,
     PathAwareParams, PathQualityAdvisory, entry_rtt_from, select_entry_path_aware,

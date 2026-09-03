@@ -8,6 +8,7 @@ use ed25519_dalek::SigningKey;
 use warren_sdk::WarrenClient;
 use warren_sdk::api::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_sdk::discovery::multihop_directory::test_helpers::mint_directory_json;
+use warren_sdk::discovery::{EntryCandidate, VerifiedEntry, pick_entry};
 use warren_sdk::identity::WarrenIdentity;
 
 /// Serves the minted directory on the directory path and a programmed
@@ -210,4 +211,41 @@ async fn a_degraded_only_candidate_is_still_selected_never_fail_closed() {
         .select_multihop_entry(&dir, &exit, advisory.as_ref(), None)
         .expect("a degraded sole candidate still forms a circuit");
     assert_eq!(circuit.endpoint, "198.51.100.20:443".parse().unwrap());
+}
+
+#[tokio::test]
+async fn select_multihop_entry_without_signal_agrees_with_the_shared_pick_entry() {
+    // With no RTT sample, no advisory and no incumbent, this client's wiring
+    // must land on the entry the promoted `pick_entry` names over the same
+    // policy-permitted set: an embedding ranking through the facade's pick
+    // and a client ranking through `select_multihop_entry` would otherwise
+    // dial different entries on the same directory.
+    let (client, _) = client_with(404, "");
+    let dir = client
+        .fetch_multihop_directory_full()
+        .await
+        .expect("directory verifies");
+    let exit = dir
+        .exits
+        .iter()
+        .find(|x| x.exit_id == [10; 16])
+        .expect("RO exit present")
+        .clone();
+
+    let permitted: Vec<&VerifiedEntry> = dir
+        .entries
+        .iter()
+        .filter(|e| dir.policy.permits(e, &exit))
+        .collect();
+    let candidates: Vec<EntryCandidate<'_>> =
+        permitted.iter().map(|e| EntryCandidate::from(*e)).collect();
+    let shared = pick_entry(&candidates, None)
+        .map(|i| permitted[i].endpoint)
+        .expect("the shared pick names an entry");
+
+    let circuit = client
+        .select_multihop_entry(&dir, &exit, None, None)
+        .expect("a legal entry exists");
+    assert_eq!(circuit.endpoint, shared);
+    assert_eq!(shared, "198.51.100.20:443".parse().unwrap());
 }
