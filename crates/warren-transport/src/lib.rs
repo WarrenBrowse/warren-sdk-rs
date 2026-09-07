@@ -57,6 +57,12 @@ pub use warrenguard_transport::drain_policy;
 // session verdict) is engine-owned; supervisors draw delays from it instead
 // of re-declaring a local schedule.
 pub use warrenguard_transport::redial_policy;
+
+/// The process-wide UDP-hostility memory behind the carrier-first dial: the
+/// supervisor feeds it how each epoch ended, the dial asks which transport to
+/// try first. Shared with the engine's own supervisor when both run in one
+/// process, so the verdict is the same whichever datapath a host uses.
+pub use warrenguard_transport::udp_hostility;
 // The "host moved to another network" detection (preferred-path probe +
 // change watcher) is engine-owned; supervisors arm it and react with their own
 // redial machinery.

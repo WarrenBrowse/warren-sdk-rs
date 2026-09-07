@@ -1317,6 +1317,20 @@ pub enum EpochEndCause {
     HostRequested,
 }
 
+/// Whether an epoch's end is the signature of a network that lets the QUIC
+/// handshake through and kills the flow afterwards: the session died on its own
+/// (idle timeout, nothing came back) or the in-tunnel probe convicted a session
+/// the transport still considered alive. A peer that closed deliberately, a
+/// drain, a network move or a host request say nothing about the network and
+/// must not count towards the carrier-first verdict.
+pub(crate) fn post_handshake_kill(cause: EpochEndCause, close: Option<&'static str>) -> bool {
+    match cause {
+        EpochEndCause::EgressDead => true,
+        EpochEndCause::SessionClosed => matches!(close, Some("timed_out")),
+        EpochEndCause::PathMoved | EpochEndCause::Drained | EpochEndCause::HostRequested => false,
+    }
+}
+
 /// Why one supervised epoch ended, published before the `Reconnecting` state
 /// that follows it so a host can journal the two together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1946,11 +1960,22 @@ pub(crate) async fn supervise_datapath<S, P, F, Fut, D>(
                 // handles: `None` here means the QUIC connection was still open
                 // when something above it ended the epoch, which is exactly the
                 // shape a probe conviction leaves behind.
-                let close = closing_session
-                    .upgrade()
+                let closing = closing_session.upgrade();
+                let close = closing
+                    .as_ref()
                     .and_then(|s| s.connection().close_reason())
                     .as_ref()
                     .map(warren_transport::close_label);
+                // Feed the carrier-first dial verdict: a UDP epoch that a
+                // watchdog killed within a minute of coming up is one
+                // post-handshake kill, and enough of them in a row make the
+                // next dial try the TLS-over-TCP carrier before racing it.
+                warren_transport::udp_hostility::record_session_end(
+                    closing.as_ref().is_some_and(|s| s.is_over_carrier()),
+                    up_since.elapsed(),
+                    post_handshake_kill(cause, close),
+                );
+                drop(closing);
                 let _ = outputs.epoch_end_tx.send(Some(EpochEnd {
                     cause,
                     close,
@@ -2414,5 +2439,49 @@ mod drain_tests {
                 .is_err(),
             "a dropped drain sender must park, never resolve"
         );
+    }
+}
+
+#[cfg(test)]
+mod post_handshake_kill_tests {
+    use super::{EpochEndCause, post_handshake_kill};
+
+    #[test]
+    fn a_session_that_timed_out_is_a_kill() {
+        assert!(post_handshake_kill(
+            EpochEndCause::SessionClosed,
+            Some("timed_out")
+        ));
+    }
+
+    #[test]
+    fn an_egress_conviction_is_a_kill() {
+        assert!(post_handshake_kill(EpochEndCause::EgressDead, None));
+    }
+
+    #[test]
+    fn a_deliberate_peer_close_is_not_a_kill() {
+        assert!(!post_handshake_kill(
+            EpochEndCause::SessionClosed,
+            Some("app_closed")
+        ));
+        assert!(!post_handshake_kill(
+            EpochEndCause::SessionClosed,
+            Some("locally_closed")
+        ));
+        assert!(!post_handshake_kill(EpochEndCause::SessionClosed, None));
+    }
+
+    #[test]
+    fn a_drain_a_network_move_and_a_host_request_are_not_kills() {
+        assert!(!post_handshake_kill(
+            EpochEndCause::Drained,
+            Some("timed_out")
+        ));
+        assert!(!post_handshake_kill(
+            EpochEndCause::PathMoved,
+            Some("timed_out")
+        ));
+        assert!(!post_handshake_kill(EpochEndCause::HostRequested, None));
     }
 }

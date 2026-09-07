@@ -22,7 +22,8 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use warrenguard_tcp_fallback::tls::connect_cover_tls;
 use warrenguard_tcp_fallback::{
-    FallbackPolicy, TcpCarrierSocket, build_carrier_client_endpoint, connect_with_fallback,
+    CarrierFirstAttempt, FallbackPolicy, TcpCarrierSocket, build_carrier_client_endpoint,
+    connect_carrier_first, connect_with_fallback,
 };
 
 use crate::multihop::Carrier;
@@ -101,6 +102,74 @@ pub(crate) async fn dial_quic_webpki_with_fallback(
     connect_with_fallback(policy, udp, tcp)
         .await
         .map_err(QuicDialError::Fallback)
+}
+
+/// [`dial_quic_webpki_with_fallback`] for a process whose UDP-hostility memory
+/// says the UDP handshake passes and the flow dies afterwards
+/// ([`warrenguard_transport::udp_hostility`]): the cover-domain carrier is
+/// dialled FIRST and the ordinary race runs only if it fails. The attempt's
+/// outcome is fed back to that memory, so a carrier that is dead too cools the
+/// preference down instead of costing a TCP dial on every redial. With the
+/// policy disabled or no cover target this is [`dial_quic_webpki_with_fallback`]
+/// verbatim.
+///
+/// # Errors
+/// As [`dial_quic_webpki_with_fallback`].
+pub(crate) async fn dial_quic_webpki_carrier_first(
+    server_name: &str,
+    exit_addr: SocketAddr,
+    bind_local_ip: Option<SocketAddr>,
+    transport_config: Option<Arc<quinn::TransportConfig>>,
+    socket_bypass: Option<warrenguard_socket_bypass::SocketBypass>,
+    policy: &FallbackPolicy,
+    cover: Option<CoverTls<'_>>,
+) -> Result<(quinn::Endpoint, quinn::Connection, Carrier), QuicDialError> {
+    let Some(cover) = cover.filter(|_| policy.tcp_fallback_enabled) else {
+        return dial_quic_webpki_with_fallback(
+            server_name,
+            exit_addr,
+            bind_local_ip,
+            transport_config,
+            socket_bypass,
+            policy,
+            None,
+        )
+        .await;
+    };
+    let udp_transport_config = transport_config.clone();
+    let udp = async move {
+        dial_quic_webpki(
+            server_name,
+            exit_addr,
+            bind_local_ip,
+            udp_transport_config,
+            socket_bypass,
+        )
+        .await
+        .map(|(endpoint, conn)| (endpoint, conn, Carrier::Udp))
+        .map_err(|_| io::Error::other("udp quic handshake failed"))
+    };
+    // Called for the carrier-first attempt and again by the race if that
+    // attempt fails, so the cover target is cloned per call.
+    let tcp = || {
+        let cover = cover.clone();
+        let transport_config = transport_config.clone();
+        async move {
+            dial_tcp_carrier_webpki(server_name, exit_addr, cover, transport_config)
+                .await
+                .map(|(endpoint, conn)| (endpoint, conn, Carrier::TlsTcp))
+        }
+    };
+    let (dialed, attempt) = connect_carrier_first(policy, udp, tcp).await;
+    match attempt {
+        CarrierFirstAttempt::Won => {
+            warrenguard_transport::udp_hostility::record_carrier_dial_succeeded();
+        }
+        CarrierFirstAttempt::Failed => {
+            warrenguard_transport::udp_hostility::record_carrier_dial_failed();
+        }
+    }
+    dialed.map_err(QuicDialError::Fallback)
 }
 
 /// WebPKI (X.509 cover-domain) analogue of [`dial_tcp_carrier`]: the inner QUIC

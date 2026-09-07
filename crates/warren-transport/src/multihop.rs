@@ -580,16 +580,36 @@ impl MultihopClientTunnel {
                         })
                     })
                     .transpose()?;
-                crate::tcp_fallback::dial_quic_webpki_with_fallback(
-                    domain,
-                    exit_addr,
-                    bind,
-                    transport_config,
-                    self.socket_bypass,
-                    &policy,
-                    cover,
-                )
-                .await?
+                // A process that has watched UDP sessions establish and die
+                // right after the handshake tries the carrier before racing it:
+                // the race alone never reaches the carrier when the handshake
+                // itself passes (the 2026-09-07 Kaliningrad pattern).
+                match warrenguard_transport::udp_hostility::preference() {
+                    warrenguard_tcp_fallback::DialPreference::CarrierFirst => {
+                        crate::tcp_fallback::dial_quic_webpki_carrier_first(
+                            domain,
+                            exit_addr,
+                            bind,
+                            transport_config,
+                            self.socket_bypass,
+                            &policy,
+                            cover,
+                        )
+                        .await?
+                    }
+                    warrenguard_tcp_fallback::DialPreference::Race => {
+                        crate::tcp_fallback::dial_quic_webpki_with_fallback(
+                            domain,
+                            exit_addr,
+                            bind,
+                            transport_config,
+                            self.socket_bypass,
+                            &policy,
+                            cover,
+                        )
+                        .await?
+                    }
+                }
             } else {
                 let (endpoint, conn) = dial_quic_webpki(
                     domain,
