@@ -160,7 +160,7 @@ async fn relay_connect<C: Connector>(
     let mut upstream = match connector.connect(target).await {
         Ok(s) => s,
         Err(e) => {
-            write_reply(client, Reply::GeneralFailure).await?;
+            write_reply(client, connect_failure_reply(&e)).await?;
             return Err(e);
         }
     };
@@ -482,6 +482,68 @@ impl<C: Connector> HttpConnectProxy<C> {
     }
 }
 
+/// Header naming which local condition refused a CONNECT, so a reader does not
+/// have to parse prose to branch on it.
+const TUNNEL_CAUSE_HEADER: &str = "Warren-Tunnel";
+
+/// The SOCKS5 reply code for a CONNECT this proxy could not carry.
+///
+/// The SOCKS5 front end answered `GeneralFailure` for every local condition,
+/// so "there is no tunnel" and "that host refused you" reached the client as the
+/// same `rep=1`, including in the egress-probe traces a diagnosis is rebuilt
+/// from. RFC 1928 already distinguishes them.
+fn connect_failure_reply(err: &NetError) -> Reply {
+    match err {
+        NetError::EngineStopped => Reply::NetworkUnreachable,
+        NetError::ConnectionRefused => Reply::ConnectionRefused,
+        NetError::ConnectTimeout => Reply::HostUnreachable,
+        _ => Reply::GeneralFailure,
+    }
+}
+
+/// Short, fixed tag for a CONNECT that never left this machine.
+///
+/// The set is deliberately tiny and every arm is a literal: this value reaches a
+/// member's terminal and a log, so it may never carry a host, an address, a port
+/// or any error text from elsewhere.
+fn connect_failure_cause(err: &NetError) -> &'static str {
+    match err {
+        NetError::EngineStopped => "tunnel-gone",
+        NetError::ConnectionRefused => "exit-refused",
+        NetError::ConnectTimeout => "connect-timeout",
+        _ => "connect-failed",
+    }
+}
+
+/// The CONNECT response for an upstream this proxy could not reach.
+///
+/// A bare `502` with no body is what an API client renders as "this is a
+/// server-side issue, usually temporary, check the status page", so a member
+/// whose own tunnel had just been torn down was sent to diagnose an outage at
+/// the other end of the world
+/// (`incidents/2026-09-12-bufferbloat-fixed-probe-budget-reconnect-storm.md`
+/// section 9.1). The status stays `502`, because a client's retry policy is
+/// keyed on it and this failure genuinely is a gateway that could not reach
+/// upstream; everything added is the answer to "whose gateway".
+fn connect_failure_response(err: &NetError) -> Vec<u8> {
+    let cause = connect_failure_cause(err);
+    let body = format!(
+        "warren: the local proxy has no working tunnel to reach the target ({cause}).\n\
+         This is a condition of the VPN on this machine, not an outage at the target service.\n"
+    );
+    format!(
+        "HTTP/1.1 502 Warren Tunnel Unavailable\r\n\
+         {TUNNEL_CAUSE_HEADER}: {cause}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
 async fn handle_connect<C: Connector>(
     mut client: TcpStream,
     connector: &C,
@@ -499,7 +561,7 @@ async fn handle_connect<C: Connector>(
     let mut upstream = match connector.connect(target).await {
         Ok(s) => s,
         Err(e) => {
-            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+            let _ = client.write_all(&connect_failure_response(&e)).await;
             return Err(e);
         }
     };
@@ -594,6 +656,128 @@ fn parse_authority(authority: &str) -> Option<Target> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_connect_answers_a_response_that_names_this_proxy() {
+        // The defect this pins: a bodyless 502 is rendered by an API client as
+        // "this is a server-side issue, usually temporary", which sends a member
+        // whose own tunnel just died to go read the API provider's status page.
+        // The response has to say whose gateway failed.
+        let raw = connect_failure_response(&NetError::EngineStopped);
+        let text = String::from_utf8(raw).expect("the response is ASCII");
+        assert!(
+            text.starts_with("HTTP/1.1 502 "),
+            "the status stays 502 so a client's retry policy is untouched: {text}"
+        );
+        assert!(
+            text.contains(&format!("{TUNNEL_CAUSE_HEADER}: tunnel-gone")),
+            "a machine reader needs the cause on its own header: {text}"
+        );
+        let body = text.split("\r\n\r\n").nth(1).expect("a body is present");
+        assert!(
+            !body.is_empty() && body.contains("warren"),
+            "the body must name this proxy, got {body:?}"
+        );
+        assert!(
+            text.contains(&format!("Content-Length: {}", body.len())),
+            "the length must match the body or the client hangs: {text}"
+        );
+    }
+
+    #[test]
+    fn the_socks_front_end_names_the_same_conditions_the_connect_one_does() {
+        // Both front ends sit over the same connector, so a member on SOCKS5 was
+        // getting `rep=1` (general failure) for every local condition, including
+        // "there is no tunnel at all". RFC 1928 already has codes for these; an
+        // undifferentiated 1 is what made the probe traces unreadable.
+        assert_eq!(
+            connect_failure_reply(&NetError::EngineStopped),
+            Reply::NetworkUnreachable
+        );
+        assert_eq!(
+            connect_failure_reply(&NetError::ConnectionRefused),
+            Reply::ConnectionRefused
+        );
+        assert_eq!(
+            connect_failure_reply(&NetError::ConnectTimeout),
+            Reply::HostUnreachable
+        );
+        assert_eq!(
+            connect_failure_reply(&NetError::ConnectFailed),
+            Reply::GeneralFailure,
+            "an unclassified failure must stay the generic code, never a guess"
+        );
+    }
+
+    #[test]
+    fn each_local_failure_carries_its_own_cause_tag() {
+        // Low cardinality and fixed strings on purpose: this reaches a log and a
+        // user's screen, so it may never carry a host, an address or a port.
+        for (err, tag) in [
+            (NetError::EngineStopped, "tunnel-gone"),
+            (NetError::ConnectionRefused, "exit-refused"),
+            (NetError::ConnectTimeout, "connect-timeout"),
+            (NetError::ConnectFailed, "connect-failed"),
+            (NetError::NoDnsRecord, "connect-failed"),
+        ] {
+            let text = String::from_utf8(connect_failure_response(&err)).expect("ascii");
+            assert!(
+                text.contains(&format!("{TUNNEL_CAUSE_HEADER}: {tag}")),
+                "{err:?} must report {tag}, got: {text}"
+            );
+        }
+    }
+
+    /// A connector that only ever fails, so the CONNECT path is exercised for
+    /// real against a real socket pair.
+    struct DeadConnector(NetError);
+
+    impl Connector for DeadConnector {
+        type Stream = tokio::net::TcpStream;
+
+        async fn connect(&self, _target: Target) -> Result<Self::Stream, NetError> {
+            Err(match self.0 {
+                NetError::EngineStopped => NetError::EngineStopped,
+                _ => NetError::ConnectFailed,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connect_over_a_dead_tunnel_reaches_the_client_with_its_cause() {
+        // The seam under test is the real `handle_connect`, over a real TCP
+        // socket: a pure-function test alone would not catch a response written
+        // without its body or with the head and body out of step.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (client, _) = listener.accept().await.expect("accept");
+            let _ = handle_connect(client, &DeadConnector(NetError::EngineStopped)).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+            .await
+            .expect("write");
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.expect("read");
+        server.await.expect("join");
+
+        let text = String::from_utf8(got).expect("ascii");
+        assert!(text.starts_with("HTTP/1.1 502 "), "{text}");
+        assert!(text.contains("tunnel-gone"), "{text}");
+        assert!(
+            text.contains("warren"),
+            "the member must be able to tell a local tunnel from an API outage: {text}"
+        );
+        assert!(
+            !text.contains("example.com"),
+            "the response may never echo the target back: {text}"
+        );
+    }
 
     #[test]
     fn parse_authority_ipv4_literal() {

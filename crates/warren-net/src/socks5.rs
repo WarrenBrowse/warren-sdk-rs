@@ -50,8 +50,16 @@ pub enum Target {
 pub enum Reply {
     /// Success.
     Succeeded,
-    /// General SOCKS server failure.
+    /// General SOCKS server failure, for a condition none of the codes below
+    /// describes. Never a guess: an unclassified failure stays here.
     GeneralFailure,
+    /// The network this proxy fronts cannot be reached at all, which for a VPN
+    /// proxy is "there is no tunnel".
+    NetworkUnreachable,
+    /// The target could not be reached through the tunnel.
+    HostUnreachable,
+    /// The target refused the connection.
+    ConnectionRefused,
     /// Command not supported.
     CommandNotSupported,
     /// Address type not supported.
@@ -63,6 +71,9 @@ impl Reply {
         match self {
             Reply::Succeeded => 0x00,
             Reply::GeneralFailure => 0x01,
+            Reply::NetworkUnreachable => 0x03,
+            Reply::HostUnreachable => 0x04,
+            Reply::ConnectionRefused => 0x05,
             Reply::CommandNotSupported => 0x07,
             Reply::AddressTypeNotSupported => 0x08,
         }
@@ -413,5 +424,23 @@ mod tests {
         assert_eq!(r[1], 0x00);
         assert_eq!(r[3], 0x01);
         assert_eq!(&r[r.len() - 2..], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn every_reply_carries_its_rfc_1928_code() {
+        // These bytes are the wire, read by clients this repo does not ship: a
+        // renumbering here silently changes what every SOCKS5 client is told.
+        for (reply, code) in [
+            (Reply::Succeeded, 0x00),
+            (Reply::GeneralFailure, 0x01),
+            (Reply::NetworkUnreachable, 0x03),
+            (Reply::HostUnreachable, 0x04),
+            (Reply::ConnectionRefused, 0x05),
+            (Reply::CommandNotSupported, 0x07),
+            (Reply::AddressTypeNotSupported, 0x08),
+        ] {
+            let r = build_reply(reply, "0.0.0.0:0".parse().unwrap());
+            assert_eq!(r[1], code, "{reply:?} must be RFC 1928 code {code:#04x}");
+        }
     }
 }
