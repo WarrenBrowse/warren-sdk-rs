@@ -62,6 +62,17 @@ pub use warren_transport::ConnectionState;
 /// Re-exported at the root so an app reading them needs no second dependency.
 pub use warren_transport::{Carrier, MultihopMetrics, MultihopMetricsSnapshot, PathQuality};
 
+/// The engine's rule for reading a received-payload counter as evidence about
+/// the exit, re-exported because a host that runs its OWN liveness probe over
+/// this SDK's listener needs the same discriminant the SDK's in-tunnel probe
+/// uses, and a second copy of a verdict rule diverges silently
+/// (`warrenguard` `5e5c87e` single-homed the first two copies of it).
+///
+/// Feed it [`MultihopMetricsSnapshot::bytes_recv`], which counts decoded inner
+/// IP packets only: a frame or datagram counter keeps advancing over an armed
+/// exit's cover traffic and would make the guard protect a dead exit forever.
+pub use warren_transport::egress_probe::{ExitEvidence, exit_evidence_from};
+
 mod client;
 pub mod egress;
 mod egress_probe;
