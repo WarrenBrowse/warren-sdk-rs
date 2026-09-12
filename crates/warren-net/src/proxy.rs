@@ -150,8 +150,9 @@ impl<C: Connector> Socks5Proxy<C> {
 }
 
 /// Opens the upstream flow for a `CONNECT` target and relays bytes both ways,
-/// replying success or general-failure to the client. Shared by the plain and
-/// UDP-capable SOCKS5 handlers so the CONNECT leg lives in one place.
+/// replying success, or the RFC 1928 code naming the local condition that
+/// refused it ([`connect_failure_reply`]). Shared by the plain and UDP-capable
+/// SOCKS5 handlers so the CONNECT leg lives in one place.
 async fn relay_connect<C: Connector>(
     client: &mut TcpStream,
     connector: &C,
@@ -488,10 +489,11 @@ const TUNNEL_CAUSE_HEADER: &str = "Warren-Tunnel";
 
 /// The SOCKS5 reply code for a CONNECT this proxy could not carry.
 ///
-/// The SOCKS5 front end answered `GeneralFailure` for every local condition,
-/// so "there is no tunnel" and "that host refused you" reached the client as the
-/// same `rep=1`, including in the egress-probe traces a diagnosis is rebuilt
-/// from. RFC 1928 already distinguishes them.
+/// RFC 1928 distinguishes "the network is unreachable" from "that host refused
+/// you", and so must this: the code reaches the client AND the egress-probe
+/// traces a diagnosis is rebuilt from, where one undifferentiated `rep=1` for
+/// every local condition says nothing about which one happened. An unclassified
+/// failure stays `GeneralFailure` rather than being guessed into a code.
 fn connect_failure_reply(err: &NetError) -> Reply {
     match err {
         NetError::EngineStopped => Reply::NetworkUnreachable,
