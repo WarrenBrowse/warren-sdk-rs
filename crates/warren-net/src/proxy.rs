@@ -489,16 +489,25 @@ const TUNNEL_CAUSE_HEADER: &str = "Warren-Tunnel";
 
 /// The SOCKS5 reply code for a CONNECT this proxy could not carry.
 ///
-/// RFC 1928 distinguishes "the network is unreachable" from "that host refused
-/// you", and so must this: the code reaches the client AND the egress-probe
-/// traces a diagnosis is rebuilt from, where one undifferentiated `rep=1` for
-/// every local condition says nothing about which one happened. An unclassified
-/// failure stays `GeneralFailure` rather than being guessed into a code.
+/// A reply code is a CLAIM ABOUT THE PATH, and the client acts on it: codes 5
+/// and 4 arrive as ECONNREFUSED and EHOSTUNREACH, which HTTP clients treat as
+/// terminal and stop retrying on. So only a condition this proxy can actually
+/// source earns its own code. `EngineStopped` qualifies: there is no tunnel, and
+/// "network unreachable" is precisely that.
+///
+/// A refused connect and a connect timeout do NOT qualify, whatever their
+/// `NetError` is called. `NetError::ConnectionRefused` is raised when the
+/// smoltcp socket reaches `Closed` while a connect is pending (`netstack.rs`),
+/// which covers SYN exhaustion on a lossy path as much as a peer RST, and
+/// `ConnectTimeout` is this proxy's own deadline. Reported as 5 and 4 they told
+/// a member on a congested uplink that a firewall was blocking them, and stopped
+/// their client from retrying something that would have worked. They stay
+/// `GeneralFailure`; the condition still travels in
+/// [`connect_failure_cause`] and the log, where it cannot change retry
+/// semantics.
 fn connect_failure_reply(err: &NetError) -> Reply {
     match err {
         NetError::EngineStopped => Reply::NetworkUnreachable,
-        NetError::ConnectionRefused => Reply::ConnectionRefused,
-        NetError::ConnectTimeout => Reply::HostUnreachable,
         _ => Reply::GeneralFailure,
     }
 }
@@ -687,23 +696,30 @@ mod tests {
     }
 
     #[test]
-    fn the_socks_front_end_names_the_same_conditions_the_connect_one_does() {
-        // Both front ends sit over the same connector, so a member on SOCKS5 was
-        // getting `rep=1` (general failure) for every local condition, including
-        // "there is no tunnel at all". RFC 1928 already has codes for these; an
-        // undifferentiated 1 is what made the probe traces unreadable.
+    fn only_a_sourced_condition_earns_its_own_reply_code() {
+        // `EngineStopped` is sourced: there is no tunnel, so the network really
+        // is unreachable and RFC 1928's code 3 says exactly that.
         assert_eq!(
             connect_failure_reply(&NetError::EngineStopped),
             Reply::NetworkUnreachable
         );
-        assert_eq!(
-            connect_failure_reply(&NetError::ConnectionRefused),
-            Reply::ConnectionRefused
-        );
-        assert_eq!(
-            connect_failure_reply(&NetError::ConnectTimeout),
-            Reply::HostUnreachable
-        );
+        // The other two are NOT, and claiming them cost a member a wrong and
+        // alarming message. `NetError::ConnectionRefused` is raised whenever the
+        // smoltcp socket reaches `Closed` with a connect pending
+        // (`netstack.rs`), which on a lossy tunnel is SYN exhaustion, not a peer
+        // RST; `ConnectTimeout` is our own deadline, not evidence about the
+        // host. Reported as codes 5 and 4 they reach the client as ECONNREFUSED
+        // and EHOSTUNREACH, which HTTP clients treat as terminal and stop
+        // retrying on, so a congested minute reads as "a firewall is blocking
+        // you". The condition still travels, in the cause tag and the log, where
+        // it cannot change retry semantics.
+        for err in [NetError::ConnectionRefused, NetError::ConnectTimeout] {
+            assert_eq!(
+                connect_failure_reply(&err),
+                Reply::GeneralFailure,
+                "{err:?} is not sourced well enough to claim its own RFC 1928 code"
+            );
+        }
         assert_eq!(
             connect_failure_reply(&NetError::ConnectFailed),
             Reply::GeneralFailure,
