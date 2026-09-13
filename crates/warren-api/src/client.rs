@@ -45,8 +45,14 @@ pub enum ClientError {
     #[error("failed to serialize request")]
     RequestSerialize(#[source] serde_json::Error),
     /// Every host in the fallback sequence (primary, alternatives, no-SNI)
-    /// failed to connect: the API is likely being blocked.
-    #[error("all API hosts are unreachable (possible censorship)")]
+    /// failed to connect. A censor is one cause; a host with no network at all
+    /// is the other and by far the commoner one (a laptop asleep with its Wi-Fi
+    /// down produced 1,752 of these in a fleet of nine members, each in under
+    /// 100 ms, 2026-09-11 to 2026-09-13), and this client cannot tell them
+    /// apart: a failed name lookup and a refused connection both arrive as a
+    /// connect error. A caller that knows whether the host has a route (the
+    /// wclaude daemon does) makes that call; this message must not.
+    #[error("all API hosts are unreachable (no network, or the API is blocked)")]
     AllHostsBlocked,
     /// The system clock is before the Unix epoch.
     #[error("system clock is before the Unix epoch")]

@@ -68,7 +68,9 @@ grep -E 'warrenguard\.git.*\brev = "' Cargo.toml | grep -v "rev = \"${rev}\"" ||
 
 ## Code style and lints
 
-- Edition 2024, MSRV 1.89 (pinned in `rust-toolchain.toml`).
+- Edition 2024, MSRV 1.91 (pinned in `rust-toolchain.toml`). The floor is
+  smoltcp 0.14, the first release whose TCP congestion window bounds the data
+  in flight; warren-core stays on 1.89 and does not compile this datapath.
 - `unsafe_code = "forbid"` workspace-wide. Zero exceptions.
 - Native `async fn in trait`; no `async-trait` macro unless a `dyn` async trait
   is genuinely required.

@@ -23,7 +23,8 @@
 #       Upload size-mb (default 3) through the arm's proxy, reps times (default
 #       2), on one of the uplink profiles below. Reads the team mnemonic from
 #       ../wclaude/secrets/warren-mnemonic (never printed) unless
-#       WARREN_MNEMONIC is already set.
+#       WARREN_MNEMONIC is already set. Dials the beta control plane the
+#       members run on (WARREN_API_BASE overrides it).
 #
 # Profiles (applied to the container's eth0, egress only):
 #   bloat   1 Mbit/s, 25 ms, a deep packet queue: the member's line before the
@@ -137,9 +138,11 @@ run_arm() {
     local name="bench-proxy-$$"
     # The container's lifetime is bounded from outside as well: a wedged upload
     # or a hung tunnel must not keep a shaped client dialing the exit forever.
-    ( sleep 3000; docker kill "$name" >/dev/null 2>&1 || true ) &
+    # Detached from our stdio: a subshell that inherited the pipe a caller
+    # reads us through would hold it open for its whole sleep.
+    ( sleep 3000; docker kill "$name" >/dev/null 2>&1 || true ) >/dev/null 2>&1 </dev/null &
     local watchdog=$!
-    trap 'kill $watchdog 2>/dev/null || true; docker kill "$name" >/dev/null 2>&1 || true' EXIT
+    trap "kill $watchdog 2>/dev/null || true; docker kill $name >/dev/null 2>&1 || true" EXIT
 
     echo "==> arm '$arm' ($(head -1 "$out/ARM-REVISION")), profile $profile, $reps x ${size_mb} MB"
     docker run --rm --name "$name" --privileged --cap-add=NET_ADMIN \
@@ -147,6 +150,7 @@ run_arm() {
         -v "$out:/arm:ro" \
         -e WARREN_MNEMONIC="$mnemonic" \
         -e WARREN_EXIT_COUNTRY="${WARREN_EXIT_COUNTRY:-NL}" \
+        -e WARREN_API_BASE="${WARREN_API_BASE:-https://api.beta.warrenbrowse.com}" \
         -e BENCH_ARM="$arm" -e BENCH_PROFILE="$profile" -e BENCH_REPS="$reps" -e BENCH_SIZE_MB="$size_mb" \
         debian:bookworm-slim \
         bash -eu -c '
@@ -187,6 +191,14 @@ run_arm() {
                 # the line narrows, as a member sits idle before a turn.
                 sleep 5
                 shape_on
+                # The control: the same upload on the same shaped line with no
+                # tunnel, so each RESULT carries what the line itself allows.
+                direct_out="$(curl -sS -o /dev/null \
+                    -w "direct_code=%{http_code} direct_secs=%{time_total} direct_up_bps=%{speed_upload}" \
+                    --max-time 1200 \
+                    -X POST --data-binary @/tmp/payload https://speed.cloudflare.com/__up 2>&1 \
+                    || true)"
+                sleep 3
                 curl_out="$(curl -sS -o /dev/null \
                     -w "code=%{http_code} secs=%{time_total} up_bps=%{speed_upload}" \
                     --socks5-hostname "$proxy" --max-time 1200 \
@@ -194,7 +206,7 @@ run_arm() {
                     || true)"
                 sleep 2
                 final="$(grep "^METRICS" /tmp/metrics.log | tail -1 | sed "s/^METRICS //")"
-                echo "RESULT arm=$BENCH_ARM profile=$BENCH_PROFILE rep=$rep size_mb=$BENCH_SIZE_MB $curl_out $final"
+                echo "RESULT arm=$BENCH_ARM profile=$BENCH_PROFILE rep=$rep size_mb=$BENCH_SIZE_MB $direct_out $curl_out $final"
                 exec 3>&-
                 wait "$client" 2>/dev/null || true
                 shape_off

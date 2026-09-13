@@ -1,2 +1,2 @@
 # Pin clippy's MSRV awareness to the workspace rust-version.
-msrv = "1.89"
+msrv = "1.91"

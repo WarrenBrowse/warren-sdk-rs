@@ -8,7 +8,9 @@
 //! under test is the shipped datapath and nothing written for the bench.
 //!
 //! Run: `WARREN_MNEMONIC="word1 ... word12" cargo run -p warren-sdk --example
-//! bench_proxy`. `WARREN_EXIT_COUNTRY` picks the exit (default `NL`).
+//! bench_proxy`. `WARREN_EXIT_COUNTRY` picks the exit (default `NL`) and
+//! `WARREN_API_BASE` the control plane (default: this build's channel; the beta
+//! fleet the members run on answers at `https://api.beta.warrenbrowse.com`).
 //!
 //! Every `METRICS` line carries the offered counters (`tx_p`, `tx_b`: what the
 //! inner stack handed the datagram queue, retransmissions included), the wire
@@ -31,10 +33,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "set WARREN_MNEMONIC to a subscribed account's 12 words")?;
     let identity = WarrenIdentity::from_mnemonic(phrase.trim())?;
     let country = std::env::var("WARREN_EXIT_COUNTRY").unwrap_or_else(|_| "NL".to_owned());
+    let api_base = std::env::var("WARREN_API_BASE").unwrap_or_else(|_| API_BASE.to_owned());
 
     let client = WarrenClient::builder()
         .identity(identity)
-        .api_base(API_BASE)
+        .api_base(api_base)
         .server_pubkey_pin(SERVER_PUBKEY_PIN)
         .build()?;
     let selector = client.fetch_exits().await?;

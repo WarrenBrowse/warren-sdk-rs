@@ -35,13 +35,19 @@ tokio-util = "0.7"
 rand = { workspace = true }
 thiserror = { workspace = true }
 # Userspace TCP/IP for the non-root proxy datapath (Medium::Ip, no Ethernet:
-# the tunnel carries bare IP packets). 0.13 requires rustc 1.91 > our MSRV.
-smoltcp = { version = "0.12", default-features = false, features = [
+# the tunnel carries bare IP packets). 0.14 is the first release whose TCP
+# congestion window actually bounds the data in flight (smoltcp #1154 to
+# #1157): before it every inner connection sent as fast as the peer's window
+# allowed and re-sent the whole window at every loss, which on a narrow uplink
+# multiplied the offered load about tenfold (workspace incident 2026-09-13).
+smoltcp = { version = "0.14", default-features = false, features = [
     "std",
     "medium-ip",
     "proto-ipv4",
     "proto-ipv6",
     "socket-tcp",
+    # Loss-responsive sender for the inner TCP; see `netstack::new_tcp_socket`.
+    "socket-tcp-cubic",
     # UDP socket for DNS-over-tunnel resolution to the gateway forwarder.
     "socket-udp",
 ], optional = true }
@@ -73,7 +79,7 @@ hex = { workspace = true }
 bytes = { workspace = true }
 # A second smoltcp stack stands in for the exit's TCP termination in the
 # netstack loopback test.
-smoltcp = { version = "0.12", default-features = false, features = [
+smoltcp = { version = "0.14", default-features = false, features = [
     "std",
     "medium-ip",
     "proto-ipv4",

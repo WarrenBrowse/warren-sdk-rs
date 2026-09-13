@@ -90,8 +90,10 @@ for (name, value) in signed.headers() {
 
 ## Minimum supported Rust version
 
-MSRV is **1.89** (edition 2024), pinned in `rust-toolchain.toml`. Newer
-toolchains work; older ones are not supported.
+MSRV is **1.91** (edition 2024), pinned in `rust-toolchain.toml`. Newer
+toolchains work; older ones are not supported. The floor is set by smoltcp
+0.14, the first release whose TCP congestion window bounds the data in flight,
+which the userspace proxy datapath depends on.
 
 ## Feature flags
 

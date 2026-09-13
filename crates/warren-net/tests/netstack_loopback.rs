@@ -1920,3 +1920,196 @@ async fn forward_port_maps_at_the_gateway_and_relays_inbound() {
         "an inbound connection to the forwarded port was relayed to the local server and echoed"
     );
 }
+
+/// A smoltcp "exit" that accepts one connection on `:9`, drains everything it
+/// receives and reports once `expect` bytes have arrived. Its receive buffer is
+/// as deep as a real server's, so the window it advertises never bounds the
+/// client the way the 64 KiB echo servers above do: what bounds the client here
+/// is the client's own sender, which is the thing under test.
+#[allow(clippy::too_many_arguments)]
+async fn sink_server(
+    ip: std::net::Ipv4Addr,
+    prefix: u8,
+    gateway: std::net::Ipv4Addr,
+    expect: usize,
+    received_so_far: Arc<AtomicUsize>,
+    done: tokio::sync::oneshot::Sender<()>,
+    mut inbound: mpsc::Receiver<Bytes>,
+    outbound: mpsc::Sender<Bytes>,
+) {
+    let mut device = ChanDevice {
+        rx: VecDeque::new(),
+        tx: outbound,
+    };
+    let base = tokio::time::Instant::now();
+    let now =
+        || SmolInstant::from_micros(i64::try_from(base.elapsed().as_micros()).unwrap_or(i64::MAX));
+
+    let mut config = Config::new(HardwareAddress::Ip);
+    config.random_seed = 0x5345_5256_0011;
+    let mut iface = Interface::new(config, &mut device, now());
+    iface.update_ip_addrs(|a| {
+        let _ = a.push(IpCidr::new(IpAddress::from(ip), prefix));
+    });
+    let _ = iface.routes_mut().add_default_ipv4_route(gateway);
+
+    let mut sockets = SocketSet::new(Vec::new());
+    let handle = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; 1024 * 1024]),
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+    ));
+    sockets
+        .get_mut::<tcp::Socket<'_>>(handle)
+        .listen(9)
+        .expect("listen");
+
+    let mut received = 0usize;
+    let mut done = Some(done);
+    loop {
+        while let Ok(f) = inbound.try_recv() {
+            device.rx.push_back(f);
+        }
+        let _ = iface.poll(now(), &mut device, &mut sockets);
+
+        let sock = sockets.get_mut::<tcp::Socket<'_>>(handle);
+        let mut buf = [0u8; 16 * 1024];
+        while sock.can_recv() {
+            match sock.recv_slice(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    received += n;
+                    received_so_far.store(received, Ordering::Relaxed);
+                }
+            }
+        }
+        if received >= expect
+            && let Some(tx) = done.take()
+        {
+            let _ = tx.send(());
+        }
+
+        let delay = iface
+            .poll_delay(now(), &sockets)
+            .map(|d| std::time::Duration::from_micros(d.total_micros()))
+            .unwrap_or_else(|| std::time::Duration::from_millis(5));
+        tokio::select! {
+            f = inbound.recv() => match f {
+                Some(f) => device.rx.push_back(f),
+                None => return,
+            },
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+/// Payload bytes of an IPv4/TCP frame, 0 for anything else (a pure ACK, a SYN).
+fn tcp_payload_len(frame: &[u8]) -> usize {
+    if frame.len() < 40 || frame[0] >> 4 != 4 || frame[9] != 6 {
+        return 0;
+    }
+    let total = usize::from(u16::from_be_bytes([frame[2], frame[3]]));
+    let ihl = usize::from(frame[0] & 0x0f) * 4;
+    let data_offset = usize::from(frame[ihl + 12] >> 4) * 4;
+    total.saturating_sub(ihl + data_offset)
+}
+
+/// Forwards client frames to the exit, dropping one payload packet in `period`
+/// on average (a seeded xorshift decides which, so the loss is reproducible
+/// without being periodic: a periodic drop phase-locks with a fixed-size
+/// retransmission window and hits the same segment on every pass) and counting
+/// every payload packet the client emits. Pure ACKs always pass: the loss under
+/// test is the data loss a congested uplink produces, and the measurement is
+/// what the client does about it.
+async fn lossy_uplink(
+    mut from_client: mpsc::Receiver<Bytes>,
+    to_exit: mpsc::Sender<Bytes>,
+    period: u64,
+    emitted: Arc<AtomicUsize>,
+) {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    while let Some(frame) = from_client.recv().await {
+        if tcp_payload_len(&frame) > 0 {
+            emitted.fetch_add(1, Ordering::Relaxed);
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            if state.is_multiple_of(period) {
+                continue;
+            }
+        }
+        if to_exit.send(frame).await.is_err() {
+            break;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lossy_uplink_does_not_multiply_the_payload_the_client_emits() {
+    // The field shape of 2026-09-12 and 2026-09-13: a narrow uplink drops a few
+    // percent of what the tunnel offers it. A sender whose window is bounded by
+    // those losses re-sends about what was lost. A sender with no congestion
+    // window keeps the whole window the peer allows in flight and re-sends all
+    // of it at every hole, which is how a 1 Mbit/s line came to be offered ten
+    // times its capacity. The bound is what the bounded sender emits at this
+    // loss rate; the unbounded one emits several times the payload.
+    const PAYLOAD: usize = 256 * 1024;
+    const DROP_EVERY: u64 = 20;
+
+    let (c2s_tx, c2s_rx) = mpsc::channel::<Bytes>(1024);
+    let (exit_in_tx, exit_in_rx) = mpsc::channel::<Bytes>(1024);
+    let (s2c_tx, s2c_rx) = mpsc::channel::<Bytes>(1024);
+    let emitted = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(lossy_uplink(
+        c2s_rx,
+        exit_in_tx,
+        DROP_EVERY,
+        Arc::clone(&emitted),
+    ));
+
+    let connector = spawn_engine(
+        NetstackConfig::new(
+            "10.66.0.2".parse().unwrap(),
+            24,
+            "10.66.0.1".parse().unwrap(),
+            MTU,
+        ),
+        s2c_rx,
+        c2s_tx,
+    );
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let received = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(sink_server(
+        "10.66.0.1".parse().unwrap(),
+        24,
+        "10.66.0.1".parse().unwrap(),
+        PAYLOAD,
+        Arc::clone(&received),
+        done_tx,
+        exit_in_rx,
+        s2c_tx,
+    ));
+
+    let mut stream = connector
+        .connect(Target::Ip("10.66.0.1:9".parse().unwrap()))
+        .await
+        .expect("connect through the lossy uplink");
+    let payload = vec![0x5a; PAYLOAD];
+    stream.write_all(&payload).await.expect("write");
+    stream.flush().await.expect("flush");
+
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(30), done_rx).await;
+    let emitted = emitted.load(Ordering::Relaxed);
+    let ideal = PAYLOAD.div_ceil(MTU - 40);
+    eprintln!("lossy uplink: {emitted} payload packets emitted for an ideal of {ideal}");
+    assert!(
+        completed.is_ok(),
+        "the transfer never completed: {} of {PAYLOAD} bytes arrived after the client \
+         emitted {emitted} payload packets for an ideal of {ideal}",
+        received.load(Ordering::Relaxed)
+    );
+    assert!(
+        emitted <= ideal * 2,
+        "the client emitted {emitted} payload packets to deliver {ideal}: \
+         the uplink's loss is being multiplied rather than repaired"
+    );
+}

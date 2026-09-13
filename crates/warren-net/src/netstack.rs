@@ -631,6 +631,24 @@ impl NetstackConfig {
     }
 }
 
+/// One inner TCP socket, as every connection and every listener gets it.
+///
+/// The sender is CUBIC, explicitly. smoltcp's default without a feature is no
+/// congestion control at all: the window is whatever the peer advertises, so
+/// on a tunnel that drops (a narrow uplink, the queue's own AQM) an upload
+/// pushes megabytes into a queue that keeps kilobytes, then re-sends the whole
+/// window at every hole. A member's 1 Mbit/s line was offered about ten times
+/// its capacity that way (workspace incident 2026-09-13). A loss-responsive
+/// window is what turns the queue's drops into the signal they are meant to be.
+fn new_tcp_socket(tcp_buffer_bytes: usize) -> tcp::Socket<'static> {
+    let mut socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; tcp_buffer_bytes]),
+        tcp::SocketBuffer::new(vec![0u8; tcp_buffer_bytes]),
+    );
+    socket.set_congestion_control(tcp::CongestionControl::Cubic);
+    socket
+}
+
 /// Spawns the netstack engine over IP-frame channels and returns a connector.
 ///
 /// `config` carries the client addressing, routing gateway, DNS resolver and
@@ -877,11 +895,7 @@ impl Engine {
         cmd: OpenCommand,
         now: SmolInstant,
     ) {
-        let socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0u8; self.tcp_buffer_bytes]),
-            tcp::SocketBuffer::new(vec![0u8; self.tcp_buffer_bytes]),
-        );
-        let handle = sockets.add(socket);
+        let handle = sockets.add(new_tcp_socket(self.tcp_buffer_bytes));
         let Some(local_port) = self.alloc_port() else {
             sockets.remove(handle);
             let _ = cmd.reply.send(Err(NetError::ConnectFailed));
@@ -930,11 +944,7 @@ impl Engine {
         port: u16,
         tcp_buffer_bytes: usize,
     ) -> Option<SocketHandle> {
-        let socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0u8; tcp_buffer_bytes]),
-            tcp::SocketBuffer::new(vec![0u8; tcp_buffer_bytes]),
-        );
-        let handle = sockets.add(socket);
+        let handle = sockets.add(new_tcp_socket(tcp_buffer_bytes));
         if sockets
             .get_mut::<tcp::Socket<'_>>(handle)
             .listen(port)

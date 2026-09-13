@@ -292,7 +292,12 @@ pub fn read_icmp(pkt: &[u8], l4_offset: usize) -> Result<IcmpHeader, PacketError
 /// `old`, the result covers `new` in its place.
 #[must_use]
 pub fn checksum_update<const N: usize>(ck: u16, old: &[u8; N], new: &[u8; N]) -> u16 {
-    const { assert!(N % 2 == 0, "an update run must be whole 16-bit words") }
+    const {
+        assert!(
+            N.is_multiple_of(2),
+            "an update run must be whole 16-bit words"
+        )
+    }
     let mut ck = ck;
     for (o, n) in old.chunks_exact(2).zip(new.chunks_exact(2)) {
         ck = incremental_checksum_update(

@@ -69,6 +69,39 @@ the pre-release `0.0.x` line.
   enabling it by default. New public surface: `IdleCover`, `IdleCoverDriver`,
   `IdleCoverDriverHandle`, `CoverSink`.
 
+### Changed
+
+- The userspace proxy datapath's inner TCP is now congestion-controlled. smoltcp
+  moves from 0.12 to 0.14, the first release whose congestion window actually
+  bounds the data in flight (smoltcp #1154 to #1157, #1155), and every inner
+  socket is CUBIC explicitly (`socket-tcp-cubic`). Before this every connection
+  through the proxy sent as fast as the peer's window allowed, up to a megabyte
+  at once into a datagram queue that keeps about 128 KiB on a narrow link, and
+  re-sent the whole window at every hole: a member's 1 Mbit/s uplink was offered
+  419 MB in 105 minutes with 10 % of the wire packets lost and the PMTU pinned
+  at the floor (workspace incident 2026-09-13). On a lossy loopback the same
+  256 KiB upload now costs 190 payload packets instead of 468 or never finishing
+  (`a_lossy_uplink_does_not_multiply_the_payload_the_client_emits`).
+- Minimum supported Rust is 1.91 (smoltcp 0.14's floor); the toolchain pin and
+  CI move with it. The wire contracts are pinned by `Cargo.lock`, not by the
+  toolchain, so the golden vectors are unaffected.
+- `ClientError::AllHostsBlocked` no longer calls itself "possible censorship":
+  a host with no network fails the same way, in the same time, and did so 1,752
+  times across the wclaude fleet in three days. The message now names both
+  causes; a caller that knows whether the host has a route decides.
+
+### Added
+
+- `PathQuality` reports `sent_packets` (QUIC packets that reached the wire),
+  `dg_dropped_aqm` and `dg_dropped_overflow` (outgoing datagrams the send queue
+  itself discarded). `packets_sent` counts what the inner stack offered the
+  queue, retransmissions included, and on a saturated uplink that alone could
+  not separate a lossy path from a dropping queue.
+- `scripts/bench/proxy-upload-shaped.sh` and the `bench_proxy` example: the
+  proxy datapath uploading through a real exit over a shaped uplink (netem
+  bufferbloat, cake) inside a privileged container on the local VM, the shape of
+  one Claude Code turn on a member's narrow line.
+
 ## [0.0.11] - 2026-06-24
 
 ### Changed
