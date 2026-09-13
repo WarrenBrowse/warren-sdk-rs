@@ -13,3 +13,4 @@ Cargo.lock.orig
 /.idea
 /.vscode
 *.swp
+bench/proxy-arms/

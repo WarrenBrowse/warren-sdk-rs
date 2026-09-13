@@ -838,10 +838,24 @@ pub struct PathQuality {
     pub max_inner_payload: u32,
     /// Black holes quinn detected on this path since connect.
     pub black_holes: u64,
+    /// QUIC packets that actually went out on this path.
+    ///
+    /// The session's `packets_sent` counts what the application offered the
+    /// datagram queue, retransmissions of the inner TCP included; on a
+    /// saturated uplink most of that never reaches the wire. The offered count
+    /// alone cannot separate a lossy path from a queue that is dropping, and
+    /// the 2026-09-13 exit-versus-client comparison was inconclusive for
+    /// exactly that reason.
+    pub sent_packets: u64,
     /// Packets lost on this path.
     pub lost_packets: u64,
     /// Congestion events on this path.
     pub congestion_events: u64,
+    /// Outgoing datagrams the send queue discarded because they sat past the
+    /// AQM's latency target.
+    pub dg_dropped_aqm: u64,
+    /// Outgoing datagrams the send queue evicted because it was full.
+    pub dg_dropped_overflow: u64,
     /// PLPMTUD probes sent, and how many were lost: a rising loss count is an
     /// MTU ceiling being discovered the hard way.
     pub plpmtud_probes_sent: u64,
@@ -863,8 +877,11 @@ impl Default for PathQuality {
             path_mtu: 0,
             max_inner_payload: 0,
             black_holes: 0,
+            sent_packets: 0,
             lost_packets: 0,
             congestion_events: 0,
+            dg_dropped_aqm: 0,
+            dg_dropped_overflow: 0,
             plpmtud_probes_sent: 0,
             plpmtud_probes_lost: 0,
         }
@@ -1187,17 +1204,21 @@ impl MultihopSession {
     /// The live quality of the QUIC path under this session.
     #[must_use]
     pub fn path_quality(&self) -> PathQuality {
-        let stats = self.conn.stats().path;
+        let stats = self.conn.stats();
+        let path = stats.path;
         PathQuality {
             carrier: self.carrier,
-            rtt_ms: u32::try_from(stats.rtt.as_millis()).unwrap_or(u32::MAX),
-            path_mtu: stats.current_mtu,
+            rtt_ms: u32::try_from(path.rtt.as_millis()).unwrap_or(u32::MAX),
+            path_mtu: path.current_mtu,
             max_inner_payload: u32::try_from(self.max_inner_payload()).unwrap_or(u32::MAX),
-            black_holes: stats.black_holes_detected,
-            lost_packets: stats.lost_packets,
-            congestion_events: stats.congestion_events,
-            plpmtud_probes_sent: stats.sent_plpmtud_probes,
-            plpmtud_probes_lost: stats.lost_plpmtud_probes,
+            black_holes: path.black_holes_detected,
+            sent_packets: path.sent_packets,
+            lost_packets: path.lost_packets,
+            congestion_events: path.congestion_events,
+            dg_dropped_aqm: stats.datagram_tx.dropped_aqm,
+            dg_dropped_overflow: stats.datagram_tx.dropped_overflow,
+            plpmtud_probes_sent: path.sent_plpmtud_probes,
+            plpmtud_probes_lost: path.lost_plpmtud_probes,
         }
     }
 
@@ -1923,6 +1944,39 @@ mod path_quality_tests {
         // A loopback path has nothing to lose and no black hole to detect.
         assert_eq!(path.black_holes, 0);
         assert_eq!(path.plpmtud_probes_lost, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_path_separates_what_reached_the_wire_from_what_the_queue_dropped() {
+        // `packets_sent` counts what the application OFFERED the datagram queue;
+        // on a saturated uplink most of that never reaches the wire, and a
+        // reader with only that counter cannot tell a lossy path from a queue
+        // that is dropping. The path reports the two other numbers: QUIC
+        // packets that actually went out, and datagrams the queue itself
+        // discarded, by AQM and by overflow.
+        let session = loopback_session().await;
+        let before = session.path_quality().sent_packets;
+        session
+            .send_packet(&[
+                0x45, 0, 0, 20, 0, 0, 0, 0, 64, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+            ])
+            .expect("loopback send");
+        // The datagram leaves on the endpoint's driver, not synchronously.
+        let mut path = session.path_quality();
+        for _ in 0..50 {
+            if path.sent_packets > before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            path = session.path_quality();
+        }
+
+        assert!(
+            path.sent_packets > before,
+            "one offered datagram must show as at least one wire packet"
+        );
+        assert_eq!(path.dg_dropped_aqm, 0, "an idle queue drops nothing by AQM");
+        assert_eq!(path.dg_dropped_overflow, 0, "an idle queue never overflows");
     }
 
     #[tokio::test(flavor = "multi_thread")]
