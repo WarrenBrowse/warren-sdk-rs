@@ -29,7 +29,10 @@
 # Profiles (applied to the container's eth0, egress only):
 #   bloat   1 Mbit/s, 25 ms, a deep packet queue: the member's line before the
 #           shaper, the bufferbloat the 2026-09-12 report measured.
-#   cake    25 ms, then cake at 860 kbit/s: the member's line after the shaper.
+#   cake    cake at 860 kbit/s, no added delay: the member's line after the
+#           shaper (the exit is ~20 ms away from here, close to the member's
+#           idle round trip; a netem delay stage in front of cake made both
+#           arms fail their first CONNECT and was dropped).
 #   clean   no shaping, the control.
 #
 # Each measurement prints one RESULT line: the curl outcome (status, seconds,
@@ -162,8 +165,7 @@ run_arm() {
             shape_on() {
                 case "$BENCH_PROFILE" in
                     bloat) tc qdisc add dev eth0 root netem delay 25ms rate 1mbit limit 1500 ;;
-                    cake)  tc qdisc add dev eth0 root handle 1: netem delay 25ms
-                           tc qdisc add dev eth0 parent 1: handle 10: cake bandwidth 860kbit ;;
+                    cake)  tc qdisc add dev eth0 root cake bandwidth 860kbit ;;
                     clean) ;;
                 esac
             }
@@ -187,26 +189,46 @@ run_arm() {
                     exec 3>&-; wait "$client" 2>/dev/null || true
                     continue
                 fi
-                # Let the fresh path settle (PMTU search, first probes) before
-                # the line narrows, as a member sits idle before a turn.
+                # Prove egress before measuring, the way wclaude does before it
+                # hands the proxy to claude: the first datagrams on a fresh path
+                # are often lost while it warms up, so a single cold CONNECT is
+                # a coin toss and would be recorded as a datapath failure.
+                warmup=0
+                for _ in $(seq 1 15); do
+                    warmup=$((warmup + 1))
+                    if curl -sS -o /dev/null --max-time 3 --socks5-hostname "$proxy" \
+                        https://1.1.1.1/cdn-cgi/trace >/dev/null 2>&1; then
+                        break
+                    fi
+                    sleep 1
+                done
+                # Let the path settle (PMTU search, first probes) before the
+                # line narrows, as a member sits idle before a turn.
                 sleep 5
                 shape_on
+                curl_out="$(curl -sS -o /dev/null \
+                    -w "code=%{http_code} secs=%{time_total} up_bps=%{speed_upload}" \
+                    --socks5-hostname "$proxy" --max-time 1200 \
+                    -X POST --data-binary @/tmp/payload https://speed.cloudflare.com/__up 2>&1 \
+                    | tr "\n" " " || true)"
+                sleep 2
+                final="$(grep "^METRICS" /tmp/metrics.log | tail -1 | sed "s/^METRICS //")"
+                case "$curl_out" in
+                    *"code=200"*) ;;
+                    *) final="$final client_err=[$(tail -2 /tmp/bench.err | tr "\n" " ")]" ;;
+                esac
                 # The control: the same upload on the same shaped line with no
                 # tunnel, so each RESULT carries what the line itself allows.
+                # AFTER the tunnel measurement: a 3 MB direct upload saturates
+                # the shaped line for half a minute, and the idle tunnel beside
+                # it sees that as bufferbloat (probes timing out, an epoch
+                # ending), which then corrupts a measurement taken right after.
                 direct_out="$(curl -sS -o /dev/null \
                     -w "direct_code=%{http_code} direct_secs=%{time_total} direct_up_bps=%{speed_upload}" \
                     --max-time 1200 \
                     -X POST --data-binary @/tmp/payload https://speed.cloudflare.com/__up 2>&1 \
                     || true)"
-                sleep 3
-                curl_out="$(curl -sS -o /dev/null \
-                    -w "code=%{http_code} secs=%{time_total} up_bps=%{speed_upload}" \
-                    --socks5-hostname "$proxy" --max-time 1200 \
-                    -X POST --data-binary @/tmp/payload https://speed.cloudflare.com/__up 2>&1 \
-                    || true)"
-                sleep 2
-                final="$(grep "^METRICS" /tmp/metrics.log | tail -1 | sed "s/^METRICS //")"
-                echo "RESULT arm=$BENCH_ARM profile=$BENCH_PROFILE rep=$rep size_mb=$BENCH_SIZE_MB $direct_out $curl_out $final"
+                echo "RESULT arm=$BENCH_ARM profile=$BENCH_PROFILE rep=$rep size_mb=$BENCH_SIZE_MB warmup_tries=$warmup $curl_out $direct_out $final"
                 exec 3>&-
                 wait "$client" 2>/dev/null || true
                 shape_off
