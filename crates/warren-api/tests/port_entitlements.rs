@@ -208,3 +208,25 @@ async fn nothing_is_handed_out_before_the_first_refresh() {
     let m = manager(&[100]);
     assert_eq!(m.credential_for_slot(0, 100 * EPOCH_SECS), None);
 }
+
+#[test]
+fn the_browser_proxy_class_names_its_own_endpoints() {
+    // A browser blinding against the session directory would mint credentials
+    // the CONNECT ingress refuses, and would spend the account's session slot
+    // for the epoch (warren-core doc 103).
+    assert_eq!(
+        CredentialClass::BrowserProxy.keys_path(),
+        "/v1/browser-proxy/keys"
+    );
+    assert_eq!(
+        CredentialClass::BrowserProxy.issue_path(),
+        "/v1/browser-proxy/issue"
+    );
+    for other in [CredentialClass::Session, CredentialClass::PortEntitlement] {
+        assert_ne!(CredentialClass::BrowserProxy.keys_path(), other.keys_path());
+        assert_ne!(
+            CredentialClass::BrowserProxy.issue_path(),
+            other.issue_path()
+        );
+    }
+}

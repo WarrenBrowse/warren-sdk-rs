@@ -310,12 +310,12 @@ impl TokenStore {
 
 /// Which credential the issuer endpoints refer to.
 ///
-/// The two classes share the whole minting flow and differ only in their
-/// endpoints, which hold different per-epoch keys: a session token admits a
-/// tunnel session, a port entitlement buys one forwarded port (warren-core
-/// doc 99). Blinding against the wrong directory mints credentials the server
-/// refuses, so the class travels with the client call rather than being
-/// implied by it.
+/// The classes share the whole minting flow and differ only in their endpoints,
+/// which hold different per-epoch keys: a session token admits a tunnel session,
+/// a port entitlement buys one forwarded port (warren-core doc 99), a
+/// browser-proxy credential admits a browser at a CONNECT ingress (doc 103).
+/// Blinding against the wrong directory mints credentials the server refuses,
+/// so the class travels with the client call rather than being implied by it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CredentialClass {
     /// Admits a tunnel session.
@@ -323,6 +323,10 @@ pub enum CredentialClass {
     Session,
     /// Buys one forwarded port.
     PortEntitlement,
+    /// Admits a browser through an exit's CONNECT proxy ingress (warren-core
+    /// doc 103). Its own class so a running tunnel client cannot take the
+    /// account's whole issuance horizon out from under a browser.
+    BrowserProxy,
 }
 
 impl CredentialClass {
@@ -332,6 +336,7 @@ impl CredentialClass {
         match self {
             Self::Session => "/v1/tokens/keys",
             Self::PortEntitlement => "/v1/port-entitlements/keys",
+            Self::BrowserProxy => "/v1/browser-proxy/keys",
         }
     }
 
@@ -341,6 +346,7 @@ impl CredentialClass {
         match self {
             Self::Session => "/v1/tokens/issue",
             Self::PortEntitlement => "/v1/port-entitlements/issue",
+            Self::BrowserProxy => "/v1/browser-proxy/issue",
         }
     }
 }
