@@ -12,6 +12,7 @@ use std::sync::Arc;
 // The client ALPN (IETF HTTP/3, mimicking a casual h3 dial) has a single home in
 // the engine config, shared with the fake exit and the real exit.
 use warrenguard_config::ALPN_H3;
+use warrenguard_multihop::dial::Reachability;
 use warrenguard_socket_bypass::{SocketBypass, apply as apply_socket_bypass};
 
 use crate::tls;
@@ -29,6 +30,47 @@ pub(crate) fn effective_bind(
     }
     auto.then(|| local_ip_for_endpoint(exit_addr).map(|ip| SocketAddr::new(ip, 0)))
         .flatten()
+}
+
+/// The unspecified address of `target`'s family, with an OS-chosen port: what
+/// this transport binds when nothing is pinned.
+#[must_use]
+pub(crate) fn unspecified_like(target: SocketAddr) -> SocketAddr {
+    if target.is_ipv6() {
+        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
+    } else {
+        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
+    }
+}
+
+/// Whether this host holds a route to `target`, for the shared address-family
+/// decision (`warrenguard_multihop::dial`).
+///
+/// A UDP socket of the target's family is bound, given the SAME bypass the dial
+/// socket will get (so the answer describes the physical link, not the tunnel
+/// this datapath may have installed), and connected: `connect(2)` performs the
+/// route lookup and stores the peer without emitting anything. A bypass that
+/// cannot be installed yields [`Reachability::Unknown`], never a verdict: an
+/// unbypassed probe would answer about the wrong routing table.
+#[must_use]
+pub(crate) fn reachability(target: SocketAddr, bypass: Option<SocketBypass>) -> Reachability {
+    let Ok(socket) = std::net::UdpSocket::bind(unspecified_like(target)) else {
+        return Reachability::Unknown;
+    };
+    if let Some(bypass) = bypass
+        && apply_socket_bypass(&socket, bypass).is_err()
+    {
+        return Reachability::Unknown;
+    }
+    match socket.connect(target) {
+        Ok(()) => Reachability::Routed,
+        Err(err) => match err.kind() {
+            std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::AddrNotAvailable => Reachability::Refused,
+            _ => Reachability::Unknown,
+        },
+    }
 }
 
 /// Detects the local source IP the OS would use to reach `exit_addr`, for pinning

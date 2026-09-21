@@ -250,6 +250,7 @@ async fn sdk_selected_circuit_respects_country_and_as_diversity() {
             exit_ed25519_pubkey: [tag; 32],
             exit_x25519_multihop_pubkey: [tag; 32],
             endpoint: format!("198.51.100.{tag}:443").parse().unwrap(),
+            endpoint_v6: None,
             country: country.to_owned(),
             asn,
             city: "City".to_owned(),
@@ -265,6 +266,7 @@ async fn sdk_selected_circuit_respects_country_and_as_diversity() {
         VerifiedEntry {
             relay_ed25519_pubkey: [tag; 32],
             endpoint: format!("198.51.100.{tag}:443").parse().unwrap(),
+            endpoint_v6: None,
             country: country.to_owned(),
             asn,
             city: "City".to_owned(),

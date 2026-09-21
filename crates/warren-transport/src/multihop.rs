@@ -94,6 +94,13 @@ pub enum MultihopError {
         #[source]
         source: quinn::ConnectionError,
     },
+    /// This host holds no route to any address family the dialed hop
+    /// publishes: the kernel refuses every candidate before a packet is built
+    /// (an IPv6-only network against a v4-only relay, or the reverse).
+    /// Distinct from a dial failure: retrying changes nothing until the host
+    /// moves to another network. Carries no address (no-log discipline).
+    #[error("no route to the dialed hop on any published address family")]
+    NoRouteToHop,
     /// The authenticated peer key did not match the pinned exit identity.
     #[error("exit identity mismatch")]
     ExitIdentityMismatch,
@@ -349,6 +356,13 @@ pub struct MultihopClientTunnel {
     /// ServerIP fix). `None` (default) for the userland proxy (no OS tunnel) and
     /// mobile (`VpnService.protect`). Set via [`Self::with_socket_bypass`].
     socket_bypass: Option<SocketBypass>,
+    /// The dialed hop's address on the OTHER family, when the directory
+    /// published one. A network that hands out no IPv4 can reach the hop only
+    /// here, and the choice between the two is made by
+    /// [`warrenguard_multihop::dial`], the single home both this transport and
+    /// the engine's own client consult. `None` keeps the historical
+    /// single-address dial. Set via [`Self::with_alt_endpoint`].
+    alt_endpoint: Option<SocketAddr>,
     /// Advertises DAITA support in the sealed setup (`IpRequest.wants_daita`):
     /// the exit then samples a machine and returns it in
     /// `IpAssign.daita_spec` (the negotiated model shared with the app). Off
@@ -379,6 +393,7 @@ impl MultihopClientTunnel {
             cover_domain: None,
             tcp_fallback: false,
             socket_bypass: None,
+            alt_endpoint: None,
             daita_support: false,
             #[cfg(feature = "pq-hpke")]
             exit_mlkem768: None,
@@ -402,6 +417,16 @@ impl MultihopClientTunnel {
     #[must_use]
     pub fn with_bind_local_ip(mut self, addr: SocketAddr) -> Self {
         self.bind_local_ip = Some(addr);
+        self
+    }
+
+    /// The dialed hop's address on the other family (`VerifiedExit.endpoint_v6`),
+    /// so a host with no route to the primary can still reach it. Ignored when
+    /// the host can reach the primary, which keeps every dual-stack dial on its
+    /// current path.
+    #[must_use]
+    pub fn with_alt_endpoint(mut self, addr: Option<SocketAddr>) -> Self {
+        self.alt_endpoint = addr;
         self
     }
 
@@ -550,6 +575,17 @@ impl MultihopClientTunnel {
         // relay's Warren identity is verified in-band after the setup frame is
         // sent (cover-domain mode, inside `setup_over_stream` below) or at the
         // TLS layer (RPK mode).
+        // Which family this host can actually reach. Decided before anything
+        // is built, by the shared engine helper, so this transport and the
+        // engine's own client can never answer it differently; the probe is
+        // ours because it has to carry this datapath's socket bypass.
+        let exit_addr = warrenguard_multihop::dial::select_from(
+            &warrenguard_multihop::dial::candidates_of(exit_addr, self.alt_endpoint),
+            self.bind_local_ip
+                .unwrap_or_else(|| crate::client::unspecified_like(exit_addr)),
+            |candidate| crate::client::reachability(candidate, self.socket_bypass),
+        )
+        .ok_or(MultihopError::NoRouteToHop)?;
         let bind = effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr);
         let (endpoint, conn, carrier) = if let Some(ref domain) = self.cover_domain {
             if self.tcp_fallback {
@@ -2024,6 +2060,60 @@ mod policy_tests {
         let bypass = SocketBypass::Fwmark(0x7761_7272);
         let tunnel = MultihopClientTunnel::new(key).with_socket_bypass(bypass);
         assert_eq!(tunnel.socket_bypass(), Some(bypass));
+    }
+
+    #[test]
+    fn the_alt_endpoint_is_absent_by_default_and_carried_when_set() {
+        // Absent by default keeps every existing dial single-address; set, it is
+        // what a host with no IPv4 route reaches the hop on.
+        let key = SigningKey::from_bytes(&[11u8; 32]);
+        assert_eq!(MultihopClientTunnel::new(key.clone()).alt_endpoint, None);
+        let v6: SocketAddr = "[2001:db8::10]:443".parse().expect("static addr parses");
+        assert_eq!(
+            MultihopClientTunnel::new(key)
+                .with_alt_endpoint(Some(v6))
+                .alt_endpoint,
+            Some(v6)
+        );
+    }
+
+    #[test]
+    fn the_v6_address_is_chosen_when_this_host_has_no_ipv4_route() {
+        // The decision this transport delegates to the engine, exercised with
+        // the same inputs the dial passes: candidates in published order, the
+        // wildcard bind, and a probe standing in for the kernel. This is the
+        // 2026-09-20 incident shape (an IPv6-only mobile network), and the
+        // answer has to be the v6 address rather than a doomed v4 dial.
+        let v4: SocketAddr = "192.0.2.10:443".parse().expect("static addr parses");
+        let v6: SocketAddr = "[2001:db8::10]:443".parse().expect("static addr parses");
+        let chosen = warrenguard_multihop::dial::select_from(
+            &warrenguard_multihop::dial::candidates_of(v4, Some(v6)),
+            crate::client::unspecified_like(v4),
+            |candidate| {
+                if candidate.is_ipv6() {
+                    warrenguard_multihop::dial::Reachability::Routed
+                } else {
+                    warrenguard_multihop::dial::Reachability::Refused
+                }
+            },
+        );
+        assert_eq!(chosen, Some(v6));
+    }
+
+    #[test]
+    fn a_host_with_no_route_at_all_yields_the_typed_no_route_error() {
+        // `select_from` returning `None` is what `connect` turns into
+        // `NoRouteToHop`, the error a client surfaces instead of dialing a
+        // network it cannot reach. The message carries no address.
+        let v4: SocketAddr = "192.0.2.10:443".parse().expect("static addr parses");
+        let chosen = warrenguard_multihop::dial::select_from(
+            &warrenguard_multihop::dial::candidates_of(v4, None),
+            crate::client::unspecified_like(v4),
+            |_| warrenguard_multihop::dial::Reachability::Refused,
+        );
+        assert_eq!(chosen, None);
+        let rendered = MultihopError::NoRouteToHop.to_string();
+        assert!(!rendered.contains("192.0.2.10"), "no address in the error");
     }
 
     #[test]

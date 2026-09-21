@@ -721,6 +721,10 @@ impl<T: HttpTransport> WarrenClient<T> {
         if exit.tcp_fallback {
             tunnel = tunnel.with_tcp_fallback(true);
         }
+        // The dialed hop's other address family, when the directory published
+        // one: on a network with no IPv4 route it is the only address that can
+        // work, and on every other network it is ignored.
+        tunnel = tunnel.with_alt_endpoint(exit.endpoint_v6);
         // Prefer the post-quantum X-Wing seal when the verified directory bound a
         // signed ML-KEM key to this exit; `None` keeps the classical seal
         // (byte-identical) and the dial never fails over a missing PQ key.
