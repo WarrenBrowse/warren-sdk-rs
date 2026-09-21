@@ -11,6 +11,10 @@ publish.workspace = true
 
 [dependencies]
 warren-contract = { workspace = true }
+# The directory ROUTE names (frozen `/v1`, dual-stack `/v2`) live beside the
+# verifier that constrains them, so this client cannot drift from what the
+# format allows. Leaf crate: it depends only on the engine's wire types.
+warren-discovery-core = { workspace = true }
 warren-identity = { path = "../warren-identity" }
 warrenguard-token = { workspace = true }
 serde = { workspace = true }

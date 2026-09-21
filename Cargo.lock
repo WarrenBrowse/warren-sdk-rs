@@ -3586,6 +3586,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "warren-contract",
+ "warren-discovery-core",
  "warren-identity",
  "warrenguard-socket-bypass",
  "warrenguard-token",

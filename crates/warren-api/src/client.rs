@@ -3,6 +3,7 @@
 use rand::RngCore;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use warren_discovery_core::{MULTIHOP_DIRECTORY_PATH_V1, MULTIHOP_DIRECTORY_PATH_V2};
 use warren_identity::WarrenIdentity;
 
 use crate::dto::{
@@ -122,16 +123,40 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         String::from_utf8(resp.body).map_err(ClientError::ResponseEncoding)
     }
 
-    /// Public `GET /v1/multihop/directory`. Returns the raw signed multihop
-    /// directory JSON, or `None` on `404` (none published). Unsigned: the body
-    /// is itself signed and the caller verifies the full trust chain with
+    /// The signed multi-hop directory, asked for on the DUAL-STACK route and
+    /// falling back to the frozen one. Returns the raw JSON, or `None` when
+    /// neither route has a directory published. Unsigned: the body is itself
+    /// signed and the caller verifies the full trust chain with
     /// `warren_discovery::verify_multihop_directory`.
+    ///
+    /// Two routes because the `/v1` body can never gain a field (its envelope
+    /// is verified against a re-serialization of the parsed nodes, so an
+    /// unknown one breaks the signature), and a client on an IPv6-only network
+    /// needs each relay's second address to dial anything at all. `/v2` carries
+    /// it; a backend that predates the route answers `404` and the frozen copy
+    /// is used, which is what keeps this SDK working against both.
     ///
     /// # Errors
     ///
     /// [`ClientError`] on transport failure or a non-200/404 status.
     pub async fn fetch_multihop_directory(&self) -> Result<Option<String>, ClientError> {
-        let req = self.unsigned_request(Method::Get, "/v1/multihop/directory", Vec::new());
+        match self
+            .fetch_multihop_directory_at(MULTIHOP_DIRECTORY_PATH_V2)
+            .await
+        {
+            Ok(Some(body)) => Ok(Some(body)),
+            // `404` here is either "no directory published" or "this backend
+            // has no v2 route": the frozen route answers both.
+            Ok(None) => {
+                self.fetch_multihop_directory_at(MULTIHOP_DIRECTORY_PATH_V1)
+                    .await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn fetch_multihop_directory_at(&self, path: &str) -> Result<Option<String>, ClientError> {
+        let req = self.unsigned_request(Method::Get, path, Vec::new());
         match self.send(req).await {
             Ok(resp) => String::from_utf8(resp.body)
                 .map(Some)
@@ -926,6 +951,83 @@ mod tests {
 
     fn connect_fail() -> Result<HttpResponse, TransportError> {
         Err(TransportError::Connect("blocked".to_owned()))
+    }
+
+    /// A backend that serves BOTH routes: the dual-stack one is what the
+    /// client must end up using, because it is the only copy carrying each
+    /// relay's second address family.
+    #[tokio::test]
+    async fn the_directory_is_asked_for_on_the_dual_stack_route_first() {
+        let t = ScriptedTransport::new(|req| {
+            if req.url.ends_with(MULTIHOP_DIRECTORY_PATH_V2) {
+                ok_200(r#"{"from":"v2"}"#)
+            } else {
+                ok_200(r#"{"from":"v1"}"#)
+            }
+        });
+        let c = WarrenApiClient::new(
+            "https://api.example.test",
+            WarrenIdentity::from_seed(&[0x11; 32]),
+            t,
+        );
+        let body = c
+            .fetch_multihop_directory()
+            .await
+            .expect("ok")
+            .expect("some");
+        assert_eq!(body, r#"{"from":"v2"}"#);
+        let asked = c.transport().attempts.lock().unwrap();
+        assert_eq!(asked.len(), 1, "the frozen route must not be asked for too");
+    }
+
+    /// A backend that predates the route answers 404 there. The client must
+    /// fall back rather than report "no directory published", which would
+    /// strand every circuit against an older API.
+    #[tokio::test]
+    async fn a_backend_without_the_dual_stack_route_falls_back_to_the_frozen_one() {
+        let t = ScriptedTransport::new(|req| {
+            if req.url.ends_with(MULTIHOP_DIRECTORY_PATH_V2) {
+                Ok(HttpResponse {
+                    status: 404,
+                    body: b"no such route".to_vec(),
+                })
+            } else {
+                ok_200(r#"{"from":"v1"}"#)
+            }
+        });
+        let c = WarrenApiClient::new(
+            "https://api.example.test",
+            WarrenIdentity::from_seed(&[0x11; 32]),
+            t,
+        );
+        let body = c
+            .fetch_multihop_directory()
+            .await
+            .expect("ok")
+            .expect("some");
+        assert_eq!(body, r#"{"from":"v1"}"#);
+        let asked = c.transport().attempts.lock().unwrap();
+        assert_eq!(asked.len(), 2, "v2 then v1, in that order");
+        assert!(asked[0].url.ends_with(MULTIHOP_DIRECTORY_PATH_V2));
+        assert!(asked[1].url.ends_with(MULTIHOP_DIRECTORY_PATH_V1));
+    }
+
+    /// Neither route has one: that is `None`, not an error, and it must not
+    /// read as a transport failure.
+    #[tokio::test]
+    async fn no_directory_on_either_route_is_none() {
+        let t = ScriptedTransport::new(|_| {
+            Ok(HttpResponse {
+                status: 404,
+                body: b"none published".to_vec(),
+            })
+        });
+        let c = WarrenApiClient::new(
+            "https://api.example.test",
+            WarrenIdentity::from_seed(&[0x11; 32]),
+            t,
+        );
+        assert!(c.fetch_multihop_directory().await.expect("ok").is_none());
     }
 
     fn fallback_client(t: ScriptedTransport) -> WarrenApiClient<ScriptedTransport> {
