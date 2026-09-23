@@ -104,6 +104,11 @@ pub enum MultihopError {
     /// The authenticated peer key did not match the pinned exit identity.
     #[error("exit identity mismatch")]
     ExitIdentityMismatch,
+    /// The connection closed during the setup round-trip, after a successful
+    /// QUIC handshake (a drained node refuses every new session this way). The
+    /// peer's close is kept whole so its code reaches diagnostics.
+    #[error("connection closed during the setup round-trip")]
+    SetupClosed(#[source] quinn::ConnectionError),
     /// Writing or reading the sealed setup frame on the reliable stream failed.
     #[error("setup stream i/o error during {context}")]
     SetupIo {
@@ -182,6 +187,10 @@ impl MultihopError {
         use warrenguard_transport::Retryability;
         match self {
             MultihopError::Setup(e) => e.retryability(),
+            // Whatever its code: the node that closed during setup has read the
+            // exit id, and on a two-hop circuit it is the entry relay, whose
+            // word must not choose which exits the client avoids.
+            MultihopError::SetupClosed(_) => Retryability::RetrySameTarget,
             MultihopError::Quic { source, .. } | MultihopError::ReadDatagram(source)
                 if is_exit_drain_close(source) =>
             {
@@ -310,6 +319,7 @@ fn map_engine_err(e: EngineMultihopError) -> MultihopError {
             source: detail.into(),
         },
         E::Recv(inner) => MultihopError::ReadDatagram(inner),
+        E::SetupClosed(inner) => MultihopError::SetupClosed(inner),
         E::UnexpectedExitId => MultihopError::ExitIdentityMismatch,
         E::RelayIdentity(reason) => MultihopError::RelayIdentity(reason),
         E::RelayPki(_)
@@ -2050,6 +2060,39 @@ mod path_quality_tests {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    fn drain_close() -> quinn::ConnectionError {
+        quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u32(warrenguard_multihop::WARREN_MH_DRAINING),
+            reason: bytes::Bytes::new(),
+        })
+    }
+
+    #[test]
+    fn a_drain_close_during_setup_retries_the_same_target() {
+        // A reselect here would hand a hostile entry relay the choice of exits.
+        use warrenguard_transport::Retryability;
+        let err = map_engine_err(EngineMultihopError::SetupClosed(drain_close()));
+        assert!(
+            matches!(err.retryability(), Retryability::RetrySameTarget),
+            "a close during setup must never reselect, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_close_during_setup_keeps_the_peer_close_code() {
+        // A drain refusal read as a malformed reply sends whoever reads the
+        // journal after the wrong cause.
+        let err = map_engine_err(EngineMultihopError::SetupClosed(drain_close()));
+        assert!(
+            matches!(
+                &err,
+                MultihopError::SetupClosed(quinn::ConnectionError::ApplicationClosed(ac))
+                    if u64::from(ac.error_code) == u64::from(warrenguard_multihop::WARREN_MH_DRAINING)
+            ),
+            "the close must survive the mapping, got {err:?}"
+        );
+    }
 
     #[test]
     fn socket_bypass_is_threaded_from_the_builder() {
