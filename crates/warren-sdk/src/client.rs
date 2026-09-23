@@ -1115,15 +1115,39 @@ impl<T: HttpTransport> WarrenClient<T> {
         circuit: &Circuit,
         cfg: &warren_net::ProxyConfig,
     ) -> Result<SupervisedProxyHandle, SdkError> {
+        ensure_dns_reachable(circuit.dialed_exit().dns_disabled, cfg)?;
+        let listeners = crate::proxy::ProxyListeners::bind(cfg).await?;
+        self.start_proxy_supervised_on(circuit, &listeners, cfg.dns_server)
+            .await
+    }
+
+    /// [`Self::start_proxy_supervised`] over listeners the caller already
+    /// holds. The caller keeps its clone of `listeners` across datapaths, so a
+    /// full teardown and redial (a fresh client, a freshly resolved exit)
+    /// never releases the ports or changes the credentials the clients were
+    /// given. `dns_server` plays the role of [`warren_net::ProxyConfig::dns_server`].
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::ExitDnsDisabled`] if the exit runs no DNS forwarder and no
+    /// resolver override is set. Tunnel establishment happens in the
+    /// background, so connect failures surface as state, not here.
+    pub async fn start_proxy_supervised_on(
+        &self,
+        circuit: &Circuit,
+        listeners: &crate::proxy::ProxyListeners,
+        dns_server: Option<std::net::Ipv4Addr>,
+    ) -> Result<SupervisedProxyHandle, SdkError> {
         let exit = circuit.dialed_exit().clone();
-        ensure_dns_reachable(exit.dns_disabled, cfg)?;
+        dns_reachable(exit.dns_disabled, dns_server.is_some())?;
         let signing = self.signing.clone();
         let auto_local_ip = self.auto_local_ip;
         let wants_ipv6 = self.wants_ipv6;
         let transport_config = self.transport_config.clone();
         let rtt_cache = Arc::clone(&self.rtt_cache);
         self.spawn_supervised(
-            cfg,
+            listeners.clone(),
+            dns_server,
             move || {
                 let signing = signing.clone();
                 let exit = exit.clone();
@@ -1197,8 +1221,10 @@ impl<T: HttpTransport> WarrenClient<T> {
             crate::portfollow::AvoidSet::<[u8; 16]>::default(),
         ));
         let rtt_cache = Arc::clone(&self.rtt_cache);
+        let listeners = crate::proxy::ProxyListeners::bind(cfg).await?;
         self.spawn_supervised(
-            cfg,
+            listeners,
+            cfg.dns_server,
             move || {
                 let signing = signing.clone();
                 let exits = exits.clone();
@@ -1463,12 +1489,13 @@ impl<T: HttpTransport> WarrenClient<T> {
         })
     }
 
-    /// Binds the stable proxy listeners, spawns the supervisor over `connect`, and
+    /// Spawns the supervisor over `connect` behind the stable `listeners`, and
     /// returns the [`SupervisedProxyHandle`]. Shared by the single-exit and
     /// failover supervised datapaths; only the (re)connect closure differs.
     async fn spawn_supervised<F, Fut, D>(
         &self,
-        cfg: &warren_net::ProxyConfig,
+        listeners: crate::proxy::ProxyListeners,
+        dns_server: Option<std::net::Ipv4Addr>,
         connect: F,
         on_drain: D,
     ) -> Result<SupervisedProxyHandle, SdkError>
@@ -1478,20 +1505,9 @@ impl<T: HttpTransport> WarrenClient<T> {
             + Send,
         D: Fn() + Send + 'static,
     {
-        let socks_listener = tokio::net::TcpListener::bind(cfg.socks5)
-            .await
-            .map_err(SdkError::Proxy)?;
-        let local_addr = socks_listener.local_addr().map_err(SdkError::Proxy)?;
-        let (http_listener, http_addr) = match cfg.http {
-            Some(bind) => {
-                let l = tokio::net::TcpListener::bind(bind)
-                    .await
-                    .map_err(SdkError::Proxy)?;
-                let a = l.local_addr().map_err(SdkError::Proxy)?;
-                (Some(l), Some(a))
-            }
-            None => (None, None),
-        };
+        let local_addr = listeners.socks5_addr();
+        let http_addr = listeners.http_addr();
+        let credentials = listeners.credentials().clone();
 
         let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
         let (forwarder_tx, forwarder_rx) = tokio::sync::watch::channel(None);
@@ -1499,13 +1515,11 @@ impl<T: HttpTransport> WarrenClient<T> {
         let (migration_tx, migration_rx) = tokio::sync::watch::channel(None);
         let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
         let (epoch_end_tx, epoch_end_rx) = tokio::sync::watch::channel(None);
-        let dns_server = cfg.dns_server;
         let reconnect_request = std::sync::Arc::new(tokio::sync::Notify::new());
         let supervisor_reconnect = std::sync::Arc::clone(&reconnect_request);
         let task = tokio::spawn(async move {
             supervise_proxy(
-                socks_listener,
-                http_listener,
+                listeners,
                 dns_server,
                 crate::supervisor::SupervisorOutputs {
                     state_tx,
@@ -1543,6 +1557,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         Ok(SupervisedProxyHandle {
             local_addr,
             http_addr,
+            credentials,
             state_rx,
             forwarder_rx,
             metrics_rx,

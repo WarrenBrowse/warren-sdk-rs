@@ -67,6 +67,7 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
         socks5: config.socks_listen,
         http: config.http_listen,
         dns_server: config.dns_server,
+        credentials: Some(config.credentials.clone()),
     };
     let handle = client
         .start_proxy_supervised_failover(&candidates, &proxy_cfg)
@@ -104,7 +105,8 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
         .context("the tunnel never reached Connected")?;
 
     let probe_addr = probe_address(handle.local_addr());
-    verify_first_egress(probe_addr, FIRST_EGRESS_VERIFY)
+    let probe_credentials = handle.credentials().clone();
+    verify_first_egress(probe_addr, &probe_credentials, FIRST_EGRESS_VERIFY)
         .await
         .map_err(|e| anyhow::anyhow!("first egress verification failed: {e:?}"))?;
     egress_verified.store(true, Ordering::Relaxed);
@@ -114,10 +116,13 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
         LOG,
         tracker_rx,
         Arc::clone(&egress_verified),
-        move || async move {
-            verify_first_egress(probe_addr, FIRST_EGRESS_RECHECK)
-                .await
-                .is_ok()
+        move || {
+            let credentials = probe_credentials.clone();
+            async move {
+                verify_first_egress(probe_addr, &credentials, FIRST_EGRESS_RECHECK)
+                    .await
+                    .is_ok()
+            }
         },
     ));
 

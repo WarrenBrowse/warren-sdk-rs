@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use warren_sdk::api::{ClientError, PubkeySs58, RegisterAccountRequest};
 use warren_sdk::identity::{WarrenIdentity, ss58};
-use warren_sdk::net::{ForwardedPort, MapProto, ProxyConfig};
+use warren_sdk::net::{ForwardedPort, MapProto, ProxyConfig, ProxyCredentials};
 use warren_sdk::transport::{Backoff, ConnectionState, FatalCause, RetryError, connect_with_state};
 use warren_sdk::{
     Circuit, DefaultClient, FileGenerationStore, FileServerKeyStore, ProxyForwarder, ProxyHandle,
@@ -487,6 +487,8 @@ fn build_proxy_config(
         socks5,
         http,
         dns_server,
+        // Fresh per proxy; the app reads them back from the handle.
+        credentials: None,
     })
 }
 
@@ -847,11 +849,13 @@ impl WarrenFfiClient {
             })?;
         let socks5_address = handle.local_addr().to_string();
         let http_address = handle.http_addr().map(|a| a.to_string());
+        let credentials = handle.credentials().clone();
         // A detached forwarder so port forwards do not need the handle's lock.
         let forwarder = handle.forwarder();
         Ok(Arc::new(WarrenFfiProxy {
             socks5_address,
             http_address,
+            credentials,
             forwarder,
             handle: Mutex::new(Some(handle)),
         }))
@@ -975,6 +979,7 @@ fn wrap_supervised(
     Arc::new(WarrenFfiSupervisedProxy {
         socks5_address: handle.local_addr().to_string(),
         http_address: handle.http_addr().map(|a| a.to_string()),
+        credentials: handle.credentials().clone(),
         handle: Mutex::new(Some(handle)),
         observer_task: Mutex::new(observer_task),
     })
@@ -982,13 +987,16 @@ fn wrap_supervised(
 
 /// A running non-root SOCKS5 proxy over a multihop tunnel.
 ///
-/// Point a SOCKS5-aware app at [`socks5_address`](Self::socks5_address). Dropping
-/// this handle (or calling [`shutdown`](Self::shutdown)) tears down the listeners
-/// and the tunnel.
+/// Point a SOCKS5-aware app at [`socks5_address`](Self::socks5_address) with
+/// [`proxy_username`](Self::proxy_username) and
+/// [`proxy_password`](Self::proxy_password): the listeners refuse any client
+/// that does not present them. Dropping this handle (or calling
+/// [`shutdown`](Self::shutdown)) tears down the listeners and the tunnel.
 #[derive(uniffi::Object)]
 pub struct WarrenFfiProxy {
     socks5_address: String,
     http_address: Option<String>,
+    credentials: ProxyCredentials,
     // Detached forwarder for `forward_port`: usable without the handle lock, so a
     // forward can be requested without contending with `shutdown`.
     forwarder: ProxyForwarder,
@@ -1010,6 +1018,20 @@ impl WarrenFfiProxy {
     #[must_use]
     pub fn http_address(&self) -> Option<String> {
         self.http_address.clone()
+    }
+
+    /// The username every client of the listeners presents (RFC 1929 on
+    /// SOCKS5, `Proxy-Authorization: Basic` on HTTP CONNECT).
+    #[must_use]
+    pub fn proxy_username(&self) -> String {
+        self.credentials.username().to_owned()
+    }
+
+    /// The password every client of the listeners presents. A per-session
+    /// secret: keep it out of logs, argv and files other accounts can read.
+    #[must_use]
+    pub fn proxy_password(&self) -> String {
+        self.credentials.password().to_owned()
     }
 
     /// Forwards a tunnel-side port: asks the exit to map `internal_port` via
@@ -1094,12 +1116,13 @@ impl WarrenFfiForwardedPort {
 }
 
 /// A self-healing SOCKS5 proxy over a multihop tunnel (see
-/// [`WarrenFfiClient::start_proxy_supervised`]). The address stays stable while
-/// the tunnel is rebuilt across drops.
+/// [`WarrenFfiClient::start_proxy_supervised`]). The address and the
+/// credentials stay stable while the tunnel is rebuilt across drops.
 #[derive(uniffi::Object)]
 pub struct WarrenFfiSupervisedProxy {
     socks5_address: String,
     http_address: Option<String>,
+    credentials: ProxyCredentials,
     handle: Mutex<Option<SupervisedProxyHandle>>,
     // The state-forwarding task, aborted on shutdown/drop so it cannot invoke the
     // foreign observer after the app has released the proxy.
@@ -1118,6 +1141,20 @@ impl WarrenFfiSupervisedProxy {
     #[must_use]
     pub fn http_address(&self) -> Option<String> {
         self.http_address.clone()
+    }
+
+    /// The username every client of the listeners presents (RFC 1929 on
+    /// SOCKS5, `Proxy-Authorization: Basic` on HTTP CONNECT).
+    #[must_use]
+    pub fn proxy_username(&self) -> String {
+        self.credentials.username().to_owned()
+    }
+
+    /// The password every client of the listeners presents. A per-session
+    /// secret: keep it out of logs, argv and files other accounts can read.
+    #[must_use]
+    pub fn proxy_password(&self) -> String {
+        self.credentials.password().to_owned()
     }
 
     /// The current connection state, or `Failed` if already shut down.
@@ -1694,6 +1731,53 @@ mod tests {
             )
             .await;
         assert!(matches!(r, Err(FfiError::Client { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_supervised_proxy_hands_out_the_credentials_its_listener_demands() {
+        let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let (addr, keys) = warren_test_support::spawn_fake_multihop_exit(exit_key).await;
+        let exit = warren_sdk::discovery::VerifiedExit {
+            exit_id: keys.exit_id,
+            exit_ed25519_pubkey: keys.ed25519_pubkey,
+            exit_x25519_multihop_pubkey: keys.x25519_pubkey,
+            endpoint: addr,
+            endpoint_v6: None,
+            country: "ZZ".to_owned(),
+            asn: 0,
+            city: "Test".to_owned(),
+            weight: 100,
+            dns_disabled: false,
+            cover_domain: None,
+            tcp_fallback: false,
+            edge_cert_sha256: None,
+            exit_mlkem768_pubkey: None,
+        };
+        let client = WarrenClient::builder()
+            .identity(WarrenIdentity::generate().0)
+            .api_base("https://api.example.test")
+            .allow_any_server_key()
+            .build()
+            .expect("client");
+        let cfg = build_proxy_config("127.0.0.1:0".parse().unwrap(), None).expect("config");
+        let handle = client
+            .start_proxy_supervised(&Circuit::SingleHop(exit), &cfg)
+            .await
+            .expect("supervised proxy");
+        let proxy = wrap_supervised(handle, None);
+        for _ in 0..200 {
+            if proxy.state() == FfiConnectionState::Connected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let given =
+            ProxyCredentials::new(proxy.proxy_username(), proxy.proxy_password()).expect("valid");
+        warren_sdk::net::prove_socks5_listener(proxy.socks5_address().parse().unwrap(), &given)
+            .await
+            .expect("the credentials handed to the app are the listener's");
+        proxy.shutdown();
     }
 
     #[test]

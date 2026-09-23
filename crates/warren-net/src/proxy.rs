@@ -6,6 +6,10 @@
 //! local resolver, sees the destination); tests use a direct connector. Keeping
 //! the connector abstract is what lets the whole accept/handshake/relay loop be
 //! tested in-process without a tunnel.
+//!
+//! Both servers authenticate every client against the session's
+//! [`ProxyCredentials`] before the connector is touched; see
+//! [`crate::proxy_auth`] for why a loopback listener needs it.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -14,11 +18,78 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use zeroize::Zeroizing;
+
 use crate::error::NetError;
-use crate::socks5::{
-    Command, METHOD_NO_AUTH, METHOD_NONE, Reply, Socks5Error, Target, VERSION, build_method_reply,
-    build_reply, encode_udp_datagram, parse_greeting, parse_request, parse_udp_datagram,
+use crate::proxy_auth::{
+    HTTP_PROOF_HEADER, HTTP_PROOF_METHOD, ListenerKind, PROOF_NONCE_LEN, ProxyCredentials,
 };
+use crate::socks5::{
+    Command, METHOD_NONE, METHOD_USERPASS, METHOD_WARREN_PROOF, Reply, Socks5Error, Target,
+    USERPASS_VERSION, build_method_reply, build_reply, encode_udp_datagram, parse_greeting,
+    parse_request, parse_udp_datagram,
+};
+
+/// How long a client has to authenticate and say what it wants. A client that
+/// connects and stays silent would otherwise hold a descriptor as long as it
+/// likes, and enough of them starve the process of descriptors.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Pause before accepting again after a transient accept failure.
+const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Accepts the next connection. Running out of descriptors, or a connection
+/// aborted before it was accepted, is a condition of this moment and not of the
+/// listener: it is waited out, because returning it ends the datapath's epoch
+/// and redials a healthy tunnel.
+async fn accept(listener: &TcpListener) -> Result<TcpStream, NetError> {
+    loop {
+        match listener.accept().await {
+            Ok((client, _peer)) => return Ok(client),
+            Err(e) if is_transient_accept_error(&e) => tokio::time::sleep(ACCEPT_BACKOFF).await,
+            Err(e) => return Err(NetError::Io(e)),
+        }
+    }
+}
+
+/// Whether an accept failure passes on its own: an aborted or reset pending
+/// connection, an interrupted call, or descriptor exhaustion (EMFILE and ENFILE
+/// on Unix, WSAEMFILE on Windows).
+fn is_transient_accept_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    let exhausted = match e.raw_os_error() {
+        Some(code) if cfg!(windows) => code == 10024,
+        Some(code) => code == 24 || code == 23,
+        None => false,
+    };
+    exhausted
+        || matches!(
+            e.kind(),
+            ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::Interrupted
+        )
+}
+
+/// Runs a client's handshake under [`HANDSHAKE_TIMEOUT`]; running out of time
+/// refuses the client like a wrong password.
+async fn within_handshake<T>(
+    handshake: impl std::future::Future<Output = Result<T, NetError>>,
+) -> Result<T, NetError> {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+        .await
+        .map_err(|_| NetError::ProxyAuth)?
+}
+
+/// The SOCKS5 greeting, authentication and request. `None` when the client
+/// only asked for a proof, which it has been given.
+async fn socks_handshake(
+    client: &mut TcpStream,
+    credentials: &ProxyCredentials,
+) -> Result<Option<(Command, Target)>, NetError> {
+    if negotiate_method(client, credentials).await? == Negotiated::Proved {
+        return Ok(None);
+    }
+    read_request(client).await.map(Some)
+}
 
 /// The unspecified bound address echoed in a successful SOCKS5 reply. A CONNECT
 /// reply does not need a meaningful bound address.
@@ -118,16 +189,20 @@ impl Connector for DirectConnector {
     }
 }
 
-/// A SOCKS5 proxy server over a [`Connector`].
+/// A SOCKS5 proxy server over a [`Connector`], admitting only clients that
+/// authenticate with the session's credentials (RFC 1929).
 pub struct Socks5Proxy<C> {
     connector: Arc<C>,
+    credentials: Arc<ProxyCredentials>,
 }
 
 impl<C: Connector> Socks5Proxy<C> {
-    /// Builds a proxy that opens upstream flows through `connector`.
-    pub fn new(connector: C) -> Self {
+    /// Builds a proxy that opens upstream flows through `connector` for clients
+    /// presenting `credentials`.
+    pub fn new(connector: C, credentials: ProxyCredentials) -> Self {
         Self {
             connector: Arc::new(connector),
+            credentials: Arc::new(credentials),
         }
     }
 
@@ -140,10 +215,11 @@ impl<C: Connector> Socks5Proxy<C> {
     /// [`NetError::Io`] only if accepting on the listener fails.
     pub async fn serve(&self, listener: TcpListener) -> Result<(), NetError> {
         loop {
-            let (client, _peer) = listener.accept().await.map_err(NetError::Io)?;
+            let client = accept(&listener).await?;
             let connector = Arc::clone(&self.connector);
+            let credentials = Arc::clone(&self.credentials);
             tokio::spawn(async move {
-                let _ = handle_connection(client, connector.as_ref()).await;
+                let _ = handle_connection(client, connector.as_ref(), &credentials).await;
             });
         }
     }
@@ -176,9 +252,13 @@ async fn relay_connect<C: Connector>(
 async fn handle_connection<C: Connector>(
     mut client: TcpStream,
     connector: &C,
+    credentials: &ProxyCredentials,
 ) -> Result<(), NetError> {
-    negotiate_method(&mut client).await?;
-    let (command, target) = read_request(&mut client).await?;
+    let Some((command, target)) =
+        within_handshake(socks_handshake(&mut client, credentials)).await?
+    else {
+        return Ok(());
+    };
 
     if !command.is_supported() {
         write_reply(&mut client, Reply::CommandNotSupported).await?;
@@ -198,10 +278,11 @@ impl<C: UdpConnector> Socks5Proxy<C> {
     /// [`NetError::Io`] only if accepting on the listener fails.
     pub async fn serve_with_udp(&self, listener: TcpListener) -> Result<(), NetError> {
         loop {
-            let (client, _peer) = listener.accept().await.map_err(NetError::Io)?;
+            let client = accept(&listener).await?;
             let connector = Arc::clone(&self.connector);
+            let credentials = Arc::clone(&self.credentials);
             tokio::spawn(async move {
-                let _ = handle_with_udp(client, connector.as_ref()).await;
+                let _ = handle_with_udp(client, connector.as_ref(), &credentials).await;
             });
         }
     }
@@ -232,11 +313,12 @@ impl<C: UdpConnector> Socks5Proxy<C> {
                         return Ok(());
                     }
                 }
-                accepted = listener.accept() => {
-                    let (client, _peer) = accepted.map_err(NetError::Io)?;
+                accepted = accept(listener) => {
+                    let client = accepted?;
                     let connector = Arc::clone(&self.connector);
+                    let credentials = Arc::clone(&self.credentials);
                     tokio::spawn(async move {
-                        let _ = handle_with_udp(client, connector.as_ref()).await;
+                        let _ = handle_with_udp(client, connector.as_ref(), &credentials).await;
                     });
                 }
             }
@@ -248,12 +330,16 @@ impl<C: UdpConnector> Socks5Proxy<C> {
 async fn handle_with_udp<C: UdpConnector>(
     mut client: TcpStream,
     connector: &C,
+    credentials: &ProxyCredentials,
 ) -> Result<(), NetError> {
-    negotiate_method(&mut client).await?;
-    let (command, target) = read_request(&mut client).await?;
+    let Some((command, target)) =
+        within_handshake(socks_handshake(&mut client, credentials)).await?
+    else {
+        return Ok(());
+    };
     match command {
         Command::Connect => relay_connect(&mut client, connector, target).await,
-        Command::UdpAssociate => udp_associate(client, connector).await,
+        Command::UdpAssociate => udp_associate(client, connector, &target).await,
         Command::Bind => {
             write_reply(&mut client, Reply::CommandNotSupported).await?;
             Ok(())
@@ -270,7 +356,16 @@ const MAX_UDP_DATAGRAM: usize = 64 * 1024;
 async fn udp_associate<C: UdpConnector>(
     mut client: TcpStream,
     connector: &C,
+    declared: &Target,
 ) -> Result<(), NetError> {
+    // The relay port is visible to every local process, and only the TCP
+    // control connection is authenticated. A client that declared where it
+    // will send from (RFC 1928 section 6) is held to it; one that declared
+    // nothing is bound to its first well-formed datagram.
+    let declared = match declared {
+        Target::Ip(addr) if addr.port() != 0 => Some(*addr),
+        _ => None,
+    };
     // The client sends its datagrams to this loopback relay socket; the BND
     // address in the reply tells it where.
     let relay = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -298,6 +393,12 @@ async fn udp_associate<C: UdpConnector>(
                 // The relay is an unconnected loopback socket, so a recv error is
                 // fatal (fd gone), not transient: ending the association is right.
                 let (n, src) = r.map_err(NetError::Io)?;
+                if declared.is_some_and(|d| !is_declared_source(d, src)) {
+                    continue;
+                }
+                let Ok((target, payload)) = parse_udp_datagram(&buf[..n]) else {
+                    continue;
+                };
                 // Bind the association to the first client source and drop
                 // datagrams from any other local source: otherwise a co-resident
                 // process could inject traffic and, by setting `client_src`,
@@ -307,23 +408,21 @@ async fn udp_associate<C: UdpConnector>(
                     Some(known) if known != src => continue,
                     Some(_) => {}
                 }
-                if let Ok((target, payload)) = parse_udp_datagram(&buf[..n]) {
-                    let dst = match target {
-                        Target::Ip(addr @ SocketAddr::V4(_)) => Some(addr),
-                        // Route v6 only when the engine has a v6 assignment;
-                        // otherwise drop rather than black-hole it.
-                        Target::Ip(addr @ SocketAddr::V6(_)) => {
-                            connector.supports_ipv6().then_some(addr)
-                        }
-                        Target::Domain(host, port) => connector
-                            .resolve_host(&host)
-                            .await
-                            .ok()
-                            .map(|ip| SocketAddr::new(ip, port)),
-                    };
-                    if let Some(dst) = dst {
-                        let _ = flow.send_to(Bytes::copy_from_slice(payload), dst).await;
+                let dst = match target {
+                    Target::Ip(addr @ SocketAddr::V4(_)) => Some(addr),
+                    // Route v6 only when the engine has a v6 assignment;
+                    // otherwise drop rather than black-hole it.
+                    Target::Ip(addr @ SocketAddr::V6(_)) => {
+                        connector.supports_ipv6().then_some(addr)
                     }
+                    Target::Domain(host, port) => connector
+                        .resolve_host(&host)
+                        .await
+                        .ok()
+                        .map(|ip| SocketAddr::new(ip, port)),
+                };
+                if let Some(dst) = dst {
+                    let _ = flow.send_to(Bytes::copy_from_slice(payload), dst).await;
                 }
             }
             // Tunnel -> client: re-wrap with the SOCKS5 UDP header and deliver to
@@ -349,8 +448,30 @@ async fn udp_associate<C: UdpConnector>(
     }
 }
 
-/// Reads the greeting and replies with the selected method.
-async fn negotiate_method(client: &mut TcpStream) -> Result<(), NetError> {
+/// How a SOCKS5 method negotiation ended without an error.
+#[derive(Debug, PartialEq, Eq)]
+enum Negotiated {
+    /// The client authenticated: its request may be served.
+    Authenticated,
+    /// The client asked for a proof of possession and got it; the connection
+    /// carries nothing else.
+    Proved,
+}
+
+/// Whether `src` is the address a client declared for its UDP association: the
+/// same port, and the same IP unless the client left it unspecified.
+fn is_declared_source(declared: SocketAddr, src: SocketAddr) -> bool {
+    declared.port() == src.port() && (declared.ip().is_unspecified() || declared.ip() == src.ip())
+}
+
+/// Reads the greeting, then either authenticates the client (RFC 1929) or
+/// answers a proof request. A client offering neither is told no method is
+/// acceptable; a client with the wrong credentials gets a failure status. Both
+/// refusals are fixed bytes that say nothing about what was wrong.
+async fn negotiate_method(
+    client: &mut TcpStream,
+    credentials: &ProxyCredentials,
+) -> Result<Negotiated, NetError> {
     let mut head = [0u8; 2];
     client.read_exact(&mut head).await.map_err(NetError::Io)?;
     let mut greeting = head.to_vec();
@@ -361,19 +482,55 @@ async fn negotiate_method(client: &mut TcpStream) -> Result<(), NetError> {
         .map_err(NetError::Io)?;
 
     let methods = parse_greeting(&greeting)?;
-    let method = if methods.contains(&METHOD_NO_AUTH) {
-        METHOD_NO_AUTH
-    } else {
-        METHOD_NONE
-    };
+    if methods.contains(&METHOD_USERPASS) {
+        write_all(client, &build_method_reply(METHOD_USERPASS)).await?;
+        let accepted = read_userpass(client, credentials).await?;
+        let status = if accepted { 0x00 } else { 0x01 };
+        write_all(client, &[USERPASS_VERSION, status]).await?;
+        return if accepted {
+            Ok(Negotiated::Authenticated)
+        } else {
+            Err(NetError::ProxyAuth)
+        };
+    }
+    if methods.contains(&METHOD_WARREN_PROOF) {
+        write_all(client, &build_method_reply(METHOD_WARREN_PROOF)).await?;
+        let mut nonce = [0u8; PROOF_NONCE_LEN];
+        client.read_exact(&mut nonce).await.map_err(NetError::Io)?;
+        write_all(client, &credentials.proof(ListenerKind::Socks5, &nonce)).await?;
+        return Ok(Negotiated::Proved);
+    }
+    write_all(client, &build_method_reply(METHOD_NONE)).await?;
+    Err(NetError::ProxyAuth)
+}
+
+/// Reads one RFC 1929 sub-negotiation (`VER ULEN UNAME PLEN PASSWD`) and says
+/// whether it carries `credentials`. A wrong version byte is a mismatch rather
+/// than a protocol error, so it earns the same refusal as a wrong password.
+async fn read_userpass(
+    client: &mut TcpStream,
+    credentials: &ProxyCredentials,
+) -> Result<bool, NetError> {
+    let mut head = [0u8; 2];
+    client.read_exact(&mut head).await.map_err(NetError::Io)?;
+    let mut username = vec![0u8; usize::from(head[1])];
     client
-        .write_all(&build_method_reply(method))
+        .read_exact(&mut username)
         .await
         .map_err(NetError::Io)?;
-    if method == METHOD_NONE {
-        return Err(NetError::Socks5(Socks5Error::BadVersion(VERSION)));
-    }
-    Ok(())
+    let mut plen = [0u8; 1];
+    client.read_exact(&mut plen).await.map_err(NetError::Io)?;
+    let mut password = Zeroizing::new(vec![0u8; usize::from(plen[0])]);
+    client
+        .read_exact(&mut password)
+        .await
+        .map_err(NetError::Io)?;
+    let matched = credentials.matches(&username, &password);
+    Ok(head[0] == USERPASS_VERSION && matched)
+}
+
+async fn write_all(client: &mut TcpStream, bytes: &[u8]) -> Result<(), NetError> {
+    client.write_all(bytes).await.map_err(NetError::Io)
 }
 
 /// Reads exactly one SOCKS5 request, reconstructing the wire buffer for the
@@ -416,20 +573,28 @@ async fn write_reply(client: &mut TcpStream, reply: Reply) -> Result<(), NetErro
 /// Largest CONNECT request head (request line plus headers) accepted.
 const MAX_HTTP_HEAD: usize = 8 * 1024;
 
+/// Bytes read per call while scanning for the end of a request head.
+const HEAD_CHUNK: usize = 256;
+
 /// An HTTP CONNECT proxy server over a [`Connector`].
 ///
 /// Handles only the `CONNECT host:port` method (the tunneling verb a browser or
 /// HTTP client uses for HTTPS); other methods are refused. Like [`Socks5Proxy`]
-/// it relays through the connector, so the same tunnel datapath backs it.
+/// it relays through the connector, so the same tunnel datapath backs it, and
+/// it admits only requests carrying the session's credentials in
+/// `Proxy-Authorization: Basic`.
 pub struct HttpConnectProxy<C> {
     connector: Arc<C>,
+    credentials: Arc<ProxyCredentials>,
 }
 
 impl<C: Connector> HttpConnectProxy<C> {
-    /// Builds a CONNECT proxy that opens upstream flows through `connector`.
-    pub fn new(connector: C) -> Self {
+    /// Builds a CONNECT proxy that opens upstream flows through `connector` for
+    /// requests presenting `credentials`.
+    pub fn new(connector: C, credentials: ProxyCredentials) -> Self {
         Self {
             connector: Arc::new(connector),
+            credentials: Arc::new(credentials),
         }
     }
 
@@ -440,10 +605,11 @@ impl<C: Connector> HttpConnectProxy<C> {
     /// [`NetError::Io`] only if accepting on the listener fails.
     pub async fn serve(&self, listener: TcpListener) -> Result<(), NetError> {
         loop {
-            let (client, _peer) = listener.accept().await.map_err(NetError::Io)?;
+            let client = accept(&listener).await?;
             let connector = Arc::clone(&self.connector);
+            let credentials = Arc::clone(&self.credentials);
             tokio::spawn(async move {
-                let _ = handle_connect(client, connector.as_ref()).await;
+                let _ = handle_connect(client, connector.as_ref(), &credentials).await;
             });
         }
     }
@@ -471,11 +637,12 @@ impl<C: Connector> HttpConnectProxy<C> {
                         return Ok(());
                     }
                 }
-                accepted = listener.accept() => {
-                    let (client, _peer) = accepted.map_err(NetError::Io)?;
+                accepted = accept(listener) => {
+                    let client = accepted?;
                     let connector = Arc::clone(&self.connector);
+                    let credentials = Arc::clone(&self.credentials);
                     tokio::spawn(async move {
-                        let _ = handle_connect(client, connector.as_ref()).await;
+                        let _ = handle_connect(client, connector.as_ref(), &credentials).await;
                     });
                 }
             }
@@ -555,13 +722,60 @@ fn connect_failure_response(err: &NetError) -> Vec<u8> {
     .into_bytes()
 }
 
+/// The answer to a request without the session's credentials. Identical for a
+/// missing and a wrong `Proxy-Authorization`, and the realm names nothing.
+const PROXY_AUTH_REQUIRED: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+Proxy-Authenticate: Basic realm=\"proxy\"\r\n\
+Content-Length: 0\r\n\
+Connection: close\r\n\
+\r\n";
+
+/// The answer to a proof request for `nonce_hex`, or `None` when the argument
+/// is not a nonce (the request is then refused like any other).
+fn proof_response(credentials: &ProxyCredentials, nonce_hex: &str) -> Option<Vec<u8>> {
+    let nonce: [u8; PROOF_NONCE_LEN] = hex::decode(nonce_hex).ok()?.try_into().ok()?;
+    let proof = hex::encode(credentials.proof(ListenerKind::Http, &nonce));
+    Some(
+        format!(
+            "HTTP/1.1 200 OK\r\n{HTTP_PROOF_HEADER}: {proof}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes(),
+    )
+}
+
 async fn handle_connect<C: Connector>(
     mut client: TcpStream,
     connector: &C,
+    credentials: &ProxyCredentials,
 ) -> Result<(), NetError> {
-    let (target, early_data) = match read_connect_target(&mut client).await? {
-        Some(t) => t,
-        None => {
+    let Some((head, early_data)) = within_handshake(read_request_head(&mut client)).await? else {
+        let _ = client
+            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+            .await;
+        return Ok(());
+    };
+    let mut lines = head.split("\r\n");
+    let mut request_line = lines.next().unwrap_or("").split_whitespace();
+    let method = request_line.next().unwrap_or("");
+    let argument = request_line.next().unwrap_or("");
+
+    if method == HTTP_PROOF_METHOD
+        && let Some(response) = proof_response(credentials, argument)
+    {
+        let _ = client.write_all(&response).await;
+        return Ok(());
+    }
+    let authorized = lines
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("proxy-authorization"))
+        .is_some_and(|(_, value)| credentials.matches_basic(value));
+    if !authorized {
+        let _ = client.write_all(PROXY_AUTH_REQUIRED).await;
+        return Err(NetError::ProxyAuth);
+    }
+    let target = match (method, parse_authority(argument)) {
+        ("CONNECT", Some(target)) => target,
+        _ => {
             let _ = client
                 .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
                 .await;
@@ -596,19 +810,22 @@ async fn handle_connect<C: Connector>(
     Ok(())
 }
 
-/// Reads the CONNECT request head and returns the target plus any tunnel bytes
-/// already received after the head (`\r\n\r\n`), or `None` if the method is not
-/// CONNECT or the head is malformed.
+/// Reads a request head and returns it (without its terminating blank line)
+/// plus any tunnel bytes already received after it, or `None` when the client
+/// closed first, sent more than [`MAX_HTTP_HEAD`] bytes of head, or sent a head
+/// that is not UTF-8.
 ///
 /// Reads in chunks rather than one byte per syscall; any bytes past the head
 /// terminator are returned so the caller can replay them to the upstream.
-async fn read_connect_target(
+async fn read_request_head(
     client: &mut TcpStream,
-) -> Result<Option<(Target, Vec<u8>)>, NetError> {
-    let mut head = Vec::with_capacity(256);
-    let mut chunk = [0u8; 256];
+) -> Result<Option<(Zeroizing<String>, Vec<u8>)>, NetError> {
+    // The head carries the client's `Proxy-Authorization`. Sized so it never
+    // reallocates, which would leave a copy of it in freed memory.
+    let mut head = Zeroizing::new(Vec::with_capacity(MAX_HTTP_HEAD + HEAD_CHUNK));
+    let mut chunk = Zeroizing::new([0u8; HEAD_CHUNK]);
     let head_len = loop {
-        let n = client.read(&mut chunk).await.map_err(NetError::Io)?;
+        let n = client.read(&mut *chunk).await.map_err(NetError::Io)?;
         if n == 0 {
             return Ok(None); // connection closed before a full head
         }
@@ -621,20 +838,14 @@ async fn read_connect_target(
         }
     };
     let early_data = head.split_off(head_len);
-    let text = match std::str::from_utf8(&head) {
-        Ok(t) => t,
-        Err(_) => return Ok(None),
-    };
-    let request_line = text.lines().next().unwrap_or("");
-    let mut parts = request_line.split_whitespace();
-    if parts.next() != Some("CONNECT") {
-        return Ok(None);
+    head.truncate(head_len - 4);
+    match String::from_utf8(std::mem::take(&mut *head)) {
+        Ok(text) => Ok(Some((Zeroizing::new(text), early_data))),
+        Err(not_utf8) => {
+            drop(Zeroizing::new(not_utf8.into_bytes()));
+            Ok(None)
+        }
     }
-    let authority = match parts.next() {
-        Some(a) => a,
-        None => return Ok(None),
-    };
-    Ok(parse_authority(authority).map(|target| (target, early_data)))
 }
 
 /// Parses an HTTP `CONNECT` authority into a [`Target`], keeping domain names
@@ -667,6 +878,31 @@ fn parse_authority(authority: &str) -> Option<Target> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_exhaustion_and_aborted_connections_are_waited_out() {
+        let exhausted = if cfg!(windows) {
+            vec![10024]
+        } else {
+            vec![24, 23]
+        };
+        for code in exhausted {
+            assert!(is_transient_accept_error(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        for kind in [
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            assert!(is_transient_accept_error(&kind.into()), "{kind:?}");
+        }
+        assert!(
+            !is_transient_accept_error(&std::io::ErrorKind::PermissionDenied.into()),
+            "a listener that cannot accept at all still ends the epoch"
+        );
+    }
 
     #[test]
     fn a_failed_connect_answers_a_response_that_names_this_proxy() {
@@ -770,16 +1006,24 @@ mod tests {
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
+        let credentials = ProxyCredentials::generate();
+        let server_credentials = credentials.clone();
         let server = tokio::spawn(async move {
             let (client, _) = listener.accept().await.expect("accept");
-            let _ = handle_connect(client, &DeadConnector(NetError::EngineStopped)).await;
+            let _ = handle_connect(
+                client,
+                &DeadConnector(NetError::EngineStopped),
+                &server_credentials,
+            )
+            .await;
         });
 
         let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
-        client
-            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
-            .await
-            .expect("write");
+        let request = format!(
+            "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: {}\r\n\r\n",
+            &*credentials.basic_authorization()
+        );
+        client.write_all(request.as_bytes()).await.expect("write");
         let mut got = Vec::new();
         client.read_to_end(&mut got).await.expect("read");
         server.await.expect("join");

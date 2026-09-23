@@ -11,7 +11,6 @@
 
 use ed25519_dalek::SigningKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use warren_sdk::discovery::VerifiedExit;
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::net::ProxyConfig;
@@ -57,24 +56,16 @@ async fn start_proxy_routes_socks5_through_a_sealed_tunnel() {
         .await
         .expect("multihop proxy starts");
 
-    let mut sock = TcpStream::connect(handle.local_addr())
-        .await
-        .expect("connect proxy");
-    sock.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    sock.read_exact(&mut method).await.unwrap();
-    assert_eq!(method, [0x05, 0x00]);
-
-    let mut req = vec![0x05, 0x01, 0x00, 0x01];
-    req.extend_from_slice(&NETSTACK_EXIT_IP);
-    req.extend_from_slice(&NETSTACK_EXIT_PORT.to_be_bytes());
-    sock.write_all(&req).await.unwrap();
-    let mut reply = [0u8; 10];
-    sock.read_exact(&mut reply).await.unwrap();
-    assert_eq!(
-        reply[1], 0x00,
-        "CONNECT through the sealed tunnel succeeded"
-    );
+    let mut sock = warren_sdk::net::socks5_connect(
+        handle.local_addr(),
+        handle.credentials(),
+        &warren_sdk::net::socks5::Target::Ip(std::net::SocketAddr::from((
+            NETSTACK_EXIT_IP,
+            NETSTACK_EXIT_PORT,
+        ))),
+    )
+    .await
+    .expect("CONNECT through the sealed tunnel succeeded");
 
     sock.write_all(b"sealed-e2e!").await.unwrap();
     let mut got = [0u8; 11];

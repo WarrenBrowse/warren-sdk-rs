@@ -13,6 +13,7 @@ use warren_headless::env::{
     self, CircuitKind, ConfigError, ExitFilter, is_off, parse_addr, parse_optional_addr,
 };
 use warren_headless::forward::{ForwardConfig, parse_forward};
+use warren_sdk::net::{CredentialsError, ProxyCredentials};
 use zeroize::Zeroizing;
 
 /// Full daemon configuration, resolved from the environment.
@@ -34,6 +35,9 @@ pub struct Config {
     pub socks_listen: SocketAddr,
     /// Optional HTTP CONNECT listener address.
     pub http_listen: Option<SocketAddr>,
+    /// What every client of the listeners presents: RFC 1929 on SOCKS5,
+    /// `Proxy-Authorization: Basic` on HTTP CONNECT. Never logged.
+    pub credentials: ProxyCredentials,
     /// DNS resolver queried over the tunnel; `None` uses the exit's gateway
     /// forwarder.
     pub dns_server: Option<Ipv4Addr>,
@@ -57,6 +61,7 @@ impl std::fmt::Debug for Config {
             .field("exit_filters", &self.exit_filters)
             .field("socks_listen", &self.socks_listen)
             .field("http_listen", &self.http_listen)
+            .field("credentials", &self.credentials)
             .field("dns_server", &self.dns_server)
             .field("health_listen", &self.health_listen)
             .field("connect_timeout", &self.connect_timeout)
@@ -66,6 +71,12 @@ impl std::fmt::Debug for Config {
 }
 
 const DEFAULT_SOCKS_LISTEN: &str = "127.0.0.1:1080";
+/// The proxy username when `WARREN_PROXY_USER` is unset.
+const DEFAULT_PROXY_USER: &str = "warren";
+/// Shortest proxy password accepted. Anyone who reaches the port can ask the
+/// listener for proofs keyed by it and guess offline, so a password has to be
+/// out of reach of a dictionary, like the output of `openssl rand -hex 32`.
+const MIN_PROXY_PASSWORD_LEN: usize = 32;
 /// The proxy's own health port. The gateway takes 9998, so both daemons run on
 /// one host without either operator changing anything.
 pub const DEFAULT_HEALTH_LISTEN: &str = "127.0.0.1:9999";
@@ -97,6 +108,7 @@ pub fn load(
     let http_listen = parse_optional_addr(get("WARREN_HTTP_LISTEN"), "WARREN_HTTP_LISTEN")?;
     let health_listen =
         env::parse_health_listen(get("WARREN_HEALTH_LISTEN"), DEFAULT_HEALTH_LISTEN)?;
+    let credentials = parse_credentials(&get, &read_file)?;
 
     let dns_server = match get("WARREN_DNS_SERVER") {
         None => None,
@@ -134,10 +146,41 @@ pub fn load(
         exit_filters,
         socks_listen,
         http_listen,
+        credentials,
         dns_server,
         health_listen,
         connect_timeout,
         forward,
+    })
+}
+
+/// The listener credentials: `WARREN_PROXY_USER` (default
+/// [`DEFAULT_PROXY_USER`]) and the password from `WARREN_PROXY_PASSWORD_FILE`
+/// or `WARREN_PROXY_PASSWORD`, which is required.
+fn parse_credentials(
+    get: &impl Fn(&str) -> Option<String>,
+    read_file: &impl Fn(&std::path::Path) -> std::io::Result<String>,
+) -> Result<ProxyCredentials, ConfigError> {
+    let password = env::read_secret(get, read_file, "WARREN_PROXY_PASSWORD")?
+        .ok_or(ConfigError::MissingProxyPassword)?;
+    if password.len() < MIN_PROXY_PASSWORD_LEN {
+        return Err(ConfigError::Invalid {
+            var: "WARREN_PROXY_PASSWORD",
+            expected: "at least 32 bytes, for example the output of `openssl rand -hex 32`",
+        });
+    }
+    let user = get("WARREN_PROXY_USER")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_PROXY_USER.to_owned());
+    ProxyCredentials::new(user, password.as_str()).map_err(|e| match e {
+        CredentialsError::Username => ConfigError::Invalid {
+            var: "WARREN_PROXY_USER",
+            expected: "1 to 255 bytes, no colon and no control character",
+        },
+        _ => ConfigError::Invalid {
+            var: "WARREN_PROXY_PASSWORD",
+            expected: "1 to 255 bytes and no control character",
+        },
     })
 }
 
@@ -160,12 +203,98 @@ mod tests {
     use std::collections::HashMap;
     use warren_headless::forward::ForwardProto;
 
+    /// A password of the accepted length.
+    const PASSWORD: &str = "0123456789abcdef0123456789abcdef";
+
+    /// The given variables, plus a proxy password unless the test sets its own.
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let mut map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        map.entry("WARREN_PROXY_PASSWORD".to_owned())
+            .or_insert_with(|| PASSWORD.to_owned());
+        move |k| map.get(k).cloned()
+    }
+
+    /// Exactly the given variables.
+    fn bare_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let map: HashMap<String, String> = pairs
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
         move |k| map.get(k).cloned()
+    }
+
+    #[test]
+    fn no_proxy_password_is_refused() {
+        let err = load(bare_env(&[("WARREN_MNEMONIC", "m")]), no_file)
+            .expect_err("the listeners have no unauthenticated mode");
+        assert!(matches!(err, ConfigError::MissingProxyPassword), "{err}");
+    }
+
+    #[test]
+    fn proxy_credentials_come_from_the_file_first_with_a_default_user() {
+        let read = |_: &std::path::Path| Ok(format!("{}\n", PASSWORD.to_uppercase()));
+        let cfg = load(
+            env(&[
+                ("WARREN_MNEMONIC", "m"),
+                ("WARREN_PROXY_PASSWORD_FILE", "/run/secrets/p"),
+            ]),
+            read,
+        )
+        .expect("file secret must load");
+        assert_eq!(cfg.credentials.username(), "warren");
+        assert_eq!(cfg.credentials.password(), PASSWORD.to_uppercase());
+    }
+
+    #[test]
+    fn a_proxy_password_short_enough_to_guess_is_refused() {
+        let err = load(
+            env(&[
+                ("WARREN_MNEMONIC", "m"),
+                ("WARREN_PROXY_PASSWORD", "hunter2"),
+            ]),
+            no_file,
+        )
+        .expect_err("a short password falls to an offline dictionary");
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "WARREN_PROXY_PASSWORD",
+                ..
+            }
+        ));
+        assert!(!err.to_string().contains("hunter2"));
+    }
+
+    #[test]
+    fn a_proxy_user_the_protocols_cannot_carry_is_refused() {
+        let err = load(
+            env(&[("WARREN_MNEMONIC", "m"), ("WARREN_PROXY_USER", "a:b")]),
+            no_file,
+        )
+        .expect_err("HTTP Basic cannot carry a colon in the user");
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "WARREN_PROXY_USER",
+                ..
+            }
+        ));
+        let long = "p".repeat(256);
+        let err = load(
+            env(&[("WARREN_MNEMONIC", "m"), ("WARREN_PROXY_PASSWORD", &long)]),
+            no_file,
+        )
+        .expect_err("RFC 1929 carries 255 bytes at most");
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "WARREN_PROXY_PASSWORD",
+                ..
+            }
+        ));
     }
 
     fn no_file(_: &std::path::Path) -> std::io::Result<String> {
@@ -232,6 +361,7 @@ mod tests {
         .unwrap();
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("correct horse"), "mnemonic leaked: {debug}");
+        assert!(!debug.contains(PASSWORD), "proxy password leaked: {debug}");
         assert!(debug.contains("<redacted>"));
     }
 

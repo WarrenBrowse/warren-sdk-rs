@@ -12,7 +12,9 @@
 //! - the ONE-SHOT connect-time verifier ([`verify_first_egress`]): fail-closed
 //!   launchers (wclaude) refuse to expose a listener until a probe has proven
 //!   the tunnel egresses; short attempts catch the datapath warm-up moment
-//!   within ~1 s.
+//!   within ~1 s. It first has the listener prove it holds the session's
+//!   credentials, so a process squatting the address is refused before it is
+//!   handed the password.
 //!
 //! The probe can never leak outside the tunnel: it enters the datapath the
 //! same way every proxied byte does. Knob names are the engine's
@@ -21,8 +23,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
+use warren_net::socks5::Target;
+use warren_net::{ListenerProofError, ProxyCredentials};
 use warren_transport::ConnectionState;
 pub use warren_transport::egress_probe::{
     EGRESS_PROBE_ENV, EGRESS_PROBE_FAILURES_ENV, EGRESS_PROBE_INTERVAL_ENV,
@@ -134,40 +137,23 @@ pub async fn run_verdict_scheduler<I: SocksProbeIo>(io: &mut I, failure_threshol
     }
 }
 
-/// SOCKS5 no-auth greeting + CONNECT to [`PROBE_TARGET`]:[`PROBE_PORT`];
-/// `Ok(())` iff the proxy replied success (REP=0), i.e. a TCP handshake
-/// completed through the tunnel. The error string carries only protocol
-/// detail, never identity material.
-async fn socks5_connect(proxy: SocketAddr) -> Result<(), String> {
-    let mut s = tokio::net::TcpStream::connect(proxy)
+/// Authenticated CONNECT to [`PROBE_TARGET`]:[`PROBE_PORT`]; `Ok(())` iff the
+/// proxy replied success, i.e. a TCP handshake completed through the tunnel.
+/// The error string carries only protocol detail, never identity material.
+async fn socks5_connect(proxy: SocketAddr, credentials: &ProxyCredentials) -> Result<(), String> {
+    let target = Target::Ip(SocketAddr::from((PROBE_TARGET, PROBE_PORT)));
+    warren_net::socks5_connect(proxy, credentials, &target)
         .await
-        .map_err(|e| e.to_string())?;
-    s.write_all(&[0x05, 0x01, 0x00])
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut method = [0u8; 2];
-    s.read_exact(&mut method).await.map_err(|e| e.to_string())?;
-    if method != [0x05, 0x00] {
-        return Err("SOCKS5 no-auth refused".to_string());
-    }
-    let mut req = vec![0x05, 0x01, 0x00, 0x01];
-    req.extend_from_slice(&PROBE_TARGET);
-    req.extend_from_slice(&PROBE_PORT.to_be_bytes());
-    s.write_all(&req).await.map_err(|e| e.to_string())?;
-    // Reply: VER REP RSV ATYP BND.ADDR BND.PORT; REP (byte 1) == 0 = success.
-    let mut reply = [0u8; 10];
-    s.read_exact(&mut reply).await.map_err(|e| e.to_string())?;
-    if reply[0] != 0x05 || reply[1] != 0x00 {
-        return Err(format!("SOCKS5 CONNECT rejected (rep={})", reply[1]));
-    }
-    Ok(())
+        .map(drop)
+        .map_err(|e| e.to_string())
 }
 
-/// One bounded periodic probe. Local dial errors against our own listener are
-/// also failures: the proxy front-end dying is not healthy egress either.
-pub async fn probe_via_socks5(socks: SocketAddr) -> bool {
+/// One bounded periodic probe through the session's own listener, presenting
+/// its credentials. Local dial errors against our own listener are also
+/// failures: the proxy front-end dying is not healthy egress either.
+pub async fn probe_via_socks5(socks: SocketAddr, credentials: &ProxyCredentials) -> bool {
     matches!(
-        tokio::time::timeout(PROBE_TIMEOUT, socks5_connect(socks)).await,
+        tokio::time::timeout(PROBE_TIMEOUT, socks5_connect(socks, credentials)).await,
         Ok(Ok(()))
     )
 }
@@ -177,6 +163,7 @@ pub async fn probe_via_socks5(socks: SocketAddr) -> bool {
 /// edges on `egress_tx`. The caller aborts the task at session teardown.
 pub async fn run_socks5_egress_probe(
     socks: SocketAddr,
+    credentials: ProxyCredentials,
     state_rx: watch::Receiver<ConnectionState>,
     egress_tx: watch::Sender<bool>,
 ) {
@@ -187,6 +174,7 @@ pub async fn run_socks5_egress_probe(
     struct RealIo {
         interval: Duration,
         socks: SocketAddr,
+        credentials: ProxyCredentials,
         state_rx: watch::Receiver<ConnectionState>,
         egress_tx: watch::Sender<bool>,
     }
@@ -205,7 +193,7 @@ pub async fn run_socks5_egress_probe(
             matches!(*self.state_rx.borrow(), ConnectionState::Connected)
         }
         async fn probe(&mut self) -> bool {
-            probe_via_socks5(self.socks).await
+            probe_via_socks5(self.socks, &self.credentials).await
         }
         fn publish(&mut self, egress_dead: bool) {
             let _ = self.egress_tx.send(egress_dead);
@@ -214,6 +202,7 @@ pub async fn run_socks5_egress_probe(
     let mut io = RealIo {
         interval: cfg.interval,
         socks,
+        credentials,
         state_rx,
         egress_tx,
     };
@@ -260,32 +249,76 @@ pub struct FirstEgressDead {
     pub last_error: String,
 }
 
-/// Proves the tunnel actually egresses: a SOCKS5 CONNECT to a public IP
-/// through the local listener, retried because the first packets race the
-/// datapath warm-up right after connect.
+/// Why a connect-time verification refused to vouch for a listener. Either way
+/// a fail-closed caller must not expose it.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum FirstEgressError {
+    /// The listener is ours and the tunnel behind it does not egress.
+    #[error(transparent)]
+    Dead(#[from] FirstEgressDead),
+    /// Something answers at the address without proving it holds the session's
+    /// credentials: a process took the port over, and it was told nothing.
+    #[error("the local listener did not prove it holds this session's credentials")]
+    ListenerNotOurs,
+}
+
+/// Proves the tunnel actually egresses: once the listener has proven it holds
+/// `credentials`, an authenticated SOCKS5 CONNECT to a public IP through it,
+/// retried because the first packets race the datapath warm-up right after
+/// connect.
 ///
 /// # Errors
 ///
-/// [`FirstEgressDead`] when every attempt failed or timed out.
+/// [`FirstEgressError::ListenerNotOurs`] as soon as the listener answers
+/// without the proof (never retried: a squatter does not become the right
+/// listener), [`FirstEgressError::Dead`] when every attempt failed or timed
+/// out.
 pub async fn verify_first_egress(
     socks: SocketAddr,
+    credentials: &ProxyCredentials,
     options: FirstEgressVerify,
-) -> Result<(), FirstEgressDead> {
+) -> Result<(), FirstEgressError> {
     let mut last_error = String::new();
     for attempt in 1..=options.attempts {
-        match tokio::time::timeout(options.timeout, socks5_connect(socks)).await {
+        let outcome =
+            tokio::time::timeout(options.timeout, first_egress_attempt(socks, credentials)).await;
+        match outcome {
             Ok(Ok(())) => return Ok(()),
-            Ok(Err(e)) => last_error = e,
+            Ok(Err(AttemptError::NotOurs)) => return Err(FirstEgressError::ListenerNotOurs),
+            Ok(Err(AttemptError::Failed(e))) => last_error = e,
             Err(_) => last_error = "probe timeout".to_string(),
         }
         if attempt < options.attempts && !options.gap.is_zero() {
             tokio::time::sleep(options.gap).await;
         }
     }
-    Err(FirstEgressDead {
+    Err(FirstEgressError::Dead(FirstEgressDead {
         attempts: options.attempts,
         last_error,
-    })
+    }))
+}
+
+enum AttemptError {
+    NotOurs,
+    Failed(String),
+}
+
+/// One verification attempt: the proof, then the egress. The proof comes first
+/// on every attempt, so no attempt hands the password to a port that changed
+/// hands since the previous one.
+async fn first_egress_attempt(
+    socks: SocketAddr,
+    credentials: &ProxyCredentials,
+) -> Result<(), AttemptError> {
+    match warren_net::prove_socks5_listener(socks, credentials).await {
+        Ok(()) => {}
+        Err(ListenerProofError::NotOurs) => return Err(AttemptError::NotOurs),
+        Err(e) => return Err(AttemptError::Failed(e.to_string())),
+    }
+    socks5_connect(socks, credentials)
+        .await
+        .map_err(AttemptError::Failed)
 }
 
 #[cfg(test)]
@@ -387,59 +420,81 @@ mod tests {
         assert!(io.published.is_empty());
     }
 
-    /// Fake SOCKS5 server scripting sessions: reads the greeting + request,
-    /// answers with `reply_code`.
-    async fn fake_socks5(reply_code: u8) -> SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind fake socks");
-        let addr = listener.local_addr().expect("local addr");
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut greeting = [0u8; 3];
-                    if stream.read_exact(&mut greeting).await.is_err() {
-                        return;
-                    }
-                    let _ = stream.write_all(&[0x05, 0x00]).await;
-                    let mut req = [0u8; 10];
-                    if stream.read_exact(&mut req).await.is_err() {
-                        return;
-                    }
-                    let _ = stream
-                        .write_all(&[0x05, reply_code, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                        .await;
-                });
+    /// A connector standing in for the tunnel: it reaches the target, or it
+    /// reports the tunnel gone. Counting its dials shows what a probe opened.
+    #[derive(Clone)]
+    struct FakeExit {
+        reachable: bool,
+        dials: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl warren_net::Connector for FakeExit {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn connect(&self, _target: Target) -> Result<Self::Stream, warren_net::NetError> {
+            self.dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.reachable {
+                Ok(tokio::io::duplex(64).0)
+            } else {
+                Err(warren_net::NetError::EngineStopped)
             }
-        });
-        addr
+        }
     }
 
-    #[tokio::test]
-    async fn socks5_probe_succeeds_on_a_zero_reply() {
-        let addr = fake_socks5(0x00).await;
-        assert!(
-            probe_via_socks5(addr).await,
-            "REP=0x00 means the engine connected through the exit"
-        );
-    }
-
-    #[tokio::test]
-    async fn socks5_probe_fails_on_an_error_reply() {
-        // 0x04 = host unreachable: the engine could not egress.
-        let addr = fake_socks5(0x04).await;
-        assert!(!probe_via_socks5(addr).await);
-    }
-
-    #[tokio::test]
-    async fn socks5_probe_fails_when_the_listener_is_gone() {
+    /// The real SOCKS5 server, serving `credentials` over a [`FakeExit`].
+    async fn session_listener(
+        credentials: &ProxyCredentials,
+        reachable: bool,
+    ) -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("local addr");
-        drop(listener);
+        let dials = std::sync::Arc::default();
+        let proxy = warren_net::Socks5Proxy::new(
+            FakeExit {
+                reachable,
+                dials: std::sync::Arc::clone(&dials),
+            },
+            credentials.clone(),
+        );
+        tokio::spawn(async move { proxy.serve(listener).await });
+        (addr, dials)
+    }
+
+    fn dead_addr() -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("local addr")
+    }
+
+    #[tokio::test]
+    async fn socks5_probe_succeeds_through_the_sessions_own_listener() {
+        let creds = ProxyCredentials::generate();
+        let (addr, _) = session_listener(&creds, true).await;
         assert!(
-            !probe_via_socks5(addr).await,
+            probe_via_socks5(addr, &creds).await,
+            "a connect that reached the target is live egress"
+        );
+    }
+
+    #[tokio::test]
+    async fn socks5_probe_fails_when_the_tunnel_cannot_reach_the_target() {
+        let creds = ProxyCredentials::generate();
+        let (addr, _) = session_listener(&creds, false).await;
+        assert!(!probe_via_socks5(addr, &creds).await);
+    }
+
+    #[tokio::test]
+    async fn socks5_probe_without_the_session_credentials_fails_and_dials_nothing() {
+        let (addr, dials) = session_listener(&ProxyCredentials::generate(), true).await;
+        assert!(!probe_via_socks5(addr, &ProxyCredentials::generate()).await);
+        assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn socks5_probe_fails_when_the_listener_is_gone() {
+        assert!(
+            !probe_via_socks5(dead_addr(), &ProxyCredentials::generate()).await,
             "a dead proxy front-end is not healthy egress"
         );
     }
@@ -451,32 +506,85 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn first_egress_passes_when_the_proxy_accepts_the_connect() {
-        let addr = fake_socks5(0x00).await;
-        verify_first_egress(addr, FAST)
+    async fn first_egress_passes_through_the_sessions_own_listener() {
+        let creds = ProxyCredentials::generate();
+        let (addr, dials) = session_listener(&creds, true).await;
+        verify_first_egress(addr, &creds, FAST)
             .await
-            .expect("an accepting proxy proves egress");
+            .expect("the session's listener proves egress");
+        assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn first_egress_fails_closed_when_the_proxy_rejects_the_connect() {
-        let addr = fake_socks5(0x05).await;
-        let err = verify_first_egress(addr, FAST)
+    async fn first_egress_fails_closed_when_the_tunnel_cannot_reach_the_target() {
+        let creds = ProxyCredentials::generate();
+        let (addr, _) = session_listener(&creds, false).await;
+        let err = verify_first_egress(addr, &creds, FAST)
             .await
-            .expect_err("a rejecting proxy must fail closed");
-        assert_eq!(err.attempts, 2);
-        assert!(err.last_error.contains("rep=5"), "{}", err.last_error);
+            .expect_err("an unreachable target must fail closed");
+        let FirstEgressError::Dead(dead) = err else {
+            panic!("a live listener with a dead tunnel is dead egress: {err:?}")
+        };
+        assert_eq!(dead.attempts, 2);
+        assert!(dead.last_error.contains("rep=3"), "{}", dead.last_error);
     }
 
     #[tokio::test]
-    async fn first_egress_fails_closed_when_nothing_listens() {
+    async fn first_egress_refuses_a_listener_holding_other_credentials() {
+        let (addr, dials) = session_listener(&ProxyCredentials::generate(), true).await;
+        let err = verify_first_egress(addr, &ProxyCredentials::generate(), FAST)
+            .await
+            .expect_err("another session's listener is not ours");
+        assert!(matches!(err, FirstEgressError::ListenerNotOurs), "{err:?}");
+        assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn first_egress_refuses_a_squatter_without_handing_it_the_password() {
+        // Accepts every method and answers any proof request with junk, the
+        // way a process that took over a released port would.
+        let creds = ProxyCredentials::generate();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("local addr");
-        drop(listener);
-        verify_first_egress(addr, FAST)
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut greeting = [0u8; 3];
+                if stream.read_exact(&mut greeting).await.is_err() {
+                    continue;
+                }
+                let _ = stream.write_all(&[0x05, greeting[2]]).await;
+                let mut rest = [0u8; 512];
+                if let Ok(n) = stream.read(&mut rest).await {
+                    log.lock().unwrap().extend_from_slice(&rest[..n]);
+                }
+                let _ = stream.write_all(&[0u8; 32]).await;
+            }
+        });
+
+        let err = verify_first_egress(addr, &creds, FAST)
+            .await
+            .expect_err("a squatter must be refused");
+
+        assert!(matches!(err, FirstEgressError::ListenerNotOurs), "{err:?}");
+        let seen = seen.lock().unwrap();
+        assert!(
+            !seen
+                .windows(creds.password().len())
+                .any(|w| w == creds.password().as_bytes()),
+            "the squatter never receives the password"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_egress_fails_closed_when_nothing_listens() {
+        let err = verify_first_egress(dead_addr(), &ProxyCredentials::generate(), FAST)
             .await
             .expect_err("a dead listener must fail closed");
+        assert!(matches!(err, FirstEgressError::Dead(_)), "{err:?}");
     }
 }

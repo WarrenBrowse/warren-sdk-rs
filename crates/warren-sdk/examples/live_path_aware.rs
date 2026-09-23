@@ -12,8 +12,6 @@
 //!    completes a TCP CONNECT to a public host through it, so the
 //!    path-aware circuit demonstrably carries traffic end to end.
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::net::ProxyConfig;
 use warren_sdk::{Circuit, WarrenClient};
@@ -95,8 +93,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let attempt_budget = std::time::Duration::from_millis(2500);
     let probe: std::net::SocketAddr = "1.1.1.1:443".parse()?;
     for attempt in 1..=15 {
-        if let Ok(Ok(())) =
-            tokio::time::timeout(attempt_budget, socks5_connect(handle.local_addr(), probe)).await
+        if let Ok(Ok(())) = tokio::time::timeout(
+            attempt_budget,
+            socks5_connect(handle.local_addr(), handle.credentials(), probe),
+        )
+        .await
         {
             println!(
                 "EGRESS CONFIRMED via the path-aware circuit (SYN-ACK through the \
@@ -118,26 +119,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Err("egress probe never succeeded through the selected circuit".into())
 }
 
-/// Minimal SOCKS5 CONNECT to `target` through the proxy at `proxy`.
+/// Authenticated SOCKS5 CONNECT to `target` through the session's own
+/// listener; Ok(()) iff the proxy replied success.
 async fn socks5_connect(
     proxy: std::net::SocketAddr,
+    credentials: &warren_sdk::net::ProxyCredentials,
     target: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut s = TcpStream::connect(proxy).await?;
-    s.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut resp = [0u8; 2];
-    s.read_exact(&mut resp).await?;
-    let std::net::SocketAddr::V4(v4) = target else {
-        return Err("ipv4 target expected".into());
-    };
-    let mut req = vec![0x05, 0x01, 0x00, 0x01];
-    req.extend_from_slice(&v4.ip().octets());
-    req.extend_from_slice(&v4.port().to_be_bytes());
-    s.write_all(&req).await?;
-    let mut reply = [0u8; 10];
-    s.read_exact(&mut reply).await?;
-    if reply[1] != 0x00 {
-        return Err(format!("SOCKS5 CONNECT refused: 0x{:02x}", reply[1]).into());
-    }
+    warren_sdk::net::socks5_connect(
+        proxy,
+        credentials,
+        &warren_sdk::net::socks5::Target::Ip(target),
+    )
+    .await?;
     Ok(())
 }

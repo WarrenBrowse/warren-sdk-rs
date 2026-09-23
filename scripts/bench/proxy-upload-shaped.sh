@@ -196,7 +196,9 @@ run_arm() {
                 warmup=0
                 for _ in $(seq 1 15); do
                     warmup=$((warmup + 1))
-                    if curl -sS -o /dev/null --max-time 3 --socks5-hostname "$proxy" \
+                    # The proxy URL carries the session secret: curl reads it
+                    # from its config on stdin, never from argv.
+                    if printf "proxy = \"%s\"\n" "$proxy" | curl -K - -sS -o /dev/null --max-time 3 \
                         https://1.1.1.1/cdn-cgi/trace >/dev/null 2>&1; then
                         break
                     fi
@@ -206,9 +208,9 @@ run_arm() {
                 # line narrows, as a member sits idle before a turn.
                 sleep 5
                 shape_on
-                curl_out="$(curl -sS -o /dev/null \
+                curl_out="$(printf "proxy = \"%s\"\n" "$proxy" | curl -K - -sS -o /dev/null \
                     -w "code=%{http_code} secs=%{time_total} up_bps=%{speed_upload}" \
-                    --socks5-hostname "$proxy" --max-time 1200 \
+                    --max-time 1200 \
                     -X POST --data-binary @/tmp/payload https://speed.cloudflare.com/__up 2>&1 \
                     | tr "\n" " " || true)"
                 sleep 2

@@ -31,7 +31,9 @@ ignored while the operator believed it applied.
 | variable | default | meaning |
 |---|---|---|
 | `WARREN_MNEMONIC` / `WARREN_MNEMONIC_FILE` | required | the account recovery phrase; the file variant wins and is what containers should use |
-| `WARREN_SOCKS_LISTEN` | `127.0.0.1:1080` | SOCKS5 listener. The listeners are unauthenticated: bind non-loopback only inside an isolated netns/container |
+| `WARREN_PROXY_PASSWORD` / `WARREN_PROXY_PASSWORD_FILE` | required | the password every client of the listeners presents (RFC 1929 on SOCKS5, `Proxy-Authorization: Basic` on HTTP CONNECT); the file variant wins and is what containers should use. 32 to 255 bytes: anyone who reaches the port can ask for proofs keyed by it and guess offline, so generate it (`openssl rand -hex 32`). There is no unauthenticated mode: without it the daemon refuses to start |
+| `WARREN_PROXY_USER` | `warren` | the username that goes with it; no colon |
+| `WARREN_SOCKS_LISTEN` | `127.0.0.1:1080` | SOCKS5 listener. Anything that reaches the port and knows the password egresses as your account, and the password crosses the network in clear (RFC 1929 and Basic carry it that way), so keep a non-loopback bind on a network you control |
 | `WARREN_HTTP_LISTEN` | off | HTTP CONNECT listener |
 | `WARREN_HEALTH_LISTEN` | `127.0.0.1:9999` | liveness endpoint: `/healthz` (200 only when Connected AND egress verified for the CURRENT epoch: a reconnect clears the proof until a fresh probe passes), `/state`, `/port`; `off`, `none` or empty disables it, and `warren-proxy healthcheck` then exits 0, which also makes the image's `HEALTHCHECK` a no-op: the runtime can no longer tell a wedged daemon from a healthy one |
 | `WARREN_EXITS` | all exits | priority list of `cc` or `cc/city` (e.g. `de, se/stockholm`); failover tries them in order |
@@ -66,6 +68,14 @@ account, device cap, suspension, opaque policy refusal). There is no code for
 "every candidate exit failed": a transient failure never stops the supervisor,
 which keeps rotating exits and retrying, so `2` always means a refusal that no
 restart and no other exit resolves. Restart on `1`, stop on `2`.
+
+## Pointing clients at it
+
+Every client carries the credentials in its proxy URL, for example
+`socks5h://warren:<password>@warren-proxy:1080` for curl or a torrent client,
+and `http://warren:<password>@warren-proxy:8888` in `HTTPS_PROXY`. The
+`socks5h` scheme keeps name resolution inside the tunnel. A wrong or missing
+password gets the same refusal as any other, and nothing is forwarded for it.
 
 ## Nested-VPN caveats (validated 2026-08-15)
 

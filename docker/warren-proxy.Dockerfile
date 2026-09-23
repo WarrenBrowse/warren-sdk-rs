@@ -27,7 +27,9 @@ LABEL org.opencontainers.image.source="https://github.com/WarrenBrowse/warren-sd
 
 # Container defaults: listeners on the container interface (reachable by
 # compose neighbours; the image is expected to run on an internal network),
-# health endpoint loopback for the HEALTHCHECK.
+# health endpoint loopback for the HEALTHCHECK. The listeners demand
+# WARREN_PROXY_PASSWORD_FILE (a compose secret) from every client, and the
+# daemon refuses to start without it.
 ENV WARREN_SOCKS_LISTEN=0.0.0.0:1080 \
     WARREN_HTTP_LISTEN=0.0.0.0:8888 \
     WARREN_HEALTH_LISTEN=127.0.0.1:9999

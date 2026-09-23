@@ -3729,10 +3729,14 @@ name = "warren-net"
 version = "0.0.1"
 dependencies = [
  "bytes",
+ "data-encoding",
  "ed25519-dalek",
  "hex",
+ "hmac",
  "rand 0.8.6",
+ "sha2",
  "smoltcp",
+ "subtle",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -3745,6 +3749,7 @@ dependencies = [
  "warren-wire",
  "warrenguard-pump",
  "warrenguard-transport-core",
+ "zeroize",
 ]
 
 [[package]]
@@ -3846,12 +3851,14 @@ dependencies = [
 name = "warren-sdk-ffi"
 version = "0.0.1"
 dependencies = [
+ "ed25519-dalek",
  "hex",
  "tempfile",
  "thiserror",
  "tokio",
  "uniffi",
  "warren-sdk",
+ "warren-test-support",
  "zeroize",
 ]
 

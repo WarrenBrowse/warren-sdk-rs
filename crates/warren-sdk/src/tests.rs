@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use warren_api::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_discovery::VerifiedExit;
@@ -9,8 +10,8 @@ use warren_transport::ConnectionState;
 use crate::client::{Circuit, DaitaMode, DefaultClient, WarrenClient, daita_mode};
 use crate::error::SdkError;
 use crate::proxy::TunnelState;
-use crate::supervisor::EstablishedTunnel;
 use crate::supervisor::supervise_proxy;
+use crate::supervisor::{EstablishedTunnel, SupervisedProxyHandle};
 
 /// A packet sink whose read side closes on demand, modelling a tunnel that
 /// dies when its `close` notifier fires (so the supervisor must reconnect).
@@ -86,6 +87,17 @@ fn make_drain_rx(
     tokio::sync::watch::channel(seed).1
 }
 
+/// Loopback SOCKS5-only listeners with fresh credentials, the way a
+/// supervisor receives them.
+async fn socks_only_listeners() -> crate::proxy::ProxyListeners {
+    crate::proxy::ProxyListeners::bind(&warren_net::ProxyConfig {
+        socks5: "127.0.0.1:0".parse().unwrap(),
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+}
+
 /// A bare TCP connect to `addr` succeeds within ~2s (the supervisor's accept
 /// loop is live there). Retried because the serve loop starts asynchronously.
 async fn proxy_accepts(addr: SocketAddr) -> bool {
@@ -102,8 +114,8 @@ async fn proxy_accepts(addr: SocketAddr) -> bool {
 async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let stable_addr = socks_listener.local_addr().unwrap();
+    let socks_listener = socks_only_listeners().await;
+    let stable_addr = socks_listener.socks5_addr();
 
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     // Each (re)connect publishes its kill notifier so the test can drop that
@@ -116,7 +128,6 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
         tokio::spawn(async move {
             supervise_proxy(
                 socks_listener,
-                None,
                 None,
                 crate::supervisor::SupervisorOutputs {
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -188,7 +199,7 @@ async fn network_path_change_redials_immediately_without_rotating() {
     // end the serving epoch and redial at once, instead of riding the dead
     // session into idle-timeout/dead-path detection minutes later. It must
     // NOT rotate the failover cursor: the exit is healthy, the network moved.
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = socks_only_listeners().await;
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
     let rotations = Arc::new(AtomicUsize::new(0));
@@ -202,7 +213,6 @@ async fn network_path_change_redials_immediately_without_rotating() {
         tokio::spawn(async move {
             supervise_proxy(
                 socks_listener,
-                None,
                 None,
                 crate::supervisor::SupervisorOutputs {
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -291,7 +301,7 @@ async fn spawn_migration_harness(exit: VerifiedExit) -> MigrationHarness {
 
     let (identity, _mnemonic) = WarrenIdentity::generate();
     let signing = identity.signing_key();
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = socks_only_listeners().await;
     let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let connects = Arc::new(AtomicUsize::new(0));
     let source = Arc::new(std::sync::Mutex::new(Some(
@@ -305,7 +315,6 @@ async fn spawn_migration_harness(exit: VerifiedExit) -> MigrationHarness {
         tokio::spawn(async move {
             supervise_proxy(
                 socks_listener,
-                None,
                 None,
                 crate::supervisor::SupervisorOutputs {
                     // The fake exit runs no resolver, so the in-tunnel egress
@@ -609,7 +618,7 @@ async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use warren_transport::{FatalCause, MultihopError, SetupError};
 
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = socks_only_listeners().await;
     let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -619,7 +628,6 @@ async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
         tokio::spawn(async move {
             supervise_proxy(
                 socks_listener,
-                None,
                 None,
                 crate::supervisor::SupervisorOutputs {
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -695,7 +703,7 @@ async fn supervisor_reselects_on_an_exhaustion_refusal_without_going_fatal() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use warren_transport::{MultihopError, SetupError};
 
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = socks_only_listeners().await;
     let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None);
     let reselects = Arc::new(AtomicUsize::new(0));
@@ -705,7 +713,6 @@ async fn supervisor_reselects_on_an_exhaustion_refusal_without_going_fatal() {
         tokio::spawn(async move {
             supervise_proxy(
                 socks_listener,
-                None,
                 None,
                 crate::supervisor::SupervisorOutputs {
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -765,7 +772,7 @@ async fn supervisor_reselects_on_an_exhaustion_refusal_without_going_fatal() {
 async fn supervisor_metrics_probe_reads_the_live_epoch_and_never_outlives_it() {
     use crate::supervisor::supervise_proxy;
 
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = socks_only_listeners().await;
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let (metrics_tx, mut metrics_rx) = tokio::sync::watch::channel(None);
     let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -773,7 +780,6 @@ async fn supervisor_metrics_probe_reads_the_live_epoch_and_never_outlives_it() {
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
-            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -856,7 +862,7 @@ async fn supervisor_metrics_probe_reads_the_live_epoch_and_never_outlives_it() {
 async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death() {
     use crate::supervisor::supervise_proxy;
 
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = socks_only_listeners().await;
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let (forwarder_tx, mut forwarder_rx) = tokio::sync::watch::channel(None);
     let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -870,7 +876,6 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
-            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -1611,17 +1616,21 @@ async fn supervise_forward_retries_a_transient_failure_within_the_epoch() {
 async fn supervisor_serves_both_socks_and_http_listeners() {
     // Exercises the dual-listener serve epoch (the `select!` two-branch path):
     // both stable addresses accept once the tunnel is up.
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let socks_addr = socks_listener.local_addr().unwrap();
-    let http_addr = http_listener.local_addr().unwrap();
+    let listeners = crate::proxy::ProxyListeners::bind(&warren_net::ProxyConfig {
+        socks5: "127.0.0.1:0".parse().unwrap(),
+        http: Some("127.0.0.1:0".parse().unwrap()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let socks_addr = listeners.socks5_addr();
+    let http_addr = listeners.http_addr().unwrap();
 
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let keep_open = Arc::new(tokio::sync::Notify::new());
     let task = tokio::spawn(async move {
         supervise_proxy(
-            socks_listener,
-            Some(http_listener),
+            listeners,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -1668,7 +1677,7 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
     // like prod SG), index 1 connects. This mirrors the rotating closure of
     // start_proxy_supervised_failover: the cursor advances only on
     // failure, so the supervisor must rotate past 0 and succeed on 1.
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = socks_only_listeners().await;
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let cursor = Arc::new(AtomicUsize::new(0));
     let (ok_tx, mut ok_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
@@ -1677,7 +1686,6 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
-            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -1739,7 +1747,7 @@ async fn supervisor_failover_rotates_on_drain() {
     // the proactive reconnect rotates 0 -> 1 directly, instead of waiting for the
     // draining exit's hard-close to produce the `Err` that the broken-exit path
     // relies on.
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = socks_only_listeners().await;
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let cursor = Arc::new(AtomicUsize::new(0));
     let drain_cursor = Arc::clone(&cursor);
@@ -1749,7 +1757,6 @@ async fn supervisor_failover_rotates_on_drain() {
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
-            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -1820,7 +1827,7 @@ async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
     // always works. After a healthy session drops, the supervisor must
     // reconnect on the SAME exit 0 (stable egress), not rotate away: the
     // cursor advances on connect failure, never on a mere drop.
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = socks_only_listeners().await;
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let cursor = Arc::new(AtomicUsize::new(0));
     let (used_tx, mut used_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
@@ -1830,7 +1837,6 @@ async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
-            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -1901,8 +1907,8 @@ async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
 async fn supervisor_retries_past_failed_attempts_then_connects() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let stable_addr = socks_listener.local_addr().unwrap();
+    let socks_listener = socks_only_listeners().await;
+    let stable_addr = socks_listener.socks5_addr();
 
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -1914,7 +1920,6 @@ async fn supervisor_retries_past_failed_attempts_then_connects() {
         tokio::spawn(async move {
             supervise_proxy(
                 socks_listener,
-                None,
                 None,
                 crate::supervisor::SupervisorOutputs {
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -1983,7 +1988,7 @@ async fn supervisor_emits_structured_migration_events_on_drain() {
     // must see MORE than the bare `Draining` state: a structured event carrying
     // the advisory's fields, first `Migrating`, then `Completed` once the
     // reconnect lands.
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = socks_only_listeners().await;
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let (migration_tx, mut migration_rx) =
         tokio::sync::watch::channel::<Option<MigrationEvent>>(None);
@@ -1994,7 +1999,6 @@ async fn supervisor_emits_structured_migration_events_on_drain() {
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
-            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -2092,8 +2096,8 @@ async fn supervisor_gate_veto_cancels_the_migration_and_keeps_serving() {
     // The reserve-then-switch gate refuses every candidate (all pinned ports
     // conflicted): the migration must be CANCELLED, the cursor must NOT rotate,
     // no reconnect happens, and the current (draining) session keeps serving.
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let stable_addr = socks_listener.local_addr().unwrap();
+    let socks_listener = socks_only_listeners().await;
+    let stable_addr = socks_listener.socks5_addr();
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let (migration_tx, mut migration_rx) =
         tokio::sync::watch::channel::<Option<MigrationEvent>>(None);
@@ -2107,7 +2111,6 @@ async fn supervisor_gate_veto_cancels_the_migration_and_keeps_serving() {
         tokio::spawn(async move {
             supervise_proxy(
                 socks_listener,
-                None,
                 None,
                 crate::supervisor::SupervisorOutputs {
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -2188,7 +2191,7 @@ async fn supervisor_gate_approval_lets_the_migration_proceed() {
 
     // The gate grants (pre-flight reserved the pinned ports on the candidate):
     // the migration proceeds exactly like the no-gate path, rotating the cursor.
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = socks_only_listeners().await;
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let cursor = Arc::new(AtomicUsize::new(0));
     let drain_cursor = Arc::clone(&cursor);
@@ -2198,7 +2201,6 @@ async fn supervisor_gate_approval_lets_the_migration_proceed() {
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
-            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -2407,8 +2409,7 @@ async fn start_proxy_reports_a_listener_bind_failure() {
     let busy = occupied.local_addr().unwrap();
     let cfg = warren_net::ProxyConfig {
         socks5: busy,
-        http: None,
-        dns_server: None,
+        ..Default::default()
     };
 
     match test_client()
@@ -2431,8 +2432,7 @@ async fn supervised_proxy_reaches_connected_against_a_fake_exit() {
 
     let cfg = warren_net::ProxyConfig {
         socks5: "127.0.0.1:0".parse().unwrap(),
-        http: None,
-        dns_server: None,
+        ..Default::default()
     };
     let handle = test_client()
         .start_proxy_supervised(&Circuit::SingleHop(exit.clone()), &cfg)
@@ -2467,8 +2467,7 @@ async fn start_proxy_against_a_fake_exit_is_connected() {
     let exit = fake_verified_exit(addr, &keys);
     let cfg = warren_net::ProxyConfig {
         socks5: "127.0.0.1:0".parse().unwrap(),
-        http: None,
-        dns_server: None,
+        ..Default::default()
     };
     let handle = test_client()
         .start_proxy(&Circuit::SingleHop(exit.clone()), &cfg)
@@ -2490,8 +2489,7 @@ async fn start_proxy_bonded_with_one_member_connects() {
     let exit = fake_verified_exit(addr, &keys);
     let cfg = warren_net::ProxyConfig {
         socks5: "127.0.0.1:0".parse().unwrap(),
-        http: None,
-        dns_server: None,
+        ..Default::default()
     };
     let handle = test_client()
         .start_proxy_bonded(&Circuit::SingleHop(exit.clone()), 1, &cfg)
@@ -2539,8 +2537,7 @@ async fn start_proxy_refuses_a_dns_disabled_exit_without_a_resolver() {
     };
     let cfg = warren_net::ProxyConfig {
         socks5: "127.0.0.1:0".parse().unwrap(),
-        http: None,
-        dns_server: None,
+        ..Default::default()
     };
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -2704,8 +2701,7 @@ async fn failover_refuses_an_all_dns_disabled_list_without_an_override() {
     let exits = [exit_with_dns(true), exit_with_dns(true)];
     let cfg = warren_net::ProxyConfig {
         socks5: "127.0.0.1:0".parse().unwrap(),
-        http: None,
-        dns_server: None,
+        ..Default::default()
     };
     let circuits: Vec<Circuit> = exits.iter().cloned().map(Circuit::SingleHop).collect();
     let result = client
@@ -2725,7 +2721,7 @@ async fn failover_refuses_an_all_dns_disabled_list_without_an_override() {
 async fn a_dead_datapath_is_reported_as_a_session_close_with_its_transport_reason() {
     use crate::supervisor::{EpochEndCause, supervise_proxy};
 
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = socks_only_listeners().await;
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let (epoch_end_tx, mut epoch_end_rx) = tokio::sync::watch::channel(None);
     let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2733,7 +2729,6 @@ async fn a_dead_datapath_is_reported_as_a_session_close_with_its_transport_reaso
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
-            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -2801,7 +2796,7 @@ async fn a_dead_datapath_is_reported_as_a_session_close_with_its_transport_reaso
 async fn an_egress_probe_conviction_is_reported_as_such_not_as_a_session_close() {
     use crate::supervisor::{EpochEndCause, supervise_proxy};
 
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socks_listener = socks_only_listeners().await;
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let (epoch_end_tx, mut epoch_end_rx) = tokio::sync::watch::channel(None);
     // Each epoch publishes its escalation notifier here, so the conviction the
@@ -2813,7 +2808,6 @@ async fn an_egress_probe_conviction_is_reported_as_such_not_as_a_session_close()
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
-            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Publish(escalate_tx),
@@ -2880,8 +2874,8 @@ async fn an_egress_probe_conviction_is_reported_as_such_not_as_a_session_close()
 async fn a_host_requested_rebuild_ends_the_epoch_without_dropping_the_listener() {
     use crate::supervisor::{EpochEndCause, supervise_proxy};
 
-    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let listener_addr = socks_listener.local_addr().unwrap();
+    let socks_listener = socks_only_listeners().await;
+    let listener_addr = socks_listener.socks5_addr();
     let (state_tx, _state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let (epoch_end_tx, mut epoch_end_rx) = tokio::sync::watch::channel(None);
     let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2891,7 +2885,6 @@ async fn a_host_requested_rebuild_ends_the_epoch_without_dropping_the_listener()
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
-            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -3763,5 +3756,188 @@ async fn a_bypass_this_os_cannot_honour_keeps_the_packet_datapath_down() {
     assert!(
         handle.addressing().is_none(),
         "nothing is published while no epoch ever ran"
+    );
+}
+
+/// Waits up to `budget` for `handle` to report `want`.
+async fn reaches_state(
+    handle: &SupervisedProxyHandle,
+    want: ConnectionState,
+    budget: std::time::Duration,
+) -> bool {
+    let mut rx = handle.watch_state();
+    tokio::time::timeout(budget, async {
+        loop {
+            if *rx.borrow_and_update() == want {
+                return true;
+            }
+            if rx.changed().await.is_err() {
+                return false;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn dual_listeners() -> crate::proxy::ProxyListeners {
+    crate::proxy::ProxyListeners::bind(&warren_net::ProxyConfig {
+        socks5: "127.0.0.1:0".parse().unwrap(),
+        http: Some("127.0.0.1:0".parse().unwrap()),
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn held_listeners_keep_their_ports_and_credentials_across_a_full_teardown() {
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    // Serves every session it is dialed with: each datapath dials its own.
+    let (addr, keys, _) = warren_test_support::spawn_migratable_multihop_exit(exit_key, true).await;
+    let circuit = Circuit::SingleHop(fake_verified_exit(addr, &keys));
+    let listeners = dual_listeners().await;
+    let socks = listeners.socks5_addr();
+    let http = listeners.http_addr().unwrap();
+    let creds = listeners.credentials().clone();
+
+    let first = test_client()
+        .start_proxy_supervised_on(&circuit, &listeners, None)
+        .await
+        .expect("first datapath");
+    assert!(reaches_state(&first, ConnectionState::Connected, Duration::from_secs(10)).await);
+    assert_eq!(first.local_addr(), socks);
+    assert_eq!(first.http_addr(), Some(http));
+    assert_eq!(first.credentials().password(), creds.password());
+    drop(first);
+
+    // Between two datapaths no other process can take either port over.
+    for held in [socks, http] {
+        let squat = tokio::net::TcpListener::bind(held).await;
+        assert!(squat.is_err(), "{held:?} was released between datapaths");
+    }
+    // A client arriving in the gap waits for the next datapath instead of
+    // being refused, and that datapath answers with the same credentials.
+    let waiting = tokio::spawn({
+        let creds = creds.clone();
+        async move { warren_net::prove_socks5_listener(socks, &creds).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!waiting.is_finished(), "nothing serves the gap");
+
+    let second = test_client()
+        .start_proxy_supervised_on(&circuit, &listeners, None)
+        .await
+        .expect("second datapath");
+    let proof = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("the waiting client is served")
+        .expect("join");
+    assert!(proof.is_ok(), "{proof:?}");
+    warren_net::prove_http_listener(http, &creds)
+        .await
+        .expect("the HTTP listener still holds the same credentials");
+    drop(second);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_datapath_on_the_same_listeners_waits_for_the_first_to_stop() {
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    // Serves every session it is dialed with: each datapath dials its own.
+    let (addr, keys, _) = warren_test_support::spawn_migratable_multihop_exit(exit_key, true).await;
+    let circuit = Circuit::SingleHop(fake_verified_exit(addr, &keys));
+    let listeners = socks_only_listeners().await;
+
+    let first = test_client()
+        .start_proxy_supervised_on(&circuit, &listeners, None)
+        .await
+        .expect("first datapath");
+    assert!(reaches_state(&first, ConnectionState::Connected, Duration::from_secs(10)).await);
+    let second = test_client()
+        .start_proxy_supervised_on(&circuit, &listeners, None)
+        .await
+        .expect("second datapath");
+
+    assert!(
+        !reaches_state(&second, ConnectionState::Connected, Duration::from_secs(1)).await,
+        "two datapaths must never race for one set of listeners"
+    );
+    drop(first);
+    assert!(
+        reaches_state(&second, ConnectionState::Connected, Duration::from_secs(10)).await,
+        "the second datapath takes over once the first stopped"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_supervised_datapath_serves_only_its_own_credentials() {
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let (addr, keys) = warren_test_support::spawn_fake_multihop_exit(exit_key).await;
+    let cfg = warren_net::ProxyConfig {
+        socks5: "127.0.0.1:0".parse().unwrap(),
+        ..Default::default()
+    };
+    let handle = test_client()
+        .start_proxy_supervised(&Circuit::SingleHop(fake_verified_exit(addr, &keys)), &cfg)
+        .await
+        .expect("supervised proxy binds");
+    assert!(reaches_state(&handle, ConnectionState::Connected, Duration::from_secs(10)).await);
+
+    warren_net::prove_socks5_listener(handle.local_addr(), handle.credentials())
+        .await
+        .expect("the handle's credentials are the listener's");
+    let stranger = warren_net::ProxyCredentials::generate();
+    let refused = warren_net::socks5_connect(
+        handle.local_addr(),
+        &stranger,
+        &warren_net::socks5::Target::Ip("10.66.0.1:9".parse().unwrap()),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(warren_net::Socks5ClientError::AuthRefused)),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_credentials_are_the_ones_served() {
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let (addr, keys) = warren_test_support::spawn_fake_multihop_exit(exit_key).await;
+    let chosen = warren_net::ProxyCredentials::new("operator", "a long operator secret").unwrap();
+    let cfg = warren_net::ProxyConfig {
+        socks5: "127.0.0.1:0".parse().unwrap(),
+        credentials: Some(chosen.clone()),
+        ..Default::default()
+    };
+    let handle = test_client()
+        .start_proxy(&Circuit::SingleHop(fake_verified_exit(addr, &keys)), &cfg)
+        .await
+        .expect("proxy datapath starts");
+
+    assert_eq!(handle.credentials().username(), "operator");
+    warren_net::prove_socks5_listener(handle.local_addr(), &chosen)
+        .await
+        .expect("the configured credentials are served");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn start_proxy_supervised_on_refuses_a_dns_disabled_exit_without_a_resolver() {
+    // Refused before any dial, so the exit need not exist.
+    let keys = warren_test_support::MultihopExitKeys {
+        ed25519_pubkey: [0u8; 32],
+        x25519_pubkey: [0u8; 32],
+        exit_id: [0u8; 16],
+    };
+    let mut exit = fake_verified_exit("203.0.113.1:443".parse().unwrap(), &keys);
+    exit.dns_disabled = true;
+    let listeners = socks_only_listeners().await;
+
+    let refused = test_client()
+        .start_proxy_supervised_on(&Circuit::SingleHop(exit), &listeners, None)
+        .await;
+
+    assert!(
+        matches!(refused, Err(SdkError::ExitDnsDisabled)),
+        "a dns_disabled exit without a resolver must be refused"
     );
 }

@@ -22,10 +22,6 @@
 //! The session is otherwise idle on purpose: an idle tunnel is what the fleet
 //! spends most of its life being, and it is the shape every observed death had.
 
-use std::net::SocketAddr;
-
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::net::ProxyConfig;
 use warren_sdk::transport::ConnectionState;
@@ -72,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .start_proxy_supervised(&Circuit::SingleHop(exit), &cfg)
         .await?;
     let proxy_addr = handle.local_addr();
+    let credentials = handle.credentials().clone();
     println!("proxy: {proxy_addr}");
 
     let started = std::time::Instant::now();
@@ -119,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         let reachable = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            socks5_connect(proxy_addr, "1.1.1.1:443".parse()?),
+            socks5_connect(proxy_addr, &credentials, "1.1.1.1:443".parse()?),
         )
         .await;
         println!(
@@ -139,29 +136,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// SOCKS5 greeting + CONNECT to `target`; Ok(()) iff the proxy replied success.
+/// Authenticated SOCKS5 CONNECT to `target` through the session's own
+/// listener; Ok(()) iff the proxy replied success.
 async fn socks5_connect(
-    proxy: SocketAddr,
-    target: SocketAddr,
+    proxy: std::net::SocketAddr,
+    credentials: &warren_sdk::net::ProxyCredentials,
+    target: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut s = TcpStream::connect(proxy).await?;
-    s.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut greeting = [0u8; 2];
-    s.read_exact(&mut greeting).await?;
-    if greeting != [0x05, 0x00] {
-        return Err("socks5 greeting refused".into());
-    }
-    let mut req = vec![0x05, 0x01, 0x00, 0x01];
-    match target.ip() {
-        std::net::IpAddr::V4(v4) => req.extend_from_slice(&v4.octets()),
-        std::net::IpAddr::V6(_) => return Err("ipv4 target only".into()),
-    }
-    req.extend_from_slice(&target.port().to_be_bytes());
-    s.write_all(&req).await?;
-    let mut reply = [0u8; 10];
-    s.read_exact(&mut reply).await?;
-    if reply[1] != 0x00 {
-        return Err(format!("socks5 connect failed (rep {})", reply[1]).into());
-    }
+    warren_sdk::net::socks5_connect(
+        proxy,
+        credentials,
+        &warren_sdk::net::socks5::Target::Ip(target),
+    )
+    .await?;
     Ok(())
 }

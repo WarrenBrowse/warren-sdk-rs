@@ -1,9 +1,104 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use warren_net::ProxyCredentials;
 use warren_transport::MultihopSession;
 
 use crate::error::SdkError;
+
+/// The credentials a datapath's listeners demand: the configured ones, or fresh
+/// ones for this session.
+fn session_credentials(cfg: &warren_net::ProxyConfig) -> ProxyCredentials {
+    cfg.credentials
+        .clone()
+        .unwrap_or_else(ProxyCredentials::generate)
+}
+
+/// The bound local proxy listeners and the credentials their clients present.
+///
+/// Clones share the same sockets. A host that must never release its ports
+/// while clients still point at them (a released loopback port can be taken
+/// over by any other process on the machine, which then receives those
+/// clients' traffic) keeps a clone for as long as those clients live and hands
+/// it to every datapath it starts
+/// ([`WarrenClient::start_proxy_supervised_on`](crate::WarrenClient::start_proxy_supervised_on)).
+/// Between one datapath and the next the ports stay bound, and a connection
+/// made meanwhile waits in the listen backlog for the next datapath instead of
+/// being refused. One datapath serves a set of listeners at a time.
+#[derive(Debug, Clone)]
+pub struct ProxyListeners {
+    socks: Arc<tokio::net::TcpListener>,
+    socks_addr: SocketAddr,
+    http: Option<Arc<tokio::net::TcpListener>>,
+    http_addr: Option<SocketAddr>,
+    credentials: ProxyCredentials,
+    serving: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl ProxyListeners {
+    /// Binds the SOCKS5 listener (and the HTTP CONNECT one when configured) and
+    /// fixes the credentials every client of them must present.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::Proxy`] if a listener cannot bind.
+    pub async fn bind(cfg: &warren_net::ProxyConfig) -> Result<Self, SdkError> {
+        let socks = tokio::net::TcpListener::bind(cfg.socks5)
+            .await
+            .map_err(SdkError::Proxy)?;
+        let socks_addr = socks.local_addr().map_err(SdkError::Proxy)?;
+        let (http, http_addr) = match cfg.http {
+            Some(bind) => {
+                let listener = tokio::net::TcpListener::bind(bind)
+                    .await
+                    .map_err(SdkError::Proxy)?;
+                let addr = listener.local_addr().map_err(SdkError::Proxy)?;
+                (Some(Arc::new(listener)), Some(addr))
+            }
+            None => (None, None),
+        };
+        Ok(Self {
+            socks: Arc::new(socks),
+            socks_addr,
+            http,
+            http_addr,
+            credentials: session_credentials(cfg),
+            serving: Arc::new(tokio::sync::Mutex::new(())),
+        })
+    }
+
+    /// The address the SOCKS5 listener bound.
+    #[must_use]
+    pub fn socks5_addr(&self) -> SocketAddr {
+        self.socks_addr
+    }
+
+    /// The address the HTTP CONNECT listener bound, if one was configured.
+    #[must_use]
+    pub fn http_addr(&self) -> Option<SocketAddr> {
+        self.http_addr
+    }
+
+    /// The credentials every client of these listeners must present.
+    #[must_use]
+    pub fn credentials(&self) -> &ProxyCredentials {
+        &self.credentials
+    }
+
+    pub(crate) fn socks_listener(&self) -> Arc<tokio::net::TcpListener> {
+        Arc::clone(&self.socks)
+    }
+
+    pub(crate) fn http_listener(&self) -> Option<Arc<tokio::net::TcpListener>> {
+        self.http.clone()
+    }
+
+    /// Waits until no other datapath serves these listeners, and holds them
+    /// until the returned guard drops (with the datapath task that owns it).
+    pub(crate) async fn serve_lease(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.serving).lock_owned().await
+    }
+}
 
 /// Liveness of a running proxy datapath's tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +190,7 @@ impl ProxyForwarder {
 pub struct ProxyHandle {
     pub(crate) local_addr: SocketAddr,
     pub(crate) http_addr: Option<SocketAddr>,
+    pub(crate) credentials: ProxyCredentials,
     pub(crate) state_rx: tokio::sync::watch::Receiver<TunnelState>,
     pub(crate) forward_connector: warren_net::TunnelConnector,
     pub(crate) gateway: std::net::Ipv4Addr,
@@ -130,6 +226,12 @@ impl ProxyHandle {
     #[must_use]
     pub fn http_addr(&self) -> Option<SocketAddr> {
         self.http_addr
+    }
+
+    /// The credentials every client of this datapath's listeners must present.
+    #[must_use]
+    pub fn credentials(&self) -> &ProxyCredentials {
+        &self.credentials
     }
 
     /// The current tunnel state ([`TunnelState::Connected`] until the tunnel
@@ -243,11 +345,12 @@ where
     let config = build_netstack_config(&sink, local_ip, prefix, gateway, ipv6, cfg.dns_server);
     let (connector, mut alive_rx) = warren_net::spawn_over_sink(Arc::new(sink), config);
 
+    let credentials = session_credentials(cfg);
     let socks_listener = tokio::net::TcpListener::bind(cfg.socks5)
         .await
         .map_err(SdkError::Proxy)?;
     let local_addr = socks_listener.local_addr().map_err(SdkError::Proxy)?;
-    let socks = warren_net::Socks5Proxy::new(connector.clone());
+    let socks = warren_net::Socks5Proxy::new(connector.clone(), credentials.clone());
     // serve_with_udp also handles UDP ASSOCIATE (datagrams egress at the exit
     // via the netstack UDP flow); CONNECT behaves identically to serve.
     let mut tasks = vec![tokio::spawn(async move {
@@ -277,7 +380,7 @@ where
             .await
             .map_err(SdkError::Proxy)?;
         http_addr = Some(http_listener.local_addr().map_err(SdkError::Proxy)?);
-        let http = warren_net::HttpConnectProxy::new(connector);
+        let http = warren_net::HttpConnectProxy::new(connector, credentials.clone());
         tasks.push(tokio::spawn(async move {
             let _ = http.serve(http_listener).await;
         }));
@@ -286,6 +389,7 @@ where
     Ok(ProxyHandle {
         local_addr,
         http_addr,
+        credentials,
         state_rx,
         forward_connector,
         gateway,

@@ -62,7 +62,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = client
         .start_proxy_supervised(&Circuit::SingleHop(exit), &cfg)
         .await?;
-    println!("PROXY {}", handle.local_addr());
+    // The line carries the session's proxy credentials: the bench reads it
+    // inside its own single-tenant container and hands it to curl on stdin.
+    println!(
+        "PROXY {}",
+        &*handle
+            .credentials()
+            .proxy_url("socks5h", handle.local_addr())
+    );
 
     let reader = handle.metrics_reader();
     let mut stdin = tokio::io::stdin();

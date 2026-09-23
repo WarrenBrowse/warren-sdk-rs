@@ -66,6 +66,7 @@ impl std::fmt::Debug for MetricsReader {
 pub struct SupervisedProxyHandle {
     pub(crate) local_addr: std::net::SocketAddr,
     pub(crate) http_addr: Option<std::net::SocketAddr>,
+    pub(crate) credentials: warren_net::ProxyCredentials,
     pub(crate) state_rx: tokio::sync::watch::Receiver<ConnectionState>,
     /// The forwarder for the current epoch, republished by the supervisor on
     /// every (re)connect and cleared (`None`) while the tunnel is down. Drives
@@ -101,6 +102,13 @@ impl SupervisedProxyHandle {
     #[must_use]
     pub fn http_addr(&self) -> Option<std::net::SocketAddr> {
         self.http_addr
+    }
+
+    /// The credentials every client of the listeners must present. They stay
+    /// the same across reconnects, like the addresses.
+    #[must_use]
+    pub fn credentials(&self) -> &warren_net::ProxyCredentials {
+        &self.credentials
     }
 
     /// The current connection state ([`ConnectionState::Connecting`] until the
@@ -864,6 +872,7 @@ impl Drop for AbortOnDrop {
 pub(crate) async fn serve_epoch(
     socks_listener: &tokio::net::TcpListener,
     http_listener: Option<&tokio::net::TcpListener>,
+    credentials: &warren_net::ProxyCredentials,
     connector: warren_net::TunnelConnector,
     alive_rx: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -875,14 +884,14 @@ pub(crate) async fn serve_epoch(
         wait_until_dead(alive_rx).await;
         let _ = run_tx.send(false);
     }));
-    let socks = warren_net::Socks5Proxy::new(connector.clone());
+    let socks = warren_net::Socks5Proxy::new(connector.clone(), credentials.clone());
     // `select!`, not `join!`: the first loop to return ends the epoch. On tunnel
     // death the bridge flips `run` and whichever loop sees it first returns; if an
     // accept loop instead fails on its own, that also ends the epoch (a `join!`
     // would hang waiting on the still-running sibling while the tunnel is alive).
     match http_listener {
         Some(http_listener) => {
-            let http = warren_net::HttpConnectProxy::new(connector);
+            let http = warren_net::HttpConnectProxy::new(connector, credentials.clone());
             tokio::select! {
                 _ = socks.serve_with_udp_until(socks_listener, run_rx.clone()) => {}
                 _ = http.serve_until(http_listener, run_rx) => {}
@@ -1454,20 +1463,17 @@ pub(crate) trait EpochDatapath<S: warren_net::PacketSink + 'static>: Send {
 /// The proxy shape: the stable SOCKS5 (and optional HTTP CONNECT) listeners,
 /// served over a fresh netstack for each epoch.
 pub(crate) struct ProxyDatapath {
-    socks: Arc<tokio::net::TcpListener>,
-    http: Option<Arc<tokio::net::TcpListener>>,
+    listeners: crate::proxy::ProxyListeners,
     dns_server: Option<std::net::Ipv4Addr>,
 }
 
 impl ProxyDatapath {
     pub(crate) fn new(
-        socks: tokio::net::TcpListener,
-        http: Option<tokio::net::TcpListener>,
+        listeners: crate::proxy::ProxyListeners,
         dns_server: Option<std::net::Ipv4Addr>,
     ) -> Self {
         Self {
-            socks: Arc::new(socks),
-            http: http.map(Arc::new),
+            listeners,
             dns_server,
         }
     }
@@ -1499,8 +1505,9 @@ impl<S: warren_net::PacketSink + 'static> EpochDatapath<S> for ProxyDatapath {
             // flag yet; stay permissive (doc 79).
             port_forward_supported: true,
         };
-        let socks = Arc::clone(&self.socks);
-        let http = self.http.clone();
+        let socks = self.listeners.socks_listener();
+        let http = self.listeners.http_listener();
+        let credentials = self.listeners.credentials().clone();
         EpochRun {
             forwarder,
             probe: Box::new(move |escalate, acks, rtt, rx| {
@@ -1514,7 +1521,7 @@ impl<S: warren_net::PacketSink + 'static> EpochDatapath<S> for ProxyDatapath {
                 )
             }),
             served: Box::pin(async move {
-                serve_epoch(&socks, http.as_deref(), connector, alive_rx).await;
+                serve_epoch(&socks, http.as_deref(), &credentials, connector, alive_rx).await;
             }),
         }
     }
@@ -1668,8 +1675,7 @@ impl ExternalPort for warren_net::RawForwardedPort {
 /// One line over [`supervise_datapath`]: the lifecycle is shared with every
 /// other datapath, the listeners are what makes this one the proxy.
 pub(crate) async fn supervise_proxy<S, F, Fut, D>(
-    socks_listener: tokio::net::TcpListener,
-    http_listener: Option<tokio::net::TcpListener>,
+    listeners: crate::proxy::ProxyListeners,
     dns_server: Option<std::net::Ipv4Addr>,
     outputs: SupervisorOutputs<ProxyForwarder>,
     guards: EpochGuards,
@@ -1681,8 +1687,11 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
     Fut: std::future::Future<Output = Result<EstablishedTunnel<S>, SdkError>>,
     D: Fn(),
 {
+    // Held for the life of this supervisor: a second datapath handed the same
+    // listeners waits here rather than racing this one for their connections.
+    let _serving = listeners.serve_lease().await;
     supervise_datapath(
-        ProxyDatapath::new(socks_listener, http_listener, dns_server),
+        ProxyDatapath::new(listeners, dns_server),
         outputs,
         guards,
         connect,

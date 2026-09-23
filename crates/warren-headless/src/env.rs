@@ -38,6 +38,14 @@ pub enum ConfigError {
     /// provided.
     #[error("no mnemonic: set WARREN_MNEMONIC or WARREN_MNEMONIC_FILE")]
     MissingMnemonic,
+    /// Neither `WARREN_PROXY_PASSWORD` nor a readable
+    /// `WARREN_PROXY_PASSWORD_FILE` was provided. The proxy listeners have no
+    /// unauthenticated mode, so there is nothing to start without one.
+    #[error(
+        "no proxy password: set WARREN_PROXY_PASSWORD_FILE or WARREN_PROXY_PASSWORD, \
+         the password every client of the listeners presents"
+    )]
+    MissingProxyPassword,
     /// A `*_FILE` secret path could not be read.
     ///
     /// The class of the I/O error is part of the message: a container secret

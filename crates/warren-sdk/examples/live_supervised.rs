@@ -13,8 +13,6 @@
 
 use std::net::SocketAddr;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use warren_sdk::identity::WarrenIdentity;
 use warren_sdk::net::ProxyConfig;
 use warren_sdk::transport::ConnectionState;
@@ -91,7 +89,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let budget = std::time::Duration::from_millis(2500);
     let mut ok = false;
     for attempt in 1..=15 {
-        if let Ok(Ok(())) = tokio::time::timeout(budget, socks5_connect(proxy_addr, probe)).await {
+        if let Ok(Ok(())) = tokio::time::timeout(
+            budget,
+            socks5_connect(proxy_addr, handle.credentials(), probe),
+        )
+        .await
+        {
             println!("egress proof: CONNECT 1.1.1.1:443 ok (attempt {attempt})");
             ok = true;
             break;
@@ -106,26 +109,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// SOCKS5 greeting + CONNECT to `target`; Ok(()) iff the proxy replied success.
+/// Authenticated SOCKS5 CONNECT to `target` through the session's own
+/// listener; Ok(()) iff the proxy replied success.
 async fn socks5_connect(
-    proxy: SocketAddr,
-    target: SocketAddr,
+    proxy: std::net::SocketAddr,
+    credentials: &warren_sdk::net::ProxyCredentials,
+    target: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut s = TcpStream::connect(proxy).await?;
-    s.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut method = [0u8; 2];
-    s.read_exact(&mut method).await?;
-    let std::net::IpAddr::V4(ip) = target.ip() else {
-        return Err("ipv4 only".into());
-    };
-    let mut req = vec![0x05, 0x01, 0x00, 0x01];
-    req.extend_from_slice(&ip.octets());
-    req.extend_from_slice(&target.port().to_be_bytes());
-    s.write_all(&req).await?;
-    let mut reply = [0u8; 10];
-    s.read_exact(&mut reply).await?;
-    if reply[1] != 0x00 {
-        return Err(format!("rep={}", reply[1]).into());
-    }
+    warren_sdk::net::socks5_connect(
+        proxy,
+        credentials,
+        &warren_sdk::net::socks5::Target::Ip(target),
+    )
+    .await?;
     Ok(())
 }

@@ -39,6 +39,7 @@ pub mod netstack;
 pub mod portforward;
 #[cfg(feature = "proxy")]
 pub mod proxy;
+pub mod proxy_auth;
 #[cfg(feature = "proxy")]
 pub mod raw_udp;
 pub mod sink;
@@ -66,6 +67,10 @@ pub use portforward::{
 };
 #[cfg(feature = "proxy")]
 pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy, UdpConnector, UdpFlow};
+pub use proxy_auth::{
+    CredentialsError, ListenerKind, ListenerProofError, ProxyCredentials, Socks5ClientError,
+    prove_http_listener, prove_socks5_listener, socks5_connect,
+};
 #[cfg(feature = "proxy")]
 pub use raw_udp::{RawUdpDemux, RawUdpFlow, build_udp_packet};
 pub use sink::{BondedPacketSink, CloseRttObserver, MultihopPacketSink, PacketSink};

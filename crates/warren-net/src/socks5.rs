@@ -9,10 +9,18 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// SOCKS protocol version byte.
 pub const VERSION: u8 = 0x05;
-/// "No authentication required" method.
+/// "No authentication required" method. The Warren listeners never select it.
 pub const METHOD_NO_AUTH: u8 = 0x00;
+/// RFC 1929 username/password method.
+pub const METHOD_USERPASS: u8 = 0x02;
+/// A private method (RFC 1928 reserves `0x80..=0xFE` for them): the client sends
+/// a nonce and the listener answers a proof that it holds the session's
+/// credentials, without the client sending them. See [`crate::proxy_auth`].
+pub const METHOD_WARREN_PROOF: u8 = 0x80;
 /// Sentinel for "no acceptable methods".
 pub const METHOD_NONE: u8 = 0xff;
+/// Version byte of the RFC 1929 username/password sub-negotiation.
+pub const USERPASS_VERSION: u8 = 0x01;
 
 /// SOCKS5 command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,9 +265,81 @@ pub fn build_reply(reply: Reply, bound: SocketAddr) -> Vec<u8> {
     out
 }
 
+/// Builds a request (`VER CMD RSV ATYP ADDR PORT`) for `target`. A domain
+/// longer than 255 bytes cannot be encoded and is truncated by the length byte,
+/// so callers pass names that came from a URL or a SOCKS5 message.
+#[must_use]
+pub fn build_request(command: Command, target: &Target) -> Vec<u8> {
+    let cmd = match command {
+        Command::Connect => 0x01,
+        Command::Bind => 0x02,
+        Command::UdpAssociate => 0x03,
+    };
+    let mut out = vec![VERSION, cmd, 0x00];
+    match target {
+        Target::Ip(SocketAddr::V4(v4)) => {
+            out.push(0x01);
+            out.extend_from_slice(&v4.ip().octets());
+            out.extend_from_slice(&v4.port().to_be_bytes());
+        }
+        Target::Ip(SocketAddr::V6(v6)) => {
+            out.push(0x04);
+            out.extend_from_slice(&v6.ip().octets());
+            out.extend_from_slice(&v6.port().to_be_bytes());
+        }
+        Target::Domain(host, port) => {
+            let name = &host.as_bytes()[..host.len().min(255)];
+            out.push(0x03);
+            out.push(name.len() as u8);
+            out.extend_from_slice(name);
+            out.extend_from_slice(&port.to_be_bytes());
+        }
+    }
+    out
+}
+
+/// Builds the RFC 1929 sub-negotiation request (`VER ULEN UNAME PLEN PASSWD`).
+/// Fields longer than 255 bytes are truncated by their length byte; the
+/// credentials type refuses them before they get here.
+#[must_use]
+pub fn build_userpass_request(username: &[u8], password: &[u8]) -> Vec<u8> {
+    let user = &username[..username.len().min(255)];
+    let pass = &password[..password.len().min(255)];
+    let mut out = Vec::with_capacity(3 + user.len() + pass.len());
+    out.push(USERPASS_VERSION);
+    out.push(user.len() as u8);
+    out.extend_from_slice(user);
+    out.push(pass.len() as u8);
+    out.extend_from_slice(pass);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_request_round_trips_through_parse_request() {
+        for target in [
+            Target::Ip("1.2.3.4:443".parse().unwrap()),
+            Target::Ip("[2001:db8::1]:8443".parse().unwrap()),
+            Target::Domain("example.com".to_owned(), 80),
+        ] {
+            let buf = build_request(Command::Connect, &target);
+            assert_eq!(
+                parse_request(&buf).unwrap(),
+                (Command::Connect, target.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn build_userpass_request_is_the_rfc_1929_layout() {
+        assert_eq!(
+            build_userpass_request(b"ab", b"xyz"),
+            vec![0x01, 2, b'a', b'b', 3, b'x', b'y', b'z']
+        );
+    }
 
     #[test]
     fn greeting_parses_methods() {

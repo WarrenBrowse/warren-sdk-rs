@@ -95,8 +95,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let probe: std::net::SocketAddr = "1.1.1.1:443".parse()?;
     let mut probe_ok = false;
     for attempt in 1..=15 {
-        if let Ok(Ok(())) =
-            tokio::time::timeout(attempt_budget, socks5_connect(handle.local_addr(), probe)).await
+        if let Ok(Ok(())) = tokio::time::timeout(
+            attempt_budget,
+            socks5_connect(handle.local_addr(), handle.credentials(), probe),
+        )
+        .await
         {
             println!(
                 "egress probe 1.1.1.1:443: CONNECT ok (SYN-ACK via the exit, attempt {attempt})"
@@ -121,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 1..=6 {
         if let Ok(Ok(ip)) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            http_get_ip_via_socks5(handle.local_addr(), echo_addr),
+            http_get_ip_via_socks5(handle.local_addr(), handle.credentials(), echo_addr),
         )
         .await
         {
@@ -161,57 +164,36 @@ async fn http_get_ip_direct(
     read_ip_body(&mut s).await
 }
 
-/// Same request, but tunneled through a local SOCKS5 proxy (CONNECT to the IP).
+/// Same request, but tunneled through the session's SOCKS5 listener (CONNECT
+/// to the IP).
 async fn http_get_ip_via_socks5(
     proxy: std::net::SocketAddr,
+    credentials: &warren_sdk::net::ProxyCredentials,
     target: std::net::SocketAddr,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut s = TcpStream::connect(proxy).await?;
-    // Greeting: VER=5, 1 method, NO-AUTH.
-    s.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut method = [0u8; 2];
-    s.read_exact(&mut method).await?;
-    if method != [0x05, 0x00] {
-        return Err("socks5 no-auth not accepted".into());
-    }
-    // CONNECT to the IPv4 target.
-    let std::net::IpAddr::V4(ip) = target.ip() else {
-        return Err("ipv4 target required".into());
-    };
-    let mut req = vec![0x05, 0x01, 0x00, 0x01];
-    req.extend_from_slice(&ip.octets());
-    req.extend_from_slice(&target.port().to_be_bytes());
-    s.write_all(&req).await?;
-    let mut reply = [0u8; 10];
-    s.read_exact(&mut reply).await?;
-    if reply[1] != 0x00 {
-        return Err(format!("socks5 CONNECT failed (rep={})", reply[1]).into());
-    }
+    let mut s = warren_sdk::net::socks5_connect(
+        proxy,
+        credentials,
+        &warren_sdk::net::socks5::Target::Ip(target),
+    )
+    .await?;
     s.write_all(http_request().as_bytes()).await?;
     read_ip_body(&mut s).await
 }
 
-/// SOCKS5 greeting + CONNECT to `target`; Ok(()) iff the proxy replied success.
+/// Authenticated SOCKS5 CONNECT to `target` through the session's own
+/// listener; Ok(()) iff the proxy replied success.
 async fn socks5_connect(
     proxy: std::net::SocketAddr,
+    credentials: &warren_sdk::net::ProxyCredentials,
     target: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut s = TcpStream::connect(proxy).await?;
-    s.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut method = [0u8; 2];
-    s.read_exact(&mut method).await?;
-    let std::net::IpAddr::V4(ip) = target.ip() else {
-        return Err("ipv4 only".into());
-    };
-    let mut req = vec![0x05, 0x01, 0x00, 0x01];
-    req.extend_from_slice(&ip.octets());
-    req.extend_from_slice(&target.port().to_be_bytes());
-    s.write_all(&req).await?;
-    let mut reply = [0u8; 10];
-    s.read_exact(&mut reply).await?;
-    if reply[1] != 0x00 {
-        return Err(format!("rep={}", reply[1]).into());
-    }
+    warren_sdk::net::socks5_connect(
+        proxy,
+        credentials,
+        &warren_sdk::net::socks5::Target::Ip(target),
+    )
+    .await?;
     Ok(())
 }
 

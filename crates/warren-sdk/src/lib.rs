@@ -103,7 +103,7 @@ pub use portfollow::{
     AvoidSet, DEFAULT_AVOID_TTL, DEFAULT_PREFLIGHT_TIMEOUT, MigrationDecision, MigrationEvent,
     MigrationOutcome, PortFollowConfig, PortFollowOutcome, PortFollowPolicy, plan_migration,
 };
-pub use proxy::{ProxyForwarder, ProxyHandle, TunnelState};
+pub use proxy::{ProxyForwarder, ProxyHandle, ProxyListeners, TunnelState};
 pub use store::{FileGenerationStore, FileServerKeyStore};
 pub use supervisor::{
     EpochEnd, EpochEndCause, MetricsReader, PacketForwarder, PortRelease, SupervisedForwardedPort,

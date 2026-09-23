@@ -10,8 +10,38 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use warren_net::socks5::Target;
 use warren_net::{
-    Connector, DirectConnector, HttpConnectProxy, NetError, Socks5Proxy, UdpConnector, UdpFlow,
+    Connector, DirectConnector, HttpConnectProxy, NetError, ProxyCredentials, Socks5Proxy,
+    UdpConnector, UdpFlow,
 };
+
+/// The credentials every proxy in this file serves and every client presents.
+fn creds() -> ProxyCredentials {
+    ProxyCredentials::new("warren", "test-secret").unwrap()
+}
+
+/// Runs the SOCKS5 greeting and the RFC 1929 sub-negotiation with [`creds`].
+async fn authenticate(client: &mut TcpStream) {
+    client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+    let mut method = [0u8; 2];
+    client.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [0x05, 0x02], "server selects username/password");
+    let mut sub = vec![0x01, 6];
+    sub.extend_from_slice(b"warren");
+    sub.push(11);
+    sub.extend_from_slice(b"test-secret");
+    client.write_all(&sub).await.unwrap();
+    let mut status = [0u8; 2];
+    client.read_exact(&mut status).await.unwrap();
+    assert_eq!(status, [0x01, 0x00], "credentials accepted");
+}
+
+/// The `Proxy-Authorization` header line for [`creds`].
+fn auth_header() -> String {
+    format!(
+        "Proxy-Authorization: {}\r\n",
+        &*creds().basic_authorization()
+    )
+}
 
 /// Accepts one connection and echoes everything until EOF.
 async fn spawn_echo() -> std::net::SocketAddr {
@@ -30,7 +60,7 @@ async fn spawn_proxy() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let proxy = Socks5Proxy::new(DirectConnector);
+        let proxy = Socks5Proxy::new(DirectConnector, creds());
         let _ = proxy.serve(listener).await;
     });
     addr
@@ -51,11 +81,7 @@ async fn socks5_connect_relays_bytes_to_upstream() {
 
     let mut client = TcpStream::connect(proxy).await.expect("connect proxy");
 
-    // Greeting: VER=5, 1 method, NO_AUTH.
-    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await.unwrap();
-    assert_eq!(method, [0x05, 0x00], "server selects NO_AUTH");
+    authenticate(&mut client).await;
 
     // CONNECT to the echo server.
     let std::net::SocketAddr::V4(echo_v4) = echo else {
@@ -81,9 +107,7 @@ async fn socks5_rejects_unsupported_command() {
     let proxy = spawn_proxy().await;
     let mut client = TcpStream::connect(proxy).await.expect("connect proxy");
 
-    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await.unwrap();
+    authenticate(&mut client).await;
 
     // BIND (0x02) to an arbitrary IPv4 target.
     let mut req = vec![0x05, 0x02, 0x00, 0x01, 127, 0, 0, 1];
@@ -99,7 +123,7 @@ async fn spawn_http_proxy() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let proxy = HttpConnectProxy::new(DirectConnector);
+        let proxy = HttpConnectProxy::new(DirectConnector, creds());
         let _ = proxy.serve(listener).await;
     });
     addr
@@ -111,7 +135,10 @@ async fn http_connect_relays_bytes_to_upstream() {
     let proxy = spawn_http_proxy().await;
 
     let mut client = TcpStream::connect(proxy).await.expect("connect proxy");
-    let req = format!("CONNECT {echo} HTTP/1.1\r\nHost: {echo}\r\n\r\n");
+    let req = format!(
+        "CONNECT {echo} HTTP/1.1\r\nHost: {echo}\r\n{}\r\n",
+        auth_header()
+    );
     client.write_all(req.as_bytes()).await.unwrap();
 
     // Read the status line up to the blank line.
@@ -142,7 +169,10 @@ async fn http_connect_forwards_pipelined_early_data() {
     let proxy = spawn_http_proxy().await;
 
     let mut client = TcpStream::connect(proxy).await.expect("connect proxy");
-    let req = format!("CONNECT {echo} HTTP/1.1\r\nHost: {echo}\r\n\r\nearly-bytes");
+    let req = format!(
+        "CONNECT {echo} HTTP/1.1\r\nHost: {echo}\r\n{}\r\nearly-bytes",
+        auth_header()
+    );
     client.write_all(req.as_bytes()).await.unwrap();
 
     let mut head = Vec::new();
@@ -230,16 +260,13 @@ async fn socks5_udp_associate_relays_datagrams() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let proxy = Socks5Proxy::new(LocalUdpConnector);
+        let proxy = Socks5Proxy::new(LocalUdpConnector, creds());
         let _ = proxy.serve_with_udp(listener).await;
     });
 
     // Control connection: greeting then UDP ASSOCIATE.
     let mut ctrl = TcpStream::connect(proxy_addr).await.expect("connect proxy");
-    ctrl.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    ctrl.read_exact(&mut method).await.unwrap();
-    assert_eq!(method, [0x05, 0x00]);
+    authenticate(&mut ctrl).await;
     // UDP ASSOCIATE (0x03) with a 0.0.0.0:0 placeholder client address.
     ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await
@@ -314,15 +341,13 @@ async fn socks5_udp_associate_pins_the_client_source() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let proxy = Socks5Proxy::new(LocalUdpConnector);
+        let proxy = Socks5Proxy::new(LocalUdpConnector, creds());
         let _ = proxy.serve_with_udp(listener).await;
     });
 
     // Associate.
     let mut ctrl = TcpStream::connect(proxy_addr).await.expect("connect proxy");
-    ctrl.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    ctrl.read_exact(&mut method).await.unwrap();
+    authenticate(&mut ctrl).await;
     ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await
         .unwrap();
@@ -399,7 +424,13 @@ async fn http_rejects_non_connect_method() {
     let proxy = spawn_http_proxy().await;
     let mut client = TcpStream::connect(proxy).await.expect("connect proxy");
     client
-        .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .write_all(
+            format!(
+                "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n{}\r\n",
+                auth_header()
+            )
+            .as_bytes(),
+        )
         .await
         .unwrap();
     let mut head = Vec::new();
@@ -415,4 +446,117 @@ async fn http_rejects_non_connect_method() {
         head.starts_with("HTTP/1.1 405"),
         "non-CONNECT refused: {head:?}"
     );
+}
+
+/// A UDP echo server standing in for the target.
+async fn spawn_udp_echo() -> std::net::SocketAddrV4 {
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let SocketAddr::V4(addr) = echo.local_addr().unwrap() else {
+        panic!("v4")
+    };
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, src)) = echo.recv_from(&mut buf).await {
+            let _ = echo.send_to(&buf[..n], src).await;
+        }
+    });
+    addr
+}
+
+/// Authenticates, asks for a UDP association declaring `client` as the
+/// address its datagrams come from, and returns the control connection (the
+/// association lives as long as it does) and the relay address.
+async fn associate(declared: std::net::SocketAddrV4) -> (TcpStream, SocketAddr) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let proxy = Socks5Proxy::new(LocalUdpConnector, creds());
+        let _ = proxy.serve_with_udp(listener).await;
+    });
+    let mut ctrl = TcpStream::connect(proxy_addr).await.unwrap();
+    authenticate(&mut ctrl).await;
+    let mut req = vec![0x05, 0x03, 0x00, 0x01];
+    req.extend_from_slice(&declared.ip().octets());
+    req.extend_from_slice(&declared.port().to_be_bytes());
+    ctrl.write_all(&req).await.unwrap();
+    let mut reply = [0u8; 10];
+    ctrl.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0x00, "UDP ASSOCIATE succeeded");
+    let relay = SocketAddr::from((
+        std::net::Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]),
+        u16::from_be_bytes([reply[8], reply[9]]),
+    ));
+    (ctrl, relay)
+}
+
+fn wrapped(target: std::net::SocketAddrV4, payload: &[u8]) -> Vec<u8> {
+    let mut d = vec![0x00, 0x00, 0x00, 0x01];
+    d.extend_from_slice(&target.ip().octets());
+    d.extend_from_slice(&target.port().to_be_bytes());
+    d.extend_from_slice(payload);
+    d
+}
+
+async fn receives(sock: &UdpSocket, within: std::time::Duration) -> Option<Vec<u8>> {
+    let mut buf = [0u8; 2048];
+    match tokio::time::timeout(within, sock.recv_from(&mut buf)).await {
+        Ok(Ok((n, _))) => Some(buf[10..n].to_vec()),
+        _ => None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn socks5_udp_associate_holds_a_client_to_the_address_it_declared() {
+    // The relay port is visible to every local process. A client that declared
+    // its source must not lose the association to one that raced it there.
+    let echo = spawn_udp_echo().await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let SocketAddr::V4(declared) = client.local_addr().unwrap() else {
+        panic!("v4")
+    };
+    let (ctrl, relay) = associate(declared).await;
+
+    let intruder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    intruder
+        .send_to(&wrapped(echo, b"intrude"), relay)
+        .await
+        .unwrap();
+    assert_eq!(
+        receives(&intruder, std::time::Duration::from_millis(500)).await,
+        None,
+        "a datagram from an undeclared source is never forwarded"
+    );
+
+    client
+        .send_to(&wrapped(echo, b"mine"), relay)
+        .await
+        .unwrap();
+    assert_eq!(
+        receives(&client, std::time::Duration::from_secs(2)).await,
+        Some(b"mine".to_vec())
+    );
+    drop(ctrl);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_datagram_does_not_claim_an_undeclared_association() {
+    let echo = spawn_udp_echo().await;
+    let (ctrl, relay) = associate("0.0.0.0:0".parse().unwrap()).await;
+
+    // Garbage first, from another local process: it must not become the
+    // association's client.
+    let intruder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    intruder.send_to(&[0xde, 0xad], relay).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .send_to(&wrapped(echo, b"mine"), relay)
+        .await
+        .unwrap();
+    assert_eq!(
+        receives(&client, std::time::Duration::from_secs(2)).await,
+        Some(b"mine".to_vec())
+    );
+    drop(ctrl);
 }

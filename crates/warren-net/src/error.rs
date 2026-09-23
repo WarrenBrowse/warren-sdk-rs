@@ -27,6 +27,10 @@ pub enum NetError {
     /// A SOCKS5 protocol error on the proxy inbound.
     #[error("socks5 error")]
     Socks5(#[from] crate::socks5::Socks5Error),
+    /// A client of a local proxy listener did not present the session's
+    /// credentials; nothing was forwarded for it.
+    #[error("proxy client not authenticated")]
+    ProxyAuth,
     /// The exit refused the connection (RST during handshake).
     #[error("connection refused by the exit")]
     ConnectionRefused,

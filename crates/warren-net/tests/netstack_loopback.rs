@@ -18,7 +18,7 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use warren_net::socks5::Target;
 use warren_net::{Connector, NetstackConfig, Socks5Proxy, UdpConnector, spawn_engine};
@@ -1700,24 +1700,21 @@ async fn socks5_proxy_over_netstack_reaches_the_exit() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
+    let credentials = warren_net::ProxyCredentials::generate();
+    let server_credentials = credentials.clone();
     tokio::spawn(async move {
-        let proxy = Socks5Proxy::new(connector);
+        let proxy = Socks5Proxy::new(connector, server_credentials);
         let _ = proxy.serve(listener).await;
     });
 
-    let mut client = TcpStream::connect(proxy_addr).await.expect("connect proxy");
-    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await.unwrap();
-    assert_eq!(method, [0x05, 0x00]);
-
     // CONNECT to the exit-side address 10.66.0.1:9.
-    let mut req = vec![0x05, 0x01, 0x00, 0x01, 10, 66, 0, 1];
-    req.extend_from_slice(&9u16.to_be_bytes());
-    client.write_all(&req).await.unwrap();
-    let mut reply = [0u8; 10];
-    client.read_exact(&mut reply).await.unwrap();
-    assert_eq!(reply[1], 0x00, "CONNECT through the tunnel succeeded");
+    let mut client = warren_net::socks5_connect(
+        proxy_addr,
+        &credentials,
+        &warren_net::socks5::Target::Ip("10.66.0.1:9".parse().unwrap()),
+    )
+    .await
+    .expect("CONNECT through the tunnel succeeded");
 
     client.write_all(b"through-proxy").await.unwrap();
     let mut got = [0u8; 13];

@@ -34,6 +34,15 @@ tokio = { workspace = true }
 tokio-util = "0.7"
 rand = { workspace = true }
 thiserror = { workspace = true }
+# Local proxy access control (`proxy_auth`): constant-time credential checks,
+# the HMAC proof a listener answers so a client can tell it from a squatter,
+# the secret zeroized on drop, Basic decoding and hex encoding of the secret.
+hmac = "0.12"
+sha2 = { workspace = true }
+subtle = "2.6"
+zeroize = { workspace = true }
+data-encoding = { workspace = true }
+hex = { workspace = true }
 # Userspace TCP/IP for the non-root proxy datapath (Medium::Ip, no Ethernet:
 # the tunnel carries bare IP packets). 0.14 is the first release whose TCP
 # congestion window actually bounds the data in flight (smoltcp #1154 to
@@ -73,8 +82,6 @@ warren-test-support = { path = "../warren-test-support" }
 # Build a real DAITA driver handle to prove the idle-cover / DAITA mutual
 # exclusion at the sink boundary.
 warren-daita = { path = "../warren-daita" }
-# Golden-byte assertions for the DNS codec tests.
-hex = { workspace = true }
 # Bytes for the UDP-flow connector used in the UDP-associate proxy test.
 bytes = { workspace = true }
 # A second smoltcp stack stands in for the exit's TCP termination in the
