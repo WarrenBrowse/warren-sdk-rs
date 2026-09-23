@@ -78,6 +78,14 @@ Caused by:
 # mid-compile on a random crate. The crash is in the log.
 expect "a rustc crash under emulation is a signature, not an exit code" plain \
 	"error: rustc interrupted by SIGSEGV, printing backtrace"
+# Run 35930715292, job "cargo test (linux)": the container's rustc was
+# SIGKILLed mid-compile on a third-party crate. Cargo exits 101, so only the
+# signal names it.
+expect "a rustc the runner killed mid-compile" plain \
+	"error: could not compile \`uniffi_bindgen\` (lib)
+
+Caused by:
+  process didn't exit successfully: \`/home/runner/.rustup/toolchains/1.91.0-aarch64-unknown-linux-gnu/bin/rustc --crate-name uniffi_bindgen --edition=2021 --crate-type lib\` (signal: 9, SIGKILL: kill)" 101
 # Run 31958663710, job "cargo test (macos)": `cargo` itself was gone between
 # one attempt and the next, because another job on the same runner was
 # reinstalling the toolchain into the shared CARGO_HOME. The shell's own 127
@@ -112,6 +120,14 @@ Summary [   4.512s] 812 tests run: 811 passed, 1 failed"
 expect "the macos errno without the spawn marker is a real failure" "" \
 	"thread 'provision::tests::writes_client_files' panicked at crates/warren-bolthole/src/provision.rs:120:
   No such file or directory (os error 2)"
+# The SIGKILL signature is anchored on rustc: a test binary killed the same
+# way may be the test's own runaway allocation, and three identical kills
+# would read as intermittent.
+expect "a test binary killed by SIGKILL is not a compiler crash" "" \
+	"error: test failed, to rerun pass \`-p warren-net --lib\`
+
+Caused by:
+  process didn't exit successfully: \`/home/runner/actions-runner/_work/warren-sdk-rs/warren-sdk-rs/target/debug/deps/warren_net-3f1c\` (signal: 9, SIGKILL: kill)" 101
 expect "an empty log retries nothing" "" ""
 
 # A log carrying both takes the clean path: a clean also fixes the spawn case,
