@@ -140,7 +140,13 @@ async fn socks5_refuses_a_request_sent_after_a_failed_authentication() {
     let _ = client.write_all(&connect_request(echo)).await;
     let answer = read_until_close(&mut client).await;
 
-    assert_eq!(answer, vec![0x01, 0x01], "a failure status, then the close");
+    // Closing with the pipelined request still unread resets the connection,
+    // and Windows then drops the status the client had not read yet: all that
+    // may arrive is the failure status, never an answer to the request.
+    assert!(
+        [0x01, 0x01].starts_with(&answer),
+        "only the failure status, then the close: {answer:?}"
+    );
     assert_eq!(dials.dials(), 0, "nothing dialed upstream");
 }
 
