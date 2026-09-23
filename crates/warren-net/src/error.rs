@@ -31,6 +31,10 @@ pub enum NetError {
     /// credentials; nothing was forwarded for it.
     #[error("proxy client not authenticated")]
     ProxyAuth,
+    /// A message relayed by the local HTTP proxy broke HTTP/1.1 framing (a body
+    /// cut short, a bad chunk, a response head no client can be handed).
+    #[error("malformed http message")]
+    MalformedHttp,
     /// The exit refused the connection (RST during handshake).
     #[error("connection refused by the exit")]
     ConnectionRefused,

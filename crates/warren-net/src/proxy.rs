@@ -579,6 +579,10 @@ const MAX_HTTP_HEAD: usize = 32 * 1024;
 /// Bytes read per call while scanning for the end of a request head.
 const HEAD_CHUNK: usize = 256;
 
+/// First capacity of the head buffer, which doubles as the head grows: a
+/// connection that has not authenticated yet holds only what it sent.
+const HEAD_START: usize = 1024;
+
 /// An HTTP proxy server over a [`Connector`].
 ///
 /// Serves `CONNECT host:port`, the tunneling verb a browser or HTTP client uses
@@ -594,7 +598,7 @@ pub struct HttpConnectProxy<C> {
 }
 
 impl<C: Connector> HttpConnectProxy<C> {
-    /// Builds a CONNECT proxy that opens upstream flows through `connector` for
+    /// Builds an HTTP proxy that opens upstream flows through `connector` for
     /// requests presenting `credentials`.
     pub fn new(connector: C, credentials: ProxyCredentials) -> Self {
         Self {
@@ -780,7 +784,9 @@ async fn handle_connect<C: Connector>(
     }
     if method != "CONNECT" && http_forward::is_absolute_http(argument) {
         return match http_forward::rewrite_request(&head) {
-            Ok(request) => http_forward::forward(&mut client, early_data, connector, request).await,
+            Ok(request) => {
+                http_forward::forward(&mut client, &early_data, connector, request).await
+            }
             Err(_) => {
                 let _ = client.write_all(http_forward::BAD_REQUEST).await;
                 Ok(())
@@ -825,33 +831,43 @@ async fn handle_connect<C: Connector>(
 }
 
 /// Reads a request head and returns it (without its terminating blank line)
-/// plus any tunnel bytes already received after it, or `None` when the client
-/// closed first, sent more than [`MAX_HTTP_HEAD`] bytes of head, or sent a head
-/// that is not UTF-8.
+/// plus the bytes already received after it (tunnel bytes after a CONNECT, the
+/// body after a plain request), or `None` when the client closed first, sent
+/// more than [`MAX_HTTP_HEAD`] bytes of head, or sent a head that is not UTF-8.
 ///
 /// Reads in chunks rather than one byte per syscall; any bytes past the head
 /// terminator are returned so the caller can replay them to the upstream.
 async fn read_request_head(
     client: &mut TcpStream,
-) -> Result<Option<(Zeroizing<String>, Vec<u8>)>, NetError> {
-    // The head carries the client's `Proxy-Authorization`. Sized so it never
-    // reallocates, which would leave a copy of it in freed memory.
-    let mut head = Zeroizing::new(Vec::with_capacity(MAX_HTTP_HEAD + HEAD_CHUNK));
+) -> Result<Option<(Zeroizing<String>, Zeroizing<Vec<u8>>)>, NetError> {
+    // The head carries the client's `Proxy-Authorization`, and so can the bytes
+    // after it: every buffer holding them is wiped when it goes, including the
+    // ones outgrown on the way.
+    let mut head = Zeroizing::new(Vec::with_capacity(HEAD_START));
     let mut chunk = Zeroizing::new([0u8; HEAD_CHUNK]);
     let head_len = loop {
         let n = client.read(&mut *chunk).await.map_err(NetError::Io)?;
         if n == 0 {
             return Ok(None); // connection closed before a full head
         }
+        if head.len() + n > head.capacity() {
+            let mut grown = Zeroizing::new(Vec::with_capacity(head.capacity() * 2));
+            grown.extend_from_slice(&head);
+            head = grown;
+        }
         head.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = head.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
+        // Only the new bytes, and the three before them, can complete the
+        // terminator: rescanning the whole head costs quadratic time for a
+        // client that sends a byte at a time.
+        let from = head.len().saturating_sub(n + 3);
+        if let Some(pos) = head[from..].windows(4).position(|w| w == b"\r\n\r\n") {
+            break from + pos + 4;
         }
         if head.len() > MAX_HTTP_HEAD {
             return Ok(None);
         }
     };
-    let early_data = head.split_off(head_len);
+    let early_data = Zeroizing::new(head.split_off(head_len));
     head.truncate(head_len - 4);
     match String::from_utf8(std::mem::take(&mut *head)) {
         Ok(text) => Ok(Some((Zeroizing::new(text), early_data))),

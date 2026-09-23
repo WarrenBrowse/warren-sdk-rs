@@ -31,7 +31,7 @@ ignored while the operator believed it applied.
 | variable | default | meaning |
 |---|---|---|
 | `WARREN_MNEMONIC` / `WARREN_MNEMONIC_FILE` | required | the account recovery phrase; the file variant wins and is what containers should use |
-| `WARREN_PROXY_PASSWORD` / `WARREN_PROXY_PASSWORD_FILE` | required | the password every client of the listeners presents (RFC 1929 on SOCKS5, `Proxy-Authorization: Basic` on HTTP CONNECT); the file variant wins and is what containers should use. 32 to 255 bytes: anyone who reaches the port can ask for proofs keyed by it and guess offline, so generate it (`openssl rand -hex 32`). There is no unauthenticated mode: without it the daemon refuses to start |
+| `WARREN_PROXY_PASSWORD` / `WARREN_PROXY_PASSWORD_FILE` | required | the password every client of the listeners presents (RFC 1929 on SOCKS5, `Proxy-Authorization: Basic` on HTTP); the file variant wins and is what containers should use. 32 to 255 bytes: anyone who reaches the port can ask for proofs keyed by it and guess offline, so generate it (`openssl rand -hex 32`). There is no unauthenticated mode: without it the daemon refuses to start |
 | `WARREN_PROXY_USER` | `warren` | the username that goes with it; no colon |
 | `WARREN_SOCKS_LISTEN` | `127.0.0.1:1080` | SOCKS5 listener. Anything that reaches the port and knows the password egresses as your account, and the password crosses the network in clear (RFC 1929 and Basic carry it that way), so keep a non-loopback bind on a network you control |
 | `WARREN_HTTP_LISTEN` | off | HTTP proxy listener: CONNECT tunnels, and plain `http://` requests forwarded one per connection |
