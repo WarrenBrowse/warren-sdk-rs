@@ -1745,7 +1745,10 @@ fn build_killswitch_opts(
         allow_lan: false,
         allow_dhcp: false,
         socket_mark: socket_bypass.and_then(|b| b.fwmark()),
+        // Both stay unset together: without an interface the macOS pass keeps
+        // the destination-only shape, which a uid would not narrow.
         phys_iface: None,
+        carrier_uid: None,
     }
 }
 
