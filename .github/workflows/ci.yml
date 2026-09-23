@@ -40,6 +40,9 @@ concurrency:
 
 jobs:
   fmt:
+    # Self-hosted runners must never execute fork code: only same-repo events
+    # reach this job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo fmt
     runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
     timeout-minutes: 15
@@ -72,6 +75,9 @@ jobs:
       - run: cargo fmt --all -- --check
 
   anti-refrag:
+    # Self-hosted runners must never execute fork code: only same-repo events
+    # reach this job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: anti-refragmentation gate
     runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
     timeout-minutes: 10
@@ -88,6 +94,9 @@ jobs:
         run: bash scripts/ci/anti-refrag.sh
 
   clippy:
+    # Self-hosted runners must never execute fork code: only same-repo events
+    # reach this job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo clippy (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
@@ -117,6 +126,9 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   test:
+    # Self-hosted runners must never execute fork code: only same-repo events
+    # reach this job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo test (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
@@ -161,6 +173,9 @@ jobs:
           cargo nextest run --locked --workspace --all-targets --all-features --retries 2
 
   shell-gates:
+    # Self-hosted runners must never execute fork code: only same-repo events
+    # reach this job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: shell gates
     # The shell that CI and the release pipeline run has no compiler to catch
     # it, so what it decides is pinned by tests of its own.
@@ -176,6 +191,9 @@ jobs:
         run: sh docs/bolthole/test-examples.sh
 
   bindings:
+    # Self-hosted runners must never execute fork code: only same-repo events
+    # reach this job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: uniffi bindings
     runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
     timeout-minutes: 20
@@ -221,6 +239,9 @@ jobs:
           grep -q "async def delete_account" target/bindings/warren_sdk_ffi.py
 
   deny:
+    # Self-hosted runners must never execute fork code: only same-repo events
+    # reach this job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo-deny
     runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
     timeout-minutes: 15
@@ -242,6 +263,9 @@ jobs:
       - run: cargo deny check
 
   coverage:
+    # Self-hosted runners must never execute fork code: only same-repo events
+    # reach this job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo llvm-cov
     # Native ARM64 Linux, NOT the x86 Rosetta runner: `-C instrument-coverage`
     # intermittently SIGSEGVs rustc under Rosetta emulation (the plain
@@ -277,6 +301,9 @@ jobs:
         run: cargo llvm-cov nextest --workspace --locked --summary-only --retries 2
 
   bolthole-slow:
+    # Self-hosted runners must never execute fork code: only same-repo events
+    # reach this job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: bolthole-core slow lane
     # The two kinds of test the default lane must not carry: one that sleeps
     # through boringtun's own monotonic clock (twenty seconds of real time,
