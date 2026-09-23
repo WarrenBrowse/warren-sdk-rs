@@ -224,12 +224,3 @@ warrenguard-pump = { path = "../warrenguard/crates/warrenguard-pump" }
 [patch."https://github.com/WarrenBrowse/warren-contract.git"]
 warren-contract = { path = "../warren-contract" }
 warren-discovery-core = { path = "../warren-contract/warren-discovery" }
-
-# The warrenguard rev pinned above still declares the warren-quinn fork over
-# ssh://, which anonymous builds cannot fetch; redirect that source to https so
-# the whole graph resolves a single quinn from the anonymous-cloneable URL.
-# Drop this section once warrenguard declares quinn over https and the
-# .warrenguard-version pin has moved past that change.
-[patch."ssh://git@github.com/WarrenBrowse/warren-quinn.git"]
-quinn = { git = "https://github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.17-fork.13", package = "warren-quinn" }
-quinn-udp = { git = "https://github.com/WarrenBrowse/warren-quinn.git", tag = "v0.11.17-fork.13", package = "warren-quinn-udp" }
