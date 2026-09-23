@@ -21,6 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 use zeroize::Zeroizing;
 
 use crate::error::NetError;
+use crate::http_forward;
 use crate::proxy_auth::{
     HTTP_PROOF_HEADER, HTTP_PROOF_METHOD, ListenerKind, PROOF_NONCE_LEN, ProxyCredentials,
 };
@@ -570,18 +571,22 @@ async fn write_reply(client: &mut TcpStream, reply: Reply) -> Result<(), NetErro
         .map_err(NetError::Io)
 }
 
-/// Largest CONNECT request head (request line plus headers) accepted.
-const MAX_HTTP_HEAD: usize = 8 * 1024;
+/// Largest request head (request line plus headers) accepted. A plain-HTTP
+/// request carries the page's cookies, so this is sized for a browser's head
+/// rather than for a bare CONNECT.
+const MAX_HTTP_HEAD: usize = 32 * 1024;
 
 /// Bytes read per call while scanning for the end of a request head.
 const HEAD_CHUNK: usize = 256;
 
-/// An HTTP CONNECT proxy server over a [`Connector`].
+/// An HTTP proxy server over a [`Connector`].
 ///
-/// Handles only the `CONNECT host:port` method (the tunneling verb a browser or
-/// HTTP client uses for HTTPS); other methods are refused. Like [`Socks5Proxy`]
-/// it relays through the connector, so the same tunnel datapath backs it, and
-/// it admits only requests carrying the session's credentials in
+/// Serves `CONNECT host:port`, the tunneling verb a browser or HTTP client uses
+/// for HTTPS, and plain `http://` requests in absolute form, one request per
+/// connection, with `Proxy-Authorization` and the other hop-by-hop fields kept
+/// off the wire to the origin. Any other request is refused. Like
+/// [`Socks5Proxy`] it relays through the connector, so the same tunnel datapath
+/// backs it, and it admits only requests carrying the session's credentials in
 /// `Proxy-Authorization: Basic`.
 pub struct HttpConnectProxy<C> {
     connector: Arc<C>,
@@ -703,7 +708,7 @@ fn connect_failure_cause(err: &NetError) -> &'static str {
 /// section 9.1). The status stays `502`, because a client's retry policy is
 /// keyed on it and this failure genuinely is a gateway that could not reach
 /// upstream; everything added is the answer to "whose gateway".
-fn connect_failure_response(err: &NetError) -> Vec<u8> {
+pub(crate) fn connect_failure_response(err: &NetError) -> Vec<u8> {
     let cause = connect_failure_cause(err);
     let body = format!(
         "warren: the local proxy has no working tunnel to reach the target ({cause}).\n\
@@ -772,6 +777,15 @@ async fn handle_connect<C: Connector>(
     if !authorized {
         let _ = client.write_all(PROXY_AUTH_REQUIRED).await;
         return Err(NetError::ProxyAuth);
+    }
+    if method != "CONNECT" && http_forward::is_absolute_http(argument) {
+        return match http_forward::rewrite_request(&head) {
+            Ok(request) => http_forward::forward(&mut client, early_data, connector, request).await,
+            Err(_) => {
+                let _ = client.write_all(http_forward::BAD_REQUEST).await;
+                Ok(())
+            }
+        };
     }
     let target = match (method, parse_authority(argument)) {
         ("CONNECT", Some(target)) => target,
@@ -852,7 +866,7 @@ async fn read_request_head(
 /// for remote resolution. IPv6 literals use the `[addr]:port` form; a bare
 /// (unbracketed) IPv6 literal or a zoned address is malformed in an authority
 /// and is rejected rather than coerced into a bogus domain name.
-fn parse_authority(authority: &str) -> Option<Target> {
+pub(crate) fn parse_authority(authority: &str) -> Option<Target> {
     // Bracketed IPv6 literal: `[addr]:port`. The address must be a real v6
     // literal (a scope/zone id is not meaningful to a remote exit), so parse it
     // strictly; anything else is rejected.

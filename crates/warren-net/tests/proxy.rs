@@ -420,32 +420,36 @@ async fn socks5_udp_associate_pins_the_client_source() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn http_rejects_non_connect_method() {
+async fn http_refuses_a_target_it_can_neither_tunnel_nor_forward() {
     let proxy = spawn_http_proxy().await;
-    let mut client = TcpStream::connect(proxy).await.expect("connect proxy");
-    client
-        .write_all(
-            format!(
-                "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n{}\r\n",
-                auth_header()
+    // Origin form addresses the proxy itself, and an `https` URL would need the
+    // proxy to speak TLS to the origin: neither is a request this proxy carries.
+    for target in ["/", "https://example.com/"] {
+        let mut client = TcpStream::connect(proxy).await.expect("connect proxy");
+        client
+            .write_all(
+                format!(
+                    "GET {target} HTTP/1.1\r\nHost: example.com\r\n{}\r\n",
+                    auth_header()
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-    let mut head = Vec::new();
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        if client.read_exact(&mut byte).await.is_err() {
-            break;
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if client.read_exact(&mut byte).await.is_err() {
+                break;
+            }
+            head.push(byte[0]);
         }
-        head.push(byte[0]);
+        let head = String::from_utf8_lossy(&head);
+        assert!(
+            head.starts_with("HTTP/1.1 405"),
+            "{target} refused: {head:?}"
+        );
     }
-    let head = String::from_utf8_lossy(&head);
-    assert!(
-        head.starts_with("HTTP/1.1 405"),
-        "non-CONNECT refused: {head:?}"
-    );
 }
 
 /// A UDP echo server standing in for the target.

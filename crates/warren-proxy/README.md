@@ -3,7 +3,7 @@
 Headless Warren proxy daemon: the SDK's supervised failover datapath as one
 long-running binary, configured entirely from the environment. No root, no
 TUN device, no capabilities: the tunnel terminates in an in-process userspace
-netstack behind a SOCKS5 listener (plus optional HTTP CONNECT), DNS resolves
+netstack behind a SOCKS5 listener (plus an optional HTTP proxy), DNS resolves
 over the tunnel, and the process keeps itself connected across drops and exit
 failures.
 
@@ -34,7 +34,7 @@ ignored while the operator believed it applied.
 | `WARREN_PROXY_PASSWORD` / `WARREN_PROXY_PASSWORD_FILE` | required | the password every client of the listeners presents (RFC 1929 on SOCKS5, `Proxy-Authorization: Basic` on HTTP CONNECT); the file variant wins and is what containers should use. 32 to 255 bytes: anyone who reaches the port can ask for proofs keyed by it and guess offline, so generate it (`openssl rand -hex 32`). There is no unauthenticated mode: without it the daemon refuses to start |
 | `WARREN_PROXY_USER` | `warren` | the username that goes with it; no colon |
 | `WARREN_SOCKS_LISTEN` | `127.0.0.1:1080` | SOCKS5 listener. Anything that reaches the port and knows the password egresses as your account, and the password crosses the network in clear (RFC 1929 and Basic carry it that way), so keep a non-loopback bind on a network you control |
-| `WARREN_HTTP_LISTEN` | off | HTTP CONNECT listener |
+| `WARREN_HTTP_LISTEN` | off | HTTP proxy listener: CONNECT tunnels, and plain `http://` requests forwarded one per connection |
 | `WARREN_HEALTH_LISTEN` | `127.0.0.1:9999` | liveness endpoint: `/healthz` (200 only when Connected AND egress verified for the CURRENT epoch: a reconnect clears the proof until a fresh probe passes), `/state`, `/port`; `off`, `none` or empty disables it, and `warren-proxy healthcheck` then exits 0, which also makes the image's `HEALTHCHECK` a no-op: the runtime can no longer tell a wedged daemon from a healthy one |
 | `WARREN_EXITS` | all exits | priority list of `cc` or `cc/city` (e.g. `de, se/stockholm`); failover tries them in order |
 | `WARREN_CIRCUIT` | `single` | `single` (direct to exit) or `multi` (entry relay then exit) |
