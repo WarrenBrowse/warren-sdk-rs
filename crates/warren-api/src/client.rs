@@ -389,20 +389,30 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         self.send_json(http).await
     }
 
-    /// Unsigned `GET /v1/checkout/{pending_id}/voucher`. Polls for a voucher
-    /// minted by a web checkout (Lightning, Monero, card). Returns the voucher
-    /// secret once it lands, or `None` on `404` (not landed yet, already
-    /// pulled, or expired); the caller keeps polling within its own deadline.
+    /// Unsigned `POST /v1/checkout/{wpid}/voucher`. Polls for the voucher a
+    /// checkout purchase minted under `wpid` (card, Lightning, Monero, ...),
+    /// presenting `pull_secret_hex`, the 64-hex secret the purchase was bound
+    /// to when it was created. The caller mints that secret with the wpid and
+    /// passes only its SHA-256 to the checkout; the secret itself travels in
+    /// this request body, never in a URL. Returns the voucher secret once it
+    /// lands, or `None` on `404` (not landed yet, already pulled, expired, or
+    /// not this purchase's secret, deliberately indistinguishable); the caller
+    /// keeps polling within its own deadline. Unsigned on purpose: a wallet
+    /// signature would join the wallet and the purchase on the server.
     ///
     /// # Errors
     ///
     /// [`ClientError`] on transport failure or any non-200/404 status.
     pub async fn pull_pending_voucher(
         &self,
-        pending_id: &str,
+        wpid: &str,
+        pull_secret_hex: &str,
     ) -> Result<Option<String>, ClientError> {
-        let path = format!("/v1/checkout/{pending_id}/voucher");
-        let req = self.unsigned_request(Method::Get, &path, Vec::new());
+        let path = format!("/v1/checkout/{wpid}/voucher");
+        let body = serialize(&PullVoucherRequest {
+            pull_secret: pull_secret_hex,
+        })?;
+        let req = self.unsigned_request(Method::Post, &path, body);
         match self.send(req).await {
             Ok(resp) => {
                 let parsed: PullVoucherResponse =
@@ -606,11 +616,17 @@ fn replace_host(url: &str, new_host: &str) -> String {
     }
 }
 
-/// Internal body of `GET /v1/checkout/{id}/voucher`. Only the secret is
+/// Internal answer of `POST /v1/checkout/{wpid}/voucher`. Only the secret is
 /// surfaced to the caller as a bare `String`.
 #[derive(serde::Deserialize)]
 struct PullVoucherResponse {
     voucher_secret: String,
+}
+
+/// Internal body of `POST /v1/checkout/{wpid}/voucher`.
+#[derive(Serialize)]
+struct PullVoucherRequest<'a> {
+    pull_secret: &'a str,
 }
 
 fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, ClientError> {
@@ -1263,21 +1279,33 @@ mod tests {
         assert!(matches!(err, ClientError::ServerStatus { status: 404, .. }));
     }
 
+    const WPID: &str = "0123456789abcdef0123456789abcdef";
+    const PULL_SECRET: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
     #[tokio::test]
-    async fn pull_pending_voucher_returns_secret_on_200_and_is_unsigned() {
+    async fn pull_pending_voucher_presents_the_pull_secret_in_an_unsigned_post() {
         let c = client(MockTransport::new(
             200,
             r#"{"voucher_secret":"vch-abcd-1234"}"#,
         ));
-        let secret = c.pull_pending_voucher("pend-1").await.expect("ok");
+        let secret = c.pull_pending_voucher(WPID, PULL_SECRET).await.expect("ok");
         assert_eq!(secret.as_deref(), Some("vch-abcd-1234"));
         let g = c.transport.last.lock().unwrap();
         let r = g.as_ref().unwrap();
-        assert_eq!(r.method, Method::Get);
-        assert_eq!(r.url, "https://api.example.test/v1/checkout/pend-1/voucher");
+        assert_eq!(r.method, Method::Post);
+        assert_eq!(
+            r.url,
+            format!("https://api.example.test/v1/checkout/{WPID}/voucher")
+        );
+        assert!(
+            !r.url.contains(PULL_SECRET),
+            "the pull secret must never ride in the URL"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(body["pull_secret"], PULL_SECRET);
         assert!(
             header(r, HEADER_PUBKEY).is_none(),
-            "voucher polling is unsigned"
+            "voucher polling is unsigned: a signature would join wallet and purchase"
         );
     }
 
@@ -1285,7 +1313,7 @@ mod tests {
     async fn pull_pending_voucher_maps_404_to_none() {
         let c = client(MockTransport::new(404, "not landed yet"));
         let secret = c
-            .pull_pending_voucher("pend-1")
+            .pull_pending_voucher(WPID, PULL_SECRET)
             .await
             .expect("404 must be Ok(None)");
         assert_eq!(secret, None);
@@ -1295,7 +1323,7 @@ mod tests {
     async fn pull_pending_voucher_propagates_other_errors() {
         let c = client(MockTransport::new(500, "boom"));
         let err = c
-            .pull_pending_voucher("pend-1")
+            .pull_pending_voucher(WPID, PULL_SECRET)
             .await
             .expect_err("a 500 must propagate");
         assert!(matches!(err, ClientError::ServerStatus { status: 500, .. }));
