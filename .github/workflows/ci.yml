@@ -126,8 +126,13 @@ jobs:
       # golden vectors must resolve against the exact transitive crates).
       # --all-features also lints the privileged per-OS datapath behind the
       # `tun`/`killswitch` features on each native runner (today empty, so this
-      # is a no-op that is already in place when those back ends land).
-      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      # is a no-op that is already in place when those back ends land). The
+      # runner-retry wrapper absorbs the runner failures the test job meets on
+      # the same runners (a rustc the host killed mid-compile); a lint still
+      # fails on the first attempt.
+      - run: >
+          bash scripts/ci/run-with-runner-retry.sh
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   test:
     # Self-hosted runners must never execute fork code: only same-repo events
@@ -211,7 +216,7 @@ jobs:
       # Build the cdylib and generate foreign bindings from it. This fails if the
       # uniffi scaffolding or any exported type/function regresses. --no-format
       # avoids a dependency on ktlint/swiftformat on the runner.
-      - run: cargo build -p warren-sdk-ffi --locked
+      - run: bash scripts/ci/run-with-runner-retry.sh cargo build -p warren-sdk-ffi --locked
       - run: >
           cargo run -p warren-sdk-ffi --bin uniffi-bindgen -- generate
           --library target/debug/libwarren_sdk_ffi.so
