@@ -63,8 +63,10 @@ warren_flake_class() { # warren_flake_class <logfile> [exit-code]
 	# A rustc SIGKILLed mid-compile. A compiler never sends itself SIGKILL:
 	# the kill comes from the host (its OOM killer, or a runner cleanup), so
 	# the crate being compiled is not at fault. Anchored on rustc: a test
-	# binary killed the same way can be the test's own doing.
-	if grep -qE "process didn't exit successfully: \`[^\`]*rustc(\.exe)? [^\`]*\` \(signal: 9, SIGKILL" "$1"; then
+	# binary killed the same way can be the test's own doing. Cargo words the
+	# signal `(signal: 9, SIGKILL: kill)`, the cargo-llvm-cov rustc wrapper
+	# `(signal: 9 (SIGKILL))`.
+	if grep -qE "process didn't exit successfully: \`[^\`]*rustc(\.exe)? [^\`]*\` \(signal: 9(, | \()SIGKILL" "$1"; then
 		echo plain
 		return
 	fi

@@ -86,6 +86,14 @@ expect "a rustc the runner killed mid-compile" plain \
 
 Caused by:
   process didn't exit successfully: \`/home/runner/.rustup/toolchains/1.91.0-aarch64-unknown-linux-gnu/bin/rustc --crate-name uniffi_bindgen --edition=2021 --crate-type lib\` (signal: 9, SIGKILL: kill)" 101
+# Run 35942251256, job "cargo llvm-cov": the same kill seen through
+# cargo-llvm-cov, which wraps rustc and words the signal its own way.
+expect "a rustc killed mid-compile under the coverage wrapper" plain \
+	"error: process didn't exit successfully: \`/home/runner/.rustup/toolchains/1.91.0-aarch64-unknown-linux-gnu/bin/rustc --crate-name uniffi_bindgen --edition=2021 -C instrument-coverage --cfg=coverage\` (signal: 9 (SIGKILL))
+error: could not compile \`uniffi_bindgen\` (lib)
+
+Caused by:
+  process didn't exit successfully: \`/home/runner/.cargo/bin/cargo-llvm-cov /home/runner/.rustup/toolchains/1.91.0-aarch64-unknown-linux-gnu/bin/rustc --crate-name uniffi_bindgen --cap-lints allow -D warnings\` (exit status: 1)" 101
 # Run 31958663710, job "cargo test (macos)": `cargo` itself was gone between
 # one attempt and the next, because another job on the same runner was
 # reinstalling the toolchain into the shared CARGO_HOME. The shell's own 127
