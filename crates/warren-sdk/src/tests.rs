@@ -2359,6 +2359,8 @@ async fn connect_multihop_with_daita_pads_the_uplink() {
         sink.session().assigned_ipv4(),
         std::net::Ipv4Addr::new(10, 66, 0, 2)
     );
+    // The connect's own first frame is cover too; only the driver's count.
+    let cover_at_connect = sink.session().metrics_snapshot().cover_packets_sent;
 
     for _ in 0..40u8 {
         let mut pkt = vec![0x45u8];
@@ -2368,7 +2370,7 @@ async fn connect_multihop_with_daita_pads_the_uplink() {
     }
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert!(
-        sink.session().metrics_snapshot().cover_packets_sent >= 1,
+        sink.session().metrics_snapshot().cover_packets_sent > cover_at_connect,
         "the DAITA driver must emit uplink cover traffic"
     );
 }

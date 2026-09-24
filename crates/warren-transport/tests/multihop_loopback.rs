@@ -5,9 +5,10 @@
 //! `WarrenMultihopFrame` first) without any real network.
 
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use warren_test_support::spawn_fake_multihop_exit;
+use warren_test_support::{spawn_fake_multihop_exit, spawn_migratable_multihop_exit};
 use warren_transport::{MultihopClientTunnel, MultihopError};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -71,6 +72,7 @@ async fn cover_traffic_is_sent_then_a_real_packet_still_round_trips() {
         )
         .await
         .expect("multihop setup");
+    let cover_before = session.metrics_snapshot().cover_packets_sent;
 
     session.send_cover_traffic(64).expect("send cover traffic");
 
@@ -88,8 +90,45 @@ async fn cover_traffic_is_sent_then_a_real_packet_still_round_trips() {
         m.packets_sent, 1,
         "cover traffic is not counted as app data"
     );
-    assert_eq!(m.cover_packets_sent, 1, "one cover frame was sent");
+    assert_eq!(
+        m.cover_packets_sent,
+        cover_before + 1,
+        "one cover frame was sent"
+    );
     session.disconnect();
+}
+
+/// A fresh session puts a frame on its connection as soon as its setup
+/// completes, before the caller has anything to send. An exit that refreshes a
+/// `/v2` session only from the connection's own traffic forgets a session that
+/// stays silent for five seconds after its setup, and drops every later frame
+/// of it until the next rekey.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_session_puts_a_frame_on_its_connection_before_any_traffic() {
+    let exit_key = SigningKey::from_bytes(&[9u8; 32]);
+    let (exit_addr, keys, observer) = spawn_migratable_multihop_exit(exit_key, true).await;
+    let session = MultihopClientTunnel::new(SigningKey::from_bytes(&[1u8; 32]))
+        .connect(
+            keys.ed25519_pubkey,
+            keys.x25519_pubkey,
+            keys.exit_id,
+            exit_addr,
+        )
+        .await
+        .expect("multihop setup");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while observer.client_addrs().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let m = session.metrics_snapshot();
+    session.disconnect();
+    assert!(
+        !observer.client_addrs().is_empty(),
+        "the exit received no datagram within a second of the setup"
+    );
+    assert_eq!(m.packets_sent, 0, "the first frame is never app data");
+    assert_eq!(m.cover_packets_sent, 1, "it is counted as the cover it is");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -773,14 +773,16 @@ impl MultihopClientTunnel {
             Err(e) => return Err(MultihopError::Setup(SetupError::Control(e))),
         };
 
-        Ok(MultihopSession {
+        let session = MultihopSession {
             inner,
             conn,
             carrier,
             assignment,
             metrics: Arc::new(MultihopMetrics::new(0)),
             drain_tx: tokio::sync::watch::channel(None).0,
-        })
+        };
+        session.send_first_frame();
+        Ok(session)
     }
 }
 
@@ -1415,6 +1417,35 @@ impl MultihopSession {
     /// Close the connection cleanly.
     pub fn disconnect(&self) {
         self.inner.close(0, b"client disconnect");
+    }
+}
+
+impl MultihopSession {
+    /// Puts one cover datagram on the connection the moment its setup
+    /// completes.
+    ///
+    /// An exit that refreshes a `/v2` session only from the connection's own
+    /// traffic forgets a session that stays silent for five seconds after its
+    /// setup, and drops every later frame of it until the client's next rekey.
+    /// Such exits are deployed, and a session can sit idle right after its
+    /// setup (a bonded member no packet has been striped onto yet, a proxy no
+    /// application uses yet), so the session speaks first. The datagram is
+    /// idle cover, dropped by the exit before its TUN and sized from the same
+    /// distribution as every other cover datagram, from a seed of its own:
+    /// the idle-cover driver seeds from
+    /// [`CoverSink::cover_seed`](warrenguard_pump::idle_cover::CoverSink::cover_seed),
+    /// and sharing it would open that driver with a datagram of the same size.
+    /// A send that fails means the connection is already dying, which the
+    /// caller learns on its first use.
+    fn send_first_frame(&self) {
+        use rand_core::RngCore;
+
+        let budget = self.max_inner_payload();
+        let now = Instant::now();
+        let seed = rand_core::UnwrapErr(rand_core::OsRng).next_u64();
+        let size =
+            warrenguard_pump::idle_cover::IdleCover::new(seed, now, Some(budget)).fire_size(now);
+        let _ = self.send_cover_traffic(size.saturating_sub(1).min(budget.saturating_sub(1)));
     }
 }
 
