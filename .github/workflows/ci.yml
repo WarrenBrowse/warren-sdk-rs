@@ -99,7 +99,11 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo clippy (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
+    # The Windows runners share one guest with every other repo's Windows jobs.
+    # The last green Windows legs under a 40-minute budget took 38 and 39
+    # minutes, and a busy guest then spent 34 minutes on checkout and setup
+    # alone, leaving the test suite six.
+    timeout-minutes: ${{ matrix.name == 'windows' && 90 || 40 }}
     strategy:
       fail-fast: false
       matrix:
@@ -131,7 +135,8 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo test (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
+    # Same Windows budget as the clippy job, for the same reason.
+    timeout-minutes: ${{ matrix.name == 'windows' && 90 || 40 }}
     strategy:
       fail-fast: false
       matrix:
