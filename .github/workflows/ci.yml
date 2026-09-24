@@ -297,8 +297,12 @@ jobs:
         # Run coverage THROUGH nextest so the same retry policy as the cargo-test
         # job (--retries 2) absorbs the in-process quinn / DNS loopback timing
         # flakes. Plain `cargo llvm-cov` has no retries and turns those transient
-        # timeouts into hard coverage failures.
-        run: cargo llvm-cov nextest --workspace --locked --summary-only --retries 2
+        # timeouts into hard coverage failures. The runner-retry wrapper covers
+        # the build, which runs on the same runners as the test job and meets
+        # the same runner failures (a rustc the host killed mid-compile).
+        run: >
+          bash scripts/ci/run-with-runner-retry.sh
+          cargo llvm-cov nextest --workspace --locked --summary-only --retries 2
 
   bolthole-slow:
     # Self-hosted runners must never execute fork code: only same-repo events
