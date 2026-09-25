@@ -20,7 +20,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use warren_wire::natpmp::{self, MapProto, Request, Response, ResultCode};
+use warren_wire::natpmp::{self, MapProto, Request, Response, ResultCode, TrailerError};
 
 use crate::error::NetError;
 use crate::netstack::{NetstackListener, NetstackStream, TunnelConnector};
@@ -61,6 +61,16 @@ pub struct PortMapping {
     pub lifetime_secs: u32,
 }
 
+/// Supplies the credential a refresh cycle presents, or `None` for a cycle that
+/// presents nothing.
+///
+/// The same contract as the engine client's `CredentialProvider`
+/// (`warrenguard-natpmp-client`): consulted once per cycle rather than captured
+/// once, because a port entitlement is valid for its own epoch only, so a
+/// mapping that outlives an epoch presents the next epoch's credential at its
+/// next renewal without the forward restarting.
+pub type CredentialProvider = Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>;
+
 /// Failure of a NAT-PMP exchange.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -78,6 +88,9 @@ pub enum PortForwardError {
     /// The gateway replied to a different request than the one sent.
     #[error("nat-pmp gateway replied to the wrong request")]
     UnexpectedReply,
+    /// The credential does not fit the request trailer. Nothing was sent.
+    #[error("nat-pmp credential does not fit the request trailer")]
+    Credential(#[source] TrailerError),
 }
 
 impl PortForwardError {
@@ -89,6 +102,15 @@ impl PortForwardError {
     #[must_use]
     pub fn is_suggested_port_conflict(&self) -> bool {
         matches!(self, Self::Gateway(ResultCode::SuggestedPortUnavailable))
+    }
+
+    /// True when the gateway refused the request as not authorized
+    /// ([`ResultCode::NotAuthorized`]). An exit that requires a port
+    /// entitlement answers this to a Map request that presents none, or one it
+    /// will not spend.
+    #[must_use]
+    pub fn is_not_authorized(&self) -> bool {
+        matches!(self, Self::Gateway(ResultCode::NotAuthorized))
     }
 }
 
@@ -119,11 +141,22 @@ pub async fn exchange<F: UdpFlow>(
     request: Request,
 ) -> Result<Response, PortForwardError> {
     let wire = natpmp::serialize_request(&request);
+    exchange_frame(flow, gateway, &request, &wire).await
+}
+
+/// [`exchange`] over an already-serialized `wire` frame for `request`, which
+/// may carry a trailer after the RFC bytes.
+async fn exchange_frame<F: UdpFlow>(
+    flow: &mut F,
+    gateway: Ipv4Addr,
+    request: &Request,
+    wire: &[u8],
+) -> Result<Response, PortForwardError> {
     let server = SocketAddr::from((gateway, NATPMP_PORT));
     let mut rto = INITIAL_RTO;
 
     for _ in 0..MAX_ATTEMPTS {
-        flow.send_to(Bytes::copy_from_slice(&wire), server)
+        flow.send_to(Bytes::copy_from_slice(wire), server)
             .await
             .map_err(PortForwardError::Transport)?;
 
@@ -147,7 +180,7 @@ pub async fn exchange<F: UdpFlow>(
                     let Ok(resp) = natpmp::parse_response(&data) else {
                         continue;
                     };
-                    if response_matches(&request, &resp) {
+                    if response_matches(request, &resp) {
                         return Ok(resp);
                     }
                     // A reply to some other opcode: keep waiting in this window.
@@ -181,17 +214,39 @@ pub async fn map<F: UdpFlow>(
     gateway: Ipv4Addr,
     spec: MapSpec,
 ) -> Result<PortMapping, PortForwardError> {
-    let resp = exchange(
-        flow,
-        gateway,
-        Request::Map {
-            proto: spec.proto,
-            internal_port: spec.internal_port,
-            suggested_external_port: spec.suggested_external_port,
-            lifetime_secs: spec.lifetime_secs,
-        },
-    )
-    .await?;
+    map_with_credential(flow, gateway, spec, None).await
+}
+
+/// [`map`] presenting `credential` in the Warren credential trailer after the
+/// 12 RFC bytes (`warrenguard-natpmp-protocol`, frozen by `vectors/natpmp.json`).
+/// The bytes are opaque here: for a Warren exit they are the entitlement
+/// envelope a `PortEntitlementManager` slot vends (warren-core doc 105).
+///
+/// # Errors
+///
+/// [`PortForwardError::Credential`] when the credential is larger than the
+/// trailer carries (nothing is sent: a truncated one would read as none),
+/// plus the [`map`] errors. An exit that requires a credential answers
+/// [`ResultCode::NotAuthorized`] to `None`
+/// ([`PortForwardError::is_not_authorized`]).
+pub async fn map_with_credential<F: UdpFlow>(
+    flow: &mut F,
+    gateway: Ipv4Addr,
+    spec: MapSpec,
+    credential: Option<&[u8]>,
+) -> Result<PortMapping, PortForwardError> {
+    let request = Request::Map {
+        proto: spec.proto,
+        internal_port: spec.internal_port,
+        suggested_external_port: spec.suggested_external_port,
+        lifetime_secs: spec.lifetime_secs,
+    };
+    let mut wire = natpmp::serialize_request(&request);
+    if let Some(credential) = credential {
+        natpmp::append_credential_trailer(&mut wire, credential)
+            .map_err(PortForwardError::Credential)?;
+    }
+    let resp = exchange_frame(flow, gateway, &request, &wire).await?;
 
     match resp {
         Response::Map {
@@ -216,6 +271,74 @@ pub async fn map<F: UdpFlow>(
         Response::Map { result_code, .. } => Err(PortForwardError::Gateway(result_code)),
         _ => Err(PortForwardError::UnexpectedReply),
     }
+}
+
+/// One refresh cycle: one Map request per leg in `legs`, every leg presenting
+/// the credential `credential` answered for this cycle.
+///
+/// The provider is asked ONCE, before the first leg: a TCP+UDP pair is one
+/// forwarded port, and two credentials for it would read as two at the exit.
+/// Every leg after the first asks for the port the first one was granted, so
+/// the pair shares one public port. A leg refused after an earlier one was
+/// granted releases the earlier ones before the error is returned, so a pair
+/// never survives half-mapped. Returns one [`PortMapping`] per leg, in order.
+///
+/// # Errors
+///
+/// The first failing leg's [`map_with_credential`] error.
+pub async fn map_cycle<F: UdpFlow>(
+    flow: &mut F,
+    gateway: Ipv4Addr,
+    legs: &[MapProto],
+    internal_port: u16,
+    suggested_external_port: u16,
+    lifetime_secs: u32,
+    credential: Option<&CredentialProvider>,
+) -> Result<Vec<PortMapping>, PortForwardError> {
+    let cycle_credential = credential.and_then(|provider| provider());
+    let mut granted: Vec<PortMapping> = Vec::with_capacity(legs.len());
+    for &proto in legs {
+        let suggested = granted
+            .first()
+            .map_or(suggested_external_port, |first| first.external_port);
+        let spec = MapSpec {
+            proto,
+            internal_port,
+            suggested_external_port: suggested,
+            lifetime_secs,
+        };
+        match map_with_credential(flow, gateway, spec, cycle_credential.as_deref()).await {
+            Ok(mapping) => granted.push(mapping),
+            Err(err) => {
+                for leg in &granted {
+                    let _ = delete(flow, gateway, leg.proto, internal_port).await;
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(granted)
+}
+
+/// [`map_cycle`] for the single leg `spec` names.
+async fn map_single_leg<F: UdpFlow>(
+    flow: &mut F,
+    gateway: Ipv4Addr,
+    spec: MapSpec,
+    credential: Option<&CredentialProvider>,
+) -> Result<PortMapping, PortForwardError> {
+    map_cycle(
+        flow,
+        gateway,
+        &[spec.proto],
+        spec.internal_port,
+        spec.suggested_external_port,
+        spec.lifetime_secs,
+        credential,
+    )
+    .await?
+    .pop()
+    .ok_or(PortForwardError::UnexpectedReply)
 }
 
 /// Queries the gateway's public IPv4 address.
@@ -289,13 +412,20 @@ pub async fn delete<F: UdpFlow>(
 /// at half the granted lifetime, until `shutdown` resolves. On shutdown it makes
 /// a best-effort delete so the exit reclaims the port promptly.
 ///
+/// Every map and renewal is one [`map_cycle`], so `credential` is asked afresh
+/// each time and a forward that outlives an entitlement epoch presents the
+/// next one. The delete presents nothing: it buys nothing, and an exit serves
+/// it whatever the client holds.
+///
 /// # Errors
 ///
-/// Propagates the first [`map`] failure (the gateway went away or refused).
+/// Propagates the first [`map_cycle`] failure (the gateway went away or
+/// refused).
 pub async fn run_refresh<F, U, S>(
     mut flow: F,
     gateway: Ipv4Addr,
     spec: MapSpec,
+    credential: Option<CredentialProvider>,
     mut on_update: U,
     shutdown: S,
 ) -> Result<(), PortForwardError>
@@ -306,7 +436,7 @@ where
 {
     tokio::pin!(shutdown);
     loop {
-        let mapping = map(&mut flow, gateway, spec).await?;
+        let mapping = map_single_leg(&mut flow, gateway, spec, credential.as_ref()).await?;
         on_update(mapping);
         tokio::select! {
             // Prefer shutdown if both are ready, so teardown is not skipped.
@@ -406,6 +536,9 @@ impl Drop for ForwardedPort {
 /// `local_target` (a local TCP server the app runs), and renews the mapping in
 /// the background until the returned [`ForwardedPort`] is dropped.
 ///
+/// Presents no credential, so an exit that requires a port entitlement
+/// refuses it; [`forward_port_with_suggested`] takes a [`CredentialProvider`].
+///
 /// The local TCP `listener` is bound before the mapping is requested, so an
 /// inbound connection arriving the instant the exit opens the port is accepted
 /// rather than refused. The initial mapping is awaited so the caller learns the
@@ -423,11 +556,21 @@ pub async fn forward_port(
     internal_port: u16,
     local_target: SocketAddr,
 ) -> Result<ForwardedPort, PortForwardError> {
-    forward_port_with_suggested(connector, gateway, proto, internal_port, local_target, 0).await
+    forward_port_with_suggested(
+        connector,
+        gateway,
+        proto,
+        internal_port,
+        local_target,
+        0,
+        None,
+    )
+    .await
 }
 
 /// Like [`forward_port`], but asks the exit to grant `suggested_external_port`
-/// (`0` lets the gateway choose, identical to [`forward_port`]).
+/// (`0` lets the gateway choose) and presents what `credential` holds on the
+/// initial map and on every renewal (see [`map_cycle`]).
 ///
 /// A supervised forward re-suggests the previously-granted port across
 /// reconnects so the public port "follows" the client. The exit honours the
@@ -438,7 +581,9 @@ pub async fn forward_port(
 /// # Errors
 ///
 /// Same as [`forward_port`], plus [`PortForwardError::Gateway`] with
-/// [`ResultCode::SuggestedPortUnavailable`] when the re-suggested port is taken.
+/// [`ResultCode::SuggestedPortUnavailable`] when the re-suggested port is taken,
+/// and [`PortForwardError::Credential`] for a credential the trailer cannot
+/// carry.
 pub async fn forward_port_with_suggested(
     connector: &TunnelConnector,
     gateway: Ipv4Addr,
@@ -446,6 +591,7 @@ pub async fn forward_port_with_suggested(
     internal_port: u16,
     local_target: SocketAddr,
     suggested_external_port: u16,
+    credential: Option<CredentialProvider>,
 ) -> Result<ForwardedPort, PortForwardError> {
     let listener = connector
         .listen(internal_port)
@@ -464,7 +610,7 @@ pub async fn forward_port_with_suggested(
     };
     // Map once synchronously: this surfaces a real gateway refusal to the caller
     // and yields the allocated external port before the handle is returned.
-    let granted = map(&mut flow, gateway, spec).await?;
+    let granted = map_single_leg(&mut flow, gateway, spec, credential.as_ref()).await?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let refresh = tokio::spawn(async move {
@@ -479,7 +625,7 @@ pub async fn forward_port_with_suggested(
                     return;
                 }
                 () = tokio::time::sleep(wait) => {
-                    match map(&mut flow, gateway, spec).await {
+                    match map_single_leg(&mut flow, gateway, spec, credential.as_ref()).await {
                         Ok(m) => wait = refresh_after(m.lifetime_secs),
                         // The gateway went away or refused renewal: stop quietly
                         // rather than spin; the lease lapses at the exit.
@@ -570,17 +716,22 @@ impl Drop for RawForwardedPort {
 /// exit honours it strictly and answers
 /// [`ResultCode::SuggestedPortUnavailable`] when it is taken.
 ///
+/// `credential` is asked on the initial map and on every renewal (see
+/// [`run_refresh`]); `None` presents nothing, which an exit that requires a
+/// port entitlement refuses.
+///
 /// # Errors
 ///
 /// [`PortForwardError::Transport`] if the flow is gone,
 /// [`PortForwardError::Gateway`] if the exit refuses the mapping, plus the
-/// remaining [`PortForwardError`] variants from the initial [`map`] exchange.
+/// remaining [`PortForwardError`] variants from the initial [`map_cycle`].
 pub async fn forward_port_raw<F>(
     mut flow: F,
     gateway: Ipv4Addr,
     proto: MapProto,
     internal_port: u16,
     suggested_external_port: u16,
+    credential: Option<CredentialProvider>,
 ) -> Result<RawForwardedPort, PortForwardError>
 where
     F: UdpFlow + Send + 'static,
@@ -591,7 +742,7 @@ where
         suggested_external_port,
         lifetime_secs: DEFAULT_MAP_LIFETIME_SECS,
     };
-    let granted = map(&mut flow, gateway, spec).await?;
+    let granted = map_single_leg(&mut flow, gateway, spec, credential.as_ref()).await?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let renewal = MapSpec {
@@ -599,7 +750,7 @@ where
         ..spec
     };
     let refresh = tokio::spawn(async move {
-        let _ = run_refresh(flow, gateway, renewal, |_| {}, async move {
+        let _ = run_refresh(flow, gateway, renewal, credential, |_| {}, async move {
             let _ = shutdown_rx.await;
         })
         .await;
@@ -932,6 +1083,7 @@ mod tests {
                 gw,
                 GW,
                 spec,
+                None,
                 move |m| {
                     assert_eq!(m.external_port, 40003);
                     updates_seen.fetch_add(1, Ordering::SeqCst);
@@ -1000,7 +1152,7 @@ mod tests {
         let gw = FakeGateway::new(Behavior::Grant(40001));
         let requests = Arc::clone(&gw.requests);
 
-        let port = forward_port_raw(gw, GW, MapProto::Tcp, 8080, 0)
+        let port = forward_port_raw(gw, GW, MapProto::Tcp, 8080, 0, None)
             .await
             .expect("the gateway grants the mapping");
 
@@ -1023,7 +1175,7 @@ mod tests {
     async fn a_raw_forward_releases_its_mapping_on_shutdown() {
         let gw = FakeGateway::new(Behavior::Grant(40001));
         let requests = Arc::clone(&gw.requests);
-        let port = forward_port_raw(gw, GW, MapProto::Udp, 51820, 0)
+        let port = forward_port_raw(gw, GW, MapProto::Udp, 51820, 0, None)
             .await
             .expect("granted");
 
@@ -1044,12 +1196,138 @@ mod tests {
         // The follow policy above this reads the conflict to decide whether to
         // degrade to a server pick or hold a pinned port.
         let gw = FakeGateway::new(Behavior::Reject(ResultCode::SuggestedPortUnavailable));
-        let err = forward_port_raw(gw, GW, MapProto::Tcp, 8080, 40001)
+        let err = forward_port_raw(gw, GW, MapProto::Tcp, 8080, 40001, None)
             .await
             .expect_err("the exit refuses a taken port");
         assert!(
             err.is_suggested_port_conflict(),
             "the refusal must stay distinguishable: {err:?}"
+        );
+    }
+
+    /// A provider that answers `[n; 8]` on its n-th call, so a frame's trailer
+    /// names the cycle that asked for it.
+    fn counting_provider() -> (CredentialProvider, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let provider: CredentialProvider = Arc::new(move || {
+            let n = seen.fetch_add(1, Ordering::SeqCst) + 1;
+            Some(vec![u8::try_from(n).expect("few calls"); 8])
+        });
+        (provider, calls)
+    }
+
+    #[test]
+    fn a_not_authorized_refusal_is_classified_distinctly() {
+        // An exit that requires a port entitlement answers NotAuthorized to a
+        // Map request without one; the SDK turns that into its typed refusal,
+        // so it must not be confused with a conflict or a transport failure.
+        assert!(PortForwardError::Gateway(ResultCode::NotAuthorized).is_not_authorized());
+        assert!(!PortForwardError::Gateway(ResultCode::OutOfResources).is_not_authorized());
+        assert!(!PortForwardError::Timeout.is_not_authorized());
+    }
+
+    #[tokio::test]
+    async fn a_map_presents_its_credential_in_the_request_trailer() {
+        let mut gw = FakeGateway::new(Behavior::Grant(40001));
+        let credential = vec![0xA5; 500];
+
+        map_with_credential(&mut gw, GW, spec(), Some(&credential))
+            .await
+            .expect("granted");
+
+        let reqs = gw.requests.lock().unwrap();
+        assert_eq!(
+            natpmp::credential_trailer(&reqs[0]),
+            Some(credential.as_slice()),
+            "the Map request must carry the credential after its 12 RFC bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_credential_the_trailer_cannot_carry_is_refused_before_anything_is_sent() {
+        let mut gw = FakeGateway::new(Behavior::Grant(40001));
+        let oversized = vec![0u8; natpmp::MAX_CREDENTIAL_LEN + 1];
+
+        let err = map_with_credential(&mut gw, GW, spec(), Some(&oversized))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, PortForwardError::Credential(_)), "{err:?}");
+        assert!(
+            gw.requests.lock().unwrap().is_empty(),
+            "a truncated credential would read as no credential at the exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_legs_of_a_pair_present_the_one_credential_their_cycle_drew() {
+        // A TCP+UDP pair is ONE forwarded port: two credentials for it would
+        // spend two entitlements, and one drawn per leg would do exactly that.
+        let mut gw = FakeGateway::new(Behavior::Grant(40001));
+        let (provider, calls) = counting_provider();
+
+        let granted = map_cycle(
+            &mut gw,
+            GW,
+            &[MapProto::Tcp, MapProto::Udp],
+            8080,
+            0,
+            3600,
+            Some(&provider),
+        )
+        .await
+        .expect("both legs granted");
+
+        assert_eq!(granted.len(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one draw per cycle");
+        let reqs = gw.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        for frame in reqs.iter() {
+            assert_eq!(natpmp::credential_trailer(frame), Some(&[1u8; 8][..]));
+        }
+        assert_eq!(
+            u16::from_be_bytes([reqs[1][6], reqs[1][7]]),
+            40001,
+            "the second leg asks for the port the first leg was granted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_renewal_presents_what_the_provider_holds_at_that_cycle() {
+        // An entitlement is valid for its own epoch only: a forward that
+        // outlives the epoch must present the next batch at its next renewal,
+        // which only a provider asked afresh each cycle can deliver.
+        let gw = FakeGateway::new(Behavior::Grant(40001));
+        let requests = Arc::clone(&gw.requests);
+        let (provider, _) = counting_provider();
+
+        let port = forward_port_raw(gw, GW, MapProto::Tcp, 8080, 0, Some(provider))
+            .await
+            .expect("granted");
+        // The granted 7200 s lease renews at half-life: cross one renewal.
+        tokio::time::sleep(Duration::from_secs(3601)).await;
+        port.shutdown().await;
+
+        let reqs = requests.lock().unwrap();
+        let maps: Vec<&Vec<u8>> = reqs
+            .iter()
+            .filter(|f| u32::from_be_bytes([f[8], f[9], f[10], f[11]]) != 0)
+            .collect();
+        assert!(maps.len() >= 3, "initial map plus renewals: {}", maps.len());
+        for (i, frame) in maps.iter().enumerate() {
+            let expected = vec![u8::try_from(i + 1).unwrap(); 8];
+            assert_eq!(
+                natpmp::credential_trailer(frame),
+                Some(expected.as_slice()),
+                "map request {i} did not present its own cycle's credential"
+            );
+        }
+        let delete = reqs.last().expect("the release");
+        assert_eq!(
+            natpmp::credential_trailer(delete),
+            None,
+            "a delete buys nothing and presents nothing"
         );
     }
 

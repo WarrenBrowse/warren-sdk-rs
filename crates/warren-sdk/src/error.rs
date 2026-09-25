@@ -90,6 +90,19 @@ pub enum SdkError {
     /// capable exit (e.g. `ExitQuery::with_require_port_forward(true)`).
     #[error("the selected exit does not support port forwarding (NAT-PMP is disabled on it)")]
     PortForwardUnsupported,
+    /// The exit refused the port-forward mapping as not authorized (NAT-PMP
+    /// result code 2). An exit enforcing warren-core doc 105 refuses a Map
+    /// request that presents no port entitlement, or one it will not spend.
+    /// `entitlement_presented` is `false` when the wallet held none for this
+    /// epoch (its batch is spent on other rules, or the issuer has not
+    /// answered). A banned wallet surfaces as
+    /// [`ClientError::Banned`] through [`SdkError::Api`] instead, because the
+    /// ban is the reason.
+    #[error("the exit refused the port forward: no port entitlement it would spend")]
+    PortForwardRefused {
+        /// Whether the refused request carried an entitlement envelope.
+        entitlement_presented: bool,
+    },
     /// The client builder was misconfigured.
     #[error(transparent)]
     Build(#[from] BuildError),

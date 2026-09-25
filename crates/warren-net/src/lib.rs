@@ -65,8 +65,9 @@ pub use netstack::{
 };
 #[cfg(feature = "proxy")]
 pub use portforward::{
-    ForwardedPort, MapSpec, PortForwardError, PortMapping, RawForwardedPort, forward_port,
-    forward_port_raw, forward_port_with_suggested, relay_to_local, run_refresh, serve_inbound,
+    CredentialProvider, ForwardedPort, MapSpec, PortForwardError, PortMapping, RawForwardedPort,
+    forward_port, forward_port_raw, forward_port_with_suggested, map_cycle, map_with_credential,
+    relay_to_local, run_refresh, serve_inbound,
 };
 #[cfg(feature = "proxy")]
 pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy, UdpConnector, UdpFlow};

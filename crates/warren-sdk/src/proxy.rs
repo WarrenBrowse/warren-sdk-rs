@@ -125,6 +125,10 @@ pub struct ProxyForwarder {
     /// reject. Defaults `true` for datapaths whose exit capability is not known
     /// on this path (e.g. multihop), preserving prior behaviour.
     pub(crate) port_forward_supported: bool,
+    /// The wallet's port entitlements (warren-core doc 105): every mapping
+    /// presents its rule's slot. `None` presents nothing, which an enforcing
+    /// exit refuses.
+    pub(crate) entitlements: Option<crate::entitlements::PortEntitlements>,
 }
 
 impl ProxyForwarder {
@@ -153,16 +157,44 @@ impl ProxyForwarder {
     /// port follows the client; a taken port surfaces as
     /// [`SdkError::PortForward`] rather than a silent random fallback.
     ///
+    /// The mapping presents a port entitlement from its own slot of the
+    /// wallet's batch, held for the life of the returned port and freed with
+    /// it (warren-core doc 105).
+    ///
     /// # Errors
     ///
     /// [`SdkError::PortForward`] if the engine has stopped, a socket cannot be
-    /// opened, or the exit refuses (or cannot honour) the mapping.
+    /// opened, or the exit refuses (or cannot honour) the mapping;
+    /// [`SdkError::PortForwardRefused`] when the exit refuses it for want of an
+    /// entitlement it would spend; [`SdkError::Api`] with
+    /// [`ClientError::Banned`](warren_api::ClientError::Banned) when that
+    /// refusal is explained by the issuer banning the wallet.
     pub async fn forward_port_with_suggested(
         &self,
         proto: warren_net::MapProto,
         internal_port: u16,
         local_target: SocketAddr,
         suggested_external_port: u16,
+    ) -> Result<warren_net::ForwardedPort, SdkError> {
+        self.forward_port_for_rule(
+            proto,
+            internal_port,
+            local_target,
+            suggested_external_port,
+            &crate::entitlements::RuleSlot::default(),
+        )
+        .await
+    }
+
+    /// [`Self::forward_port_with_suggested`] for a rule that keeps `rule`'s
+    /// slot across the mappings it re-establishes.
+    pub(crate) async fn forward_port_for_rule(
+        &self,
+        proto: warren_net::MapProto,
+        internal_port: u16,
+        local_target: SocketAddr,
+        suggested_external_port: u16,
+        rule: &crate::entitlements::RuleSlot,
     ) -> Result<warren_net::ForwardedPort, SdkError> {
         // doc 79: gate the feature on the exit's advertised capability. Warren
         // is mono-IP, so an exit that does not run NAT-PMP cannot honour a
@@ -173,6 +205,7 @@ impl ProxyForwarder {
         if !self.port_forward_supported {
             return Err(SdkError::PortForwardUnsupported);
         }
+        let (credential, lease) = rule.provider(self.entitlements.as_ref()).await.unzip();
         warren_net::forward_port_with_suggested(
             &self.connector,
             self.gateway,
@@ -180,9 +213,12 @@ impl ProxyForwarder {
             internal_port,
             local_target,
             suggested_external_port,
+            credential,
         )
         .await
-        .map_err(SdkError::from)
+        .map_err(|e| {
+            crate::entitlements::forward_error(e, self.entitlements.as_ref(), lease.as_deref())
+        })
     }
 }
 
@@ -200,6 +236,9 @@ pub struct ProxyHandle {
     /// single-hop [`start_proxy`](crate::WarrenClient::start_proxy) overrides it
     /// from the resolved relay's roster flag.
     pub(crate) port_forward_supported: bool,
+    /// The wallet's port entitlements, threaded onto every [`ProxyForwarder`]
+    /// this handle hands out. Set by the client that started the datapath.
+    pub(crate) entitlements: Option<crate::entitlements::PortEntitlements>,
     pub(crate) tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Live session counters, present for the multihop datapath (`None` for the
     /// single-hop `start_proxy`, which has no sealed-session metrics).
@@ -281,6 +320,7 @@ impl ProxyHandle {
             connector: self.forward_connector.clone(),
             gateway: self.gateway,
             port_forward_supported: self.port_forward_supported,
+            entitlements: self.entitlements.clone(),
         }
     }
 
@@ -397,6 +437,7 @@ where
         // this shared path (multihop carries no such flag yet). The single-hop
         // start_proxy overrides this from the resolved relay (doc 79).
         port_forward_supported: true,
+        entitlements: None,
         tasks,
         metrics: None,
     })

@@ -129,6 +129,7 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
             supervise_proxy(
                 socks_listener,
                 None,
+                None,
                 crate::supervisor::SupervisorOutputs {
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
                     reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -213,6 +214,7 @@ async fn network_path_change_redials_immediately_without_rotating() {
         tokio::spawn(async move {
             supervise_proxy(
                 socks_listener,
+                None,
                 None,
                 crate::supervisor::SupervisorOutputs {
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -315,6 +317,7 @@ async fn spawn_migration_harness(exit: VerifiedExit) -> MigrationHarness {
         tokio::spawn(async move {
             supervise_proxy(
                 socks_listener,
+                None,
                 None,
                 crate::supervisor::SupervisorOutputs {
                     // The fake exit runs no resolver, so the in-tunnel egress
@@ -629,6 +632,7 @@ async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
             supervise_proxy(
                 socks_listener,
                 None,
+                None,
                 crate::supervisor::SupervisorOutputs {
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
                     reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -714,6 +718,7 @@ async fn supervisor_reselects_on_an_exhaustion_refusal_without_going_fatal() {
             supervise_proxy(
                 socks_listener,
                 None,
+                None,
                 crate::supervisor::SupervisorOutputs {
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
                     reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -780,6 +785,7 @@ async fn supervisor_metrics_probe_reads_the_live_epoch_and_never_outlives_it() {
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
+            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -876,6 +882,7 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
+            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -1632,6 +1639,7 @@ async fn supervisor_serves_both_socks_and_http_listeners() {
         supervise_proxy(
             listeners,
             None,
+            None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -1686,6 +1694,7 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
+            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -1757,6 +1766,7 @@ async fn supervisor_failover_rotates_on_drain() {
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
+            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -1837,6 +1847,7 @@ async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
+            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -1921,6 +1932,7 @@ async fn supervisor_retries_past_failed_attempts_then_connects() {
             supervise_proxy(
                 socks_listener,
                 None,
+                None,
                 crate::supervisor::SupervisorOutputs {
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
                     reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -1999,6 +2011,7 @@ async fn supervisor_emits_structured_migration_events_on_drain() {
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
+            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -2112,6 +2125,7 @@ async fn supervisor_gate_veto_cancels_the_migration_and_keeps_serving() {
             supervise_proxy(
                 socks_listener,
                 None,
+                None,
                 crate::supervisor::SupervisorOutputs {
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
                     reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -2201,6 +2215,7 @@ async fn supervisor_gate_approval_lets_the_migration_proceed() {
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
+            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -2572,6 +2587,7 @@ async fn forward_port_is_refused_when_exit_lacks_port_forward_capability() {
         connector,
         gateway: gw,
         port_forward_supported: false,
+        entitlements: None,
     };
     let err = forwarder
         .forward_port(
@@ -2732,6 +2748,7 @@ async fn a_dead_datapath_is_reported_as_a_session_close_with_its_transport_reaso
         supervise_proxy(
             socks_listener,
             None,
+            None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -2811,6 +2828,7 @@ async fn an_egress_probe_conviction_is_reported_as_such_not_as_a_session_close()
         supervise_proxy(
             socks_listener,
             None,
+            None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Publish(escalate_tx),
                 reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -2887,6 +2905,7 @@ async fn a_host_requested_rebuild_ends_the_epoch_without_dropping_the_listener()
     let task = tokio::spawn(async move {
         supervise_proxy(
             socks_listener,
+            None,
             None,
             crate::supervisor::SupervisorOutputs {
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -3606,6 +3625,7 @@ async fn a_supervised_packet_datapath_counts_the_uplink_it_drops() {
         OneShotUplinkDevice,
         addressing_tx,
         Arc::clone(&stats),
+        None,
     );
     let run = EpochDatapath::<OverBudgetSink>::start(
         &mut datapath,

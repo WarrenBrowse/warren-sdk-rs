@@ -32,7 +32,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use warren_sdk::api::{ClientError, PubkeySs58, RegisterAccountRequest};
+use warren_sdk::api::{BanReasonCode, ClientError, PubkeySs58, RegisterAccountRequest};
 use warren_sdk::identity::{WarrenIdentity, ss58};
 use warren_sdk::net::{ForwardedPort, MapProto, ProxyConfig, ProxyCredentials};
 use warren_sdk::transport::{Backoff, ConnectionState, FatalCause, RetryError, connect_with_state};
@@ -71,6 +71,36 @@ pub enum FfiError {
         /// Human-readable, redaction-safe summary.
         message: String,
     },
+    /// The exit refused a port forward as not authorized (NAT-PMP result code
+    /// 2): it presented no port entitlement, or one the exit would not spend
+    /// (warren-core doc 105). `entitlement_presented` is `false` when the
+    /// wallet held none for this epoch, which every live forward of the wallet
+    /// beyond its batch meets.
+    #[error("the exit refused the port forward: no port entitlement it would spend")]
+    PortForwardRefused {
+        /// Whether the refused request carried an entitlement envelope.
+        entitlement_presented: bool,
+    },
+    /// The issuer refuses the wallet: it is banned, so no enforcing exit
+    /// grants it a forwarded port until the ban lapses or is lifted.
+    #[error("the account is banned")]
+    Banned {
+        /// Why the account is banned.
+        reason: FfiBanReason,
+        /// When the ban lapses on its own, Unix seconds; `None` when it does
+        /// not.
+        lapses_at_unix_secs: Option<u64>,
+    },
+}
+
+/// Why an account is banned. Mirrors the contract's `BanReasonCode` across
+/// the FFI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiBanReason {
+    /// Three port-forward abuse strikes inside the sliding window.
+    PortForwardingAbuse,
+    /// Any other revocation, and any reason this build does not know.
+    Other,
 }
 
 /// Connection lifecycle state reported to a [`ConnectionObserver`]. Mirrors
@@ -1042,10 +1072,15 @@ impl WarrenFfiProxy {
     ///
     /// Needs an exit running a NAT-PMP gateway; not every exit does.
     ///
+    /// The mapping presents a port entitlement of the wallet's (warren-core
+    /// doc 105), drawn on its own slot and freed with the returned port.
+    ///
     /// # Errors
     ///
     /// [`FfiError::Client`] for a malformed `local_target` or if the engine has
-    /// stopped or the exit refuses the mapping.
+    /// stopped or the exit refuses the mapping; [`FfiError::PortForwardRefused`]
+    /// when the exit refuses it for want of an entitlement it would spend;
+    /// [`FfiError::Banned`] when the issuer refuses the wallet.
     pub async fn forward_port(
         &self,
         protocol: FfiMapProto,
@@ -1246,6 +1281,18 @@ fn map_fatal_cause(cause: FatalCause) -> FfiFatalCause {
 fn map_client_error(e: ClientError) -> FfiError {
     match e {
         ClientError::ServerStatus { status, .. } => FfiError::ServerStatus { status },
+        ClientError::Banned {
+            reason_code,
+            lapses_at_unix_secs,
+        } => FfiError::Banned {
+            reason: match reason_code {
+                BanReasonCode::PortForwardingAbuse => FfiBanReason::PortForwardingAbuse,
+                // `BanReasonCode` is `#[non_exhaustive]`: a reason this build
+                // does not know is still a ban.
+                _ => FfiBanReason::Other,
+            },
+            lapses_at_unix_secs,
+        },
         other => FfiError::Client {
             message: other.to_string(),
         },
@@ -1259,6 +1306,11 @@ fn map_client_error(e: ClientError) -> FfiError {
 fn map_sdk_error(e: SdkError) -> FfiError {
     match e {
         SdkError::Api(inner) => map_client_error(inner),
+        SdkError::PortForwardRefused {
+            entitlement_presented,
+        } => FfiError::PortForwardRefused {
+            entitlement_presented,
+        },
         other => FfiError::Client {
             message: other.to_string(),
         },
@@ -1292,6 +1344,42 @@ mod tests {
     use super::*;
 
     const ZERO_ENTROPY_24W: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+
+    #[test]
+    fn a_port_forward_refusal_crosses_the_ffi_typed() {
+        let err = map_sdk_error(SdkError::PortForwardRefused {
+            entitlement_presented: false,
+        });
+
+        assert!(
+            matches!(
+                err,
+                FfiError::PortForwardRefused {
+                    entitlement_presented: false
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_ban_crosses_the_ffi_typed_with_its_reason_and_lapse() {
+        let err = map_sdk_error(SdkError::Api(ClientError::Banned {
+            reason_code: warren_sdk::api::BanReasonCode::PortForwardingAbuse,
+            lapses_at_unix_secs: Some(1_790_000_000),
+        }));
+
+        assert!(
+            matches!(
+                err,
+                FfiError::Banned {
+                    reason: FfiBanReason::PortForwardingAbuse,
+                    lapses_at_unix_secs: Some(1_790_000_000),
+                }
+            ),
+            "{err:?}"
+        );
+    }
 
     #[test]
     fn address_from_mnemonic_matches_frozen_vector() {

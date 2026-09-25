@@ -266,6 +266,9 @@ impl SupervisedProxyHandle {
         let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
         let forwarder_rx = self.forwarder_rx.clone();
         let release = ReleaseGate::default();
+        // Held by the rule for its whole life: every rebuild presents the
+        // entitlement of the same slot.
+        let rule = crate::entitlements::RuleSlot::default();
         let task = tokio::spawn({
             let release = release.clone();
             async move {
@@ -275,15 +278,19 @@ impl SupervisedProxyHandle {
                     outcome_tx,
                     config,
                     release,
-                    move |forwarder: ProxyForwarder, suggested| async move {
-                        forwarder
-                            .forward_port_with_suggested(
-                                proto,
-                                internal_port,
-                                local_target,
-                                suggested,
-                            )
-                            .await
+                    move |forwarder: ProxyForwarder, suggested| {
+                        let rule = rule.clone();
+                        async move {
+                            forwarder
+                                .forward_port_for_rule(
+                                    proto,
+                                    internal_port,
+                                    local_target,
+                                    suggested,
+                                    &rule,
+                                )
+                                .await
+                        }
                     },
                 )
                 .await;
@@ -474,6 +481,7 @@ impl SupervisedPacketHandle {
         let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
         let forwarder_rx = self.forwarder_rx.clone();
         let release = ReleaseGate::default();
+        let rule = crate::entitlements::RuleSlot::default();
         let task = tokio::spawn({
             let release = release.clone();
             async move {
@@ -483,10 +491,13 @@ impl SupervisedPacketHandle {
                     outcome_tx,
                     config,
                     release,
-                    move |forwarder: PacketForwarder, suggested| async move {
-                        forwarder
-                            .forward_port_with_suggested(proto, internal_port, suggested)
-                            .await
+                    move |forwarder: PacketForwarder, suggested| {
+                        let rule = rule.clone();
+                        async move {
+                            forwarder
+                                .forward_port_for_rule(proto, internal_port, suggested, &rule)
+                                .await
+                        }
                     },
                 )
                 .await;
@@ -796,14 +807,15 @@ pub(crate) async fn supervise_forward<F, P, E, Fut>(
                                     current = Some(port);
                                     backoff.reset();
                                 }
-                                Err(_) => {
-                                    let _ = outcome_tx.send(Some(PortFollowOutcome::Failed));
+                                Err(e) => {
+                                    let _ =
+                                        outcome_tx.send(Some(PortFollowOutcome::from_failure(&e)));
                                 }
                             }
                         }
                     }
-                    Err(_) => {
-                        let _ = outcome_tx.send(Some(PortFollowOutcome::Failed));
+                    Err(e) => {
+                        let _ = outcome_tx.send(Some(PortFollowOutcome::from_failure(&e)));
                     }
                 }
                 if current.is_none() && !conflicted_epoch {
@@ -1465,16 +1477,19 @@ pub(crate) trait EpochDatapath<S: warren_net::PacketSink + 'static>: Send {
 pub(crate) struct ProxyDatapath {
     listeners: crate::proxy::ProxyListeners,
     dns_server: Option<std::net::Ipv4Addr>,
+    entitlements: Option<crate::entitlements::PortEntitlements>,
 }
 
 impl ProxyDatapath {
     pub(crate) fn new(
         listeners: crate::proxy::ProxyListeners,
         dns_server: Option<std::net::Ipv4Addr>,
+        entitlements: Option<crate::entitlements::PortEntitlements>,
     ) -> Self {
         Self {
             listeners,
             dns_server,
+            entitlements,
         }
     }
 }
@@ -1504,6 +1519,7 @@ impl<S: warren_net::PacketSink + 'static> EpochDatapath<S> for ProxyDatapath {
             // Supervised path is multihop, which carries no per-exit NAT-PMP
             // flag yet; stay permissive (doc 79).
             port_forward_supported: true,
+            entitlements: self.entitlements.clone(),
         };
         let socks = self.listeners.socks_listener();
         let http = self.listeners.http_listener();
@@ -1536,6 +1552,7 @@ pub(crate) struct PacketDatapath<D: warren_net::EpochPacketDevice> {
     /// silence, so the count is the only evidence it happened, and it has to
     /// outlive the epoch it happened in.
     stats: Arc<warren_net::PumpStats>,
+    entitlements: Option<crate::entitlements::PortEntitlements>,
 }
 
 impl<D: warren_net::EpochPacketDevice> PacketDatapath<D> {
@@ -1543,11 +1560,13 @@ impl<D: warren_net::EpochPacketDevice> PacketDatapath<D> {
         device: D,
         addressing_tx: tokio::sync::watch::Sender<Option<warren_net::EpochAddressing>>,
         stats: Arc<warren_net::PumpStats>,
+        entitlements: Option<crate::entitlements::PortEntitlements>,
     ) -> Self {
         Self {
             device: Arc::new(device),
             addressing_tx,
             stats,
+            entitlements,
         }
     }
 }
@@ -1569,6 +1588,7 @@ impl<S: warren_net::PacketSink + 'static, D: warren_net::EpochPacketDevice> Epoc
         let forwarder = PacketForwarder {
             udp: Arc::new(udp),
             gateway,
+            entitlements: self.entitlements.clone(),
         };
         // Published after the device has begun the epoch, so a host reading the
         // addressing knows the device is already serving it.
@@ -1601,8 +1621,9 @@ impl<S: warren_net::PacketSink + 'static, D: warren_net::EpochPacketDevice> Epoc
 /// device is under it.
 #[derive(Clone)]
 pub struct PacketForwarder {
-    udp: Arc<dyn warren_net::DynUdpOpener>,
-    gateway: std::net::Ipv4Addr,
+    pub(crate) udp: Arc<dyn warren_net::DynUdpOpener>,
+    pub(crate) gateway: std::net::Ipv4Addr,
+    pub(crate) entitlements: Option<crate::entitlements::PortEntitlements>,
 }
 
 impl std::fmt::Debug for PacketForwarder {
@@ -1618,30 +1639,59 @@ impl PacketForwarder {
     /// (`0` lets the exit choose). Delivery of what arrives on the mapped port
     /// is the device's own business: a raw datapath has no local relay target.
     ///
+    /// The mapping presents a port entitlement from its own slot of the
+    /// wallet's batch, held for the life of the returned port and freed with
+    /// it (warren-core doc 105).
+    ///
     /// # Errors
     ///
     /// [`SdkError::PortForward`] if the epoch's UDP path is gone or the exit
-    /// refuses the mapping.
+    /// refuses the mapping; [`SdkError::PortForwardRefused`] when the exit
+    /// refuses it for want of an entitlement it would spend; [`SdkError::Api`]
+    /// with [`ClientError::Banned`](warren_api::ClientError::Banned) when that
+    /// refusal is explained by the issuer banning the wallet.
     pub async fn forward_port_with_suggested(
         &self,
         proto: MapProto,
         internal_port: u16,
         suggested_external_port: u16,
     ) -> Result<warren_net::RawForwardedPort, SdkError> {
+        self.forward_port_for_rule(
+            proto,
+            internal_port,
+            suggested_external_port,
+            &crate::entitlements::RuleSlot::default(),
+        )
+        .await
+    }
+
+    /// [`Self::forward_port_with_suggested`] for a rule that keeps `rule`'s
+    /// slot across the mappings it re-establishes.
+    pub(crate) async fn forward_port_for_rule(
+        &self,
+        proto: MapProto,
+        internal_port: u16,
+        suggested_external_port: u16,
+        rule: &crate::entitlements::RuleSlot,
+    ) -> Result<warren_net::RawForwardedPort, SdkError> {
         let flow = self
             .udp
             .open_udp_boxed()
             .await
             .map_err(|e| SdkError::PortForward(warren_net::PortForwardError::Transport(e)))?;
+        let (credential, lease) = rule.provider(self.entitlements.as_ref()).await.unzip();
         warren_net::forward_port_raw(
             flow,
             self.gateway,
             proto,
             internal_port,
             suggested_external_port,
+            credential,
         )
         .await
-        .map_err(SdkError::from)
+        .map_err(|e| {
+            crate::entitlements::forward_error(e, self.entitlements.as_ref(), lease.as_deref())
+        })
     }
 
     /// [`Self::forward_port_with_suggested`] letting the exit choose the port.
@@ -1677,6 +1727,7 @@ impl ExternalPort for warren_net::RawForwardedPort {
 pub(crate) async fn supervise_proxy<S, F, Fut, D>(
     listeners: crate::proxy::ProxyListeners,
     dns_server: Option<std::net::Ipv4Addr>,
+    entitlements: Option<crate::entitlements::PortEntitlements>,
     outputs: SupervisorOutputs<ProxyForwarder>,
     guards: EpochGuards,
     connect: F,
@@ -1691,7 +1742,7 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
     // listeners waits here rather than racing this one for their connections.
     let _serving = listeners.serve_lease().await;
     supervise_datapath(
-        ProxyDatapath::new(listeners, dns_server),
+        ProxyDatapath::new(listeners, dns_server, entitlements),
         outputs,
         guards,
         connect,

@@ -37,5 +37,19 @@ smoltcp = { version = "0.14", default-features = false, features = [
     "socket-tcp",
 ] }
 
+# A port-entitlement issuer behind warren-api's transport seam (`issuer`), so
+# the SDK's real entitlement manager mints and vends envelopes in a test.
+warren-api = { path = "../warren-api" }
+warren-contract = { workspace = true }
+warrenguard-token = { workspace = true }
+rand010 = { package = "rand", version = "0.10" }
+serde_json = { workspace = true }
+data-encoding = { workspace = true }
+hex = { workspace = true }
+# The engine's NAT-PMP server behind the credential-requiring harness in
+# `natpmp`, so the SDK's port-forward client is tested against the gateway
+# exits run rather than a scripted fake.
+warrenguard-natpmp-server = { workspace = true }
+
 [lints]
 workspace = true

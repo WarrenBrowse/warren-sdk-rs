@@ -4,6 +4,9 @@
 //! so the in-process fake exit lives in one place instead of being copy-pasted
 //! into every crate's integration tests.
 
+pub mod issuer;
+pub mod natpmp;
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;

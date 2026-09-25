@@ -55,6 +55,10 @@ warrenguard-tls = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev
 # shim + auto-activation policy `warren-transport` wraps around its UDP dial.
 warrenguard-tcp-fallback = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "291d59999334fc4c59a4dbc4b281bb2cf7c551c1" }
 warrenguard-natpmp-protocol = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "291d59999334fc4c59a4dbc4b281bb2cf7c551c1" }
+# The engine's NAT-PMP server, test-only: the SDK's NAT-PMP client is proven
+# against the gateway exits actually run, with a credential authority that
+# requires a credential the way an exit enforcing warren-core doc 105 does.
+warrenguard-natpmp-server = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "291d59999334fc4c59a4dbc4b281bb2cf7c551c1" }
 warrenguard-tun-core = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "291d59999334fc4c59a4dbc4b281bb2cf7c551c1" }
 warrenguard-tun-device = { git = "https://github.com/WarrenBrowse/warrenguard.git", rev = "291d59999334fc4c59a4dbc4b281bb2cf7c551c1" }
 # Single home of the per-OS carrier-socket bypass picker
@@ -209,6 +213,7 @@ warrenguard-daita = { path = "../warrenguard/crates/warrenguard-daita" }
 warrenguard-tls = { path = "../warrenguard/crates/warrenguard-tls" }
 warrenguard-tcp-fallback = { path = "../warrenguard/crates/warrenguard-tcp-fallback" }
 warrenguard-natpmp-protocol = { path = "../warrenguard/crates/warrenguard-natpmp-protocol" }
+warrenguard-natpmp-server = { path = "../warrenguard/crates/warrenguard-natpmp-server" }
 warrenguard-tun-core = { path = "../warrenguard/crates/warrenguard-tun-core" }
 warrenguard-tun-device = { path = "../warrenguard/crates/warrenguard-tun-device" }
 warrenguard-route-split = { path = "../warrenguard/crates/warrenguard-route-split" }

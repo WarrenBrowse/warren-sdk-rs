@@ -306,7 +306,7 @@ impl WarrenClientBuilder {
     /// [`BuildError::MissingIdentity`] if no identity was set, or
     /// [`BuildError::UnpinnedServerKey`] if neither a pin nor
     /// [`allow_any_server_key`](Self::allow_any_server_key) was set.
-    pub fn build_with_transport<T: HttpTransport>(
+    pub fn build_with_transport<T: HttpTransport + 'static>(
         self,
         transport: T,
     ) -> Result<WarrenClient<T>, BuildError> {
@@ -323,14 +323,18 @@ impl WarrenClientBuilder {
         // The wallet key doubles as the QUIC tunnel client identity, so keep a
         // copy before the identity moves into the API client.
         let signing = identity.signing_key();
-        let api = WarrenApiClient::new_with_fallback(
+        let entitlements_key = format!("{}\n{}", self.api_base, identity.address());
+        let api = Arc::new(WarrenApiClient::new_with_fallback(
             self.api_base,
             self.api_alternative_hosts,
             identity,
             transport,
-        );
+        ));
+        let port_entitlements =
+            crate::entitlements::PortEntitlements::for_wallet(entitlements_key, &api);
         Ok(WarrenClient {
             api,
+            port_entitlements,
             signing,
             server_pubkey_pin: pin,
             multihop_root_pubkey_pins: self.multihop_root_pubkey_pins,
@@ -354,7 +358,11 @@ pub type DefaultClient = WarrenClient<ReqwestTransport>;
 
 /// The high-level Warren client.
 pub struct WarrenClient<T> {
-    pub(crate) api: WarrenApiClient<T>,
+    pub(crate) api: Arc<WarrenApiClient<T>>,
+    /// The wallet's port entitlements, shared with every client of the same
+    /// wallet and API in the process: every forward of every datapath this
+    /// client starts presents one (warren-core doc 105).
+    pub(crate) port_entitlements: crate::entitlements::PortEntitlements,
     pub(crate) signing: warren_identity::ed25519_dalek::SigningKey,
     pub(crate) server_pubkey_pin: Option<String>,
     /// Pinned offline multihop-directory root keys (empty = root TOFU).
@@ -1034,6 +1042,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         let (local_ip, prefix, gateway, ipv6) = addressing_from_session(sink.session());
         let mut handle = serve_proxy_over_sink(sink, local_ip, prefix, gateway, ipv6, cfg).await?;
         handle.metrics = Some(metrics);
+        handle.entitlements = Some(self.port_entitlements.clone());
         Ok(handle)
     }
 
@@ -1087,6 +1096,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         let bond = warren_net::BondedPacketSink::new(sinks);
         let mut handle = serve_proxy_over_sink(bond, local_ip, prefix, gateway, ipv6, cfg).await?;
         handle.metrics = Some(metrics);
+        handle.entitlements = Some(self.port_entitlements.clone());
         Ok(handle)
     }
 
@@ -1447,9 +1457,15 @@ impl<T: HttpTransport> WarrenClient<T> {
         let (epoch_end_tx, epoch_end_rx) = tokio::sync::watch::channel(None);
         let reconnect_request = std::sync::Arc::new(tokio::sync::Notify::new());
         let supervisor_reconnect = std::sync::Arc::clone(&reconnect_request);
+        let entitlements = self.port_entitlements.clone();
         let task = tokio::spawn(async move {
             crate::supervisor::supervise_datapath(
-                crate::supervisor::PacketDatapath::new(device, addressing_tx, datapath_stats),
+                crate::supervisor::PacketDatapath::new(
+                    device,
+                    addressing_tx,
+                    datapath_stats,
+                    Some(entitlements),
+                ),
                 crate::supervisor::SupervisorOutputs {
                     state_tx,
                     forwarder_tx,
@@ -1517,10 +1533,12 @@ impl<T: HttpTransport> WarrenClient<T> {
         let (epoch_end_tx, epoch_end_rx) = tokio::sync::watch::channel(None);
         let reconnect_request = std::sync::Arc::new(tokio::sync::Notify::new());
         let supervisor_reconnect = std::sync::Arc::clone(&reconnect_request);
+        let entitlements = self.port_entitlements.clone();
         let task = tokio::spawn(async move {
             supervise_proxy(
                 listeners,
                 dns_server,
+                Some(entitlements),
                 crate::supervisor::SupervisorOutputs {
                     state_tx,
                     forwarder_tx,

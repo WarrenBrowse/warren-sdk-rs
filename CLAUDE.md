@@ -51,7 +51,7 @@ build resolves through the patch and every test passes locally while the
 declared `rev` still points at the old commit. Nothing on your machine can see
 the divergence, and CI's lockstep gate is what fails.
 
-Bump the version file and the matching `rev = "..."` lines together (18 of them
+Bump the version file and the matching `rev = "..."` lines together (19 of them
 for warrenguard), then re-run the tests. Same check CI runs:
 
 ```sh

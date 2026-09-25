@@ -92,6 +92,47 @@ pub enum PortFollowOutcome {
     /// The mapping could not be established this epoch (transport failure or a
     /// non-conflict refusal); the supervisor keeps retrying.
     Failed,
+    /// The exit refused the mapping as not authorized: it presented no port
+    /// entitlement, or one the exit would not spend (warren-core doc 105).
+    /// The supervisor keeps retrying, since the next entitlement refresh can
+    /// stock one.
+    NotAuthorized {
+        /// Whether the refused request carried an entitlement envelope.
+        entitlement_presented: bool,
+    },
+    /// The account is banned: the issuer refuses its port entitlements, so
+    /// every enforcing exit refuses its mappings until the ban lapses or is
+    /// lifted. The supervisor keeps retrying, which a lifted ban answers.
+    Banned {
+        /// Why the account is banned.
+        reason_code: warren_api::BanReasonCode,
+        /// When the ban lapses on its own, Unix seconds; `None` when it does
+        /// not.
+        lapses_at_unix_secs: Option<u64>,
+    },
+}
+
+impl PortFollowOutcome {
+    /// The outcome a failed (re)establish publishes: the typed refusal when
+    /// the exit refused for lack of an entitlement, else [`Self::Failed`].
+    #[must_use]
+    pub(crate) fn from_failure(err: &crate::error::SdkError) -> Self {
+        match err {
+            crate::error::SdkError::PortForwardRefused {
+                entitlement_presented,
+            } => Self::NotAuthorized {
+                entitlement_presented: *entitlement_presented,
+            },
+            crate::error::SdkError::Api(warren_api::ClientError::Banned {
+                reason_code,
+                lapses_at_unix_secs,
+            }) => Self::Banned {
+                reason_code: *reason_code,
+                lapses_at_unix_secs: *lapses_at_unix_secs,
+            },
+            _ => Self::Failed,
+        }
+    }
 }
 
 /// A TTL set of candidate exits to keep out of rotation after a port conflict,

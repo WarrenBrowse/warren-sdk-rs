@@ -3831,15 +3831,23 @@ name = "warren-test-support"
 version = "0.0.1"
 dependencies = [
  "chacha20poly1305",
+ "data-encoding",
  "ed25519-dalek",
+ "hex",
  "hpke",
+ "rand 0.10.1",
  "rand_core 0.9.5",
+ "serde_json",
  "smoltcp",
  "tokio",
+ "warren-api",
+ "warren-contract",
  "warren-quinn",
  "warren-transport",
  "warren-wire",
  "warrenguard-config",
+ "warrenguard-natpmp-server",
+ "warrenguard-token",
 ]
 
 [[package]]
@@ -3977,6 +3985,21 @@ name = "warrenguard-natpmp-protocol"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "warrenguard-natpmp-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "parking_lot",
+ "rand 0.10.1",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "warrenguard-config",
+ "warrenguard-natpmp-protocol",
+ "warrenguard-systool",
 ]
 
 [[package]]

@@ -76,6 +76,7 @@ pub use warren_transport::egress_probe::{ExitEvidence, exit_evidence_from};
 mod client;
 pub mod egress;
 mod egress_probe;
+mod entitlements;
 mod error;
 /// One-shot in-tunnel egress proof for a datapath that has no local listener
 /// to probe through (see [`socks_egress`] for the proxy datapath's own).
