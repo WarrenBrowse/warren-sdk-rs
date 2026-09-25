@@ -34,6 +34,9 @@ pub use tokens::{
     TokenManager, TokenStore, current_epoch, mint_tokens, mint_tokens_for,
 };
 pub use transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
+/// The port-forward attribution tag and the entitlement envelope a
+/// [`PortEntitlementManager`] slot presents (warren-core doc 105).
+pub use warren_contract::pf_attribution::{AttributionTag, EntitlementEnvelope};
 
 #[cfg(feature = "reqwest-transport")]
 pub use reqwest_transport::ReqwestTransport;

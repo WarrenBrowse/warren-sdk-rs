@@ -17,6 +17,9 @@ warren-contract = { workspace = true }
 warren-discovery-core = { workspace = true }
 warren-identity = { path = "../warren-identity" }
 warrenguard-token = { workspace = true }
+# Verifies the port-forward attribution tag minted beside each entitlement,
+# against the key the entitlement directory publishes.
+ed25519-dalek = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
@@ -70,7 +73,6 @@ marked-transport = [
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
-ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 
 [lints]

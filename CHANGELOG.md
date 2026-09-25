@@ -71,6 +71,23 @@ the pre-release `0.0.x` line.
 
 ### Changed
 
+- A port-forwarding slot now presents the entitlement ENVELOPE, not a bare
+  token (warren-core doc 105): `PortEntitlementManager::credential_for_slot`
+  returns the 500-byte `EntitlementEnvelope` encoding (version, token, and the
+  attribution tag the issuer minted beside it), which every exit now requires
+  on a NAT-PMP Map request. Minting a port-entitlement batch checks each tag
+  the way the exit will: one tag per blind signature
+  (`TokenClientError::AttributionTagCount`), minted for the batch's epoch
+  (`AttributionTagEpoch`), signed under the directory's
+  `attribution_verifying_key_hex` (`AttributionTagInvalid`). A directory with
+  no usable key fails with `BadAttributionKey` before anything is blinded, so
+  the once-per-epoch issuance is not spent on credentials no exit accepts.
+  `MintedEpoch` gains `attribution_tags`. A `TokenManager` of the
+  port-entitlement class no longer vends, exports or restores bare
+  entitlements; the batch stays RAM-only. `AttributionTag` and
+  `EntitlementEnvelope` are re-exported from `warren_api`, and
+  `vectors/pf_attribution.json` is replayed through the SDK's store and mint
+  checks.
 - The userspace proxy datapath's inner TCP is now congestion-controlled. smoltcp
   moves from 0.12 to 0.14, the first release whose congestion window actually
   bounds the data in flight (smoltcp #1154 to #1157, #1155), and every inner

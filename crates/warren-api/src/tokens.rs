@@ -20,13 +20,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use data_encoding::BASE64URL_NOPAD;
+use ed25519_dalek::VerifyingKey;
 use rand010::CryptoRng;
 use serde::{Deserialize, Serialize};
+use warren_contract::pf_attribution::{AttributionTag, AttributionTagError, EntitlementEnvelope};
 use warrenguard_token::{IssuerPublicKey, TOKEN_LEN, Token, TokenChallenge, TokenError};
 
 use crate::client::{ClientError, WarrenApiClient};
 use crate::dto::{TokenEpochRequest, TokenIssueRequest, TokenIssuerDirectory};
 use crate::transport::HttpTransport;
+
+// The envelope declares the entitlement length itself so the contract does not
+// pull the RSA stack; the two must agree for a minted token to fit it.
+const _: () = assert!(TOKEN_LEN == warren_contract::pf_attribution::TOKEN_LEN);
 
 /// Error from the token-minting flow.
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +84,43 @@ pub enum TokenClientError {
     /// that does not verify under the key it was requested from).
     #[error(transparent)]
     Crypto(#[from] TokenError),
+    /// The port-entitlement directory publishes no attribution verifying key,
+    /// or one that is not an Ed25519 public key. Raised before anything is
+    /// blinded: issuance is once per account and epoch, and a batch whose tags
+    /// cannot be checked would spend it for credentials no exit accepts.
+    #[error("port-entitlement directory carries no usable attribution key")]
+    BadAttributionKey,
+    /// A port-entitlement batch does not carry exactly one attribution tag per
+    /// blind signature. An entitlement without its tag is refused by every
+    /// exit.
+    #[error(
+        "port-entitlement batch for epoch {epoch} carries {tags} attribution tags for {signatures} signatures"
+    )]
+    AttributionTagCount {
+        /// The epoch whose batch is malformed.
+        epoch: u64,
+        /// Blind signatures in the batch.
+        signatures: usize,
+        /// Attribution tags in the batch.
+        tags: usize,
+    },
+    /// An attribution tag was minted for another epoch than the entitlement
+    /// it travels with. The exit refuses the pair.
+    #[error("attribution tag in the batch for epoch {epoch} names another epoch")]
+    AttributionTagEpoch {
+        /// The epoch the batch was requested for.
+        epoch: u64,
+    },
+    /// An attribution tag does not verify under the published attribution
+    /// key.
+    #[error("attribution tag in the batch for epoch {epoch} does not verify")]
+    AttributionTagInvalid {
+        /// The epoch whose batch carries the tag.
+        epoch: u64,
+        /// Why the tag was refused.
+        #[source]
+        source: AttributionTagError,
+    },
 }
 
 /// The finalized tokens minted for one epoch.
@@ -86,6 +129,10 @@ pub struct MintedEpoch {
     pub epoch: u64,
     /// The finalized, locally-verified tokens (one per device slot).
     pub tokens: Vec<Token>,
+    /// Port-entitlement class only: the verified attribution tag minted beside
+    /// each token, `attribution_tags[i]` travelling with `tokens[i]`. Empty for
+    /// every other class.
+    pub attribution_tags: Vec<AttributionTag>,
 }
 
 impl std::fmt::Debug for MintedEpoch {
@@ -94,6 +141,7 @@ impl std::fmt::Debug for MintedEpoch {
         f.debug_struct("MintedEpoch")
             .field("epoch", &self.epoch)
             .field("tokens", &self.tokens.len())
+            .field("attribution_tags", &self.attribution_tags.len())
             .finish()
     }
 }
@@ -131,6 +179,51 @@ pub fn epoch_key(
     Ok(pk)
 }
 
+/// The key attribution tags verify under, from a port-entitlement directory.
+fn attribution_key(directory: &TokenIssuerDirectory) -> Result<VerifyingKey, TokenClientError> {
+    let published = directory
+        .attribution_verifying_key_hex
+        .as_ref()
+        .ok_or(TokenClientError::BadAttributionKey)?;
+    warren_contract::pf_attribution::verifying_key(published)
+        .map_err(|_| TokenClientError::BadAttributionKey)
+}
+
+/// The checks the exit runs on a tag before it spends the entitlement, run at
+/// mint time so a broken issuer surfaces as a mint error on the device rather
+/// than as every Map request refused later.
+fn verify_attribution_tag(
+    tag: &AttributionTag,
+    epoch: u64,
+    key: &VerifyingKey,
+) -> Result<(), TokenClientError> {
+    if tag.epoch() != epoch {
+        return Err(TokenClientError::AttributionTagEpoch { epoch });
+    }
+    tag.verify(key)
+        .map_err(|source| TokenClientError::AttributionTagInvalid { epoch, source })
+}
+
+/// One tag per blind signature, each verified, in the issuer's order.
+fn checked_attribution_tags(
+    epoch: u64,
+    tags: &[AttributionTag],
+    signatures: usize,
+    key: &VerifyingKey,
+) -> Result<Vec<AttributionTag>, TokenClientError> {
+    if tags.len() != signatures {
+        return Err(TokenClientError::AttributionTagCount {
+            epoch,
+            signatures,
+            tags: tags.len(),
+        });
+    }
+    for tag in tags {
+        verify_attribution_tag(tag, epoch, key)?;
+    }
+    Ok(tags.to_vec())
+}
+
 /// Mints the full token batch for each of `epochs`: blind against each
 /// epoch's directory key, submit one wallet-signed issue request, finalize
 /// and verify every token. All-or-nothing: any refused epoch or malformed
@@ -163,6 +256,10 @@ pub async fn mint_tokens_for<T: HttpTransport, R: CryptoRng + ?Sized>(
     if quota == 0 || directory.epoch_secs == 0 {
         return Err(TokenClientError::BadDirectoryPolicy);
     }
+    let attribution_key = match class {
+        CredentialClass::PortEntitlement => Some(attribution_key(directory)?),
+        CredentialClass::Session | CredentialClass::BrowserProxy => None,
+    };
 
     // Blind locally, per epoch, before anything leaves the device.
     let mut per_epoch = Vec::with_capacity(epochs.len());
@@ -208,6 +305,15 @@ pub async fn mint_tokens_for<T: HttpTransport, R: CryptoRng + ?Sized>(
         if out.blind_signatures.len() != states.len() {
             return Err(TokenClientError::BatchMismatch { epoch });
         }
+        let attribution_tags = match &attribution_key {
+            Some(key) => checked_attribution_tags(
+                epoch,
+                &out.attribution_tags,
+                out.blind_signatures.len(),
+                key,
+            )?,
+            None => Vec::new(),
+        };
         let mut tokens = Vec::with_capacity(states.len());
         for (state, sig_b64) in states.into_iter().zip(&out.blind_signatures) {
             let sig = BASE64URL_NOPAD
@@ -219,7 +325,11 @@ pub async fn mint_tokens_for<T: HttpTransport, R: CryptoRng + ?Sized>(
             pk.verify_token(&token)?;
             tokens.push(token);
         }
-        minted.push(MintedEpoch { epoch, tokens });
+        minted.push(MintedEpoch {
+            epoch,
+            tokens,
+            attribution_tags,
+        });
     }
     Ok(minted)
 }
@@ -238,7 +348,14 @@ pub async fn mint_tokens_for<T: HttpTransport, R: CryptoRng + ?Sized>(
 /// wallet-identified v6 path.
 #[derive(Default)]
 pub struct TokenStore {
-    per_epoch: BTreeMap<u64, Vec<Token>>,
+    per_epoch: BTreeMap<u64, Vec<Stored>>,
+}
+
+/// A token and, for a port entitlement, the tag minted beside it. Stored as
+/// one entry so the pair can never be split by a pop.
+struct Stored {
+    token: Token,
+    tag: Option<AttributionTag>,
 }
 
 impl std::fmt::Debug for TokenStore {
@@ -261,22 +378,45 @@ impl TokenStore {
     /// Adds a minted batch. Tokens for an epoch accumulate (a re-mint after a
     /// partial spend keeps the remainder usable).
     pub fn insert(&mut self, minted: MintedEpoch) {
+        let mut tags = minted.attribution_tags.into_iter();
         self.per_epoch
             .entry(minted.epoch)
             .or_default()
-            .extend(minted.tokens);
+            .extend(minted.tokens.into_iter().map(|token| Stored {
+                token,
+                tag: tags.next(),
+            }));
+    }
+
+    fn pop(&mut self, epoch: u64) -> Option<Stored> {
+        let entries = self.per_epoch.get_mut(&epoch)?;
+        let entry = entries.pop();
+        if entries.is_empty() {
+            self.per_epoch.remove(&epoch);
+        }
+        entry
     }
 
     /// Pops one token for `epoch`, or `None` when none remain. Consuming here
     /// (rather than cloning) is what makes "one token = one device slot"
     /// locally true.
     pub fn take(&mut self, epoch: u64) -> Option<Token> {
-        let tokens = self.per_epoch.get_mut(&epoch)?;
-        let token = tokens.pop();
-        if tokens.is_empty() {
-            self.per_epoch.remove(&epoch);
+        self.pop(epoch).map(|entry| entry.token)
+    }
+
+    /// Pops one entitlement for `epoch` together with its tag, as the envelope
+    /// the exit takes. An entry without a tag is discarded, never presented:
+    /// every exit refuses a bare entitlement.
+    pub(crate) fn take_envelope(&mut self, epoch: u64) -> Option<EntitlementEnvelope> {
+        while let Some(entry) = self.pop(epoch) {
+            if let Some(tag) = entry.tag {
+                return Some(
+                    EntitlementEnvelope::new(&entry.token.serialize(), tag)
+                        .expect("a minted token has the envelope's token length"),
+                );
+            }
         }
-        token
+        None
     }
 
     /// Tokens remaining for `epoch`.
@@ -303,7 +443,15 @@ impl TokenStore {
     pub fn snapshot_serialized(&self) -> Vec<(u64, Vec<[u8; TOKEN_LEN]>)> {
         self.per_epoch
             .iter()
-            .map(|(epoch, tokens)| (*epoch, tokens.iter().map(Token::serialize).collect()))
+            .map(|(epoch, entries)| {
+                (
+                    *epoch,
+                    entries
+                        .iter()
+                        .map(|entry| entry.token.serialize())
+                        .collect(),
+                )
+            })
             .collect()
     }
 }
@@ -400,6 +548,12 @@ impl<T: HttpTransport> TokenManager<T> {
 
     /// [`Self::new`] for any credential class. Same minting flow, same
     /// once-per-epoch bookkeeping, this class's endpoints and batch size.
+    ///
+    /// A [`CredentialClass::PortEntitlement`] manager mints and counts its
+    /// batch but vends nothing through [`Self::take_current_stack`] and never
+    /// exports or restores a bundle: those carry bare tokens, and every exit
+    /// refuses an entitlement without its tag. [`PortEntitlementManager`] is
+    /// the surface that presents them.
     #[must_use]
     pub fn for_class(client: Arc<WarrenApiClient<T>>, class: CredentialClass) -> Self {
         Self {
@@ -542,6 +696,9 @@ impl<T: HttpTransport> TokenManager<T> {
     /// token this epoch": the tunnel then uses the v6 path. Never mints.
     #[must_use]
     pub fn take_current_stack(&self, now_unix_secs: u64) -> Vec<[u8; TOKEN_LEN]> {
+        if self.class == CredentialClass::PortEntitlement {
+            return Vec::new();
+        }
         let mut st = self.state.lock().expect("token manager mutex poisoned");
         let Some(epoch) = st.epoch_secs.filter(|&s| s > 0).map(|s| now_unix_secs / s) else {
             return Vec::new();
@@ -550,6 +707,17 @@ impl<T: HttpTransport> TokenManager<T> {
             Some(token) => vec![token.serialize()],
             None => Vec::new(),
         }
+    }
+
+    /// Pops one port entitlement for the epoch `now` falls in, paired with
+    /// its attribution tag. Never mints.
+    fn take_current_envelope(&self, now_unix_secs: u64) -> Option<EntitlementEnvelope> {
+        let mut st = self.state.lock().expect("token manager mutex poisoned");
+        let epoch = st
+            .epoch_secs
+            .filter(|&s| s > 0)
+            .map(|s| now_unix_secs / s)?;
+        st.store.take_envelope(epoch)
     }
 
     /// Loads a previously exported bundle ([`Self::export_persistable`]) back
@@ -563,6 +731,9 @@ impl<T: HttpTransport> TokenManager<T> {
     /// hence no `#[must_use]`).
     #[allow(clippy::must_use_candidate)]
     pub fn restore_persisted(&self, bundle: &PersistedTokens) -> usize {
+        if self.class == CredentialClass::PortEntitlement {
+            return 0;
+        }
         let mut st = self.state.lock().expect("token manager mutex poisoned");
         if st.epoch_secs.is_none() && bundle.epoch_secs > 0 {
             st.epoch_secs = Some(bundle.epoch_secs);
@@ -575,7 +746,11 @@ impl<T: HttpTransport> TokenManager<T> {
                 .filter_map(|bytes| Token::parse(&bytes).ok())
                 .collect();
             restored += tokens.len();
-            st.store.insert(MintedEpoch { epoch, tokens });
+            st.store.insert(MintedEpoch {
+                epoch,
+                tokens,
+                attribution_tags: Vec::new(),
+            });
         }
         restored
     }
@@ -593,6 +768,9 @@ impl<T: HttpTransport> TokenManager<T> {
     /// pubkey.
     #[must_use]
     pub fn export_persistable(&self) -> Option<PersistedTokens> {
+        if self.class == CredentialClass::PortEntitlement {
+            return None;
+        }
         let st = self.state.lock().expect("token manager mutex poisoned");
         let epoch_secs = st.epoch_secs?;
         Some(PersistedTokens::from_snapshot(
@@ -726,6 +904,7 @@ mod persistence_tests {
         store.insert(MintedEpoch {
             epoch: 7,
             tokens: vec![fake_token(1), fake_token(2)],
+            attribution_tags: Vec::new(),
         });
         let snap = store.snapshot_serialized();
         assert_eq!(
@@ -816,7 +995,7 @@ mod persistence_tests {
 }
 
 /// Hands each port-forwarding rule the entitlement it presents (warren-core
-/// doc 99).
+/// docs 99 and 105).
 ///
 /// A wrapper over [`TokenManager`] rather than a second minting flow: what an
 /// entitlement needs on top is an ASSIGNMENT. The exit spends a credential the
@@ -825,6 +1004,11 @@ mod persistence_tests {
 /// subscriber's whole batch on one port. Slot `n` therefore keeps its
 /// credential for the whole epoch, and moves to the next epoch's batch when
 /// the current one stops being spendable anywhere.
+///
+/// What a slot presents is the [`EntitlementEnvelope`]: the entitlement and
+/// the attribution tag the issuer minted beside it, verified at mint time.
+/// The batch lives in RAM only and is never persisted (see
+/// [`TokenManager::for_class`]).
 pub struct PortEntitlementManager<T> {
     inner: TokenManager<T>,
     assigned: Mutex<Assigned>,
@@ -835,7 +1019,7 @@ struct Assigned {
     /// The epoch `slots` was filled for. A credential verifies against its own
     /// epoch's issuer key and no other, so the whole map is dead at a boundary.
     epoch: Option<u64>,
-    slots: BTreeMap<usize, Vec<u8>>,
+    slots: BTreeMap<usize, EntitlementEnvelope>,
 }
 
 impl<T: HttpTransport> PortEntitlementManager<T> {
@@ -857,12 +1041,13 @@ impl<T: HttpTransport> PortEntitlementManager<T> {
         self.inner.refresh_auto(now_unix_secs).await
     }
 
-    /// The credential rule `slot` presents right now, or `None` when the
-    /// subscriber has none left for this epoch.
+    /// The credential rule `slot` presents right now: the encoded
+    /// [`EntitlementEnvelope`], or `None` when the subscriber has none left
+    /// for this epoch.
     ///
-    /// `None` is a working answer: the exit then applies its configured quota,
-    /// which is the documented degrade path. Handing out an already-assigned
-    /// credential instead would make two rules read as one port at the exit.
+    /// On `None` the rule's Map request goes out without a credential, which
+    /// the exit refuses. Handing out an already-assigned credential instead
+    /// would make two rules read as one port at the exit.
     #[must_use]
     pub fn credential_for_slot(&self, slot: usize, now_unix_secs: u64) -> Option<Vec<u8>> {
         let epoch = self.inner.epoch_at(now_unix_secs)?;
@@ -875,12 +1060,143 @@ impl<T: HttpTransport> PortEntitlementManager<T> {
             assigned.slots.clear();
         }
         if let Some(held) = assigned.slots.get(&slot) {
-            return Some(held.clone());
+            return Some(held.encode().to_vec());
         }
         // Popping is what makes "one entitlement, one port" locally true: the
         // credential leaves the store for good and no other slot can draw it.
-        let credential = self.inner.take_current_stack(now_unix_secs).pop()?.to_vec();
-        assigned.slots.insert(slot, credential.clone());
+        let envelope = self.inner.take_current_envelope(now_unix_secs)?;
+        let credential = envelope.encode().to_vec();
+        assigned.slots.insert(slot, envelope);
         Some(credential)
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    //! Replays `vectors/pf_attribution.json` through the SDK's own path: the
+    //! checks a minted batch goes through and the store that pairs a token
+    //! with its tag. The contract replays the layouts themselves.
+
+    use serde_json::Value;
+    use warren_contract::pf_attribution::verifying_key;
+
+    use super::*;
+    use crate::dto::{PubkeyHex, TokenEpochResponse};
+
+    fn corpus() -> Value {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../vectors/pf_attribution.json"
+        );
+        let body = std::fs::read_to_string(path).expect("the vectors submodule is checked out");
+        serde_json::from_str(&body).expect("pf_attribution.json is JSON")
+    }
+
+    fn bytes(v: &Value) -> Vec<u8> {
+        hex::decode(v.as_str().expect("hex string")).expect("valid hex")
+    }
+
+    fn key(v: &Value) -> VerifyingKey {
+        let published = PubkeyHex::try_from(v.as_str().expect("hex string")).expect("32-byte hex");
+        verifying_key(&published).expect("an Ed25519 key")
+    }
+
+    #[test]
+    fn the_store_presents_the_vector_envelope_for_the_vector_token_and_tag() {
+        let v = corpus();
+        let token = Token::parse(&bytes(&v["envelope"]["token_hex"])).expect("vector token");
+        let tag = AttributionTag::from_bytes(&bytes(&v["tag"]["tag_hex"])).expect("vector tag");
+        let epoch = tag.epoch();
+        let mut store = TokenStore::new();
+        store.insert(MintedEpoch {
+            epoch,
+            tokens: vec![token],
+            attribution_tags: vec![tag],
+        });
+
+        let envelope = store.take_envelope(epoch).expect("a paired entitlement");
+
+        assert_eq!(
+            envelope.encode().as_slice(),
+            bytes(&v["envelope"]["envelope_hex"]).as_slice()
+        );
+    }
+
+    #[test]
+    fn the_vector_tag_passes_the_mint_checks_and_every_forged_one_fails_them() {
+        let v = corpus();
+        let good = AttributionTag::from_bytes(&bytes(&v["tag"]["tag_hex"])).expect("vector tag");
+        let published = key(&v["keys"]["verifying_key_hex"]);
+        let epoch = v["tag"]["epoch"].as_u64().expect("epoch");
+
+        verify_attribution_tag(&good, epoch, &published).expect("the vector tag verifies");
+        assert!(matches!(
+            verify_attribution_tag(&good, epoch + 1, &published),
+            Err(TokenClientError::AttributionTagEpoch { .. })
+        ));
+
+        for case in v["invalid_tags"].as_array().expect("invalid_tags") {
+            let name = case["name"].as_str().expect("name");
+            let raw = bytes(&case["tag_hex"]);
+            match case["expect"].as_str().expect("expect") {
+                "bad_signature" => {
+                    let tag = AttributionTag::from_bytes(&raw).expect(name);
+                    assert!(
+                        matches!(
+                            verify_attribution_tag(
+                                &tag,
+                                tag.epoch(),
+                                &key(&case["verifying_key_hex"])
+                            ),
+                            Err(TokenClientError::AttributionTagInvalid { .. })
+                        ),
+                        "{name}"
+                    );
+                }
+                "wrong_length" | "unsupported_version" => {
+                    // Such a tag never reaches the checks: the issue response
+                    // carrying it does not deserialize.
+                    let response = serde_json::json!({
+                        "epoch": epoch,
+                        "issued": true,
+                        "blind_signatures": ["AA"],
+                        "attribution_tags": [BASE64URL_NOPAD.encode(&raw)],
+                    });
+                    assert!(
+                        serde_json::from_value::<TokenEpochResponse>(response).is_err(),
+                        "{name}"
+                    );
+                }
+                other => panic!("unknown invalid_tags expectation {other} ({name})"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_entitlement_stored_without_its_tag_is_skipped_never_presented() {
+        let v = corpus();
+        let token = Token::parse(&bytes(&v["envelope"]["token_hex"])).expect("vector token");
+        let tag = AttributionTag::from_bytes(&bytes(&v["tag"]["tag_hex"])).expect("vector tag");
+        let epoch = tag.epoch();
+        let mut store = TokenStore::new();
+        store.insert(MintedEpoch {
+            epoch,
+            tokens: vec![token.clone()],
+            attribution_tags: vec![tag],
+        });
+        // Pushed last, so popped first.
+        store.insert(MintedEpoch {
+            epoch,
+            tokens: vec![token],
+            attribution_tags: Vec::new(),
+        });
+
+        let envelope = store.take_envelope(epoch).expect("the paired entry");
+
+        assert_eq!(
+            envelope.encode().as_slice(),
+            bytes(&v["envelope"]["envelope_hex"]).as_slice()
+        );
+        assert!(store.take_envelope(epoch).is_none());
     }
 }
