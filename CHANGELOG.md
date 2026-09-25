@@ -20,6 +20,13 @@ the pre-release `0.0.x` line.
   per-epoch failure, and settle nothing, so a lifted ban mints at the next
   tick. `BanReasonCode` and `IssuanceRefusal` are re-exported from
   `warren_api`.
+- `WarrenApiClient::account_standing()`: the wallet-signed
+  `GET /v1/account/standing`, returning the contract's
+  `AccountStandingResponse` (live port-forward abuse strikes with day,
+  category, exit country, port and case reference; the threshold and window;
+  the ban in force with its lapse date). Meant to be polled on the token
+  refresh timer. `AccountStandingResponse`, `AccountStrike`, `AccountBan` and
+  `AbuseCategory` are re-exported from `warren_api`.
 
 - Network changes now MIGRATE the live QUIC session instead of always redialing
   it. The supervised proxy datapath arms the engine migration watchdog

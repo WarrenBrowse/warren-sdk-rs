@@ -7,11 +7,11 @@ use warren_discovery_core::{MULTIHOP_DIRECTORY_PATH_V1, MULTIHOP_DIRECTORY_PATH_
 use warren_identity::WarrenIdentity;
 
 use crate::dto::{
-    BanReasonCode, CampaignVoucherResponse, CheckApplePaymentRequest, CheckResponse,
-    IncidentExitDownRequest, IncidentPubkeyMismatchRequest, InitApplePaymentResponse,
-    IssuanceRefusal, MobilePaymentResponse, RegisterAccountRequest, RegisterAccountResponse,
-    SessionCloseRequest, SessionOpenRequest, SessionOpenResponse, SubscriptionResponse,
-    TokenIssueRequest, TokenIssueResponse, TokenIssuerDirectory,
+    AccountStandingResponse, BanReasonCode, CampaignVoucherResponse, CheckApplePaymentRequest,
+    CheckResponse, IncidentExitDownRequest, IncidentPubkeyMismatchRequest,
+    InitApplePaymentResponse, IssuanceRefusal, MobilePaymentResponse, RegisterAccountRequest,
+    RegisterAccountResponse, SessionCloseRequest, SessionOpenRequest, SessionOpenResponse,
+    SubscriptionResponse, TokenIssueRequest, TokenIssueResponse, TokenIssuerDirectory,
 };
 use crate::transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 
@@ -255,6 +255,22 @@ impl<T: HttpTransport> WarrenApiClient<T> {
             Err(ClientError::ServerStatus { status: 404, .. }) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Signed `GET /v1/account/standing`: the port-forward abuse strikes
+    /// still inside the sliding window, the threshold and window that govern
+    /// them, and the ban in force if any (warren-core doc 105). Poll it on the
+    /// token refresh timer; a new strike is what the app warns about.
+    ///
+    /// The strikes carry a case reference and the port that was closed, which
+    /// belong in the account's own UI and nowhere else, never in a log.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`].
+    pub async fn account_standing(&self) -> Result<AccountStandingResponse, ClientError> {
+        let http = self.signed_request(Method::Get, "/v1/account/standing", Vec::new())?;
+        self.send_json(http).await
     }
 
     /// Signed `GET /v1/check`. Reports the client's egress IP and whether it is
@@ -737,6 +753,36 @@ mod tests {
         let c = client(MockTransport::new(200, r#"{"expires_at":1700000000}"#));
         let sub = c.subscription().await.expect("ok");
         assert_eq!(sub.expires_at, 1_700_000_000);
+    }
+
+    #[tokio::test]
+    async fn account_standing_is_a_wallet_signed_get_returning_strikes_and_ban() {
+        let body = r#"{"strikes":[{"day_unix_secs":1758758400,"category":"copyright","exit_country":"NL","port":51234,"case_reference":"case-0001"}],"threshold":3,"window_days":90,"ban":{"banned_at_unix_secs":1758800000,"lapses_at_unix_secs":1790336000,"reason_code":"port_forwarding_abuse"}}"#;
+        let c = client(MockTransport::new(200, body));
+
+        let standing = c.account_standing().await.expect("ok");
+
+        assert_eq!(standing.threshold, 3);
+        assert_eq!(standing.window_days, 90);
+        assert_eq!(standing.strikes.len(), 1);
+        assert_eq!(standing.strikes[0].port, 51_234);
+        assert_eq!(standing.strikes[0].case_reference, "case-0001");
+        let ban = standing.ban.expect("banned");
+        assert_eq!(
+            ban.reason_code,
+            crate::dto::BanReasonCode::PortForwardingAbuse
+        );
+        assert_eq!(ban.lapses_at_unix_secs, Some(1_790_336_000));
+        let guard = c.transport.last.lock().unwrap();
+        let req = guard.as_ref().expect("request captured");
+        assert_eq!(req.method, Method::Get);
+        assert_eq!(req.url, "https://api.example.test/v1/account/standing");
+        assert_eq!(
+            header(req, HEADER_PUBKEY),
+            Some(WarrenIdentity::from_seed(&[0x11; 32]).address().as_str()),
+            "the standing is the wallet's own: the request must name it"
+        );
+        assert!(header(req, HEADER_SIGNATURE).is_some());
     }
 
     #[tokio::test]
