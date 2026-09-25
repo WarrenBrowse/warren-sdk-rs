@@ -30,6 +30,14 @@ rand = { workspace = true }
 # the workspace-wide rand 0.8 used for signing nonces; renamed so both can be
 # named side by side in this crate.
 rand010 = { package = "rand", version = "0.10" }
+# The wallet-derived blinding (`token_blinding`): HKDF-SHA256 over the wallet
+# seed, the blinding factor reduced mod the issuer modulus (the same bigint
+# crate the engine's blind-RSA stack computes with), and the modulus read out
+# of the published SPKI.
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+crypto-bigint = { version = "0.7", default-features = false, features = ["alloc", "zeroize"] }
+der = { version = "0.8", default-features = false }
 data-encoding = { workspace = true }
 thiserror = { workspace = true }
 
@@ -75,7 +83,6 @@ marked-transport = [
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
-sha2 = { workspace = true }
 
 [lints]
 workspace = true

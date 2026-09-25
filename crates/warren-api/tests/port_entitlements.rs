@@ -22,8 +22,8 @@ use warren_api::transport::{HttpRequest, HttpResponse, HttpTransport, TransportE
 use warren_api::{
     AttributionTag, BanReasonCode, ClientError, CredentialClass, EntitlementEnvelope,
     PortEntitlementManager, PubkeyHex, TokenClientError, TokenEpochResponse, TokenIssueRequest,
-    TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey, TokenManager, WarrenApiClient,
-    mint_tokens_for,
+    TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey, WarrenApiClient,
+    mint_port_entitlements,
 };
 use warren_contract::pf_attribution::{
     CIPHERTEXT_LEN, ENVELOPE_LEN, NONCE_LEN, TAG_VERSION, signing_preimage,
@@ -225,15 +225,9 @@ async fn mint_with(fault: TagFault) -> (Result<usize, TokenClientError>, usize) 
     let api = client(FakeIssuer::with_fault(&[100], fault));
     let directory = api.transport().directory();
     let mut rng = StdRng::seed_from_u64(7);
-    let minted = mint_tokens_for(
-        CredentialClass::PortEntitlement,
-        &api,
-        &directory,
-        &[100],
-        &mut rng,
-    )
-    .await
-    .map(|batches| batches.iter().map(|b| b.tokens.len()).sum());
+    let minted = mint_port_entitlements(&api, &directory, &[100], &mut rng)
+        .await
+        .map(|batches| batches.iter().map(|b| b.tokens.len()).sum());
     (minted, api.transport().issue_calls.load(Ordering::SeqCst))
 }
 
@@ -374,63 +368,6 @@ async fn a_refresh_surfaces_a_batch_whose_tags_fail_the_checks() {
         ),
         "{err:?}"
     );
-}
-
-#[tokio::test]
-async fn a_port_entitlement_token_manager_never_vends_a_bare_token() {
-    // Every exit refuses a bare entitlement, so the session-token surface of
-    // a manager of this class hands out nothing.
-    let manager = TokenManager::for_class(
-        std::sync::Arc::new(client(FakeIssuer::new(&[100]))),
-        CredentialClass::PortEntitlement,
-    );
-    manager.refresh_auto(100 * EPOCH_SECS).await.unwrap();
-    assert_eq!(
-        manager.available(100),
-        QUOTA as usize,
-        "the batch was minted"
-    );
-
-    assert!(manager.take_current_stack(100 * EPOCH_SECS).is_empty());
-}
-
-#[tokio::test]
-async fn a_port_entitlement_batch_is_never_exported_for_persistence() {
-    // The persisted bundle carries bare tokens only, so an entitlement written
-    // to disk would come back without its tag and be refused everywhere.
-    let manager = TokenManager::for_class(
-        std::sync::Arc::new(client(FakeIssuer::new(&[100]))),
-        CredentialClass::PortEntitlement,
-    );
-    manager.refresh_auto(100 * EPOCH_SECS).await.unwrap();
-
-    assert!(manager.export_persistable().is_none());
-}
-
-#[tokio::test]
-async fn a_persisted_bundle_restores_no_port_entitlement() {
-    // A bundle holds bare tokens only (one written by a build that predates
-    // the tag, or crafted): dropped rather than presented.
-    let mut well_formed = [0u8; warrenguard_token::TOKEN_LEN];
-    well_formed[..2].copy_from_slice(&0x0002u16.to_be_bytes());
-    let body = format!(
-        r#"{{"epoch_secs":3600,"epochs":{{"100":["{}"]}}}}"#,
-        BASE64URL_NOPAD.encode(&well_formed)
-    );
-    let bundle = warren_api::PersistedTokens::from_json(&body).unwrap();
-    let session = TokenManager::new(std::sync::Arc::new(client(FakeIssuer::new(&[100]))));
-    assert_eq!(
-        session.restore_persisted(&bundle),
-        1,
-        "the bundle is well formed: a session manager takes it"
-    );
-    let entitlements = TokenManager::for_class(
-        std::sync::Arc::new(client(FakeIssuer::new(&[100]))),
-        CredentialClass::PortEntitlement,
-    );
-
-    assert_eq!(entitlements.restore_persisted(&bundle), 0);
-    assert_eq!(entitlements.available(100), 0);
 }
 
 #[tokio::test]

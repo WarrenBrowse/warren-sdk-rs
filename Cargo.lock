@@ -3528,9 +3528,12 @@ name = "warren-api"
 version = "0.0.1"
 dependencies = [
  "bytes",
+ "crypto-bigint",
  "data-encoding",
+ "der 0.8.1",
  "ed25519-dalek",
  "hex",
+ "hkdf",
  "http",
  "http-body-util",
  "hyper",

@@ -9,6 +9,26 @@ the pre-release `0.0.x` line.
 
 ### Added
 
+- Session and browser-proxy token batches are derived from the wallet instead
+  of the CSPRNG, byte for byte as the TypeScript SDK does
+  (`vectors/token_blinding_v1.json`). The issuer serves an account's epoch
+  batch again to whoever sends it bit for bit, so a second device of the
+  wallet, the browser extension and a reinstall that lost its store are all
+  served the credentials the account holds instead of `already_issued`.
+  Those clients then hold the SAME session tokens and pop them in the same
+  order, and an exit leases a serial to one session at a time, so two
+  concurrent devices contend for serials until each device draws from its own
+  index (warren-core `PROD-READINESS.md` section 7).
+  `BlindingKey::session(seed)` / `BlindingKey::browser_proxy(seed)` derive the
+  class key from the 32-byte wallet seed (purposes `session/v1` and
+  `browser-proxy/v1`, `BLINDING_*` constants). Breaking:
+  `TokenManager::new(client, key)` takes the key and mints its class
+  (`TokenManager::for_class` is gone), `TokenManager::refresh(now)` takes no
+  RNG and replaces `refresh_auto`, `mint_tokens(client, directory, epochs,
+  key)` takes the key, and `mint_tokens_for` is replaced by
+  `mint_port_entitlements`, the one class still drawn from the CSPRNG.
+  `TokenClientError::BlindingDrawOrder` refuses a batch the engine blinded in
+  another order than the derivation defines.
 - The SDK's own port forwards present the wallet's port entitlement envelope
   (warren-core doc 105), so an exit that refuses a credential-less NAT-PMP Map
   request (engine `requires_credential`, result code 2) keeps granting them.

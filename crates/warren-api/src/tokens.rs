@@ -11,7 +11,9 @@
 //! challenge context label all come from the self-describing directory, and
 //! the frozen challenge derivation itself lives in the engine
 //! (`TokenChallenge::for_epoch`). The only local inputs are the current time
-//! and an RNG (an injected system boundary, per the shared TDD rules).
+//! and the blinding material: derived from the wallet for the session and
+//! browser-proxy classes ([`BlindingKey`], so every client of a wallet sends
+//! the same batch and is served), drawn from the CSPRNG for port entitlements.
 //!
 //! Anti-correlation guidance: mint on unlock or on a timer, never at
 //! connect time, so issuance timing does not mirror session timing.
@@ -21,14 +23,17 @@ use std::sync::{Arc, Mutex};
 
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::VerifyingKey;
-use rand010::CryptoRng;
+use rand010::{CryptoRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use warren_contract::pf_attribution::{AttributionTag, AttributionTagError, EntitlementEnvelope};
-use warrenguard_token::{IssuerPublicKey, TOKEN_LEN, Token, TokenChallenge, TokenError};
+use warrenguard_token::{
+    ClientState, IssuerPublicKey, TOKEN_LEN, Token, TokenChallenge, TokenError,
+};
 use zeroize::Zeroizing;
 
 use crate::client::{ClientError, WarrenApiClient};
 use crate::dto::{TokenEpochRequest, TokenIssueRequest, TokenIssuerDirectory};
+use crate::token_blinding::BlindingKey;
 use crate::transport::HttpTransport;
 
 // The envelope declares the entitlement length itself so the contract does not
@@ -85,6 +90,12 @@ pub enum TokenClientError {
     /// that does not verify under the key it was requested from).
     #[error(transparent)]
     Crypto(#[from] TokenError),
+    /// The engine drew its blinding material in another order than the
+    /// wallet-derived batch is defined by. Raised before anything is sent: a
+    /// batch built anyway could not be rebuilt by any other client of the
+    /// wallet, and it would spend the epoch for this one alone.
+    #[error("token blinding no longer draws its material in the derived order")]
+    BlindingDrawOrder,
     /// The port-entitlement directory publishes no attribution verifying key,
     /// or one that is not an Ed25519 public key. Raised before anything is
     /// blinded: issuance is once per account and epoch, and a batch whose tags
@@ -225,33 +236,67 @@ fn checked_attribution_tags(
     Ok(tags)
 }
 
-/// Mints the full token batch for each of `epochs`: blind against each
-/// epoch's directory key, submit one wallet-signed issue request, finalize
-/// and verify every token. All-or-nothing: any refused epoch or malformed
-/// batch fails the whole call (the caller retries or narrows the epochs; a
-/// partially-minted state is never returned).
+/// Mints the full token batch for each of `epochs` in `key`'s class: blind
+/// against each epoch's directory key with the material `key` derives, submit
+/// one wallet-signed issue request, finalize and verify every token.
+/// All-or-nothing: any refused epoch or malformed batch fails the whole call
+/// (the caller retries or narrows the epochs; a partially-minted state is never
+/// returned).
+///
+/// Every client of the wallet derives the same batch for an epoch, so the
+/// issuer serves each of them the credentials the account already holds.
 ///
 /// # Errors
 /// [`TokenClientError`]; see each variant.
-pub async fn mint_tokens<T: HttpTransport, R: CryptoRng + ?Sized>(
+pub async fn mint_tokens<T: HttpTransport>(
+    client: &WarrenApiClient<T>,
+    directory: &TokenIssuerDirectory,
+    epochs: &[u64],
+    key: &BlindingKey,
+) -> Result<Vec<MintedEpoch>, TokenClientError> {
+    mint_batches(
+        key.class(),
+        client,
+        directory,
+        epochs,
+        |pk, challenge, epoch, index| key.blind_slot(pk, challenge, epoch, index),
+    )
+    .await
+}
+
+/// [`mint_tokens`] for port entitlements, whose batches are drawn from `rng`:
+/// an entitlement is assigned to one forwarded port, and two clients holding
+/// the same batch would present one credential for two ports.
+///
+/// # Errors
+/// [`TokenClientError`]; see each variant.
+pub async fn mint_port_entitlements<T: HttpTransport, R: CryptoRng + ?Sized>(
     client: &WarrenApiClient<T>,
     directory: &TokenIssuerDirectory,
     epochs: &[u64],
     rng: &mut R,
 ) -> Result<Vec<MintedEpoch>, TokenClientError> {
-    mint_tokens_for(CredentialClass::Session, client, directory, epochs, rng).await
+    mint_batches(
+        CredentialClass::PortEntitlement,
+        client,
+        directory,
+        epochs,
+        |pk, challenge, _, _| Ok(pk.blind_token(&mut *rng, challenge)?),
+    )
+    .await
 }
 
-/// [`mint_tokens`] for any credential class.
-///
-/// # Errors
-/// [`TokenClientError`]; see each variant.
-pub async fn mint_tokens_for<T: HttpTransport, R: CryptoRng + ?Sized>(
+async fn mint_batches<T: HttpTransport>(
     class: CredentialClass,
     client: &WarrenApiClient<T>,
     directory: &TokenIssuerDirectory,
     epochs: &[u64],
-    rng: &mut R,
+    mut blind: impl FnMut(
+        &IssuerPublicKey,
+        &TokenChallenge,
+        u64,
+        u32,
+    ) -> Result<(Vec<u8>, ClientState), TokenClientError>,
 ) -> Result<Vec<MintedEpoch>, TokenClientError> {
     let quota = directory.quota_per_epoch as usize;
     if quota == 0 || directory.epoch_secs == 0 {
@@ -271,8 +316,8 @@ pub async fn mint_tokens_for<T: HttpTransport, R: CryptoRng + ?Sized>(
             TokenChallenge::for_epoch(&directory.issuer_name, &directory.context_label, epoch)?;
         let mut blinded = Vec::with_capacity(quota);
         let mut states = Vec::with_capacity(quota);
-        for _ in 0..quota {
-            let (req, state) = pk.blind_token(rng, &challenge)?;
+        for index in 0..directory.quota_per_epoch {
+            let (req, state) = blind(&pk, &challenge, epoch, index)?;
             blinded.push(BASE64URL_NOPAD.encode(&req));
             states.push(state);
         }
@@ -503,6 +548,23 @@ impl CredentialClass {
     }
 }
 
+/// Whether a mint failure gives every remaining epoch the same answer, so a
+/// refresh must stop and return it: swallowed, it would read as a refresh that
+/// went fine and stocked nothing. A ban; an issuer whose attribution tags
+/// cannot pass the exit's checks; a token crate that no longer blinds in the
+/// derived order, which would leave every tick with no batch at all.
+fn answers_every_epoch_alike(err: &TokenClientError) -> bool {
+    matches!(
+        err,
+        TokenClientError::Api(ClientError::Banned { .. })
+            | TokenClientError::BadAttributionKey
+            | TokenClientError::AttributionTagCount { .. }
+            | TokenClientError::AttributionTagEpoch { .. }
+            | TokenClientError::AttributionTagInvalid { .. }
+            | TokenClientError::BlindingDrawOrder
+    )
+}
+
 /// The issuer's machine-readable reject code for its once-per-account-epoch
 /// ledger (`warren-api/src/handlers/token.rs::reject_reason`). The only refusal
 /// that is definitive for the rest of the epoch, hence the only one that
@@ -534,7 +596,7 @@ struct ManagerState {
 /// downgrade; the per-epoch quota bounds concurrent sessions anyway).
 pub struct TokenManager<T> {
     client: Arc<WarrenApiClient<T>>,
-    class: CredentialClass,
+    blinding: Blinding,
     state: Arc<Mutex<ManagerState>>,
     /// When set, [`Self::refresh`] mints only `current..=current + horizon`
     /// instead of the whole published window. `None` keeps the full-window
@@ -542,33 +604,51 @@ pub struct TokenManager<T> {
     mint_horizon: Option<u64>,
 }
 
+/// Where a manager's batches draw their blinding material.
+enum Blinding {
+    /// From the wallet: every client of the wallet sends the same batch.
+    Derived(BlindingKey),
+    /// From the CSPRNG, for port entitlements only.
+    Random,
+}
+
 impl<T: HttpTransport> TokenManager<T> {
-    /// Builds a manager over a wallet-signed API client. Empty until the first
+    /// Builds a manager over a wallet-signed API client for `key`'s class,
+    /// minting the batches `key` derives. Empty until the first
     /// [`Self::refresh`].
+    ///
+    /// `key` must come from the same wallet as the client's identity: the
+    /// issuer serves an account the batch it first signed for that account.
     #[must_use]
-    pub fn new(client: Arc<WarrenApiClient<T>>) -> Self {
-        Self::for_class(client, CredentialClass::Session)
+    pub fn new(client: Arc<WarrenApiClient<T>>, key: BlindingKey) -> Self {
+        Self::with_blinding(client, Blinding::Derived(key))
     }
 
-    /// [`Self::new`] for any credential class. Same minting flow, same
-    /// once-per-epoch bookkeeping, this class's endpoints and batch size.
-    ///
-    /// A [`CredentialClass::PortEntitlement`] manager mints and counts its
+    /// The manager inside [`PortEntitlementManager`]. It mints and counts its
     /// batch but vends nothing through [`Self::take_current_stack`] and never
     /// exports or restores a bundle: those carry bare tokens, and every exit
-    /// refuses an entitlement without its tag. [`PortEntitlementManager`] is
-    /// the surface that presents them.
-    #[must_use]
-    pub fn for_class(client: Arc<WarrenApiClient<T>>, class: CredentialClass) -> Self {
+    /// refuses an entitlement without its tag.
+    fn port_entitlements(client: Arc<WarrenApiClient<T>>) -> Self {
+        Self::with_blinding(client, Blinding::Random)
+    }
+
+    fn with_blinding(client: Arc<WarrenApiClient<T>>, blinding: Blinding) -> Self {
         Self {
             client,
-            class,
+            blinding,
             state: Arc::new(Mutex::new(ManagerState {
                 store: TokenStore::new(),
                 epoch_secs: None,
                 minted: BTreeSet::new(),
             })),
             mint_horizon: None,
+        }
+    }
+
+    fn class(&self) -> CredentialClass {
+        match &self.blinding {
+            Blinding::Derived(key) => key.class(),
+            Blinding::Random => CredentialClass::PortEntitlement,
         }
     }
 
@@ -614,12 +694,8 @@ impl<T: HttpTransport> TokenManager<T> {
     /// `AttributionTag*`). The pass stops there, leaving that epoch and the
     /// later ones unsettled, so the next tick asks again. Any other per-epoch
     /// mint refusal or transport error is swallowed.
-    pub async fn refresh<R: CryptoRng + ?Sized>(
-        &self,
-        now_unix_secs: u64,
-        rng: &mut R,
-    ) -> Result<(), TokenClientError> {
-        let directory = self.client.token_keys_for(self.class).await?;
+    pub async fn refresh(&self, now_unix_secs: u64) -> Result<(), TokenClientError> {
+        let directory = self.client.token_keys_for(self.class()).await?;
         let Some(current) = current_epoch(&directory, now_unix_secs) else {
             return Err(TokenClientError::BadDirectoryPolicy);
         };
@@ -643,7 +719,18 @@ impl<T: HttpTransport> TokenManager<T> {
         };
 
         for epoch in targets {
-            match mint_tokens_for(self.class, &self.client, &directory, &[epoch], rng).await {
+            let minted = match &self.blinding {
+                Blinding::Derived(key) => {
+                    mint_tokens(&self.client, &directory, &[epoch], key).await
+                }
+                Blinding::Random => {
+                    // Seeded synchronously: the !Send thread rng never crosses
+                    // the await.
+                    let mut rng = rand010::rngs::StdRng::from_rng(&mut rand010::rng());
+                    mint_port_entitlements(&self.client, &directory, &[epoch], &mut rng).await
+                }
+            };
+            match minted {
                 Ok(mut batches) => {
                     let mut st = self.state.lock().expect("token manager mutex poisoned");
                     st.minted.insert(epoch);
@@ -663,19 +750,10 @@ impl<T: HttpTransport> TokenManager<T> {
                         .minted
                         .insert(epoch);
                 }
-                // A ban, or an issuer whose attribution tags cannot pass the
-                // exit's checks, gives every remaining epoch the same answer,
-                // and swallowed they read as a refresh that went fine and
-                // stocked nothing. The failed epoch stays unsettled: a lifted
-                // ban mints at the next tick, and an epoch the issuer did
-                // record is settled then by its already_issued answer.
-                Err(
-                    e @ (TokenClientError::Api(ClientError::Banned { .. })
-                    | TokenClientError::BadAttributionKey
-                    | TokenClientError::AttributionTagCount { .. }
-                    | TokenClientError::AttributionTagEpoch { .. }
-                    | TokenClientError::AttributionTagInvalid { .. }),
-                ) => return Err(e),
+                // The failed epoch stays unsettled: a lifted ban mints at the
+                // next tick, and an epoch the issuer did record is settled
+                // then by its already_issued answer.
+                Err(e) if answers_every_epoch_alike(&e) => return Err(e),
                 Err(_) => {
                     // Anything else (transport error, 5xx, a refusal that can
                     // heal like not_subscribed, a malformed response) proves
@@ -689,18 +767,6 @@ impl<T: HttpTransport> TokenManager<T> {
             }
         }
         Ok(())
-    }
-
-    /// [`Self::refresh`] with an OS-seeded CSPRNG built internally, so callers
-    /// (the daemon's refresh task) need no `rand` dependency of their own.
-    ///
-    /// # Errors
-    /// As [`Self::refresh`].
-    pub async fn refresh_auto(&self, now_unix_secs: u64) -> Result<(), TokenClientError> {
-        use rand010::SeedableRng;
-        // Seed synchronously (the !Send thread rng never crosses the await).
-        let mut rng = rand010::rngs::StdRng::from_rng(&mut rand010::rng());
-        self.refresh(now_unix_secs, &mut rng).await
     }
 
     /// Tokens currently available for `epoch` (test/observability).
@@ -719,7 +785,7 @@ impl<T: HttpTransport> TokenManager<T> {
     /// token this epoch": the tunnel then uses the v6 path. Never mints.
     #[must_use]
     pub fn take_current_stack(&self, now_unix_secs: u64) -> Vec<[u8; TOKEN_LEN]> {
-        if self.class == CredentialClass::PortEntitlement {
+        if self.class() == CredentialClass::PortEntitlement {
             return Vec::new();
         }
         let mut st = self.state.lock().expect("token manager mutex poisoned");
@@ -754,7 +820,7 @@ impl<T: HttpTransport> TokenManager<T> {
     /// hence no `#[must_use]`).
     #[allow(clippy::must_use_candidate)]
     pub fn restore_persisted(&self, bundle: &PersistedTokens) -> usize {
-        if self.class == CredentialClass::PortEntitlement {
+        if self.class() == CredentialClass::PortEntitlement {
             return 0;
         }
         let mut st = self.state.lock().expect("token manager mutex poisoned");
@@ -791,7 +857,7 @@ impl<T: HttpTransport> TokenManager<T> {
     /// pubkey.
     #[must_use]
     pub fn export_persistable(&self) -> Option<PersistedTokens> {
-        if self.class == CredentialClass::PortEntitlement {
+        if self.class() == CredentialClass::PortEntitlement {
             return None;
         }
         let st = self.state.lock().expect("token manager mutex poisoned");
@@ -1017,6 +1083,96 @@ mod persistence_tests {
     }
 }
 
+#[cfg(test)]
+mod port_entitlement_guard_tests {
+    //! The bare-token surfaces of the manager inside
+    //! [`PortEntitlementManager`] hand nothing out: every exit refuses an
+    //! entitlement without its tag, and a persisted bundle carries none.
+
+    use warren_identity::WarrenIdentity;
+
+    use super::*;
+    use crate::transport::{HttpRequest, HttpResponse, TransportError};
+
+    /// Never reached: the store is filled by hand.
+    struct Offline;
+
+    impl HttpTransport for Offline {
+        async fn execute(&self, _: HttpRequest) -> Result<HttpResponse, TransportError> {
+            Err(TransportError::Connect("offline".to_owned()))
+        }
+    }
+
+    const EPOCH_SECS: u64 = 3600;
+
+    fn token() -> Token {
+        let mut bytes = [0u8; TOKEN_LEN];
+        bytes[0..2].copy_from_slice(&0x0002u16.to_be_bytes());
+        Token::parse(&bytes).expect("well-formed token bytes parse")
+    }
+
+    fn entitlements() -> TokenManager<Offline> {
+        TokenManager::port_entitlements(Arc::new(WarrenApiClient::new(
+            "https://api.example.test",
+            WarrenIdentity::from_seed(&[0x51; 32]),
+            Offline,
+        )))
+    }
+
+    fn stocked_entitlements() -> TokenManager<Offline> {
+        let manager = entitlements();
+        {
+            let mut st = manager.state.lock().expect("fresh mutex");
+            st.epoch_secs = Some(EPOCH_SECS);
+            st.store.insert(MintedEpoch {
+                epoch: 100,
+                tokens: vec![token()],
+                attribution_tags: Vec::new(),
+            });
+        }
+        manager
+    }
+
+    #[test]
+    fn a_port_entitlement_manager_never_vends_a_bare_token() {
+        let manager = stocked_entitlements();
+
+        assert!(manager.take_current_stack(100 * EPOCH_SECS).is_empty());
+        assert_eq!(
+            manager.available(100),
+            1,
+            "the batch stays for the envelope surface"
+        );
+    }
+
+    #[test]
+    fn a_port_entitlement_batch_is_never_exported_for_persistence() {
+        assert!(stocked_entitlements().export_persistable().is_none());
+    }
+
+    #[test]
+    fn a_blinding_drift_stops_the_refresh_pass_like_a_ban() {
+        // Deterministic on every epoch and every tick: swallowed, the manager
+        // would stock nothing for good while reporting success.
+        assert!(answers_every_epoch_alike(
+            &TokenClientError::BlindingDrawOrder
+        ));
+        assert!(!answers_every_epoch_alike(
+            &TokenClientError::BatchMismatch { epoch: 100 }
+        ));
+    }
+
+    #[test]
+    fn a_persisted_bundle_restores_no_port_entitlement() {
+        let bundle =
+            PersistedTokens::from_snapshot(EPOCH_SECS, vec![(100, vec![token().serialize()])]);
+        let manager = entitlements();
+
+        assert_eq!(manager.restore_persisted(&bundle), 0);
+        assert_eq!(manager.available(100), 0);
+    }
+}
+
 /// Hands each port-forwarding rule the entitlement it presents (warren-core
 /// docs 99 and 105).
 ///
@@ -1030,8 +1186,8 @@ mod persistence_tests {
 ///
 /// What a slot presents is the [`EntitlementEnvelope`]: the entitlement and
 /// the attribution tag the issuer minted beside it, verified at mint time.
-/// The batch lives in RAM only and is never persisted (see
-/// [`TokenManager::for_class`]).
+/// The batch lives in RAM only and is never persisted: a bundle carries bare
+/// tokens, and every exit refuses an entitlement without its tag.
 pub struct PortEntitlementManager<T> {
     inner: TokenManager<T>,
     assigned: Mutex<Assigned>,
@@ -1051,7 +1207,7 @@ impl<T: HttpTransport> PortEntitlementManager<T> {
     #[must_use]
     pub fn new(client: Arc<WarrenApiClient<T>>) -> Self {
         Self {
-            inner: TokenManager::for_class(client, CredentialClass::PortEntitlement),
+            inner: TokenManager::port_entitlements(client),
             assigned: Mutex::new(Assigned::default()),
         }
     }
@@ -1064,7 +1220,7 @@ impl<T: HttpTransport> PortEntitlementManager<T> {
     /// shows as the suspension), or an issuer whose attribution tags the exit
     /// would refuse.
     pub async fn refresh_auto(&self, now_unix_secs: u64) -> Result<(), TokenClientError> {
-        self.inner.refresh_auto(now_unix_secs).await
+        self.inner.refresh(now_unix_secs).await
     }
 
     /// The credential rule `slot` presents right now: the encoded

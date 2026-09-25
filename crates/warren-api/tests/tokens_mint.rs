@@ -16,9 +16,9 @@ use rand010::SeedableRng;
 use rand010::rngs::StdRng;
 use warren_api::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_api::{
-    BanReasonCode, ClientError, TokenClientError, TokenEpochResponse, TokenIssueRequest,
-    TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey, TokenManager, TokenStore,
-    WarrenApiClient, current_epoch, mint_tokens,
+    BanReasonCode, BlindingKey, ClientError, TokenClientError, TokenEpochResponse,
+    TokenIssueRequest, TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey, TokenManager,
+    TokenStore, WarrenApiClient, current_epoch, mint_tokens,
 };
 use warren_identity::WarrenIdentity;
 use warrenguard_token::{IssuerSecretKey, TokenChallenge};
@@ -51,6 +51,14 @@ struct FakeIssuer {
     last_issue: Mutex<Option<(HttpRequest, TokenIssueRequest)>>,
     /// Headers seen on the directory fetch.
     last_keys_headers: Mutex<Option<Vec<(String, String)>>>,
+    /// URL of the last directory fetch.
+    last_keys_url: Mutex<Option<String>>,
+    /// When set, the fake keeps warren-api's issuance ledger: the first batch
+    /// sent for an epoch takes it, the SAME batch sent again is signed again,
+    /// and any other batch is refused as `already_issued`.
+    replay_ledger: bool,
+    /// The batch that took each epoch, under `replay_ledger`.
+    ledger: Mutex<HashMap<u64, Vec<String>>>,
 }
 
 impl FakeIssuer {
@@ -69,6 +77,9 @@ impl FakeIssuer {
             issue_calls: AtomicUsize::new(0),
             last_issue: Mutex::new(None),
             last_keys_headers: Mutex::new(None),
+            last_keys_url: Mutex::new(None),
+            replay_ledger: false,
+            ledger: Mutex::new(HashMap::new()),
         }
     }
 
@@ -104,12 +115,16 @@ impl FakeIssuer {
 impl HttpTransport for FakeIssuer {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
         let ok = |body: Vec<u8>| Ok(HttpResponse { status: 200, body });
-        if request.url.ends_with("/v1/tokens/keys") {
+        if request.url.ends_with("/v1/tokens/keys")
+            || request.url.ends_with("/v1/browser-proxy/keys")
+        {
             *self.last_keys_headers.lock().unwrap() = Some(request.headers.clone());
+            *self.last_keys_url.lock().unwrap() = Some(request.url.clone());
             return ok(serde_json::to_vec(&self.directory()).unwrap());
         }
         assert!(
-            request.url.ends_with("/v1/tokens/issue"),
+            request.url.ends_with("/v1/tokens/issue")
+                || request.url.ends_with("/v1/browser-proxy/issue"),
             "unexpected URL {}",
             request.url
         );
@@ -131,6 +146,25 @@ impl HttpTransport for FakeIssuer {
         let req: TokenIssueRequest = serde_json::from_slice(&request.body).unwrap();
         let mut epochs = Vec::new();
         for e in &req.epochs {
+            let taken_by_another_batch = self.replay_ledger
+                && self
+                    .ledger
+                    .lock()
+                    .unwrap()
+                    .entry(e.epoch)
+                    .or_insert_with(|| e.blinded.clone())
+                    != &e.blinded;
+            if taken_by_another_batch {
+                epochs.push(TokenEpochResponse {
+                    epoch: e.epoch,
+                    issued: false,
+                    blind_signatures: Vec::new(),
+                    token_key_id: None,
+                    reject_reason: Some("already_issued".to_owned()),
+                    attribution_tags: Vec::new(),
+                });
+                continue;
+            }
             if self.refuse.contains(&e.epoch) {
                 epochs.push(TokenEpochResponse {
                     epoch: e.epoch,
@@ -165,21 +199,27 @@ impl HttpTransport for FakeIssuer {
     }
 }
 
+/// The wallet every client here signs as.
+const WALLET_SEED: [u8; 32] = [0x33; 32];
+
 fn client(fake: FakeIssuer) -> WarrenApiClient<FakeIssuer> {
     WarrenApiClient::new(
         "https://api.example.test",
-        WarrenIdentity::from_seed(&[0x33; 32]),
+        WarrenIdentity::from_seed(&WALLET_SEED),
         fake,
     )
+}
+
+fn session_key() -> BlindingKey {
+    BlindingKey::session(&WALLET_SEED)
 }
 
 #[tokio::test]
 async fn mints_verifying_tokens_for_the_requested_epochs() {
     let c = client(FakeIssuer::new(&[100, 101]));
     let directory = c.token_keys().await.unwrap();
-    let mut rng = StdRng::seed_from_u64(7);
 
-    let minted = mint_tokens(&c, &directory, &[100, 101], &mut rng)
+    let minted = mint_tokens(&c, &directory, &[100, 101], &session_key())
         .await
         .unwrap();
 
@@ -209,8 +249,9 @@ async fn keys_fetch_is_unsigned_and_issue_is_wallet_signed() {
     // wallet; the issue request must (that is where policy is enforced).
     let c = client(FakeIssuer::new(&[100]));
     let directory = c.token_keys().await.unwrap();
-    let mut rng = StdRng::seed_from_u64(8);
-    mint_tokens(&c, &directory, &[100], &mut rng).await.unwrap();
+    mint_tokens(&c, &directory, &[100], &session_key())
+        .await
+        .unwrap();
 
     let keys_headers = c
         .transport()
@@ -243,9 +284,8 @@ async fn a_refused_epoch_fails_the_mint_with_the_server_reason() {
     fake.refuse.push(101);
     let c = client(fake);
     let directory = c.token_keys().await.unwrap();
-    let mut rng = StdRng::seed_from_u64(9);
 
-    let err = mint_tokens(&c, &directory, &[100, 101], &mut rng)
+    let err = mint_tokens(&c, &directory, &[100, 101], &session_key())
         .await
         .unwrap_err();
     match err {
@@ -261,9 +301,8 @@ async fn a_refused_epoch_fails_the_mint_with_the_server_reason() {
 async fn a_missing_directory_key_fails_before_any_network_issue() {
     let c = client(FakeIssuer::new(&[100]));
     let directory = c.token_keys().await.unwrap();
-    let mut rng = StdRng::seed_from_u64(10);
 
-    let err = mint_tokens(&c, &directory, &[999], &mut rng)
+    let err = mint_tokens(&c, &directory, &[999], &session_key())
         .await
         .unwrap_err();
     assert!(matches!(
@@ -281,9 +320,8 @@ async fn a_tampered_directory_key_id_fails_closed() {
     let c = client(FakeIssuer::new(&[100]));
     let mut directory = c.token_keys().await.unwrap();
     directory.keys[0].token_key_id = "00".repeat(32);
-    let mut rng = StdRng::seed_from_u64(11);
 
-    let err = mint_tokens(&c, &directory, &[100], &mut rng)
+    let err = mint_tokens(&c, &directory, &[100], &session_key())
         .await
         .unwrap_err();
     assert!(matches!(
@@ -296,8 +334,7 @@ async fn a_tampered_directory_key_id_fails_closed() {
 async fn store_pops_tokens_once_and_prunes_past_epochs() {
     let c = client(FakeIssuer::new(&[100, 101]));
     let directory = c.token_keys().await.unwrap();
-    let mut rng = StdRng::seed_from_u64(12);
-    let minted = mint_tokens(&c, &directory, &[100, 101], &mut rng)
+    let minted = mint_tokens(&c, &directory, &[100, 101], &session_key())
         .await
         .unwrap();
 
@@ -345,9 +382,11 @@ async fn token_manager_refreshes_then_vends_one_serialized_token_per_session() {
 
     // Current epoch 100; the directory also publishes 101 (prefetch horizon).
     let now = 100 * EPOCH_SECS + 5;
-    let manager = TokenManager::new(Arc::new(client(FakeIssuer::new(&[100, 101]))));
-    let mut rng = StdRng::seed_from_u64(11);
-    manager.refresh(now, &mut rng).await.expect("refresh mints");
+    let manager = TokenManager::new(
+        Arc::new(client(FakeIssuer::new(&[100, 101]))),
+        session_key(),
+    );
+    manager.refresh(now).await.expect("refresh mints");
 
     // Current epoch is fully stocked; the prefetch horizon stocked the next.
     assert_eq!(manager.available(100), QUOTA as usize);
@@ -375,7 +414,7 @@ async fn token_manager_provider_is_empty_before_any_refresh() {
     use warren_api::TokenManager;
     // No directory yet: the provider must yield an empty stack (never panic),
     // so a connect before the first refresh cleanly uses the v6 path.
-    let manager = TokenManager::new(Arc::new(client(FakeIssuer::new(&[100]))));
+    let manager = TokenManager::new(Arc::new(client(FakeIssuer::new(&[100]))), session_key());
     assert!(manager.take_current_stack(100 * EPOCH_SECS).is_empty());
 }
 
@@ -388,12 +427,11 @@ async fn a_transient_mint_failure_is_retried_on_the_next_refresh() {
     // then heals.
     let fake = FakeIssuer::new(&[100]);
     fake.fail_issue_once.store(true, Ordering::SeqCst);
-    let manager = TokenManager::new(Arc::new(client(fake)));
+    let manager = TokenManager::new(Arc::new(client(fake)), session_key());
     let now = 100 * EPOCH_SECS + 5;
-    let mut rng = StdRng::seed_from_u64(21);
 
     manager
-        .refresh(now, &mut rng)
+        .refresh(now)
         .await
         .expect("a per-epoch mint failure is absorbed; refresh itself succeeds");
     assert_eq!(
@@ -405,10 +443,7 @@ async fn a_transient_mint_failure_is_retried_on_the_next_refresh() {
     // The failure was transient, so the next tick must re-ask. Settling the
     // epoch on a transport error would silently downgrade every session of the
     // whole epoch to the v6 wallet-signed path after one blip.
-    manager
-        .refresh(now, &mut rng)
-        .await
-        .expect("second refresh");
+    manager.refresh(now).await.expect("second refresh");
     assert_eq!(
         manager.available(100),
         QUOTA as usize,
@@ -428,20 +463,16 @@ async fn a_definitive_already_issued_refusal_settles_the_epoch() {
     fake.refuse.push(100);
     fake.refuse_reason = "already_issued".to_owned();
     let api = Arc::new(client(fake));
-    let manager = TokenManager::new(Arc::clone(&api));
+    let manager = TokenManager::new(Arc::clone(&api), session_key());
     let now = 100 * EPOCH_SECS + 5;
-    let mut rng = StdRng::seed_from_u64(22);
 
-    manager
-        .refresh(now, &mut rng)
-        .await
-        .expect("refused refresh");
+    manager.refresh(now).await.expect("refused refresh");
     assert_eq!(manager.available(100), 0, "a refused epoch stocks nothing");
     let calls_after_refusal = api.transport().issue_calls.load(Ordering::SeqCst);
     assert_eq!(calls_after_refusal, 1, "the epoch was asked exactly once");
 
     // already_issued is definitive: the next tick must not re-ask the issuer.
-    manager.refresh(now, &mut rng).await.expect("third refresh");
+    manager.refresh(now).await.expect("third refresh");
     assert_eq!(
         api.transport().issue_calls.load(Ordering::SeqCst),
         calls_after_refusal,
@@ -474,10 +505,9 @@ async fn a_mint_horizon_narrows_refresh_to_current_plus_horizon() {
 
     // Five epochs published; a horizon of 2 must mint only current..=current+2.
     let api = Arc::new(client(FakeIssuer::new(&[100, 101, 102, 103, 104])));
-    let manager = TokenManager::new(Arc::clone(&api)).with_mint_horizon(2);
-    let mut rng = StdRng::seed_from_u64(31);
+    let manager = TokenManager::new(Arc::clone(&api), session_key()).with_mint_horizon(2);
     manager
-        .refresh(100 * EPOCH_SECS + 5, &mut rng)
+        .refresh(100 * EPOCH_SECS + 5)
         .await
         .expect("refresh");
 
@@ -497,7 +527,7 @@ async fn a_mint_horizon_narrows_refresh_to_current_plus_horizon() {
     // The horizon slides with the clock: one epoch later, exactly the newly
     // in-horizon epoch is minted (settled ones are never re-asked).
     manager
-        .refresh(101 * EPOCH_SECS + 5, &mut rng)
+        .refresh(101 * EPOCH_SECS + 5)
         .await
         .expect("second refresh");
     assert_eq!(manager.available(103), QUOTA as usize);
@@ -514,7 +544,7 @@ async fn a_restored_bundle_vends_tokens_before_any_refresh() {
     // v7 tokens immediately, with no directory fetch and no mint (the whole
     // point of persistence is surviving process death while offline).
     let api = Arc::new(client(FakeIssuer::new(&[])));
-    let manager = TokenManager::new(Arc::clone(&api));
+    let manager = TokenManager::new(Arc::clone(&api), session_key());
     let token = fake_token_bytes(7);
     let bundle = PersistedTokens::from_json(&bundle_json(100, &[token])).expect("parse");
     assert_eq!(manager.restore_persisted(&bundle), 1, "one token restored");
@@ -548,14 +578,13 @@ async fn a_refresh_after_restore_keeps_the_restored_stock_on_already_issued() {
     fake.refuse.push(100);
     fake.refuse_reason = "already_issued".to_owned();
     let api = Arc::new(client(fake));
-    let manager = TokenManager::new(Arc::clone(&api));
+    let manager = TokenManager::new(Arc::clone(&api), session_key());
     let bundle =
         PersistedTokens::from_json(&bundle_json(100, &[fake_token_bytes(9)])).expect("parse");
     manager.restore_persisted(&bundle);
 
-    let mut rng = StdRng::seed_from_u64(41);
     manager
-        .refresh(100 * EPOCH_SECS + 5, &mut rng)
+        .refresh(100 * EPOCH_SECS + 5)
         .await
         .expect("refresh");
     assert_eq!(
@@ -576,9 +605,8 @@ async fn a_banned_wallet_gets_a_typed_refusal_from_token_issuance() {
     *fake.issue_refusal.lock().unwrap() = Some((403, BANNED_BODY));
     let c = client(fake);
     let directory = c.token_keys().await.unwrap();
-    let mut rng = StdRng::seed_from_u64(7);
 
-    let err = mint_tokens(&c, &directory, &[100], &mut rng)
+    let err = mint_tokens(&c, &directory, &[100], &session_key())
         .await
         .expect_err("a banned wallet mints nothing");
 
@@ -600,9 +628,8 @@ async fn a_forbidden_answer_that_is_not_a_ban_keeps_the_status_error() {
     *fake.issue_refusal.lock().unwrap() = Some((403, r#"{"error":"forbidden"}"#));
     let c = client(fake);
     let directory = c.token_keys().await.unwrap();
-    let mut rng = StdRng::seed_from_u64(7);
 
-    let err = mint_tokens(&c, &directory, &[100], &mut rng)
+    let err = mint_tokens(&c, &directory, &[100], &session_key())
         .await
         .expect_err("refused");
 
@@ -623,10 +650,10 @@ async fn a_refresh_surfaces_a_ban_and_mints_once_it_is_lifted() {
     let fake = FakeIssuer::new(&[100, 101]);
     *fake.issue_refusal.lock().unwrap() = Some((403, BANNED_BODY));
     let api = std::sync::Arc::new(client(fake));
-    let manager = TokenManager::new(api.clone());
+    let manager = TokenManager::new(api.clone(), session_key());
 
     let err = manager
-        .refresh(100 * EPOCH_SECS, &mut StdRng::seed_from_u64(7))
+        .refresh(100 * EPOCH_SECS)
         .await
         .expect_err("the ban reaches the caller");
 
@@ -641,8 +668,80 @@ async fn a_refresh_surfaces_a_ban_and_mints_once_it_is_lifted() {
     );
     *api.transport().issue_refusal.lock().unwrap() = None;
     manager
-        .refresh(100 * EPOCH_SECS, &mut StdRng::seed_from_u64(8))
+        .refresh(100 * EPOCH_SECS)
         .await
         .expect("the ban is lifted");
     assert_eq!(manager.available(100), QUOTA as usize);
+}
+
+fn drain(manager: &TokenManager<FakeIssuer>, now: u64) -> Vec<[u8; warrenguard_token::TOKEN_LEN]> {
+    let mut tokens = Vec::new();
+    loop {
+        let stack = manager.take_current_stack(now);
+        if stack.is_empty() {
+            return tokens;
+        }
+        tokens.extend(stack);
+    }
+}
+
+#[tokio::test]
+async fn every_client_of_a_wallet_is_served_the_batch_the_issuer_first_signed() {
+    // The issuer takes an account's epoch with the first batch it signs and
+    // serves that batch again to whoever sends it bit for bit. Two devices of
+    // one wallet (or the app and the extension) derive the same batch, so the
+    // second is served the account's credentials instead of being refused.
+    use std::sync::Arc;
+
+    let mut fake = FakeIssuer::new(&[100]);
+    fake.replay_ledger = true;
+    let api = Arc::new(client(fake));
+    let now = 100 * EPOCH_SECS + 5;
+    let first = TokenManager::new(Arc::clone(&api), session_key());
+    let second = TokenManager::new(Arc::clone(&api), session_key());
+
+    first.refresh(now).await.expect("first device");
+    second.refresh(now).await.expect("second device");
+
+    let (mut a, mut b) = (drain(&first, now), drain(&second, now));
+    a.sort_unstable();
+    b.sort_unstable();
+    assert_eq!(a.len(), QUOTA as usize);
+    assert_eq!(a, b, "both devices hold the account's credentials");
+    let stranger = TokenManager::new(Arc::clone(&api), BlindingKey::session(&[0x44; 32]));
+    stranger.refresh(now).await.expect("refused, not failed");
+    assert_eq!(
+        stranger.available(100),
+        0,
+        "a batch the wallet does not derive is still refused once the epoch is taken"
+    );
+}
+
+#[tokio::test]
+async fn a_browser_proxy_key_mints_from_the_browser_proxy_issuer() {
+    use std::sync::Arc;
+
+    let api = Arc::new(client(FakeIssuer::new(&[100])));
+    let manager = TokenManager::new(Arc::clone(&api), BlindingKey::browser_proxy(&WALLET_SEED));
+
+    manager
+        .refresh(100 * EPOCH_SECS + 5)
+        .await
+        .expect("refresh");
+
+    assert_eq!(manager.available(100), QUOTA as usize);
+    let keys_url = api
+        .transport()
+        .last_keys_url
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap();
+    assert!(keys_url.ends_with("/v1/browser-proxy/keys"), "{keys_url}");
+    let (issue, _) = api.transport().last_issue.lock().unwrap().take().unwrap();
+    assert!(
+        issue.url.ends_with("/v1/browser-proxy/issue"),
+        "{}",
+        issue.url
+    );
 }
