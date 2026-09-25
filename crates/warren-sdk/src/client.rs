@@ -12,7 +12,7 @@ use warren_discovery::{
 };
 use warren_identity::WarrenIdentity;
 use warren_net::MultihopPacketSink;
-use warren_transport::{ConnectionState, MultihopClientTunnel, SocketBypass};
+use warren_transport::{ConnectionState, MultihopSession, SessionAdmission, SocketBypass};
 
 #[cfg(feature = "reqwest-transport")]
 use warren_api::ReqwestTransport;
@@ -132,6 +132,8 @@ pub struct WarrenClientBuilder {
     pub(crate) generation_store: Arc<dyn GenerationStore>,
     pub(crate) multihop_generation_store: Arc<dyn GenerationStore>,
     pub(crate) server_key_store: Option<Arc<dyn ServerKeyStore>>,
+    pub(crate) session_admission: SessionAdmission,
+    pub(crate) session_blinding_key: Option<warren_api::BlindingKey>,
 }
 
 impl WarrenClientBuilder {
@@ -273,6 +275,37 @@ impl WarrenClientBuilder {
         self
     }
 
+    /// How the client's tunnels are admitted at the exit.
+    ///
+    /// A client whose identity was built from a mnemonic or a seed presents the
+    /// wallet's anonymous session tokens (warren-core doc 64), so the exit
+    /// admits the session without learning the wallet. The default,
+    /// [`SessionAdmission::TokensOrWallet`], falls back to the wallet-signed
+    /// request when no token is admitted (none minted yet, or every one held
+    /// by another session of the wallet), which keeps a wallet shared by more
+    /// people than it has tokens in service.
+    /// [`SessionAdmission::TokensOnly`] never sends a request naming the
+    /// wallet: such a dial fails with
+    /// [`MultihopError::NoSessionToken`](warren_transport::MultihopError::NoSessionToken)
+    /// instead, and a supervised datapath retries it.
+    #[must_use]
+    pub fn session_admission(mut self, admission: SessionAdmission) -> Self {
+        self.session_admission = admission;
+        self
+    }
+
+    /// Hands the client the wallet's session blinding key
+    /// ([`BlindingKey::session`](warren_api::BlindingKey::session)), for an
+    /// identity built from a bare signing key, which carries no seed to derive
+    /// it from (an FFI wallet handle keeps only the derived keys). Without it,
+    /// such a client dials on the wallet-signed request. An identity built from
+    /// a mnemonic or a seed needs none.
+    #[must_use]
+    pub fn session_blinding_key(mut self, key: warren_api::BlindingKey) -> Self {
+        self.session_blinding_key = Some(key);
+        self
+    }
+
     /// Sets a [`ServerKeyStore`] to enable trust-on-first-use pinning of the
     /// signed-exit-list server key. A TOFU store is itself a valid pinning
     /// strategy, so setting it satisfies the build-time pin requirement.
@@ -288,9 +321,11 @@ impl WarrenClientBuilder {
     ///
     /// [`BuildError::MissingIdentity`] if no identity was set,
     /// [`BuildError::UnpinnedServerKey`] if neither a pin nor
-    /// [`allow_any_server_key`](Self::allow_any_server_key) was set, or
-    /// [`BuildError::TransportInit`] if the bundled HTTP transport cannot
-    /// initialize (a broken TLS backend).
+    /// [`allow_any_server_key`](Self::allow_any_server_key) was set,
+    /// [`BuildError::NotASessionBlindingKey`] if the key handed to
+    /// [`session_blinding_key`](Self::session_blinding_key) mints another
+    /// class, or [`BuildError::TransportInit`] if the bundled HTTP transport
+    /// cannot initialize (a broken TLS backend).
     #[cfg(feature = "reqwest-transport")]
     pub fn build(self) -> Result<WarrenClient<ReqwestTransport>, BuildError> {
         // Fallible construction (no panic across the FFI boundary): a broken TLS
@@ -303,14 +338,17 @@ impl WarrenClientBuilder {
     ///
     /// # Errors
     ///
-    /// [`BuildError::MissingIdentity`] if no identity was set, or
+    /// [`BuildError::MissingIdentity`] if no identity was set,
     /// [`BuildError::UnpinnedServerKey`] if neither a pin nor
-    /// [`allow_any_server_key`](Self::allow_any_server_key) was set.
+    /// [`allow_any_server_key`](Self::allow_any_server_key) was set, or
+    /// [`BuildError::NotASessionBlindingKey`] if the key handed to
+    /// [`session_blinding_key`](Self::session_blinding_key) mints another
+    /// class.
     pub fn build_with_transport<T: HttpTransport + 'static>(
         self,
         transport: T,
     ) -> Result<WarrenClient<T>, BuildError> {
-        let identity = self.identity.ok_or(BuildError::MissingIdentity)?;
+        let mut identity = self.identity.ok_or(BuildError::MissingIdentity)?;
         // A TOFU store is a deliberate pinning strategy, so it also satisfies
         // the requirement that an unpinned client be an explicit choice.
         if self.server_pubkey_pin.is_none()
@@ -323,6 +361,18 @@ impl WarrenClientBuilder {
         // The wallet key doubles as the QUIC tunnel client identity, so keep a
         // copy before the identity moves into the API client.
         let signing = identity.signing_key();
+        // Taken here so the API client, which lives as long as the process
+        // keeps this wallet's batches, never holds the seed.
+        let session_blinding = identity
+            .take_seed()
+            .map(|seed| warren_api::BlindingKey::session(&seed))
+            .or(self.session_blinding_key);
+        if session_blinding
+            .as_ref()
+            .is_some_and(|key| key.class() != warren_api::CredentialClass::Session)
+        {
+            return Err(BuildError::NotASessionBlindingKey);
+        }
         let entitlements_key = format!("{}\n{}", self.api_base, identity.address());
         let api = Arc::new(WarrenApiClient::new_with_fallback(
             self.api_base,
@@ -330,12 +380,19 @@ impl WarrenClientBuilder {
             identity,
             transport,
         ));
+        let session_tokens = session_blinding.map(|key| {
+            crate::session_tokens::SessionTokens::for_wallet(entitlements_key.clone(), &api, key)
+        });
         let port_entitlements =
             crate::entitlements::PortEntitlements::for_wallet(entitlements_key, &api);
         Ok(WarrenClient {
             api,
             port_entitlements,
-            signing,
+            auth: crate::session_tokens::DialAuth {
+                signing,
+                tokens: session_tokens,
+                admission: self.session_admission,
+            },
             server_pubkey_pin: pin,
             multihop_root_pubkey_pins: self.multihop_root_pubkey_pins,
             auto_local_ip: self.auto_local_ip,
@@ -363,7 +420,9 @@ pub struct WarrenClient<T> {
     /// wallet and API in the process: every forward of every datapath this
     /// client starts presents one (warren-core doc 105).
     pub(crate) port_entitlements: crate::entitlements::PortEntitlements,
-    pub(crate) signing: warren_identity::ed25519_dalek::SigningKey,
+    /// The wallet key, the wallet's session tokens and the admission policy
+    /// every tunnel of this client dials with.
+    pub(crate) auth: crate::session_tokens::DialAuth,
     pub(crate) server_pubkey_pin: Option<String>,
     /// Pinned offline multihop-directory root keys (empty = root TOFU).
     pub(crate) multihop_root_pubkey_pins: Vec<String>,
@@ -412,6 +471,8 @@ impl WarrenClient<()> {
             generation_store: Arc::new(InMemoryGenerationStore::default()),
             multihop_generation_store: Arc::new(InMemoryGenerationStore::default()),
             server_key_store: None,
+            session_admission: SessionAdmission::default(),
+            session_blinding_key: None,
         }
     }
 }
@@ -685,7 +746,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         // The userland proxy installs no OS tunnel, so its carrier socket is never
         // marked/bound (no bypass): the privileged TUN datapath is the only caller
         // that sets one, via `connect_multihop_with_bypass`.
-        self.connect_multihop_with_bypass(exit, None).await
+        self.connect_multihop_with_bypass(exit, None, None).await
     }
 
     /// [`Self::connect_multihop`] with an explicit carrier-socket bypass. The
@@ -693,10 +754,14 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// physical link (`SO_MARK` / `IP_BOUND_IF`) BEFORE its first send, which is
     /// what lets the split-default routing drop the `<exit_ip>/32` host route
     /// (Port Fail / TunnelCrack ServerIP fix). `None` is the userland proxy path.
+    ///
+    /// `join` bonds the dial onto that session (see
+    /// [`MultihopClientTunnel::joining`](warren_transport::MultihopClientTunnel::joining)).
     async fn connect_multihop_with_bypass(
         &self,
         exit: &VerifiedExit,
         socket_bypass: Option<SocketBypass>,
+        join: Option<&MultihopSession>,
     ) -> Result<MultihopPacketSink, SdkError> {
         // Resolve the coupled cover-defense switch from the engine knobs (idle
         // cover default ON, DAITA mutual exclusion), the single home shared with
@@ -704,7 +769,10 @@ impl<T: HttpTransport> WarrenClient<T> {
         // armed only on the non-DAITA path below.
         let cover = warrenguard_config::knobs::cover_defenses();
         let daita = daita_mode(self.daita, self.daita_machine.as_deref());
-        let mut tunnel = MultihopClientTunnel::new(self.signing.clone());
+        let mut tunnel = self.auth.tunnel().await;
+        if let Some(session) = join {
+            tunnel = tunnel.joining(session);
+        }
         if daita == DaitaMode::Negotiated {
             tunnel = tunnel.with_daita(true);
         }
@@ -757,6 +825,11 @@ impl<T: HttpTransport> WarrenClient<T> {
                 exit.endpoint,
             )
             .await?;
+        // No-log: whether the exit learned the wallet, never which token.
+        tracing::debug!(
+            anonymous = session.admission().is_anonymous(),
+            "multihop session admitted"
+        );
         // Feed the RTT proximity cache (doc 52 §6.2 client): the first-hop path RTT is
         // available once the multihop handshake completes. Keyed by the exit's
         // Ed25519 endpoint pubkey, the same key the selector looks up.
@@ -882,7 +955,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         };
 
         let sink = self
-            .connect_multihop_with_bypass(exit, socket_bypass)
+            .connect_multihop_with_bypass(exit, socket_bypass, None)
             .await?;
         let session = sink.session();
         let ipv4 = session.assigned_ipv4();
@@ -1046,6 +1119,27 @@ impl<T: HttpTransport> WarrenClient<T> {
         Ok(handle)
     }
 
+    /// The `n` (>= 1) members of a bond to `exit`: the first dials as any
+    /// session does, every other one joins what it was admitted on, so the
+    /// exit resolves all of them to one serial (or one wallet) and one tunnel
+    /// address.
+    async fn connect_bonded_members(
+        &self,
+        exit: &VerifiedExit,
+        n: usize,
+    ) -> Result<Vec<MultihopPacketSink>, SdkError> {
+        let first = self.connect_multihop(exit).await?;
+        let mut joined = Vec::with_capacity(n.max(1));
+        for _ in 1..n.max(1) {
+            joined.push(
+                self.connect_multihop_with_bypass(exit, None, Some(first.session()))
+                    .await?,
+            );
+        }
+        joined.insert(0, first);
+        Ok(joined)
+    }
+
     /// Opens `n` (>= 1) multihop sessions to `exit` and bonds them into one
     /// [`warren_net::BondedPacketSink`]: outbound packets stripe across members,
     /// inbound packets merge. Every member uses this client's identity, so a real
@@ -1061,11 +1155,9 @@ impl<T: HttpTransport> WarrenClient<T> {
         exit: &VerifiedExit,
         n: usize,
     ) -> Result<warren_net::BondedPacketSink, SdkError> {
-        let mut sinks = Vec::with_capacity(n.max(1));
-        for _ in 0..n.max(1) {
-            sinks.push(self.connect_multihop(exit).await?);
-        }
-        Ok(warren_net::BondedPacketSink::new(sinks))
+        Ok(warren_net::BondedPacketSink::new(
+            self.connect_bonded_members(exit, n).await?,
+        ))
     }
 
     /// Starts the non-root proxy datapath over a bonded set of `n` multihop
@@ -1084,11 +1176,7 @@ impl<T: HttpTransport> WarrenClient<T> {
     ) -> Result<ProxyHandle, SdkError> {
         let exit = circuit.dialed_exit();
         ensure_dns_reachable(exit.dns_disabled, cfg)?;
-        let n = n.max(1);
-        let mut sinks = Vec::with_capacity(n);
-        for _ in 0..n {
-            sinks.push(self.connect_multihop(exit).await?);
-        }
+        let sinks = self.connect_bonded_members(exit, n).await?;
         // All members share the exit's sticky assignment; read it from the first,
         // and expose that member's metrics on the handle.
         let (local_ip, prefix, gateway, ipv6) = addressing_from_session(sinks[0].session());
@@ -1150,7 +1238,7 @@ impl<T: HttpTransport> WarrenClient<T> {
     ) -> Result<SupervisedProxyHandle, SdkError> {
         let exit = circuit.dialed_exit().clone();
         dns_reachable(exit.dns_disabled, dns_server.is_some())?;
-        let signing = self.signing.clone();
+        let auth = self.auth.clone();
         let auto_local_ip = self.auto_local_ip;
         let wants_ipv6 = self.wants_ipv6;
         let transport_config = self.transport_config.clone();
@@ -1159,13 +1247,13 @@ impl<T: HttpTransport> WarrenClient<T> {
             listeners.clone(),
             dns_server,
             move || {
-                let signing = signing.clone();
+                let auth = auth.clone();
                 let exit = exit.clone();
                 let transport_config = transport_config.clone();
                 let rtt_cache = Arc::clone(&rtt_cache);
                 async move {
                     establish_multihop(
-                        signing,
+                        auth,
                         &exit,
                         auto_local_ip,
                         wants_ipv6,
@@ -1212,7 +1300,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         if exits.is_empty() {
             return Err(SdkError::ExitDnsDisabled);
         }
-        let signing = self.signing.clone();
+        let auth = self.auth.clone();
         let auto_local_ip = self.auto_local_ip;
         let wants_ipv6 = self.wants_ipv6;
         let transport_config = self.transport_config.clone();
@@ -1236,7 +1324,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             listeners,
             cfg.dns_server,
             move || {
-                let signing = signing.clone();
+                let auth = auth.clone();
                 let exits = exits.clone();
                 let cursor = Arc::clone(&cursor);
                 let avoid = Arc::clone(&avoid);
@@ -1253,7 +1341,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                         )
                     };
                     match establish_multihop(
-                        signing,
+                        auth,
                         &exits[idx],
                         auto_local_ip,
                         wants_ipv6,
@@ -1305,7 +1393,7 @@ impl<T: HttpTransport> WarrenClient<T> {
     ) -> Result<SupervisedPacketHandle, SdkError> {
         let exit = circuit.dialed_exit().clone();
         dns_reachable(exit.dns_disabled, cfg.dns_override)?;
-        let signing = self.signing.clone();
+        let auth = self.auth.clone();
         let auto_local_ip = self.auto_local_ip;
         let wants_ipv6 = self.wants_ipv6;
         let transport_config = self.transport_config.clone();
@@ -1315,13 +1403,13 @@ impl<T: HttpTransport> WarrenClient<T> {
             device,
             cfg,
             move || {
-                let signing = signing.clone();
+                let auth = auth.clone();
                 let exit = exit.clone();
                 let transport_config = transport_config.clone();
                 let rtt_cache = Arc::clone(&rtt_cache);
                 async move {
                     establish_multihop_with_bypass(
-                        signing,
+                        auth,
                         &exit,
                         auto_local_ip,
                         wants_ipv6,
@@ -1364,7 +1452,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         if exits.is_empty() {
             return Err(SdkError::ExitDnsDisabled);
         }
-        let signing = self.signing.clone();
+        let auth = self.auth.clone();
         let auto_local_ip = self.auto_local_ip;
         let wants_ipv6 = self.wants_ipv6;
         let transport_config = self.transport_config.clone();
@@ -1379,7 +1467,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             device,
             cfg,
             move || {
-                let signing = signing.clone();
+                let auth = auth.clone();
                 let exits = exits.clone();
                 let cursor = Arc::clone(&cursor);
                 let avoid = Arc::clone(&avoid);
@@ -1396,7 +1484,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                         )
                     };
                     match establish_multihop_with_bypass(
-                        signing,
+                        auth,
                         &exits[idx],
                         auto_local_ip,
                         wants_ipv6,

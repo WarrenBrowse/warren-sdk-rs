@@ -28,3 +28,6 @@ pub use multihop::{
     MULTIHOP_FRAME_MAX_OVERHEAD, MultihopError, WARREN_HPKE_AAD_V1, WARREN_HPKE_VERSION_V1,
     WARREN_PKI_OPERATIONAL_EXIT_V1, WarrenMultihopFrame,
 };
+/// The anonymous v7 session token a setup request presents instead of the
+/// wallet (warren-core doc 64): an opaque bearer blob at this layer.
+pub use warrenguard_wire::{MAX_SESSION_TOKENS, SESSION_TOKEN_LEN, SessionToken};

@@ -11,6 +11,7 @@ pub mod client;
 pub mod daita_driver;
 pub mod multihop;
 pub mod reconnect;
+pub mod session_tokens;
 pub(crate) mod tcp_fallback;
 pub mod tls;
 
@@ -40,8 +41,12 @@ pub use reconnect::{
     Backoff, BackoffIter, ConnectionState, JitterBackoff, RetryError, connect_with_retry,
     connect_with_state,
 };
+pub use session_tokens::{
+    Admission, NoSessionTokenCause, SessionAdmission, SessionTokenSource, TokenHold,
+};
 pub use tls::{WarrenTlsError, default_crypto_provider, make_client_config, make_server_config};
 pub use warren_multihop::SetupError;
+pub use warren_wire::{SESSION_TOKEN_LEN, SessionToken};
 // The engine's reconnect verdict (fatal / retry-same / retry-reselect) and its
 // fatal cause, re-exported so a supervisor consuming a `TunnelError` /
 // `MultihopError` verdict names them without depending on the engine crate.

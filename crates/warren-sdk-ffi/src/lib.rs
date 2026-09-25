@@ -32,7 +32,9 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use warren_sdk::api::{BanReasonCode, ClientError, PubkeySs58, RegisterAccountRequest};
+use warren_sdk::api::{
+    BanReasonCode, BlindingKey, ClientError, PubkeySs58, RegisterAccountRequest,
+};
 use warren_sdk::identity::{WarrenIdentity, ss58};
 use warren_sdk::net::{ForwardedPort, MapProto, ProxyConfig, ProxyCredentials};
 use warren_sdk::transport::{Backoff, ConnectionState, FatalCause, RetryError, connect_with_state};
@@ -214,6 +216,10 @@ impl std::fmt::Debug for FfiIdentity {
 #[derive(uniffi::Object)]
 pub struct WarrenWallet {
     identity: WarrenIdentity,
+    /// The wallet's session-token blinding key, derived from the seed when
+    /// the handle is built, so a client built from the handle presents
+    /// anonymous tokens while the handle itself never keeps the seed.
+    session_blinding: Option<BlindingKey>,
     // Present only right after `generate`, so the host can read the phrase ONCE
     // for secure-store backup; `reveal_mnemonic_for_backup` takes it and it is
     // zeroized on drop. A wallet restored via `from_mnemonic` carries `None`
@@ -231,10 +237,10 @@ impl WarrenWallet {
     #[must_use]
     pub fn generate() -> Arc<Self> {
         let (identity, mnemonic) = WarrenIdentity::generate();
-        Arc::new(Self {
+        Arc::new(Self::holding(
             identity,
-            backup: Mutex::new(Some(Zeroizing::new(mnemonic))),
-        })
+            Mutex::new(Some(Zeroizing::new(mnemonic))),
+        ))
     }
 
     /// Restores a wallet from a BIP39 mnemonic. The phrase crosses the boundary
@@ -250,10 +256,7 @@ impl WarrenWallet {
         let phrase = Zeroizing::new(mnemonic);
         let identity =
             WarrenIdentity::from_mnemonic(&phrase).map_err(|_| FfiError::InvalidMnemonic)?;
-        Ok(Arc::new(Self {
-            identity,
-            backup: Mutex::new(None),
-        }))
+        Ok(Arc::new(Self::holding(identity, Mutex::new(None))))
     }
 
     /// The canonical SS58 `wb…` address.
@@ -308,6 +311,18 @@ impl WarrenWallet {
             .expect("wallet backup mutex is never poisoned")
             .take()
             .map(|phrase| phrase.to_string())
+    }
+}
+
+impl WarrenWallet {
+    /// A handle over `identity` that keeps the session key and drops the seed.
+    fn holding(mut identity: WarrenIdentity, backup: Mutex<Option<Zeroizing<String>>>) -> Self {
+        let session_blinding = identity.take_seed().map(|seed| BlindingKey::session(&seed));
+        Self {
+            identity,
+            session_blinding,
+            backup,
+        }
     }
 }
 
@@ -538,6 +553,7 @@ pub struct WarrenFfiClient {
 /// item) so it stays out of the `#[uniffi::export]` impl surface.
 fn build_client_with_identity(
     identity: WarrenIdentity,
+    session_blinding: Option<BlindingKey>,
     api_base: String,
     server_pubkey_pin: String,
     options: FfiClientOptions,
@@ -546,6 +562,9 @@ fn build_client_with_identity(
         .identity(identity)
         .api_base(api_base)
         .server_pubkey_pin(server_pubkey_pin);
+    if let Some(key) = session_blinding {
+        builder = builder.session_blinding_key(key);
+    }
     for root in options.multihop_root_pubkey_pins {
         builder = builder.multihop_root_pubkey_pin(root);
     }
@@ -692,7 +711,7 @@ impl WarrenFfiClient {
     ) -> Result<Arc<Self>, FfiError> {
         let identity =
             WarrenIdentity::from_mnemonic(&mnemonic).map_err(|_| FfiError::InvalidMnemonic)?;
-        build_client_with_identity(identity, api_base, server_pubkey_pin, options)
+        build_client_with_identity(identity, None, api_base, server_pubkey_pin, options)
     }
 
     /// Builds a client from an opaque [`WarrenWallet`] handle instead of a raw
@@ -714,7 +733,13 @@ impl WarrenFfiClient {
         // Reconstruct an owned identity from the wallet's signing key (which
         // zeroizes on drop); the seed phrase is never marshalled.
         let identity = WarrenIdentity::from_signing_key(wallet.identity.signing_key());
-        build_client_with_identity(identity, api_base, server_pubkey_pin, options)
+        build_client_with_identity(
+            identity,
+            wallet.session_blinding.clone(),
+            api_base,
+            server_pubkey_pin,
+            options,
+        )
     }
 
     /// The wallet SS58 `wb…` address of this client.
@@ -1342,6 +1367,20 @@ fn hex16(s: &str) -> Result<[u8; 16], FfiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wallet_handle_keeps_its_session_key_and_never_its_seed() {
+        let (_, phrase) = WarrenIdentity::generate();
+        for wallet in [
+            WarrenWallet::generate(),
+            WarrenWallet::from_mnemonic(phrase).expect("valid mnemonic"),
+        ] {
+            let mut wallet = Arc::try_unwrap(wallet).expect("sole handle");
+
+            assert!(wallet.session_blinding.is_some());
+            assert!(wallet.identity.take_seed().is_none());
+        }
+    }
 
     const ZERO_ENTROPY_24W: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
 

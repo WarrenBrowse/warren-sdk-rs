@@ -302,7 +302,7 @@ async fn spawn_migration_harness(exit: VerifiedExit) -> MigrationHarness {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let (identity, _mnemonic) = WarrenIdentity::generate();
-    let signing = identity.signing_key();
+    let auth = crate::session_tokens::DialAuth::wallet(identity.signing_key());
     let socks_listener = socks_only_listeners().await;
     let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
     let connects = Arc::new(AtomicUsize::new(0));
@@ -340,13 +340,13 @@ async fn spawn_migration_harness(exit: VerifiedExit) -> MigrationHarness {
                     ..Default::default()
                 },
                 move || {
-                    let signing = signing.clone();
+                    let auth = auth.clone();
                     let exit = exit.clone();
                     let rtt_cache = Arc::clone(&rtt_cache);
                     let connects = Arc::clone(&connects);
                     async move {
                         let est = crate::supervisor::establish_multihop(
-                            signing, &exit, false, false, None, rtt_cache,
+                            auth, &exit, false, false, None, rtt_cache,
                         )
                         .await?;
                         connects.fetch_add(1, Ordering::SeqCst);
@@ -3525,8 +3525,14 @@ fn a_carrier_bypass_reaches_the_dial_the_datapath_will_make() {
     let exit = exit_with_dns(false);
     let (identity, _mnemonic) = WarrenIdentity::generate();
 
-    let plain =
-        crate::supervisor::multihop_dial(identity.signing_key(), &exit, false, false, None, None);
+    let plain = crate::supervisor::multihop_dial(
+        warren_transport::MultihopClientTunnel::new(identity.signing_key()),
+        &exit,
+        false,
+        false,
+        None,
+        None,
+    );
     assert!(
         plain.socket_bypass().is_none(),
         "the userland proxy dial marks nothing"
@@ -3534,7 +3540,7 @@ fn a_carrier_bypass_reaches_the_dial_the_datapath_will_make() {
 
     let bypass = warren_transport::SocketBypass::Fwmark(0x7761_7272);
     let marked = crate::supervisor::multihop_dial(
-        identity.signing_key(),
+        warren_transport::MultihopClientTunnel::new(identity.signing_key()),
         &exit,
         false,
         false,
@@ -3962,4 +3968,262 @@ async fn start_proxy_supervised_on_refuses_a_dns_disabled_exit_without_a_resolve
         matches!(refused, Err(SdkError::ExitDnsDisabled)),
         "a dns_disabled exit without a resolver must be refused"
     );
+}
+
+mod session_token_dials {
+    //! The facade's dials present the wallet's anonymous tokens: the wallet's
+    //! real `TokenManager` minting against a fake issuer (the HTTP boundary),
+    //! the real tunnel, and a fake exit that reads each setup request.
+
+    use warren_test_support::issuer::{EPOCH_SECS, FakeEntitlementIssuer};
+    use warren_test_support::{SeenSetup, TokenExit, spawn_token_multihop_exit};
+    use warren_transport::{MultihopError, NoSessionTokenCause, SessionAdmission, SessionToken};
+
+    use super::*;
+
+    fn current_epochs() -> [u64; 2] {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after 1970")
+            .as_secs();
+        [now / EPOCH_SECS, now / EPOCH_SECS + 1]
+    }
+
+    /// A client of the wallet `seed` whose issuer mints every current epoch.
+    /// Each test uses its own seed: clients of one wallet share its batch.
+    fn client(
+        seed: u8,
+        issuer: FakeEntitlementIssuer,
+        admission: SessionAdmission,
+    ) -> WarrenClient<FakeEntitlementIssuer> {
+        WarrenClient::builder()
+            .identity(WarrenIdentity::from_seed(&[seed; 32]))
+            .api_base("https://api.example.test")
+            .allow_any_server_key()
+            .session_admission(admission)
+            .build_with_transport(issuer)
+            .expect("build")
+    }
+
+    fn minting() -> FakeEntitlementIssuer {
+        FakeEntitlementIssuer::new(&current_epochs(), 3)
+    }
+
+    async fn exit() -> (VerifiedExit, TokenExit) {
+        let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let (addr, keys, seen) = spawn_token_multihop_exit(exit_key).await;
+        (fake_verified_exit(addr, &keys), seen)
+    }
+
+    /// The single token each request presented, in order.
+    fn leads(exit: &TokenExit) -> Vec<SessionToken> {
+        exit.seen()
+            .into_iter()
+            .map(|seen| match seen {
+                SeenSetup::Tokens(tokens) => {
+                    assert_eq!(tokens.len(), 1, "one token per request");
+                    tokens[0]
+                }
+                other => panic!("expected a token request, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_presents_one_of_its_wallet_tokens_and_never_the_wallet() {
+        let (exit, seen) = exit().await;
+        let client = client(0x71, minting(), SessionAdmission::default());
+
+        let sink = client.connect_multihop(&exit).await.expect("admitted");
+
+        assert_eq!(leads(&seen).len(), 1);
+        assert!(sink.session().admission().is_anonymous());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clients_of_one_wallet_never_lead_with_a_token_another_one_holds() {
+        // The issuer's batch is three tokens: three live sessions hold all of
+        // them, and the fourth has none left to lead with.
+        let (exit, seen) = exit().await;
+        let clients: Vec<_> = (0..4)
+            .map(|_| client(0x72, minting(), SessionAdmission::default()))
+            .collect();
+
+        let mut sessions = Vec::new();
+        for client in &clients {
+            sessions.push(client.connect_multihop(&exit).await.expect("admitted"));
+        }
+
+        let seen = seen.seen();
+        let (tokens, wallet) = seen.split_at(3);
+        let mut leads: Vec<_> = tokens
+            .iter()
+            .map(|s| match s {
+                SeenSetup::Tokens(t) => t[0].0,
+                other => panic!("expected a token request, got {other:?}"),
+            })
+            .collect();
+        leads.sort_unstable();
+        leads.dedup();
+        assert_eq!(leads.len(), 3, "three sessions, three serials");
+        assert_eq!(wallet, [SeenSetup::Wallet { names_pubkey: true }]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_token_the_exit_refuses_is_walked_past() {
+        let (exit, seen) = exit().await;
+        let client = client(0x73, minting(), SessionAdmission::default());
+        let first = client.connect_multihop(&exit).await.expect("first");
+        let held_elsewhere = leads(&seen)[0];
+        drop(first);
+        seen.hold_elsewhere(held_elsewhere);
+
+        let sink = client.connect_multihop(&exit).await.expect("admitted");
+
+        let leads = leads(&seen);
+        assert_eq!(leads[1], held_elsewhere, "the freed token leads again");
+        assert_ne!(leads[2], held_elsewhere, "then the walk moves on");
+        assert!(sink.session().admission().is_anonymous());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_leg_of_a_bond_presents_the_same_token() {
+        let (exit, seen) = exit().await;
+        let client = client(0x74, minting(), SessionAdmission::default());
+
+        let _bond = client
+            .connect_multihop_bonded(&exit, 2)
+            .await
+            .expect("bonded");
+
+        let leads = leads(&seen);
+        assert_eq!(leads.len(), 2);
+        assert_eq!(leads[0], leads[1], "one serial, one tunnel address");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_supervised_dial_presents_a_token() {
+        let (exit, seen) = exit().await;
+        let client = client(0x75, minting(), SessionAdmission::default());
+
+        let tunnel = crate::supervisor::establish_multihop(
+            client.auth.clone(),
+            &exit,
+            false,
+            false,
+            None,
+            Arc::clone(&client.rtt_cache),
+        )
+        .await
+        .expect("admitted");
+
+        assert_eq!(leads(&seen).len(), 1);
+        assert!(tunnel.sink.session().admission().is_anonymous());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_whose_issuer_mints_nothing_dials_on_the_wallet() {
+        let (exit, seen) = exit().await;
+        let issuer = minting();
+        issuer.ban();
+        let client = client(0x76, issuer, SessionAdmission::default());
+
+        let sink = client.connect_multihop(&exit).await.expect("admitted");
+
+        assert_eq!(seen.seen(), [SeenSetup::Wallet { names_pubkey: true }]);
+        assert!(!sink.session().admission().is_anonymous());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tokens_only_client_without_a_token_never_names_the_wallet() {
+        let (exit, seen) = exit().await;
+        let issuer = minting();
+        issuer.ban();
+        let client = client(0x77, issuer, SessionAdmission::TokensOnly);
+
+        let result = client.connect_multihop(&exit).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(SdkError::Multihop(MultihopError::NoSessionToken(
+                    NoSessionTokenCause::Empty
+                )))
+            ),
+            "got {:?}",
+            result.map(|_| ())
+        );
+        assert!(seen.seen().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_built_in_a_runtime_asks_the_issuer_before_any_dial() {
+        // Issuance timing must not mirror a connect: the batch is opened when
+        // the client is, and the first dial finds it being minted already.
+        let client = client(0x79, minting(), SessionAdmission::default());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while client.api().transport().directory_fetches() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the issuer is asked with no dial");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_given_the_session_key_of_a_bare_signing_key_presents_tokens() {
+        // A wallet handle that keeps only the derived key (the FFI one) hands
+        // the session key over instead of the seed.
+        let (exit, seen) = exit().await;
+        let client = WarrenClient::builder()
+            .identity(WarrenIdentity::from_signing_key(
+                warren_identity::derive_node_key(&[0x7a; 32]),
+            ))
+            .session_blinding_key(warren_api::BlindingKey::session(&[0x7a; 32]))
+            .api_base("https://api.example.test")
+            .allow_any_server_key()
+            .build_with_transport(minting())
+            .expect("build");
+
+        let sink = client.connect_multihop(&exit).await.expect("admitted");
+
+        assert_eq!(leads(&seen).len(), 1);
+        assert!(sink.session().admission().is_anonymous());
+    }
+
+    #[test]
+    fn a_blinding_key_of_another_class_is_refused_at_build() {
+        let result = WarrenClient::builder()
+            .identity(WarrenIdentity::from_signing_key(
+                warren_identity::derive_node_key(&[0x7b; 32]),
+            ))
+            .session_blinding_key(warren_api::BlindingKey::browser_proxy(&[0x7b; 32]))
+            .api_base("https://api.example.test")
+            .allow_any_server_key()
+            .build_with_transport(minting());
+
+        assert!(matches!(
+            result,
+            Err(crate::error::BuildError::NotASessionBlindingKey)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_built_from_a_signing_key_dials_on_the_wallet() {
+        // No seed, no blinding key: nothing to mint the wallet's batch with.
+        let (exit, seen) = exit().await;
+        let client = WarrenClient::builder()
+            .identity(WarrenIdentity::from_signing_key(
+                warren_identity::derive_node_key(&[0x78; 32]),
+            ))
+            .api_base("https://api.example.test")
+            .allow_any_server_key()
+            .build_with_transport(minting())
+            .expect("build");
+
+        client.connect_multihop(&exit).await.expect("admitted");
+
+        assert_eq!(seen.seen(), [SeenSetup::Wallet { names_pubkey: true }]);
+    }
 }

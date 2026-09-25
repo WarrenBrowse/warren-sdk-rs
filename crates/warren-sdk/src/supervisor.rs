@@ -2146,7 +2146,7 @@ async fn wait_for_drain(
 /// addressing derived from its fresh `IpAssign`. The (re)connect step shared by
 /// the supervised single-exit and failover datapaths.
 pub(crate) async fn establish_multihop(
-    signing: warren_identity::ed25519_dalek::SigningKey,
+    auth: crate::session_tokens::DialAuth,
     exit: &VerifiedExit,
     auto_local_ip: bool,
     wants_ipv6: bool,
@@ -2156,7 +2156,7 @@ pub(crate) async fn establish_multihop(
     // The userland proxy installs no OS tunnel, so its carrier socket has
     // nothing to escape from.
     establish_multihop_with_bypass(
-        signing,
+        auth,
         exit,
         auto_local_ip,
         wants_ipv6,
@@ -2173,7 +2173,7 @@ pub(crate) async fn establish_multihop(
 /// bound to the physical link BEFORE its first send, so the tunnel cannot
 /// swallow its own carrier.
 pub(crate) async fn establish_multihop_with_bypass(
-    signing: warren_identity::ed25519_dalek::SigningKey,
+    auth: crate::session_tokens::DialAuth,
     exit: &VerifiedExit,
     auto_local_ip: bool,
     wants_ipv6: bool,
@@ -2182,7 +2182,7 @@ pub(crate) async fn establish_multihop_with_bypass(
     socket_bypass: Option<warren_transport::SocketBypass>,
 ) -> Result<EstablishedTunnel<MultihopPacketSink>, SdkError> {
     let tunnel = multihop_dial(
-        signing,
+        auth.tunnel().await,
         exit,
         auto_local_ip,
         wants_ipv6,
@@ -2198,14 +2198,13 @@ pub(crate) async fn establish_multihop_with_bypass(
 /// socket is bound (the carrier bypass) is otherwise unobservable until a real
 /// dial; built separately, it can be read back off the dial.
 pub(crate) fn multihop_dial(
-    signing: warren_identity::ed25519_dalek::SigningKey,
+    mut tunnel: MultihopClientTunnel,
     exit: &VerifiedExit,
     auto_local_ip: bool,
     wants_ipv6: bool,
     transport_config: Option<std::sync::Arc<warren_transport::TransportConfig>>,
     socket_bypass: Option<warren_transport::SocketBypass>,
 ) -> MultihopClientTunnel {
-    let mut tunnel = MultihopClientTunnel::new(signing);
     if let Some(bypass) = socket_bypass {
         tunnel = tunnel.with_socket_bypass(bypass);
     }

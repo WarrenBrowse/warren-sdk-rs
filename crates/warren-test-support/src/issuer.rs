@@ -1,6 +1,6 @@
-//! A port-entitlement issuer behind the [`HttpTransport`] seam, so the SDK's
-//! real `PortEntitlementManager` mints, pairs and vends entitlement envelopes
-//! in a test without a network.
+//! A port-entitlement and session-token issuer behind the [`HttpTransport`]
+//! seam, so the SDK's real `PortEntitlementManager` and `TokenManager` mint,
+//! pair and vend credentials in a test without a network.
 //!
 //! It serves the two entitlement endpoints the way warren-api does (warren-core
 //! docs 99 and 105): a per-epoch blind-signing key directory with the
@@ -30,7 +30,9 @@ pub const EPOCH_SECS: u64 = 3600;
 const BANNED_BODY: &str =
     r#"{"error":"banned","reason_code":"port_forwarding_abuse","lapses_at_unix_secs":1790000000}"#;
 
-/// Serves `/v1/port-entitlements/{keys,issue}` for a fixed set of epochs.
+/// Serves `/v1/port-entitlements/{keys,issue}` and `/v1/tokens/{keys,issue}`
+/// for a fixed set of epochs. The session class gets the same directory and
+/// the same answers; a session client ignores the attribution tags.
 pub struct FakeEntitlementIssuer {
     keys: HashMap<u64, IssuerSecretKey>,
     attribution_key: SigningKey,
@@ -166,7 +168,9 @@ impl FakeEntitlementIssuer {
 
 impl HttpTransport for FakeEntitlementIssuer {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
-        if request.url.ends_with("/v1/port-entitlements/keys") {
+        if request.url.ends_with("/v1/port-entitlements/keys")
+            || request.url.ends_with("/v1/tokens/keys")
+        {
             self.directory_fetches.fetch_add(1, Ordering::SeqCst);
             return Ok(HttpResponse {
                 status: 200,
@@ -174,8 +178,9 @@ impl HttpTransport for FakeEntitlementIssuer {
             });
         }
         assert!(
-            request.url.ends_with("/v1/port-entitlements/issue"),
-            "an entitlement client must never reach {}",
+            request.url.ends_with("/v1/port-entitlements/issue")
+                || request.url.ends_with("/v1/tokens/issue"),
+            "a credential client must never reach {}",
             request.url
         );
         if self.banned.load(Ordering::SeqCst) {

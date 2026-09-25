@@ -15,6 +15,8 @@ warren-contract = { workspace = true }
 ed25519-dalek = { workspace = true }
 bip39 = { workspace = true }
 thiserror = { workspace = true }
+# Wipes the wallet seed the identity keeps until the SDK builder takes it.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }

@@ -9,6 +9,40 @@ the pre-release `0.0.x` line.
 
 ### Added
 
+- Every SDK tunnel is admitted on an anonymous v7 session token when the
+  wallet has one (`IpRequestV7`, warren-core doc 64), so the exit no longer
+  learns the wallet. `WarrenClient` opens one `TokenManager` per wallet and
+  API when it is built (at its first dial when built outside a runtime),
+  shared by every client of that wallet in the process and refreshed on a
+  10-minute timer, a minute when the current epoch is left without a token.
+  A dial never asks the issuer: the first one waits up to 10 s for the first
+  answer. A dial draws the whole current-epoch batch, leads with a token no
+  session of the process holds, and when the exit refuses it (its serial is
+  leased on another exit) redials leading with the next one. Bonded legs join
+  the token and the address their session was admitted on. Every dial now
+  sends the engine's placement hint (`0.0.0.0` for an independent session,
+  the session's address for a bonded leg), because an exit renews a serial
+  leased on itself and would otherwise put two sessions of one serial, or of
+  one wallet, on one inner address.
+  `WarrenClientBuilder::session_admission` picks the policy: the default,
+  `SessionAdmission::TokensOrWallet`, sends the wallet-signed request once no
+  token is admitted, so a wallet shared by more people than it has tokens
+  keeps its service (the engine's own supervisor stops on the refusal
+  instead); `SessionAdmission::TokensOnly` never names the wallet and fails
+  with `MultihopError::NoSessionToken` (retried by a supervisor).
+  `MultihopClientTunnel` gains `with_session_tokens` (a `SessionTokenSource`),
+  `with_session_admission` and `joining`, `MultihopSession::admission()`
+  reports what the exit admitted, and `MultihopMetricsSnapshot::anonymous`
+  says whether the exit learned the wallet. `WarrenIdentity` keeps its seed
+  until `take_seed()`, which the builder calls to derive the blinding key, so
+  a consumer building its identity from a mnemonic needs no change. An
+  identity built from a bare signing key has no seed:
+  `WarrenClientBuilder::session_blinding_key` hands the client the session
+  key instead (`BuildError::NotASessionBlindingKey` for another class), and
+  the FFI `WarrenWallet` handle now derives that key at construction, keeps
+  it instead of the seed, and passes it on from `WarrenFfiClient::from_wallet`.
+  `BlindingKey` is `Clone`. `warren-proxy` logs which of the two admitted its
+  session.
 - `TokenManager::session_stack(now)` hands one session every token of the
   current epoch, without consuming any, starting at a rotation drawn once per
   manager and leaving out the serials this process's live sessions hold.

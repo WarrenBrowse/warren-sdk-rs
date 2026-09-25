@@ -58,6 +58,7 @@ const BLOCK_LEN: usize = 32;
 /// One-way: holding it does not give back the seed, so a component that only
 /// mints credentials never holds the wallet. Zeroized on drop, and its `Debug`
 /// names the class only.
+#[derive(Clone)]
 pub struct BlindingKey {
     key: Zeroizing<[u8; 32]>,
     class: CredentialClass,

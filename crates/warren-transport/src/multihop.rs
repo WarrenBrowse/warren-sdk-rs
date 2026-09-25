@@ -66,7 +66,12 @@ use warrenguard_transport::multihop::{
 pub use warrenguard_transport::multihop::{RebindError, RebindPolicy};
 
 use crate::client::{QuicDialError, dial_quic, dial_quic_webpki, effective_bind};
+use crate::session_tokens::{
+    Admission, Admitted, NoSessionTokenCause, SessionAdmission, SessionTokenSource,
+    is_token_refusal,
+};
 use crate::tls;
+use warren_wire::{MAX_SESSION_TOKENS, SessionToken};
 use warrenguard_socket_bypass::SocketBypass;
 
 /// DAITA dummy first byte (padding traffic), dropped on the receive path.
@@ -151,6 +156,11 @@ pub enum MultihopError {
     /// case returns a typed error here instead of panicking the process.
     #[error("missing IP assignment in setup reply")]
     MissingAssignment,
+    /// A tokens-only tunnel had no anonymous token the exit would admit, so no
+    /// session was set up and no request naming the wallet was sent (see
+    /// [`SessionAdmission::TokensOnly`]). Carries no token material.
+    #[error("no usable session token: {0}")]
+    NoSessionToken(NoSessionTokenCause),
 }
 
 impl From<QuicDialError> for MultihopError {
@@ -387,6 +397,22 @@ pub struct MultihopClientTunnel {
     /// exit advertises PQ. Set via [`Self::with_exit_mlkem768`].
     #[cfg(feature = "pq-hpke")]
     exit_mlkem768: Option<Vec<u8>>,
+    /// Where the anonymous tokens this tunnel presents come from. `None`
+    /// presents the wallet-signed request. Set via
+    /// [`Self::with_session_tokens`].
+    session_tokens: Option<Arc<dyn SessionTokenSource>>,
+    /// Whether the wallet-signed request may be sent at all. Set via
+    /// [`Self::with_session_admission`].
+    admission: SessionAdmission,
+    /// The session this leg joins, presented verbatim instead of walking a
+    /// stack. Set via [`Self::joining`].
+    join: Option<Join>,
+}
+
+/// What a bonded leg repeats of the session it joins.
+struct Join {
+    admission: Admission,
+    address: Ipv4Addr,
 }
 
 impl MultihopClientTunnel {
@@ -407,7 +433,55 @@ impl MultihopClientTunnel {
             daita_support: false,
             #[cfg(feature = "pq-hpke")]
             exit_mlkem768: None,
+            session_tokens: None,
+            admission: SessionAdmission::default(),
+            join: None,
         }
+    }
+
+    /// Presents anonymous v7 tokens from `source` instead of the wallet: the
+    /// exit admits the session without learning the account. The dial leads
+    /// with the first token of the source's stack it can claim and, when the
+    /// exit refuses it (its serial is leased to a session on another exit, or
+    /// it does not verify), redials leading with the next one: one dial per
+    /// token, at most [`MAX_SESSION_TOKENS`](warren_wire::MAX_SESSION_TOKENS).
+    /// With every token refused or none to claim,
+    /// [`SessionAdmission::TokensOrWallet`] (the default) sends the
+    /// wallet-signed request, where the engine's own supervisor stops on the
+    /// refusal, and [`SessionAdmission::TokensOnly`] fails with
+    /// [`MultihopError::NoSessionToken`].
+    ///
+    /// An exit renews a serial leased on itself, so a second session leading
+    /// with the same token on the SAME exit is admitted rather than refused;
+    /// the placement hint every dial sends keeps it off the first one's inner
+    /// address.
+    #[must_use]
+    pub fn with_session_tokens(mut self, source: Arc<dyn SessionTokenSource>) -> Self {
+        self.session_tokens = Some(source);
+        self
+    }
+
+    /// Admits the session under `admission` instead of the default
+    /// [`SessionAdmission::TokensOrWallet`]. Under
+    /// [`SessionAdmission::TokensOnly`] no request naming the wallet is ever
+    /// built.
+    #[must_use]
+    pub fn with_session_admission(mut self, admission: SessionAdmission) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    /// Makes this dial a bonded leg of `session`: it presents that session's
+    /// token and shares its hold (or the wallet, when the session was admitted
+    /// on the wallet), and names the session's address, so the exit resolves
+    /// both to one serial and one tunnel address.
+    #[must_use]
+    pub fn joining(mut self, session: &MultihopSession) -> Self {
+        self.join = Some(Join {
+            admission: session.admission().clone(),
+            address: session.assigned_ipv4(),
+        });
+        self
     }
 
     /// Advertises DAITA support so the exit samples and returns the machine
@@ -564,6 +638,11 @@ impl MultihopClientTunnel {
     /// ([`SetupError::IpExhausted`]), and [`MultihopError::RelayIdentity`] means
     /// the relay's in-band identity proof was absent, malformed, or signed by the
     /// wrong key (X.509 cover-domain mode only).
+    ///
+    /// With session tokens ([`Self::with_session_tokens`]) the dial may take
+    /// several handshakes, one per token the exit refuses;
+    /// [`MultihopError::NoSessionToken`] then means no token was admitted
+    /// under [`SessionAdmission::TokensOnly`].
     pub async fn connect(
         &self,
         exit_pubkey: [u8; 32],
@@ -571,6 +650,88 @@ impl MultihopClientTunnel {
         exit_id: [u8; EXIT_ID_LEN],
         exit_addr: SocketAddr,
     ) -> Result<MultihopSession, MultihopError> {
+        let target = Target {
+            exit_pubkey,
+            exit_x25519,
+            exit_id,
+            exit_addr,
+        };
+        if let Some(join) = &self.join {
+            let placement = Some(join.address);
+            return match &join.admission.0 {
+                Admitted::Token { token, hold } => Ok(self
+                    .connect_once(&target, Some(token), placement)
+                    .await?
+                    .admitted_on(Admission::on_token(**token, hold.clone()))),
+                Admitted::Wallet => self.connect_on_wallet(&target, 0, placement).await,
+            };
+        }
+        // An independent session: never co-housed on an address another live
+        // session of this serial or wallet holds on the exit.
+        let placement = Some(Ipv4Addr::UNSPECIFIED);
+        let stack = self
+            .session_tokens
+            .as_ref()
+            .map(|source| source.stack())
+            .unwrap_or_default();
+        let mut refused = 0usize;
+        for token in stack.iter().take(MAX_SESSION_TOKENS) {
+            let Some(hold) = self
+                .session_tokens
+                .as_ref()
+                .and_then(|source| source.claim(token))
+            else {
+                continue;
+            };
+            match self.connect_once(&target, Some(token), placement).await {
+                Ok(session) => return Ok(session.admitted_on(Admission::on_token(*token, hold))),
+                // A refusal spends nothing: release the token and lead the
+                // next dial with the next one.
+                Err(e) if is_token_refusal(&e) => refused += 1,
+                Err(e) => return Err(e),
+            }
+        }
+        self.connect_on_wallet(&target, refused, placement).await
+    }
+
+    /// The wallet-signed dial, once the token walk admitted nothing (after
+    /// `refused` refusals), or refused outright under
+    /// [`SessionAdmission::TokensOnly`].
+    async fn connect_on_wallet(
+        &self,
+        target: &Target,
+        refused: usize,
+        placement: Option<Ipv4Addr>,
+    ) -> Result<MultihopSession, MultihopError> {
+        match self.admission {
+            SessionAdmission::TokensOrWallet => Ok(self
+                .connect_once(target, None, placement)
+                .await?
+                .admitted_on(Admission::on_wallet())),
+            // Tokens only, and any policy this build does not know: never
+            // name the wallet.
+            _ => Err(MultihopError::NoSessionToken(if refused == 0 {
+                NoSessionTokenCause::Empty
+            } else {
+                NoSessionTokenCause::AllRefused
+            })),
+        }
+    }
+
+    /// One dial and one setup exchange, presenting `token` or, without one,
+    /// the wallet, with `placement` as the session-placement hint.
+    async fn connect_once(
+        &self,
+        target: &Target,
+        token: Option<&SessionToken>,
+        placement: Option<Ipv4Addr>,
+    ) -> Result<MultihopSession, MultihopError> {
+        let Target {
+            exit_pubkey,
+            exit_x25519,
+            exit_id,
+            exit_addr,
+        } = *target;
         // An explicit override wins; else, when idle cover is on, use the
         // keep-alive-disabled config so the cover driver replaces the beacon.
         let transport_config = self.transport_config.clone().or_else(|| {
@@ -728,8 +889,18 @@ impl MultihopClientTunnel {
         // caller that advertises MUST drive the granted spec on its uplink,
         // otherwise the session would be misreported as defended, the exact
         // lie the /v3 capability echo exists to prevent.
+        // A token request never carries the wallet key, whatever the engine
+        // would do with it.
+        let presented = token.map(std::slice::from_ref);
+        let identity = presented.is_none().then_some(&self.signing_key);
         let opened = inner
-            .setup_over_stream(Some(&self.signing_key), self.wants_ipv6, self.daita_support)
+            .setup_over_stream_with_options(
+                identity,
+                self.wants_ipv6,
+                self.daita_support,
+                presented,
+                placement,
+            )
             .await
             .map_err(map_engine_err)?;
 
@@ -780,6 +951,7 @@ impl MultihopClientTunnel {
             assignment,
             metrics: Arc::new(MultihopMetrics::new(0)),
             drain_tx: tokio::sync::watch::channel(None).0,
+            admission: Admission::on_wallet(),
         };
         session.send_first_frame();
         Ok(session)
@@ -797,6 +969,7 @@ pub struct MultihopMetrics {
     cover_packets_sent: AtomicU64,
     epoch: AtomicU32,
     connected_since: Instant,
+    anonymous: std::sync::atomic::AtomicBool,
 }
 
 impl Default for MultihopMetrics {
@@ -817,6 +990,7 @@ impl MultihopMetrics {
             cover_packets_sent: AtomicU64::new(0),
             epoch: AtomicU32::new(epoch),
             connected_since: Instant::now(),
+            anonymous: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -836,6 +1010,7 @@ impl MultihopMetrics {
             epoch: self.epoch.load(Ordering::Relaxed),
             uptime_secs: self.connected_since.elapsed().as_secs(),
             path: None,
+            anonymous: self.anonymous.load(Ordering::Relaxed),
         }
     }
 }
@@ -959,6 +1134,9 @@ pub struct MultihopMetricsSnapshot {
     /// Live path quality, present only when the snapshot was taken from the live
     /// session rather than a detached counters handle.
     pub path: Option<PathQuality>,
+    /// Whether the exit admitted the session on an anonymous token, so it
+    /// never learned the wallet.
+    pub anonymous: bool,
 }
 
 /// The session rekey doctrine (warren-core doc 19 § 11.6): rotate the HPKE
@@ -1071,6 +1249,18 @@ pub struct MultihopSession {
     /// ADR 36: republishes a mid-session `ExitDraining` advisory to the upper
     /// layer. Holds `None` until the exit signals a drain.
     drain_tx: tokio::sync::watch::Sender<Option<DrainAdvisory>>,
+    /// What the exit admitted this session on; a token stays held until the
+    /// session drops.
+    admission: Admission,
+}
+
+/// The dialed exit, as [`MultihopClientTunnel::connect`] received it.
+#[derive(Clone, Copy)]
+struct Target {
+    exit_pubkey: [u8; 32],
+    exit_x25519: [u8; 32],
+    exit_id: [u8; EXIT_ID_LEN],
+    exit_addr: SocketAddr,
 }
 
 impl MultihopSession {
@@ -1078,6 +1268,22 @@ impl MultihopSession {
     #[must_use]
     pub fn assignment(&self) -> &IpAssignment {
         &self.assignment
+    }
+
+    /// What the exit admitted this session on: an anonymous token, or the
+    /// wallet. Pass it to [`MultihopClientTunnel::joining`] to bond another
+    /// leg onto the same session.
+    #[must_use]
+    pub fn admission(&self) -> &Admission {
+        &self.admission
+    }
+
+    fn admitted_on(mut self, admission: Admission) -> Self {
+        self.metrics
+            .anonymous
+            .store(admission.is_anonymous(), Ordering::Relaxed);
+        self.admission = admission;
+        self
     }
 
     /// The assigned tunnel IPv4.
@@ -1488,6 +1694,7 @@ impl MultihopSession {
             assignment: IpAssignment::placeholder_for_test(),
             metrics: Arc::new(MultihopMetrics::new(0)),
             drain_tx: tokio::sync::watch::channel(None).0,
+            admission: Admission::on_wallet(),
         }
     }
 }

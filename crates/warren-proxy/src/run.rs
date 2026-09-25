@@ -111,6 +111,7 @@ pub async fn run(config: Config) -> anyhow::Result<i32> {
         .map_err(|e| anyhow::anyhow!("first egress verification failed: {e:?}"))?;
     egress_verified.store(true, Ordering::Relaxed);
     LOG.info("tunnel up, egress verified");
+    LOG.info(admission_line(handle.metrics()));
 
     tokio::spawn(warren_headless::health::track_egress_across_epochs(
         LOG,
@@ -183,6 +184,16 @@ async fn wait_until_connected(
     })
     .await
     .map_err(|_| anyhow::anyhow!("timed out after {timeout:?}"))?
+}
+
+/// Whether the exit admitted the live session without learning the wallet,
+/// for the operator reading the log. Names no token and no account.
+fn admission_line(metrics: Option<warren_sdk::MultihopMetricsSnapshot>) -> &'static str {
+    match metrics {
+        Some(m) if m.anonymous => "admitted on an anonymous session token",
+        Some(_) => "admitted on the wallet-signed request",
+        None => "admission unknown: no live session",
+    }
 }
 
 /// The SOCKS listener may be bound on an unspecified address (containers);
@@ -274,6 +285,21 @@ fn start_forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_admission_line_says_whether_the_exit_learned_the_wallet() {
+        let mut snapshot = warren_sdk::MultihopMetrics::default().snapshot();
+        assert_eq!(
+            admission_line(Some(snapshot)),
+            "admitted on the wallet-signed request"
+        );
+        snapshot.anonymous = true;
+        assert_eq!(
+            admission_line(Some(snapshot)),
+            "admitted on an anonymous session token"
+        );
+        assert_eq!(admission_line(None), "admission unknown: no live session");
+    }
 
     #[test]
     fn probe_address_maps_unspecified_to_loopback() {

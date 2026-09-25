@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 use warren_transport::{default_crypto_provider, make_server_config};
 use warren_wire::multihop::{EXIT_ID_LEN, WarrenMultihopFrame};
 use warren_wire::{
-    WARREN_HPKE_AAD_V1, WARREN_HPKE_VERSION_V1, WarrenControlMessage, encode_control,
+    SessionToken, WARREN_HPKE_AAD_V1, WARREN_HPKE_VERSION_V1, WarrenControlMessage, encode_control,
     try_decode_control,
 };
 // The fake exit accepts the same single-home ALPN the real client offers.
@@ -207,7 +207,7 @@ pub async fn spawn_fake_multihop_exit(exit_key: SigningKey) -> (SocketAddr, Mult
             .expect("incoming")
             .await
             .expect("conn");
-        serve_echo_connection(conn, &recipient_priv, exit_id, None).await;
+        serve_echo_connection(conn, &recipient_priv, exit_id, None, None).await;
         drop(endpoint);
     });
 
@@ -221,6 +221,171 @@ pub async fn spawn_fake_multihop_exit(exit_key: SigningKey) -> (SocketAddr, Mult
     )
 }
 
+/// What a [`spawn_token_multihop_exit`] exit read from one setup request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeenSetup {
+    /// A v6 wallet-path `IpRequest`, and whether it named an account pubkey.
+    Wallet {
+        /// `client_pubkey` was present.
+        names_pubkey: bool,
+    },
+    /// A v7 `IpRequestV7`, its tokens in presentation order.
+    Tokens(Vec<SessionToken>),
+}
+
+/// The setup requests a [`spawn_token_multihop_exit`] exit read, and the
+/// tokens it treats as leased to a session elsewhere in the fleet.
+#[derive(Clone, Default)]
+pub struct TokenExit {
+    seen: Arc<std::sync::Mutex<Vec<SeenSetup>>>,
+    placements: Arc<std::sync::Mutex<Vec<Option<[u8; 4]>>>>,
+    held_elsewhere: Arc<std::sync::Mutex<Vec<SessionToken>>>,
+    exhausted_for: Arc<std::sync::Mutex<Vec<SessionToken>>>,
+}
+
+/// How a [`TokenExit`] answers one setup request.
+enum TokenExitReply {
+    Assign,
+    Rejected,
+    IpExhausted,
+}
+
+impl TokenExit {
+    /// Every setup request read so far, in arrival order.
+    #[must_use]
+    pub fn seen(&self) -> Vec<SeenSetup> {
+        self.seen.lock().expect("seen-setup lock").clone()
+    }
+
+    /// From now on, a v7 request leading with `token` is refused with the
+    /// sealed `Rejected`, the way a real exit refuses a serial another session
+    /// holds.
+    pub fn hold_elsewhere(&self, token: SessionToken) {
+        self.held_elsewhere
+            .lock()
+            .expect("held-token lock")
+            .push(token);
+    }
+
+    /// The placement hint (`prefer_ipv4`) of every setup request read so far,
+    /// in arrival order.
+    #[must_use]
+    pub fn placements(&self) -> Vec<Option<[u8; 4]>> {
+        self.placements.lock().expect("placement lock").clone()
+    }
+
+    /// From now on, a v7 request leading with `token` is answered with the
+    /// sealed `IpExhausted`, a refusal that says nothing about the token.
+    pub fn exhaust_for(&self, token: SessionToken) {
+        self.exhausted_for
+            .lock()
+            .expect("exhausted-token lock")
+            .push(token);
+    }
+
+    /// Records `request` and picks the answer.
+    fn answer(&self, request: &WarrenControlMessage) -> TokenExitReply {
+        let (seen, placement, lead) = match request {
+            WarrenControlMessage::IpRequest {
+                client_pubkey,
+                prefer_ipv4,
+                ..
+            } => (
+                SeenSetup::Wallet {
+                    names_pubkey: client_pubkey.is_some(),
+                },
+                *prefer_ipv4,
+                None,
+            ),
+            WarrenControlMessage::IpRequestV7 {
+                session_tokens,
+                prefer_ipv4,
+                ..
+            } => (
+                SeenSetup::Tokens(session_tokens.clone()),
+                *prefer_ipv4,
+                session_tokens.first().copied(),
+            ),
+            other => panic!("expected a setup request, got {other:?}"),
+        };
+        self.seen.lock().expect("seen-setup lock").push(seen);
+        self.placements
+            .lock()
+            .expect("placement lock")
+            .push(placement);
+        let Some(lead) = lead else {
+            return TokenExitReply::Assign;
+        };
+        if self
+            .held_elsewhere
+            .lock()
+            .expect("held-token lock")
+            .contains(&lead)
+        {
+            TokenExitReply::Rejected
+        } else if self
+            .exhausted_for
+            .lock()
+            .expect("exhausted-token lock")
+            .contains(&lead)
+        {
+            TokenExitReply::IpExhausted
+        } else {
+            TokenExitReply::Assign
+        }
+    }
+}
+
+/// Spawns a loopback multihop exit that serves every connection, admits both
+/// the v6 wallet request and the v7 token request, records each one in the
+/// returned [`TokenExit`], and refuses a v7 request whose lead token it was
+/// told is held elsewhere ([`TokenExit::hold_elsewhere`]).
+///
+/// # Panics
+///
+/// Panics on any setup failure (test helper).
+pub async fn spawn_token_multihop_exit(
+    exit_key: SigningKey,
+) -> (SocketAddr, MultihopExitKeys, TokenExit) {
+    let ed25519_pubkey = exit_key.verifying_key().to_bytes();
+    let (recipient_priv, recipient_pub) =
+        ExitKem::gen_keypair(&mut rand_core::UnwrapErr(rand_core::OsRng));
+    let x25519_pubkey: [u8; 32] = recipient_pub.to_bytes().into();
+    let exit_id = [0x11u8; EXIT_ID_LEN];
+
+    let cfg = make_server_config(&exit_key, default_crypto_provider(), &[ALPN_H3])
+        .expect("server config");
+    let endpoint = quinn::Endpoint::server(cfg, "127.0.0.1:0".parse().unwrap())
+        .expect("server endpoint binds");
+    let addr = endpoint.local_addr().expect("local addr");
+
+    let exit = TokenExit::default();
+    let served = exit.clone();
+    tokio::spawn(async move {
+        let recipient_priv = Arc::new(recipient_priv);
+        while let Some(incoming) = endpoint.accept().await {
+            let Ok(conn) = incoming.await else {
+                continue;
+            };
+            let recipient_priv = Arc::clone(&recipient_priv);
+            let served = served.clone();
+            tokio::spawn(async move {
+                serve_echo_connection(conn, &recipient_priv, exit_id, None, Some(&served)).await;
+            });
+        }
+    });
+
+    (
+        addr,
+        MultihopExitKeys {
+            ed25519_pubkey,
+            x25519_pubkey,
+            exit_id,
+        },
+        exit,
+    )
+}
+
 /// Serves ONE accepted multihop connection: reads the HPKE-sealed setup frame
 /// (inner `IpRequest`), replies with a sealed `IpAssign`, then echoes every
 /// sealed data datagram back.
@@ -228,7 +393,9 @@ pub async fn spawn_fake_multihop_exit(exit_key: SigningKey) -> (SocketAddr, Mult
 /// `seen_addrs`, when wired, records the client source address quinn currently
 /// attributes to this connection on each datagram, so a test can observe a QUIC
 /// path MIGRATION (the address moves under one connection) as something
-/// distinct from a redial (a second accept).
+/// distinct from a redial (a second accept). `tokens`, when wired, records the
+/// setup request and may refuse it (see [`TokenExit`]); without it only the v6
+/// request is accepted.
 ///
 /// # Panics
 ///
@@ -238,6 +405,7 @@ async fn serve_echo_connection(
     recipient_priv: &<ExitKem as KemTrait>::PrivateKey,
     exit_id: [u8; EXIT_ID_LEN],
     seen_addrs: Option<Arc<std::sync::Mutex<Vec<SocketAddr>>>>,
+    tokens: Option<&TokenExit>,
 ) {
     let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
     let request_bytes = recv.read_to_end(65536).await.expect("read setup request");
@@ -259,12 +427,34 @@ async fn serve_echo_connection(
     .expect("setup_receiver");
 
     let plaintext = exit_open(&ctx, &exit_id, &request).expect("open setup request");
-    match try_decode_control(&plaintext)
+    let setup = try_decode_control(&plaintext)
         .expect("decode control")
-        .expect("control present")
-    {
-        WarrenControlMessage::IpRequest { .. } => {}
-        other => panic!("expected an IpRequest, got {other:?}"),
+        .expect("control present");
+    let refusal = match tokens.map(|tokens| tokens.answer(&setup)) {
+        Some(TokenExitReply::Rejected) => Some(WarrenControlMessage::Rejected),
+        Some(TokenExitReply::IpExhausted) => Some(WarrenControlMessage::IpExhausted),
+        Some(TokenExitReply::Assign) => None,
+        None => match setup {
+            WarrenControlMessage::IpRequest { .. } => None,
+            other => panic!("expected an IpRequest, got {other:?}"),
+        },
+    };
+    if let Some(refusal) = refusal {
+        let reply = encode_control(&refusal).expect("encode the refusal");
+        let frame = exit_seal(
+            &ctx,
+            &exit_id,
+            request.encapsulated_key,
+            &reply,
+            request.epoch,
+            0,
+        );
+        send.write_all(&frame.encode().expect("encode reply"))
+            .await
+            .expect("write reply");
+        send.finish().expect("finish reply");
+        conn.closed().await;
+        return;
     }
 
     let assign = WarrenControlMessage::IpAssign {
@@ -392,7 +582,7 @@ pub async fn spawn_migratable_multihop_exit(
             let recipient_priv = Arc::clone(&recipient_priv);
             let addrs = Arc::clone(&spawned.client_addrs);
             tokio::spawn(async move {
-                serve_echo_connection(conn, &recipient_priv, exit_id, Some(addrs)).await;
+                serve_echo_connection(conn, &recipient_priv, exit_id, Some(addrs), None).await;
             });
         }
     });
@@ -668,4 +858,74 @@ pub async fn spawn_replaying_multihop_exit(exit_key: SigningKey) -> (SocketAddr,
             exit_id,
         },
     )
+}
+
+/// A token whose every byte is `fill`: opaque to the transport, told apart by
+/// the fake exit by value.
+#[must_use]
+pub fn fake_session_token(fill: u8) -> SessionToken {
+    SessionToken([fill; warren_wire::SESSION_TOKEN_LEN])
+}
+
+/// A [`warren_transport::SessionTokenSource`] over a fixed stack, holding
+/// tokens the way the SDK's lease registry does: a held token leaves the stack
+/// and cannot be claimed again until its last hold drops.
+#[derive(Clone, Default)]
+pub struct StaticTokens {
+    stack: Vec<SessionToken>,
+    held: Arc<std::sync::Mutex<Vec<SessionToken>>>,
+}
+
+impl StaticTokens {
+    /// A source handing out `stack`, in that order.
+    #[must_use]
+    pub fn new(stack: Vec<SessionToken>) -> Self {
+        Self {
+            stack,
+            held: Arc::default(),
+        }
+    }
+
+    /// The tokens a live hold keeps right now.
+    #[must_use]
+    pub fn held(&self) -> Vec<SessionToken> {
+        self.held.lock().expect("held-token lock").clone()
+    }
+}
+
+struct Release {
+    token: SessionToken,
+    held: Arc<std::sync::Mutex<Vec<SessionToken>>>,
+}
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        let mut held = self.held.lock().expect("held-token lock");
+        if let Some(at) = held.iter().position(|t| *t == self.token) {
+            held.remove(at);
+        }
+    }
+}
+
+impl warren_transport::SessionTokenSource for StaticTokens {
+    fn stack(&self) -> Vec<SessionToken> {
+        let held = self.held.lock().expect("held-token lock");
+        self.stack
+            .iter()
+            .filter(|t| !held.contains(t))
+            .copied()
+            .collect()
+    }
+
+    fn claim(&self, token: &SessionToken) -> Option<warren_transport::TokenHold> {
+        let mut held = self.held.lock().expect("held-token lock");
+        if held.contains(token) {
+            return None;
+        }
+        held.push(*token);
+        Some(warren_transport::TokenHold::new(Release {
+            token: *token,
+            held: Arc::clone(&self.held),
+        }))
+    }
 }

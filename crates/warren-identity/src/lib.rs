@@ -23,6 +23,7 @@ pub mod signing;
 pub mod ss58;
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use zeroize::Zeroizing;
 
 /// Re-export of the exact `ed25519-dalek` the SDK builds against, so dependent
 /// crates can name `SigningKey`/`VerifyingKey` without pinning the version
@@ -81,6 +82,11 @@ pub enum IdentityError {
 /// ```
 pub struct WarrenIdentity {
     signing: SigningKey,
+    /// The 32-byte wallet seed the key was derived from, kept until
+    /// [`Self::take_seed`] hands it to the one consumer that derives more from
+    /// it (the anonymous-token blinding key). `None` for an identity built
+    /// from a bare signing key.
+    seed: Option<Zeroizing<[u8; 32]>>,
 }
 
 impl WarrenIdentity {
@@ -111,6 +117,7 @@ impl WarrenIdentity {
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         Self {
             signing: derive_node_key(seed),
+            seed: Some(Zeroizing::new(*seed)),
         }
     }
 
@@ -121,7 +128,22 @@ impl WarrenIdentity {
     /// bit-for-bit the same wallet the key authenticates as.
     #[must_use]
     pub fn from_signing_key(signing: SigningKey) -> Self {
-        Self { signing }
+        Self {
+            signing,
+            seed: None,
+        }
+    }
+
+    /// Moves the wallet seed out of the identity, which keeps only its signing
+    /// key from then on. `None` once taken, or for an identity built from a
+    /// signing key.
+    ///
+    /// Secret: every key of the wallet derives from it. The SDK client builder
+    /// takes it to derive the wallet's anonymous-token blinding key, so the
+    /// long-lived API client never holds it.
+    #[must_use]
+    pub fn take_seed(&mut self) -> Option<Zeroizing<[u8; 32]>> {
+        self.seed.take()
     }
 
     /// The 32-byte Ed25519 public key.
@@ -189,6 +211,34 @@ impl std::fmt::Debug for WarrenIdentity {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signature, Verifier};
+
+    #[test]
+    fn an_identity_built_from_its_seed_hands_the_seed_over_once() {
+        let mut id = WarrenIdentity::from_seed(&[0x5d; 32]);
+
+        assert_eq!(id.take_seed().as_deref(), Some(&[0x5d; 32]));
+        assert!(id.take_seed().is_none(), "the seed leaves the identity");
+        assert_eq!(
+            id.public_key(),
+            WarrenIdentity::from_seed(&[0x5d; 32]).public_key(),
+            "the identity keeps signing as the same wallet"
+        );
+    }
+
+    #[test]
+    fn an_identity_from_a_mnemonic_carries_the_seed_the_mnemonic_derives() {
+        let (mut id, phrase) = WarrenIdentity::generate();
+        let seed = seed_from_mnemonic(&phrase).expect("valid mnemonic");
+
+        assert_eq!(id.take_seed().as_deref(), Some(&*seed));
+    }
+
+    #[test]
+    fn an_identity_from_a_signing_key_has_no_seed() {
+        let mut id = WarrenIdentity::from_signing_key(derive_node_key(&[0x5e; 32]));
+
+        assert!(id.take_seed().is_none());
+    }
     use sha2::{Digest, Sha256};
 
     #[test]

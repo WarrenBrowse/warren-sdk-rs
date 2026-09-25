@@ -62,6 +62,11 @@ pub use warren_transport::ConnectionState;
 /// Re-exported at the root so an app reading them needs no second dependency.
 pub use warren_transport::{Carrier, MultihopMetrics, MultihopMetricsSnapshot, PathQuality};
 
+/// How a tunnel is admitted at the exit (see
+/// [`WarrenClientBuilder::session_admission`]): the policy, what a session was
+/// admitted on, and why a tokens-only dial found no token.
+pub use warren_transport::{Admission, NoSessionTokenCause, SessionAdmission};
+
 /// The engine's rule for reading a received-payload counter as evidence about
 /// the exit, re-exported because a host that runs its OWN liveness probe over
 /// this SDK's listener needs the same discriminant the SDK's in-tunnel probe
@@ -87,6 +92,7 @@ mod portfollow;
 /// downstream consumers read one source of truth instead of local literals.
 pub mod product;
 mod proxy;
+mod session_tokens;
 pub mod socks_egress;
 mod store;
 mod supervisor;

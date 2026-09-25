@@ -3674,6 +3674,7 @@ dependencies = [
  "thiserror",
  "warren-contract",
  "warrenguard-identity",
+ "zeroize",
 ]
 
 [[package]]

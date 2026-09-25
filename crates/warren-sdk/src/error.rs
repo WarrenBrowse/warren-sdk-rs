@@ -153,4 +153,10 @@ pub enum BuildError {
     /// Surfaced instead of panicking so an FFI embedder gets a recoverable error.
     #[error("the default HTTP transport could not be initialized")]
     TransportInit,
+    /// The blinding key handed to
+    /// [`WarrenClientBuilder::session_blinding_key`](crate::WarrenClientBuilder::session_blinding_key)
+    /// derives another credential class than session tokens: it would mint
+    /// credentials no exit admits a tunnel on.
+    #[error("the blinding key does not derive session tokens")]
+    NotASessionBlindingKey,
 }
