@@ -3553,6 +3553,7 @@ dependencies = [
  "warrenguard-token",
  "warrenguard-tun-core",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]

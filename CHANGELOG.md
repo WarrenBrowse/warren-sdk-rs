@@ -17,9 +17,11 @@ the pre-release `0.0.x` line.
   with another body included, keeps its `ServerStatus` mapping.
   `TokenManager::refresh` and `PortEntitlementManager::refresh_auto` return the
   ban (wrapped in `TokenClientError::Api`) instead of swallowing it as a
-  per-epoch failure, and settle nothing, so a lifted ban mints at the next
-  tick. `BanReasonCode` and `IssuanceRefusal` are re-exported from
-  `warren_api`.
+  per-epoch failure, and stop the pass there with that epoch unsettled, so a
+  lifted ban mints at the next tick. The attribution failures below
+  (`BadAttributionKey`, `AttributionTag*`) are returned the same way, so a
+  broken issuer shows up at refresh instead of as a batch that never fills.
+  `BanReasonCode` and `IssuanceRefusal` are re-exported from `warren_api`.
 - `WarrenApiClient::account_standing()`: the wallet-signed
   `GET /v1/account/standing`, returning the contract's
   `AccountStandingResponse` (live port-forward abuse strikes with day,

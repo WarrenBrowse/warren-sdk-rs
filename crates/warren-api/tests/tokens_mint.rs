@@ -43,7 +43,7 @@ struct FakeIssuer {
     fail_issue_once: AtomicBool,
     /// When set, every `/v1/tokens/issue` call is answered with this status
     /// and body instead of a batch.
-    issue_refusal: Option<(u16, &'static str)>,
+    issue_refusal: Mutex<Option<(u16, &'static str)>>,
     /// Count of `/v1/tokens/issue` calls, to prove a settled epoch is never
     /// re-asked.
     issue_calls: AtomicUsize,
@@ -65,7 +65,7 @@ impl FakeIssuer {
             refuse: Vec::new(),
             refuse_reason: "not_subscribed".to_owned(),
             fail_issue_once: AtomicBool::new(false),
-            issue_refusal: None,
+            issue_refusal: Mutex::new(None),
             issue_calls: AtomicUsize::new(0),
             last_issue: Mutex::new(None),
             last_keys_headers: Mutex::new(None),
@@ -114,7 +114,7 @@ impl HttpTransport for FakeIssuer {
             request.url
         );
         self.issue_calls.fetch_add(1, Ordering::SeqCst);
-        if let Some((status, body)) = self.issue_refusal {
+        if let Some((status, body)) = *self.issue_refusal.lock().unwrap() {
             return Ok(HttpResponse {
                 status,
                 body: body.as_bytes().to_vec(),
@@ -572,8 +572,8 @@ const BANNED_BODY: &str =
 #[tokio::test]
 async fn a_banned_wallet_gets_a_typed_refusal_from_token_issuance() {
     // The app shows the suspension from this answer, without dialing an exit.
-    let mut fake = FakeIssuer::new(&[100]);
-    fake.issue_refusal = Some((403, BANNED_BODY));
+    let fake = FakeIssuer::new(&[100]);
+    *fake.issue_refusal.lock().unwrap() = Some((403, BANNED_BODY));
     let c = client(fake);
     let directory = c.token_keys().await.unwrap();
     let mut rng = StdRng::seed_from_u64(7);
@@ -596,8 +596,8 @@ async fn a_banned_wallet_gets_a_typed_refusal_from_token_issuance() {
 
 #[tokio::test]
 async fn a_forbidden_answer_that_is_not_a_ban_keeps_the_status_error() {
-    let mut fake = FakeIssuer::new(&[100]);
-    fake.issue_refusal = Some((403, r#"{"error":"forbidden"}"#));
+    let fake = FakeIssuer::new(&[100]);
+    *fake.issue_refusal.lock().unwrap() = Some((403, r#"{"error":"forbidden"}"#));
     let c = client(fake);
     let directory = c.token_keys().await.unwrap();
     let mut rng = StdRng::seed_from_u64(7);
@@ -616,13 +616,14 @@ async fn a_forbidden_answer_that_is_not_a_ban_keeps_the_status_error() {
 }
 
 #[tokio::test]
-async fn a_refresh_surfaces_a_ban_instead_of_swallowing_it() {
+async fn a_refresh_surfaces_a_ban_and_mints_once_it_is_lifted() {
     // Every other per-epoch failure is swallowed and retried at the next tick;
     // a ban is the one the caller must see, since it is the only thing the
-    // user can act on.
-    let mut fake = FakeIssuer::new(&[100, 101]);
-    fake.issue_refusal = Some((403, BANNED_BODY));
-    let manager = TokenManager::new(std::sync::Arc::new(client(fake)));
+    // user can act on. It settles nothing: a lifted ban mints at the next tick.
+    let fake = FakeIssuer::new(&[100, 101]);
+    *fake.issue_refusal.lock().unwrap() = Some((403, BANNED_BODY));
+    let api = std::sync::Arc::new(client(fake));
+    let manager = TokenManager::new(api.clone());
 
     let err = manager
         .refresh(100 * EPOCH_SECS, &mut StdRng::seed_from_u64(7))
@@ -633,4 +634,15 @@ async fn a_refresh_surfaces_a_ban_instead_of_swallowing_it() {
         matches!(err, TokenClientError::Api(ClientError::Banned { .. })),
         "{err:?}"
     );
+    assert_eq!(
+        api.transport().issue_calls.load(Ordering::SeqCst),
+        1,
+        "the pass stops at the ban: every later epoch would get the same answer"
+    );
+    *api.transport().issue_refusal.lock().unwrap() = None;
+    manager
+        .refresh(100 * EPOCH_SECS, &mut StdRng::seed_from_u64(8))
+        .await
+        .expect("the ban is lifted");
+    assert_eq!(manager.available(100), QUOTA as usize);
 }

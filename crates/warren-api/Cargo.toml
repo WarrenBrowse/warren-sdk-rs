@@ -20,6 +20,8 @@ warrenguard-token = { workspace = true }
 # Verifies the port-forward attribution tag minted beside each entitlement,
 # against the key the entitlement directory publishes.
 ed25519-dalek = { workspace = true }
+# Wipes the serialized entitlement copied into an envelope.
+zeroize = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }

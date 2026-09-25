@@ -318,15 +318,62 @@ async fn a_tag_that_does_not_verify_under_the_published_key_is_refused() {
 }
 
 #[tokio::test]
-async fn an_unusable_attribution_key_fails_before_the_epoch_is_issued() {
+async fn a_directory_without_an_attribution_key_fails_before_the_epoch_is_issued() {
     // Issuance is once per account and epoch: a mint that could only end in
     // unverifiable tags must not spend it.
-    for fault in [TagFault::NoPublishedKey, TagFault::InvalidPublishedKey] {
-        let (minted, issue_calls) = mint_with(fault).await;
+    let (minted, issue_calls) = mint_with(TagFault::NoPublishedKey).await;
 
-        assert!(matches!(minted, Err(TokenClientError::BadAttributionKey)));
-        assert_eq!(issue_calls, 0, "the epoch was issued for nothing");
-    }
+    assert!(matches!(minted, Err(TokenClientError::BadAttributionKey)));
+    assert_eq!(issue_calls, 0, "the epoch was issued for nothing");
+}
+
+#[tokio::test]
+async fn an_attribution_key_that_is_not_an_ed25519_point_fails_before_the_epoch_is_issued() {
+    let (minted, issue_calls) = mint_with(TagFault::InvalidPublishedKey).await;
+
+    assert!(matches!(minted, Err(TokenClientError::BadAttributionKey)));
+    assert_eq!(issue_calls, 0, "the epoch was issued for nothing");
+}
+
+#[tokio::test]
+async fn a_refresh_surfaces_a_directory_without_an_attribution_key() {
+    // Swallowed, this reads as a refresh that went fine and stocked nothing,
+    // and every rule's request then goes out bare and is refused.
+    let m = PortEntitlementManager::new(std::sync::Arc::new(client(FakeIssuer::with_fault(
+        &[100],
+        TagFault::NoPublishedKey,
+    ))));
+
+    let err = m
+        .refresh_auto(100 * EPOCH_SECS)
+        .await
+        .expect_err("the broken directory reaches the caller");
+
+    assert!(
+        matches!(err, TokenClientError::BadAttributionKey),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_surfaces_a_batch_whose_tags_fail_the_checks() {
+    let m = PortEntitlementManager::new(std::sync::Arc::new(client(FakeIssuer::with_fault(
+        &[100],
+        TagFault::DropOne,
+    ))));
+
+    let err = m
+        .refresh_auto(100 * EPOCH_SECS)
+        .await
+        .expect_err("the broken batch reaches the caller");
+
+    assert!(
+        matches!(
+            err,
+            TokenClientError::AttributionTagCount { epoch: 100, .. }
+        ),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]

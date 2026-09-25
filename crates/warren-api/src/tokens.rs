@@ -25,6 +25,7 @@ use rand010::CryptoRng;
 use serde::{Deserialize, Serialize};
 use warren_contract::pf_attribution::{AttributionTag, AttributionTagError, EntitlementEnvelope};
 use warrenguard_token::{IssuerPublicKey, TOKEN_LEN, Token, TokenChallenge, TokenError};
+use zeroize::Zeroizing;
 
 use crate::client::{ClientError, WarrenApiClient};
 use crate::dto::{TokenEpochRequest, TokenIssueRequest, TokenIssuerDirectory};
@@ -207,7 +208,7 @@ fn verify_attribution_tag(
 /// One tag per blind signature, each verified, in the issuer's order.
 fn checked_attribution_tags(
     epoch: u64,
-    tags: &[AttributionTag],
+    tags: Vec<AttributionTag>,
     signatures: usize,
     key: &VerifyingKey,
 ) -> Result<Vec<AttributionTag>, TokenClientError> {
@@ -218,10 +219,10 @@ fn checked_attribution_tags(
             tags: tags.len(),
         });
     }
-    for tag in tags {
+    for tag in &tags {
         verify_attribution_tag(tag, epoch, key)?;
     }
-    Ok(tags.to_vec())
+    Ok(tags)
 }
 
 /// Mints the full token batch for each of `epochs`: blind against each
@@ -279,7 +280,7 @@ pub async fn mint_tokens_for<T: HttpTransport, R: CryptoRng + ?Sized>(
         per_epoch.push((epoch, pk, states));
     }
 
-    let response = client
+    let mut response = client
         .issue_tokens_for(
             class,
             &TokenIssueRequest {
@@ -293,7 +294,7 @@ pub async fn mint_tokens_for<T: HttpTransport, R: CryptoRng + ?Sized>(
     for (epoch, pk, states) in per_epoch {
         let out = response
             .epochs
-            .iter()
+            .iter_mut()
             .find(|e| e.epoch == epoch)
             .ok_or(TokenClientError::BatchMismatch { epoch })?;
         if !out.issued {
@@ -308,7 +309,7 @@ pub async fn mint_tokens_for<T: HttpTransport, R: CryptoRng + ?Sized>(
         let attribution_tags = match &attribution_key {
             Some(key) => checked_attribution_tags(
                 epoch,
-                &out.attribution_tags,
+                std::mem::take(&mut out.attribution_tags),
                 out.blind_signatures.len(),
                 key,
             )?,
@@ -351,8 +352,10 @@ pub struct TokenStore {
     per_epoch: BTreeMap<u64, Vec<Stored>>,
 }
 
-/// A token and, for a port entitlement, the tag minted beside it. Stored as
-/// one entry so the pair can never be split by a pop.
+/// A token and, for a port entitlement, the tag minted beside it, stored as
+/// one entry so [`TokenStore::take_envelope`] pops the pair together. The
+/// bare-token surfaces ([`TokenStore::take`], the snapshot) ignore the tag;
+/// `TokenManager` keeps a port-entitlement store off them.
 struct Stored {
     token: Token,
     tag: Option<AttributionTag>,
@@ -410,8 +413,9 @@ impl TokenStore {
     pub(crate) fn take_envelope(&mut self, epoch: u64) -> Option<EntitlementEnvelope> {
         while let Some(entry) = self.pop(epoch) {
             if let Some(tag) = entry.tag {
+                let token = Zeroizing::new(entry.token.serialize());
                 return Some(
-                    EntitlementEnvelope::new(&entry.token.serialize(), tag)
+                    EntitlementEnvelope::new(token.as_slice(), tag)
                         .expect("a minted token has the envelope's token length"),
                 );
             }
@@ -602,11 +606,14 @@ impl<T: HttpTransport> TokenManager<T> {
     /// failure is left retryable for the next tick.
     ///
     /// # Errors
-    /// [`TokenClientError`] when the directory fetch itself fails, and
-    /// `TokenClientError::Api(ClientError::Banned { .. })` when the issuer
-    /// refuses the wallet as banned (nothing is settled, so a lifted ban mints
-    /// at the next tick). Any other per-epoch mint refusal or transport error
-    /// is swallowed.
+    /// [`TokenClientError`] when the directory fetch itself fails; when the
+    /// issuer refuses the wallet as banned
+    /// (`TokenClientError::Api(ClientError::Banned { .. })`); and, for port
+    /// entitlements, when the directory carries no usable attribution key or
+    /// a batch's tags fail the checks (`BadAttributionKey`,
+    /// `AttributionTag*`). The pass stops there, leaving that epoch and the
+    /// later ones unsettled, so the next tick asks again. Any other per-epoch
+    /// mint refusal or transport error is swallowed.
     pub async fn refresh<R: CryptoRng + ?Sized>(
         &self,
         now_unix_secs: u64,
@@ -656,7 +663,19 @@ impl<T: HttpTransport> TokenManager<T> {
                         .minted
                         .insert(epoch);
                 }
-                Err(e @ TokenClientError::Api(ClientError::Banned { .. })) => return Err(e),
+                // A ban, or an issuer whose attribution tags cannot pass the
+                // exit's checks, gives every remaining epoch the same answer,
+                // and swallowed they read as a refresh that went fine and
+                // stocked nothing. The failed epoch stays unsettled: a lifted
+                // ban mints at the next tick, and an epoch the issuer did
+                // record is settled then by its already_issued answer.
+                Err(
+                    e @ (TokenClientError::Api(ClientError::Banned { .. })
+                    | TokenClientError::BadAttributionKey
+                    | TokenClientError::AttributionTagCount { .. }
+                    | TokenClientError::AttributionTagEpoch { .. }
+                    | TokenClientError::AttributionTagInvalid { .. }),
+                ) => return Err(e),
                 Err(_) => {
                     // Anything else (transport error, 5xx, a refusal that can
                     // heal like not_subscribed, a malformed response) proves
@@ -1040,7 +1059,10 @@ impl<T: HttpTransport> PortEntitlementManager<T> {
     /// Tops the batch up, on the same coarse timer as session tokens.
     ///
     /// # Errors
-    /// [`TokenClientError`] when the directory fetch fails.
+    /// As [`TokenManager::refresh`]: a failed directory fetch, a banned wallet
+    /// (`TokenClientError::Api(ClientError::Banned { .. })`, which the app
+    /// shows as the suspension), or an issuer whose attribution tags the exit
+    /// would refuse.
     pub async fn refresh_auto(&self, now_unix_secs: u64) -> Result<(), TokenClientError> {
         self.inner.refresh_auto(now_unix_secs).await
     }

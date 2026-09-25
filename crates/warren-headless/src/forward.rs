@@ -24,9 +24,10 @@ use crate::log::Log;
 /// forward path these daemons run on does not carry that pair yet: that is
 /// what refuses `both` here, and the protocol imposes no such limit.
 ///
-/// These daemons also present no entitlement credential, so the exit applies
-/// its default per-client quota rather than the account's fleet-wide slot
-/// count.
+/// These daemons also present no entitlement envelope. An exit that enforces
+/// warren-core doc 105 refuses a Map request without one, so their port
+/// forward stops being granted there until the SDK forward path presents the
+/// envelope a `warren_api::PortEntitlementManager` slot vends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardProto {
     /// TCP only.
