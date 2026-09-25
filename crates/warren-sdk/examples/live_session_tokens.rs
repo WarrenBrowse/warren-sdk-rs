@@ -92,7 +92,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("need two cross-checked exits, found {}", exits.len()).into());
     };
     println!("exit X: {} / {}", exit_x.country, exit_x.city);
-    println!("exit Y: {} / {}", exit_y.country, exit_y.city);
+    println!(
+        "exit Y: {} / {}  cover_domain={}",
+        exit_y.country,
+        exit_y.city,
+        exit_y.cover_domain.is_some()
+    );
 
     // (1) Session A.
     let a = client.connect_multihop(exit_x).await?;
@@ -186,16 +191,19 @@ async fn walk_past(
         stack,
         claims: AtomicUsize::new(0),
     });
-    let c = MultihopClientTunnel::new(WarrenIdentity::from_seed(&seed).signing_key())
-        .with_session_tokens(forced.clone())
-        .with_session_admission(SessionAdmission::TokensOnly)
-        .connect(
-            exit_y.exit_ed25519_pubkey,
-            exit_y.exit_x25519_multihop_pubkey,
-            exit_y.exit_id,
-            exit_y.endpoint,
-        )
-        .await?;
+    let c = dial_like_the_sdk(
+        MultihopClientTunnel::new(WarrenIdentity::from_seed(&seed).signing_key()),
+        exit_y,
+    )
+    .with_session_tokens(forced.clone())
+    .with_session_admission(SessionAdmission::TokensOnly)
+    .connect(
+        exit_y.exit_ed25519_pubkey,
+        exit_y.exit_x25519_multihop_pubkey,
+        exit_y.exit_id,
+        exit_y.endpoint,
+    )
+    .await?;
     let c_token = *c
         .admission()
         .token()
@@ -211,6 +219,21 @@ async fn walk_past(
     }
 
     Ok(c)
+}
+
+/// Applies what the SDK's own dials take from a verified exit
+/// (`supervisor::multihop_dial`): an exit behind a cover domain presents an
+/// X.509 certificate, and a dial pinning its raw public key instead is refused
+/// at the TLS handshake (`IncorrectCertificateTypeExtension`).
+fn dial_like_the_sdk(
+    tunnel: MultihopClientTunnel,
+    exit: &warren_sdk::discovery::VerifiedExit,
+) -> MultihopClientTunnel {
+    tunnel
+        .with_cover_domain(exit.cover_domain.clone())
+        .with_tcp_fallback(exit.tcp_fallback)
+        .with_alt_endpoint(exit.endpoint_v6)
+        .with_exit_mlkem768(exit.exit_mlkem768_pubkey.clone())
 }
 
 /// The address the echo sees, through `proxy` when one is given. The proxy
