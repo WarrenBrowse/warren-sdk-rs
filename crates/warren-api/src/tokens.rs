@@ -18,8 +18,8 @@
 //! Anti-correlation guidance: mint on unlock or on a timer, never at
 //! connect time, so issuance timing does not mirror session timing.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::VerifyingKey;
@@ -27,7 +27,7 @@ use rand010::{CryptoRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use warren_contract::pf_attribution::{AttributionTag, AttributionTagError, EntitlementEnvelope};
 use warrenguard_token::{
-    ClientState, IssuerPublicKey, TOKEN_LEN, Token, TokenChallenge, TokenError,
+    ClientState, IssuerPublicKey, TOKEN_LEN, Token, TokenChallenge, TokenError, TokenSerial,
 };
 use zeroize::Zeroizing;
 
@@ -474,6 +474,15 @@ impl TokenStore {
         self.per_epoch.get(&epoch).map_or(0, Vec::len)
     }
 
+    /// The tokens held for `epoch`, in mint order, left in the store.
+    fn tokens(&self, epoch: u64) -> impl Iterator<Item = &Token> {
+        self.per_epoch
+            .get(&epoch)
+            .into_iter()
+            .flatten()
+            .map(|entry| &entry.token)
+    }
+
     /// Epochs that still hold at least one token, ascending.
     #[must_use]
     pub fn epochs(&self) -> Vec<u64> {
@@ -602,6 +611,50 @@ pub struct TokenManager<T> {
     /// instead of the whole published window. `None` keeps the full-window
     /// prefetch.
     mint_horizon: Option<u64>,
+    /// The serials this process's live sessions were admitted on
+    /// ([`Self::claim`]), left out of every [`Self::session_stack`].
+    live: Arc<LiveSerials>,
+    /// Where [`Self::session_stack`] starts in the epoch's batch, drawn once
+    /// per manager. Every client of a wallet holds the same batch in the same
+    /// order, so a fixed start would send all of them to the first serial.
+    rotation: usize,
+}
+
+/// The serials held by the live sessions of one [`TokenManager`].
+#[derive(Default)]
+struct LiveSerials(Mutex<HashSet<TokenSerial>>);
+
+impl LiveSerials {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<TokenSerial>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A live session's hold on the serial it presents
+/// ([`TokenManager::claim`]). While any clone lives, the serial stays out of
+/// the manager's [`TokenManager::session_stack`]; the last drop releases it.
+/// Bonded legs of one session clone the lease of the leg that was admitted.
+#[derive(Clone)]
+pub struct SerialLease {
+    _held: Arc<Held>,
+}
+
+struct Held {
+    serial: TokenSerial,
+    live: Arc<LiveSerials>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.live.lock().remove(&self.serial);
+    }
+}
+
+impl std::fmt::Debug for SerialLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The serial keys a live session in the exit's ledger: never render it.
+        f.write_str("SerialLease(..)")
+    }
 }
 
 /// Where a manager's batches draw their blinding material.
@@ -642,7 +695,15 @@ impl<T: HttpTransport> TokenManager<T> {
                 minted: BTreeSet::new(),
             })),
             mint_horizon: None,
+            live: Arc::default(),
+            rotation: rand::random(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_rotation(mut self, rotation: usize) -> Self {
+        self.rotation = rotation;
+        self
     }
 
     fn class(&self) -> CredentialClass {
@@ -796,6 +857,55 @@ impl<T: HttpTransport> TokenManager<T> {
             Some(token) => vec![token.serialize()],
             None => Vec::new(),
         }
+    }
+
+    /// Every token of the epoch `now` falls in, serialized, for ONE session to
+    /// present in this order: starting at this manager's rotation, and leaving
+    /// out the serials this process's live sessions hold ([`Self::claim`]).
+    /// Nothing is consumed and nothing is minted.
+    ///
+    /// Every client of the wallet holds the same tokens, and the exit refuses
+    /// a serial another session holds anywhere in the fleet, so a session
+    /// walks this stack: it claims the lead, and on a refusal moves to the next
+    /// token. An empty stack means no token is free this epoch.
+    #[must_use]
+    pub fn session_stack(&self, now_unix_secs: u64) -> Vec<[u8; TOKEN_LEN]> {
+        if self.class() == CredentialClass::PortEntitlement {
+            return Vec::new();
+        }
+        let st = self.state.lock().expect("token manager mutex poisoned");
+        let Some(epoch) = st.epoch_secs.filter(|&s| s > 0).map(|s| now_unix_secs / s) else {
+            return Vec::new();
+        };
+        let mut tokens: Vec<&Token> = st.store.tokens(epoch).collect();
+        if !tokens.is_empty() {
+            let start = self.rotation % tokens.len();
+            tokens.rotate_left(start);
+        }
+        let held = self.live.lock();
+        tokens
+            .into_iter()
+            .filter(|token| !held.contains(&token.serial()))
+            .map(Token::serialize)
+            .collect()
+    }
+
+    /// Holds `token`'s serial for a session about to present it, so no other
+    /// session of this process leads with it while the returned lease lives.
+    /// `None` when a live session already holds it, or when the bytes are no
+    /// token.
+    #[must_use]
+    pub fn claim(&self, token: &[u8; TOKEN_LEN]) -> Option<SerialLease> {
+        let serial = Token::parse(token).ok()?.serial();
+        if !self.live.lock().insert(serial) {
+            return None;
+        }
+        Some(SerialLease {
+            _held: Arc::new(Held {
+                serial,
+                live: Arc::clone(&self.live),
+            }),
+        })
     }
 
     /// Pops one port entitlement for the epoch `now` falls in, paired with
@@ -1084,6 +1194,154 @@ mod persistence_tests {
 }
 
 #[cfg(test)]
+mod session_stack_tests {
+    //! The stack a session presents: every token of the current epoch, in the
+    //! manager's own rotation, minus the serials this process's live sessions
+    //! hold. Every client of a wallet holds the same batch in the same order,
+    //! so where each one starts is what keeps two of them off one serial.
+
+    use warren_identity::WarrenIdentity;
+
+    use super::*;
+    use crate::transport::{HttpRequest, HttpResponse, TransportError};
+
+    /// Never reached: the store is filled by hand.
+    struct Offline;
+
+    impl HttpTransport for Offline {
+        async fn execute(&self, _: HttpRequest) -> Result<HttpResponse, TransportError> {
+            Err(TransportError::Connect("offline".to_owned()))
+        }
+    }
+
+    const EPOCH_SECS: u64 = 3600;
+    const EPOCH: u64 = 100;
+    const NOW: u64 = EPOCH * EPOCH_SECS + 10;
+
+    /// A well-formed token whose nonce starts with `marker`, so each marker
+    /// has its own serial.
+    fn token(marker: u8) -> Token {
+        let mut bytes = [0u8; TOKEN_LEN];
+        bytes[0..2].copy_from_slice(&0x0002u16.to_be_bytes());
+        bytes[2] = marker;
+        Token::parse(&bytes).expect("well-formed token bytes parse")
+    }
+
+    fn manager() -> TokenManager<Offline> {
+        TokenManager::new(
+            Arc::new(WarrenApiClient::new(
+                "https://api.example.test",
+                WarrenIdentity::from_seed(&[0x52; 32]),
+                Offline,
+            )),
+            BlindingKey::session(&[0x52; 32]),
+        )
+    }
+
+    /// A manager holding `markers` for `epoch`, in that (mint) order.
+    fn stocked(epoch: u64, markers: &[u8]) -> TokenManager<Offline> {
+        let manager = manager();
+        stock(&manager, epoch, markers);
+        manager
+    }
+
+    fn stock(manager: &TokenManager<Offline>, epoch: u64, markers: &[u8]) {
+        let mut st = manager.state.lock().expect("fresh mutex");
+        st.epoch_secs = Some(EPOCH_SECS);
+        st.store.insert(MintedEpoch {
+            epoch,
+            tokens: markers.iter().map(|&m| token(m)).collect(),
+            attribution_tags: Vec::new(),
+        });
+    }
+
+    fn markers(stack: &[[u8; TOKEN_LEN]]) -> Vec<u8> {
+        stack.iter().map(|t| t[2]).collect()
+    }
+
+    #[test]
+    fn the_stack_carries_every_current_token_and_consumes_none() {
+        let manager = stocked(EPOCH, &[1, 2, 3]).with_rotation(0);
+
+        assert_eq!(markers(&manager.session_stack(NOW)), [1, 2, 3]);
+        assert_eq!(markers(&manager.session_stack(NOW)), [1, 2, 3]);
+        assert_eq!(manager.available(EPOCH), 3);
+    }
+
+    #[test]
+    fn the_stack_starts_at_the_manager_rotation() {
+        let manager = stocked(EPOCH, &[1, 2, 3]).with_rotation(4);
+
+        assert_eq!(markers(&manager.session_stack(NOW)), [2, 3, 1]);
+    }
+
+    #[test]
+    fn managers_of_one_wallet_do_not_all_lead_with_the_same_token() {
+        // Every client of a wallet holds the same batch in the same order: a
+        // fixed start would put all of them on the first serial.
+        let leads: BTreeSet<u8> = (0..64)
+            .map(|_| stocked(EPOCH, &[1, 2, 3]).session_stack(NOW)[0][2])
+            .collect();
+
+        assert!(leads.len() > 1, "every manager led with {leads:?}");
+    }
+
+    #[test]
+    fn the_stack_holds_only_the_current_epoch() {
+        let manager = stocked(EPOCH, &[1, 2]).with_rotation(0);
+        stock(&manager, EPOCH + 1, &[7, 8]);
+
+        assert_eq!(markers(&manager.session_stack(NOW + EPOCH_SECS)), [7, 8]);
+    }
+
+    #[test]
+    fn the_stack_leaves_out_a_serial_a_live_session_holds_until_it_ends() {
+        let manager = stocked(EPOCH, &[1, 2, 3]).with_rotation(0);
+        let lease = manager
+            .claim(&token(2).serialize())
+            .expect("an unheld serial is claimed");
+
+        assert_eq!(markers(&manager.session_stack(NOW)), [1, 3]);
+        drop(lease);
+        assert_eq!(markers(&manager.session_stack(NOW)), [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_held_serial_is_claimed_again_only_once_its_last_holder_is_gone() {
+        // Bonded legs share the lease of the session they joined: the serial
+        // stays held while any of them lives.
+        let manager = stocked(EPOCH, &[1]);
+        let first = manager.claim(&token(1).serialize()).expect("unheld");
+        let joined = first.clone();
+
+        assert!(manager.claim(&token(1).serialize()).is_none());
+        drop(first);
+        assert!(manager.claim(&token(1).serialize()).is_none());
+        drop(joined);
+        assert!(manager.claim(&token(1).serialize()).is_some());
+    }
+
+    #[test]
+    fn bytes_that_are_no_token_are_never_claimed() {
+        let manager = stocked(EPOCH, &[1]);
+
+        assert!(manager.claim(&[0u8; TOKEN_LEN]).is_none());
+    }
+
+    #[test]
+    fn a_lease_renders_no_serial() {
+        let manager = stocked(EPOCH, &[1]);
+        let lease = manager.claim(&token(1).serialize()).expect("unheld");
+        let serial = token(1).serial().to_hex();
+
+        let rendered = format!("{lease:?}");
+
+        assert!(rendered.starts_with("SerialLease"), "{rendered}");
+        assert!(!rendered.contains(&serial[..8]), "{rendered}");
+    }
+}
+
+#[cfg(test)]
 mod port_entitlement_guard_tests {
     //! The bare-token surfaces of the manager inside
     //! [`PortEntitlementManager`] hand nothing out: every exit refuses an
@@ -1138,6 +1396,7 @@ mod port_entitlement_guard_tests {
         let manager = stocked_entitlements();
 
         assert!(manager.take_current_stack(100 * EPOCH_SECS).is_empty());
+        assert!(manager.session_stack(100 * EPOCH_SECS).is_empty());
         assert_eq!(
             manager.available(100),
             1,

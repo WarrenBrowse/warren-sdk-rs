@@ -9,6 +9,13 @@ the pre-release `0.0.x` line.
 
 ### Added
 
+- `TokenManager::session_stack(now)` hands one session every token of the
+  current epoch, without consuming any, starting at a rotation drawn once per
+  manager and leaving out the serials this process's live sessions hold.
+  `TokenManager::claim(token)` records such a hold as a `SerialLease`, cloned
+  by bonded legs and released with the last of them. Every client of a wallet
+  holds the same batch, so the rotation spreads them over its serials, and a
+  session the exit refuses on one serial walks on to the next.
 - Session and browser-proxy token batches are derived from the wallet instead
   of the CSPRNG, byte for byte as the TypeScript SDK does
   (`vectors/token_blinding_v1.json`). The issuer serves an account's epoch
