@@ -16,8 +16,9 @@ use rand010::SeedableRng;
 use rand010::rngs::StdRng;
 use warren_api::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_api::{
-    TokenClientError, TokenEpochResponse, TokenIssueRequest, TokenIssueResponse,
-    TokenIssuerDirectory, TokenIssuerKey, TokenStore, WarrenApiClient, current_epoch, mint_tokens,
+    BanReasonCode, ClientError, TokenClientError, TokenEpochResponse, TokenIssueRequest,
+    TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey, TokenManager, TokenStore,
+    WarrenApiClient, current_epoch, mint_tokens,
 };
 use warren_identity::WarrenIdentity;
 use warrenguard_token::{IssuerSecretKey, TokenChallenge};
@@ -40,6 +41,9 @@ struct FakeIssuer {
     /// When set, the first `/v1/tokens/issue` call answers 503 (a
     /// transport-class failure) then heals, so a refresh can prove it retries.
     fail_issue_once: AtomicBool,
+    /// When set, every `/v1/tokens/issue` call is answered with this status
+    /// and body instead of a batch.
+    issue_refusal: Option<(u16, &'static str)>,
     /// Count of `/v1/tokens/issue` calls, to prove a settled epoch is never
     /// re-asked.
     issue_calls: AtomicUsize,
@@ -61,6 +65,7 @@ impl FakeIssuer {
             refuse: Vec::new(),
             refuse_reason: "not_subscribed".to_owned(),
             fail_issue_once: AtomicBool::new(false),
+            issue_refusal: None,
             issue_calls: AtomicUsize::new(0),
             last_issue: Mutex::new(None),
             last_keys_headers: Mutex::new(None),
@@ -109,6 +114,12 @@ impl HttpTransport for FakeIssuer {
             request.url
         );
         self.issue_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some((status, body)) = self.issue_refusal {
+            return Ok(HttpResponse {
+                status,
+                body: body.as_bytes().to_vec(),
+            });
+        }
         if self.fail_issue_once.swap(false, Ordering::SeqCst) {
             // A connected-but-unavailable answer: a transient transport-class
             // failure the client must retry, not a definitive ledger refusal.
@@ -553,4 +564,73 @@ async fn a_refresh_after_restore_keeps_the_restored_stock_on_already_issued() {
         "an already_issued settle must keep the restored stock"
     );
     assert_eq!(manager.take_current_stack(100 * EPOCH_SECS + 6).len(), 1);
+}
+
+const BANNED_BODY: &str =
+    r#"{"error":"banned","reason_code":"port_forwarding_abuse","lapses_at_unix_secs":1790336000}"#;
+
+#[tokio::test]
+async fn a_banned_wallet_gets_a_typed_refusal_from_token_issuance() {
+    // The app shows the suspension from this answer, without dialing an exit.
+    let mut fake = FakeIssuer::new(&[100]);
+    fake.issue_refusal = Some((403, BANNED_BODY));
+    let c = client(fake);
+    let directory = c.token_keys().await.unwrap();
+    let mut rng = StdRng::seed_from_u64(7);
+
+    let err = mint_tokens(&c, &directory, &[100], &mut rng)
+        .await
+        .expect_err("a banned wallet mints nothing");
+
+    assert!(
+        matches!(
+            err,
+            TokenClientError::Api(ClientError::Banned {
+                reason_code: BanReasonCode::PortForwardingAbuse,
+                lapses_at_unix_secs: Some(1_790_336_000),
+            })
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_forbidden_answer_that_is_not_a_ban_keeps_the_status_error() {
+    let mut fake = FakeIssuer::new(&[100]);
+    fake.issue_refusal = Some((403, r#"{"error":"forbidden"}"#));
+    let c = client(fake);
+    let directory = c.token_keys().await.unwrap();
+    let mut rng = StdRng::seed_from_u64(7);
+
+    let err = mint_tokens(&c, &directory, &[100], &mut rng)
+        .await
+        .expect_err("refused");
+
+    assert!(
+        matches!(
+            err,
+            TokenClientError::Api(ClientError::ServerStatus { status: 403, .. })
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_surfaces_a_ban_instead_of_swallowing_it() {
+    // Every other per-epoch failure is swallowed and retried at the next tick;
+    // a ban is the one the caller must see, since it is the only thing the
+    // user can act on.
+    let mut fake = FakeIssuer::new(&[100, 101]);
+    fake.issue_refusal = Some((403, BANNED_BODY));
+    let manager = TokenManager::new(std::sync::Arc::new(client(fake)));
+
+    let err = manager
+        .refresh(100 * EPOCH_SECS, &mut StdRng::seed_from_u64(7))
+        .await
+        .expect_err("the ban reaches the caller");
+
+    assert!(
+        matches!(err, TokenClientError::Api(ClientError::Banned { .. })),
+        "{err:?}"
+    );
 }

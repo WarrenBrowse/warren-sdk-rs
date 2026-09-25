@@ -7,11 +7,11 @@ use warren_discovery_core::{MULTIHOP_DIRECTORY_PATH_V1, MULTIHOP_DIRECTORY_PATH_
 use warren_identity::WarrenIdentity;
 
 use crate::dto::{
-    CampaignVoucherResponse, CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
-    IncidentPubkeyMismatchRequest, InitApplePaymentResponse, MobilePaymentResponse,
-    RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest, SessionOpenRequest,
-    SessionOpenResponse, SubscriptionResponse, TokenIssueRequest, TokenIssueResponse,
-    TokenIssuerDirectory,
+    BanReasonCode, CampaignVoucherResponse, CheckApplePaymentRequest, CheckResponse,
+    IncidentExitDownRequest, IncidentPubkeyMismatchRequest, InitApplePaymentResponse,
+    IssuanceRefusal, MobilePaymentResponse, RegisterAccountRequest, RegisterAccountResponse,
+    SessionCloseRequest, SessionOpenRequest, SessionOpenResponse, SubscriptionResponse,
+    TokenIssueRequest, TokenIssueResponse, TokenIssuerDirectory,
 };
 use crate::transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 
@@ -58,6 +58,17 @@ pub enum ClientError {
     /// The system clock is before the Unix epoch.
     #[error("system clock is before the Unix epoch")]
     BadClock,
+    /// Session-token or port-entitlement issuance refused the wallet because
+    /// it is banned (HTTP 403 `{"error":"banned"}`, warren-core doc 105). The
+    /// app shows the suspension from this answer without dialing an exit.
+    #[error("issuance refused: the account is banned")]
+    Banned {
+        /// Why the account is banned.
+        reason_code: BanReasonCode,
+        /// When the ban lapses on its own, Unix seconds. `None` for a ban
+        /// that does not lapse.
+        lapses_at_unix_secs: Option<u64>,
+    },
 }
 
 /// Signed HTTP client for the Warren account API.
@@ -321,7 +332,8 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     ///
     /// # Errors
     ///
-    /// See [`Self::register`].
+    /// See [`Self::register`]. A wallet on the revocation list is refused
+    /// with [`ClientError::Banned`].
     pub async fn issue_tokens(
         &self,
         req: &TokenIssueRequest,
@@ -342,7 +354,7 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     ) -> Result<TokenIssueResponse, ClientError> {
         let body = serialize(req)?;
         let http = self.signed_request(Method::Post, class.issue_path(), body)?;
-        self.send_json(http).await
+        self.send_json(http).await.map_err(issuance_refusal)
     }
 
     /// Signed `DELETE /v1/account`. Deletes the account's subscription.
@@ -572,6 +584,24 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     async fn send_json<R: DeserializeOwned>(&self, request: HttpRequest) -> Result<R, ClientError> {
         let resp = self.send(request).await?;
         serde_json::from_slice(&resp.body).map_err(ClientError::ResponseJson)
+    }
+}
+
+/// Types the issuer's ban refusal (403 `{"error":"banned"}`); any other error,
+/// a 403 with another body included, is returned as it came.
+fn issuance_refusal(err: ClientError) -> ClientError {
+    let ClientError::ServerStatus { status: 403, body } = &err else {
+        return err;
+    };
+    match serde_json::from_str::<IssuanceRefusal>(body) {
+        Ok(IssuanceRefusal::Banned {
+            reason_code,
+            lapses_at_unix_secs,
+        }) => ClientError::Banned {
+            reason_code,
+            lapses_at_unix_secs,
+        },
+        _ => err,
     }
 }
 

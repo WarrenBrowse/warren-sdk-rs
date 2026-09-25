@@ -20,9 +20,10 @@ use rand010::SeedableRng;
 use rand010::rngs::StdRng;
 use warren_api::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_api::{
-    AttributionTag, CredentialClass, EntitlementEnvelope, PortEntitlementManager, PubkeyHex,
-    TokenClientError, TokenEpochResponse, TokenIssueRequest, TokenIssueResponse,
-    TokenIssuerDirectory, TokenIssuerKey, TokenManager, WarrenApiClient, mint_tokens_for,
+    AttributionTag, BanReasonCode, ClientError, CredentialClass, EntitlementEnvelope,
+    PortEntitlementManager, PubkeyHex, TokenClientError, TokenEpochResponse, TokenIssueRequest,
+    TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey, TokenManager, WarrenApiClient,
+    mint_tokens_for,
 };
 use warren_contract::pf_attribution::{
     CIPHERTEXT_LEN, ENVELOPE_LEN, NONCE_LEN, TAG_VERSION, signing_preimage,
@@ -73,6 +74,8 @@ struct FakeIssuer {
     keys: HashMap<u64, IssuerSecretKey>,
     attribution_key: SigningKey,
     fault: TagFault,
+    /// When set, every issue call is answered 403 with this body.
+    banned_body: Option<&'static str>,
     issue_calls: AtomicUsize,
     last_paths: Mutex<Vec<String>>,
 }
@@ -91,6 +94,7 @@ impl FakeIssuer {
                 .collect(),
             attribution_key: SigningKey::from_bytes(&[0x42; 32]),
             fault,
+            banned_body: None,
             issue_calls: AtomicUsize::new(0),
             last_paths: Mutex::new(Vec::new()),
         }
@@ -168,6 +172,12 @@ impl HttpTransport for FakeIssuer {
             request.url
         );
         self.issue_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(body) = self.banned_body {
+            return Ok(HttpResponse {
+                status: 403,
+                body: body.as_bytes().to_vec(),
+            });
+        }
         let req: TokenIssueRequest = serde_json::from_slice(&request.body).unwrap();
         let epochs = req
             .epochs
@@ -374,6 +384,30 @@ async fn a_persisted_bundle_restores_no_port_entitlement() {
 
     assert_eq!(entitlements.restore_persisted(&bundle), 0);
     assert_eq!(entitlements.available(100), 0);
+}
+
+#[tokio::test]
+async fn a_banned_wallet_gets_a_typed_refusal_from_entitlement_issuance() {
+    let mut issuer = FakeIssuer::new(&[100]);
+    issuer.banned_body = Some(r#"{"error":"banned","reason_code":"other"}"#);
+    let m = PortEntitlementManager::new(std::sync::Arc::new(client(issuer)));
+
+    let err = m
+        .refresh_auto(100 * EPOCH_SECS)
+        .await
+        .expect_err("a banned wallet mints no entitlement");
+
+    assert!(
+        matches!(
+            err,
+            TokenClientError::Api(ClientError::Banned {
+                reason_code: BanReasonCode::Other,
+                lapses_at_unix_secs: None,
+            })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(m.credential_for_slot(0, 100 * EPOCH_SECS), None);
 }
 
 #[test]

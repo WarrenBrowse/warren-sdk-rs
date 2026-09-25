@@ -9,6 +9,18 @@ the pre-release `0.0.x` line.
 
 ### Added
 
+- A banned wallet gets a typed refusal from issuance (warren-core doc 105):
+  `ClientError::Banned { reason_code: BanReasonCode, lapses_at_unix_secs }`
+  from `issue_tokens` / `issue_tokens_for` when the issuer answers 403
+  `{"error":"banned"}`, for session tokens and port entitlements alike, so an
+  app can show the suspension without dialing an exit. Any other status, a 403
+  with another body included, keeps its `ServerStatus` mapping.
+  `TokenManager::refresh` and `PortEntitlementManager::refresh_auto` return the
+  ban (wrapped in `TokenClientError::Api`) instead of swallowing it as a
+  per-epoch failure, and settle nothing, so a lifted ban mints at the next
+  tick. `BanReasonCode` and `IssuanceRefusal` are re-exported from
+  `warren_api`.
+
 - Network changes now MIGRATE the live QUIC session instead of always redialing
   it. The supervised proxy datapath arms the engine migration watchdog
   (`warrenguard_transport::migration_watchdog`, re-exported as

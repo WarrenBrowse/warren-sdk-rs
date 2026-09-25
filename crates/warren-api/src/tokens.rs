@@ -602,8 +602,11 @@ impl<T: HttpTransport> TokenManager<T> {
     /// failure is left retryable for the next tick.
     ///
     /// # Errors
-    /// [`TokenClientError`] only when the directory fetch itself fails; a
-    /// per-epoch mint refusal or transport error is swallowed.
+    /// [`TokenClientError`] when the directory fetch itself fails, and
+    /// `TokenClientError::Api(ClientError::Banned { .. })` when the issuer
+    /// refuses the wallet as banned (nothing is settled, so a lifted ban mints
+    /// at the next tick). Any other per-epoch mint refusal or transport error
+    /// is swallowed.
     pub async fn refresh<R: CryptoRng + ?Sized>(
         &self,
         now_unix_secs: u64,
@@ -653,6 +656,7 @@ impl<T: HttpTransport> TokenManager<T> {
                         .minted
                         .insert(epoch);
                 }
+                Err(e @ TokenClientError::Api(ClientError::Banned { .. })) => return Err(e),
                 Err(_) => {
                     // Anything else (transport error, 5xx, a refusal that can
                     // heal like not_subscribed, a malformed response) proves
