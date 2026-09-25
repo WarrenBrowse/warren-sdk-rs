@@ -3593,6 +3593,7 @@ dependencies = [
 name = "warren-contract"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "blake2",
  "bs58",
  "ed25519-dalek",
@@ -3602,6 +3603,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "warrenguard-wire",
+ "zeroize",
 ]
 
 [[package]]

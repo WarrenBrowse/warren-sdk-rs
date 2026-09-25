@@ -91,6 +91,7 @@ impl FakeIssuer {
             quota_per_epoch: QUOTA,
             prefetch_epochs: 48,
             keys,
+            attribution_verifying_key_hex: None,
         }
     }
 }
@@ -126,6 +127,7 @@ impl HttpTransport for FakeIssuer {
                     blind_signatures: Vec::new(),
                     token_key_id: None,
                     reject_reason: Some(self.refuse_reason.clone()),
+                    attribution_tags: Vec::new(),
                 });
                 continue;
             }
@@ -144,6 +146,7 @@ impl HttpTransport for FakeIssuer {
                 blind_signatures: sigs,
                 token_key_id: Some(sk.public_key().key_id().to_hex()),
                 reject_reason: None,
+                attribution_tags: Vec::new(),
             });
         }
         *self.last_issue.lock().unwrap() = Some((request.clone(), req));

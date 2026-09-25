@@ -73,6 +73,7 @@ impl FakeIssuer {
             quota_per_epoch: QUOTA,
             prefetch_epochs: 48,
             keys,
+            attribution_verifying_key_hex: None,
         }
     }
 }
@@ -111,6 +112,7 @@ impl HttpTransport for FakeIssuer {
                         .collect(),
                     token_key_id: Some(sk.public_key().key_id().to_hex()),
                     reject_reason: None,
+                    attribution_tags: Vec::new(),
                 }
             })
             .collect();
