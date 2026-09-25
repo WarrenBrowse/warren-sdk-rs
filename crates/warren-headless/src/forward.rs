@@ -4,8 +4,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use warren_sdk::ConnectionState;
 use warren_sdk::transport::FatalCause;
+use warren_sdk::{ConnectionState, PortFollowOutcome};
 
 use crate::env::ConfigError;
 use crate::hooks;
@@ -20,14 +20,15 @@ use crate::log::Log;
 /// would hold two of the exit's per-client forward slots.
 ///
 /// The engine implements the atomic TCP+UDP pair on ONE public port under ONE
-/// entitlement credential, which is what a BitTorrent client wants. The SDK
-/// forward path these daemons run on does not carry that pair yet: that is
-/// what refuses `both` here, and the protocol imposes no such limit.
+/// entitlement credential, which is what a BitTorrent client wants. The SDK's
+/// NAT-PMP cycle can map such a pair (`warren_net::map_cycle`), but the
+/// supervised forward these daemons run on maps one transport per rule: that
+/// is what refuses `both` here, and the protocol imposes no such limit.
 ///
-/// These daemons also present no entitlement envelope. An exit that enforces
-/// warren-core doc 105 refuses a Map request without one, so their port
-/// forward stops being granted there until the SDK forward path presents the
-/// envelope a `warren_api::PortEntitlementManager` slot vends.
+/// Every forward presents the wallet's port entitlement envelope, drawn on its
+/// own slot of the batch the SDK keeps for the wallet (warren-core doc 105),
+/// so an exit that requires one grants it. A refusal for want of one, and a
+/// suspended account, are logged through [`log_refusals`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardProto {
     /// TCP only.
@@ -287,6 +288,67 @@ pub async fn conclude<H: HookSink>(
     code
 }
 
+/// Turns a forward's outcomes into the lines an operator needs: one when the
+/// exit starts refusing the forward for want of a port entitlement
+/// (warren-core doc 105), none while the same refusal repeats at every retry,
+/// and a fresh one after a grant if the refusal comes back.
+#[derive(Debug, Default)]
+pub struct RefusalWatch {
+    last: Option<String>,
+}
+
+impl RefusalWatch {
+    /// The line to log for `outcome`, or `None` when there is nothing new to
+    /// say. Carries no identity material.
+    pub fn observe(&mut self, outcome: Option<PortFollowOutcome>) -> Option<String> {
+        let line = outcome.and_then(refusal_line);
+        if line == self.last {
+            return None;
+        }
+        self.last.clone_from(&line);
+        line
+    }
+}
+
+fn refusal_line(outcome: PortFollowOutcome) -> Option<String> {
+    let detail = match outcome {
+        PortFollowOutcome::NotAuthorized {
+            entitlement_presented: false,
+        } => "no port entitlement is left for the current epoch (the account's \
+              batch is held by its other forwarded ports or devices, or the API \
+              has not answered)"
+            .to_owned(),
+        PortFollowOutcome::NotAuthorized {
+            entitlement_presented: true,
+        } => "the exit would not spend the port entitlement presented".to_owned(),
+        PortFollowOutcome::Banned {
+            lapses_at_unix_secs,
+            ..
+        } => match lapses_at_unix_secs {
+            Some(at) => format!("the account is suspended until unix time {at}"),
+            None => "the account is suspended".to_owned(),
+        },
+        _ => return None,
+    };
+    Some(format!("port forward refused: {detail}. Retrying"))
+}
+
+/// Logs each new refusal of a forward until the forward is gone.
+pub async fn log_refusals(
+    log: Log,
+    mut outcomes: tokio::sync::watch::Receiver<Option<PortFollowOutcome>>,
+) {
+    let mut watch = RefusalWatch::default();
+    loop {
+        if let Some(line) = watch.observe(*outcomes.borrow_and_update()) {
+            log.error(&line);
+        }
+        if outcomes.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// The operator-facing line for a terminal verdict. Carries the cause and no
 /// identity material: the account is named nowhere, on any branch.
 #[must_use]
@@ -313,6 +375,74 @@ pub fn fatal_line(cause: Option<FatalCause>) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_refusal_is_logged_once_until_a_grant_clears_it() {
+        let mut watch = RefusalWatch::default();
+        let refused = Some(PortFollowOutcome::NotAuthorized {
+            entitlement_presented: false,
+        });
+
+        let first = watch.observe(refused).expect("the first refusal is news");
+        assert!(first.contains("no port entitlement"), "{first}");
+        assert_eq!(
+            watch.observe(refused),
+            None,
+            "a retry refused again says nothing new"
+        );
+        assert_eq!(
+            watch.observe(Some(PortFollowOutcome::Kept { port: 50000 })),
+            None
+        );
+        assert!(
+            watch.observe(refused).is_some(),
+            "a refusal after a grant is news again"
+        );
+    }
+
+    #[test]
+    fn a_ban_names_the_suspension_and_its_lapse() {
+        let mut watch = RefusalWatch::default();
+
+        let line = watch
+            .observe(Some(PortFollowOutcome::Banned {
+                reason_code: warren_sdk::api::BanReasonCode::PortForwardingAbuse,
+                lapses_at_unix_secs: Some(1_790_000_000),
+            }))
+            .expect("a ban is news");
+
+        assert!(line.contains("suspended"), "{line}");
+        assert!(line.contains("1790000000"), "{line}");
+    }
+
+    #[test]
+    fn an_entitlement_the_exit_refused_is_told_apart_from_none() {
+        let line = RefusalWatch::default()
+            .observe(Some(PortFollowOutcome::NotAuthorized {
+                entitlement_presented: true,
+            }))
+            .expect("a refusal is news");
+
+        assert!(line.contains("would not spend"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn the_refusal_logger_ends_with_its_forward() {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let logger = tokio::spawn(log_refusals(LOG, rx));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !logger.is_finished(),
+            "it watches for as long as the forward lives"
+        );
+
+        drop(tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), logger)
+            .await
+            .expect("the logger returns once the forward is gone")
+            .expect("the logger does not panic");
+    }
 
     const LOG: Log = Log("warren-headless-test");
 

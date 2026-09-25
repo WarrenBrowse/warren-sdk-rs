@@ -612,6 +612,10 @@ fn start_forward(
         )),
     }
 
+    tasks.push(tokio::spawn(warren_headless::forward::log_refusals(
+        LOG,
+        forward.watch_outcome(),
+    )));
     let mut external_rx = forward.watch_external_port();
     let fwd: ForwardConfig = fwd.clone();
     tasks.push(tokio::spawn(async move {

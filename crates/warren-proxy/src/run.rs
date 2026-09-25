@@ -239,6 +239,10 @@ fn start_forward(
         )),
     }
 
+    tokio::spawn(warren_headless::forward::log_refusals(
+        LOG,
+        forward.watch_outcome(),
+    ));
     let mut external_rx = forward.watch_external_port();
     let fwd = fwd.clone();
     tokio::spawn(async move {

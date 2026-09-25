@@ -50,11 +50,15 @@ ignored while the operator believed it applied.
 | `WARREN_PORT_FORWARD_DOWN_COMMAND` | | run when the port is replaced, when the grant is lost, and at shutdown |
 | `WARREN_PORT_FORWARD_STATUS_FILE` | | the granted public port, one decimal line, atomically rewritten; removed when the mapping goes away and on every daemon exit. The image ships `/run/warren` writable by the runtime user: put the file there and share that directory with the container that reads it |
 
-Port forwarding runs on the exit's default per-client quota: this daemon
-presents no entitlement credential, so the account's fleet-wide slot count is
-not what bounds it. The engine implements the atomic TCP+UDP pair (one public
-port, one credential); the SDK forward path this daemon uses does not carry it
-yet, which is why `both` is refused. The down command runs and the status file
+Every forward presents one of the account's port entitlements (warren-core
+doc 105): the SDK keeps the wallet's per-epoch batch, issued on first use and
+topped up every ten minutes while a forward is live, and the forward holds one entitlement for as long
+as it lives. The batch is the account's, fleet-wide: a forward refused because
+the account's other ports or devices hold it all, or because the account is
+suspended, is logged (`port forward refused: ...`) and retried. The engine
+implements the atomic TCP+UDP pair (one public port, one credential); the SDK's
+supervised forward this daemon uses maps one transport per rule, which is why
+`both` is refused. The down command runs and the status file
 is removed on every exit, a signal and a terminal refusal alike. The NAT-PMP
 mapping is released at the exit rather than left to lapse with its lease, and
 the release is bounded: the daemon logs which of the three outcomes it got (the

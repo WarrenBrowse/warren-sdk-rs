@@ -9,6 +9,39 @@ the pre-release `0.0.x` line.
 
 ### Added
 
+- The SDK's own port forwards present the wallet's port entitlement envelope
+  (warren-core doc 105), so an exit that refuses a credential-less NAT-PMP Map
+  request (engine `requires_credential`, result code 2) keeps granting them.
+  `warren_net` gains the credential seam, built on the engine's trailer codec
+  (`append_credential_trailer`, re-exported from `warren_wire::natpmp`) rather
+  than a copy of it: `CredentialProvider` (the engine client's contract, asked
+  once per refresh cycle), `map_with_credential`, and `map_cycle`, which maps
+  one or two legs under ONE credential, the second leg on the first leg's
+  port, and releases a granted leg when a later one is refused.
+  `forward_port_with_suggested`, `forward_port_raw` and `run_refresh` take an
+  `Option<CredentialProvider>` (breaking); `forward_port` presents none.
+  `PortForwardError::Credential` (a credential the trailer cannot carry,
+  nothing sent) and `PortForwardError::is_not_authorized` are new.
+  `warren-sdk` opens one `PortEntitlementManager` per wallet and API at the
+  wallet's first slot claim (a client that never forwards mints and keeps
+  nothing) and keeps it for the life of the process, as warren-app does,
+  since a reopened batch would be answered `already_issued` for the whole
+  prefetch window. It refreshes every ten minutes while a rule holds a slot
+  and stops once none does, and gives every forwarding rule the lowest free
+  slot for its whole life (across reconnects for a supervised rule), freed
+  with it: `ProxyHandle`, `ProxyForwarder`, `PacketForwarder` and both
+  supervised handles all present it. A code-2 refusal surfaces as
+  `SdkError::PortForwardRefused { entitlement_presented }`, or as
+  `SdkError::Api(ClientError::Banned { .. })` when the issuer has answered
+  that the wallet is banned; a supervised rule publishes
+  `PortFollowOutcome::NotAuthorized { entitlement_presented }` or
+  `PortFollowOutcome::Banned { reason_code, lapses_at_unix_secs }` and keeps
+  retrying. Across uniffi: `FfiError::PortForwardRefused` and
+  `FfiError::Banned { reason: FfiBanReason, lapses_at_unix_secs }` (the latter
+  for any API call answered with a ban). `warren-proxy` and `warren-bolthole`
+  log a refused forward once per refusal (`warren_headless::RefusalWatch`,
+  `log_refusals`). `WarrenClientBuilder::build_with_transport` now requires
+  `T: 'static`.
 - A banned wallet gets a typed refusal from issuance (warren-core doc 105):
   `ClientError::Banned { reason_code: BanReasonCode, lapses_at_unix_secs }`
   from `issue_tokens` / `issue_tokens_for` when the issuer answers 403
