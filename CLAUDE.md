@@ -66,6 +66,11 @@ grep -E 'warrenguard\.git.*\brev = "' Cargo.toml | grep -v "rev = \"${rev}\"" ||
 - Local fake-device tests are necessary but not sufficient for tunnel features:
   the real behavior is validated against a real exit before claiming it works.
 
+The Windows legs (ci.yml `windows`: clippy and nextest; release-bolthole.yml
+`build-windows`) build on Codemagic from `codemagic.yaml` and
+`scripts/ci/codemagic/`, started through warren-app's proxy action pinned by
+SHA: the `warren-codemagic` skill.
+
 ## Code style and lints
 
 - Edition 2024, MSRV 1.91 (pinned in `rust-toolchain.toml`). The floor is

@@ -1,12 +1,13 @@
 name: CI
 
-# Runs exclusively on the WarrenBrowse self-hosted runners; the label sets
-# below are matched against the live fleet. Verification jobs run on the
-# NATIVE arm64 Linux runners: x86-under-emulation containers can wedge
-# cargo/nextest when rustc dies unreaped (zombie jobserver deadlock). Only
-# jobs that must PRODUCE x86_64 artifacts belong on the emulation runners;
-# this workflow has none.
-# Do not switch any job to a GitHub-hosted runner.
+# Every job that compiles or runs code from this repo runs on the WarrenBrowse
+# self-hosted runners (libra for Linux, axiomStudio for macOS); the label sets
+# below are matched against the live fleet. Do not move one of those to a
+# GitHub-hosted runner.
+#
+# The Windows leg is the exception: it compiles and tests on a Codemagic
+# windows_x2 machine (codemagic.yaml), and its GitHub job only drives that
+# build through the API, so it runs on a GitHub-hosted runner.
 #
 # No dependency-cache action here, and adding one back breaks other jobs. Two
 # runner instances share one host and therefore one CARGO_HOME, and
@@ -99,19 +100,13 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo clippy (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
-    # The Windows runners share one guest with every other repo's Windows jobs.
-    # The last green Windows legs under a 40-minute budget took 38 and 39
-    # minutes, and a busy guest then spent 34 minutes on checkout and setup
-    # alone, leaving the test suite six.
-    timeout-minutes: ${{ matrix.name == 'windows' && 90 || 40 }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: linux
             runner: [self-hosted, Linux, X64, libra]
-          - name: windows
-            runner: [self-hosted, Windows, macstudio-win]
           - name: macos
             runner: [self-hosted, macOS, ARM64]
     steps:
@@ -140,16 +135,13 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo test (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
-    # Same Windows budget as the clippy job, for the same reason.
-    timeout-minutes: ${{ matrix.name == 'windows' && 90 || 40 }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: linux
             runner: [self-hosted, Linux, X64, libra]
-          - name: windows
-            runner: [self-hosted, Windows, macstudio-win]
           - name: macos
             runner: [self-hosted, macOS, ARM64]
     steps:
@@ -182,6 +174,26 @@ jobs:
           bash scripts/ci/run-with-runner-retry.sh
           cargo nextest run --locked --workspace --all-targets --all-features --retries 2
 
+  windows:
+    # Self-hosted runners must never execute fork code, and a fork's run gets
+    # no Codemagic token: only same-repo events reach this job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    name: cargo clippy + test (windows)
+    # The Windows leg of the clippy and test gates, in one Codemagic build
+    # (codemagic.yaml `windows-ci`, scripts/ci/codemagic/windows-ci.sh) so the
+    # two share one clone and one compiled tree. This job only starts the build,
+    # replays its logs and carries its verdict; it runs no code from the repo,
+    # which is why a GitHub-hosted runner is fine here and keeps a libra slot
+    # free while the build queues on Codemagic's single concurrency.
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: WarrenBrowse/warren-app/.github/actions/codemagic-build@13b7f019c1eba7c6b0702ce2416defc994b39229
+        with:
+          app-id: ${{ vars.CODEMAGIC_APP_ID }}
+          workflow: windows-ci
+          token: ${{ secrets.CODEMAGIC_API_TOKEN }}
+
   shell-gates:
     # Self-hosted runners must never execute fork code: only same-repo events
     # reach this job.
@@ -195,6 +207,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: runner-retry classifier tests
         run: bash scripts/ci/test-run-with-runner-retry.sh
+      # The guard every Codemagic step runs under, and the check that no step
+      # of codemagic.yaml escapes it.
+      - name: Codemagic step watchdog tests
+        run: bash scripts/ci/codemagic/test-watchdog.sh
       # The compose examples are copy-paste templates: whatever they get wrong,
       # users deploy. Nothing else in this repo reads them.
       - name: deployment example tests

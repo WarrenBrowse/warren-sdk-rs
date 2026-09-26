@@ -162,8 +162,7 @@ jobs:
             # cold build of this lane, 40 minutes on the emulated pool, which a
             # 40-minute limit killed one minute before it finished (the retry
             # then took 2m20s on the warm directory). GNU coreutils is a
-            # Linux-lane assumption: macOS has no `timeout`, and on Windows the
-            # name resolves to a System32 tool that merely sleeps.
+            # Linux-lane assumption: macOS has no `timeout`.
             wedge_timeout: 70m
             persistent_target: "true"
           - lane: linux-aarch64-musl
@@ -184,14 +183,6 @@ jobs:
             asset_os: macos-x86_64
             wedge_timeout: ""
             persistent_target: "true"
-          - lane: windows-x86_64
-            target: x86_64-pc-windows-msvc
-            runner: [self-hosted, Windows, macstudio-win]
-            asset_os: windows-x86_64
-            wedge_timeout: ""
-            # Left at the workspace default: a bash-shaped $HOME reaches cargo
-            # as an MSYS path it cannot resolve.
-            persistent_target: "false"
     runs-on: ${{ matrix.runner }}
     # Sized so the retry wrapper always outlives its own worst case and the
     # failure carries its diagnosis rather than GitHub's: two invocations
@@ -243,8 +234,7 @@ jobs:
             # on one cargo lock.
             export CARGO_TARGET_DIR="$HOME/warren-sdk-target-$CARGO_TARGET"
           fi
-          case "$CARGO_TARGET" in *windows*) EXE=".exe" ;; *) EXE="" ;; esac
-          BIN="${CARGO_TARGET_DIR:-target}/$CARGO_TARGET/release/warren-bolthole$EXE"
+          BIN="${CARGO_TARGET_DIR:-target}/$CARGO_TARGET/release/warren-bolthole"
           # A persistent cache means the previous run's binary is sitting at
           # $BIN: remove it, and no failure downstream can package a binary
           # that was not compiled from this tag.
@@ -300,18 +290,8 @@ jobs:
           "$BIN" --help >/dev/null
           name="warren-bolthole${ENV_TAG}-${VERSION}-${ASSET_OS}"
           mkdir -p out staging
-          cp "$BIN" "staging/warren-bolthole$EXE"
-          case "$CARGO_TARGET" in
-            *windows*)
-              # Compress-Archive ships with Windows PowerShell; `zip` does not
-              # exist on this runner.
-              powershell -NoProfile -Command \
-                "Compress-Archive -Path staging/warren-bolthole.exe -DestinationPath out/${name}.zip -Force"
-              ;;
-            *)
-              tar -C staging -czf "out/${name}.tar.gz" warren-bolthole
-              ;;
-          esac
+          cp "$BIN" staging/warren-bolthole
+          tar -C staging -czf "out/${name}.tar.gz" warren-bolthole
           ls -l out
       - uses: actions/upload-artifact@v4
         with:
@@ -319,9 +299,35 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  build-windows:
+    name: Build windows-x86_64
+    needs: resolve
+    # Built, tested and packaged on a Codemagic windows_x2 machine
+    # (codemagic.yaml `bolthole-windows`); this job starts the build, replays
+    # its logs and hands the verified zip to publish under the artifact name
+    # the matrix lanes use.
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: WarrenBrowse/warren-app/.github/actions/codemagic-build@13b7f019c1eba7c6b0702ce2416defc994b39229
+        with:
+          app-id: ${{ vars.CODEMAGIC_APP_ID }}
+          workflow: bolthole-windows
+          token: ${{ secrets.CODEMAGIC_API_TOKEN }}
+          out-dir: out
+          inputs: |
+            channel=${{ needs.resolve.outputs.channel }}
+            version=${{ needs.resolve.outputs.version }}
+            env_tag=${{ needs.resolve.outputs.env_tag }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: warren-bolthole-windows-x86_64
+          path: out/*
+          if-no-files-found: error
+
   publish:
     name: Publish release and image
-    needs: [resolve, build]
+    needs: [resolve, build, build-windows]
     if: needs.resolve.outputs.publish == 'true'
     runs-on: [self-hosted, Linux, X64, libra-docker]
     timeout-minutes: 45
