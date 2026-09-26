@@ -18,6 +18,9 @@ the pre-release `0.0.x` line.
   signed by no pinned key, expired, or read by a manager with no pin makes
   `route_admission()` return `None`: routes run on tokens, and the engine is
   never handed a key that whoever serves the directory could have chosen.
+  `RouteAdmission::info()` returns the signed block it was validated from, so
+  a client can keep it across a restart and trust it again only through
+  `from_info`.
 
 ### Added
 

@@ -56,6 +56,7 @@ pub struct RouteAdmission {
     kem: RouteKemPublicKey,
     max_routes_per_anchor: u32,
     exits: BTreeSet<[u8; 16]>,
+    info: RouteAdmissionInfo,
 }
 
 impl RouteAdmission {
@@ -120,7 +121,16 @@ impl RouteAdmission {
                 .iter()
                 .map(|exit| *exit.as_bytes())
                 .collect(),
+            info: info.clone(),
         })
+    }
+
+    /// The signed block this was validated from, for a client that keeps it
+    /// across a restart: a kept copy is trusted again only through
+    /// [`Self::from_info`], its signature and validity checked anew.
+    #[must_use]
+    pub fn info(&self) -> &RouteAdmissionInfo {
+        &self.info
     }
 
     /// The key the engine seals the anchor and each route locator to.
@@ -219,6 +229,19 @@ mod tests {
         assert!(admission.offers_routes(&[3; 16]));
         assert!(admission.offers_routes(&[4; 16]));
         assert!(!admission.offers_routes(&[5; 16]));
+    }
+
+    #[test]
+    fn a_valid_block_keeps_the_signed_block_it_was_read_from() {
+        let signed = info();
+
+        let admission = check(&signed).expect("valid");
+
+        assert_eq!(admission.info(), &signed);
+        assert!(
+            check(admission.info()).is_ok(),
+            "the kept block verifies again, so a copy of it can be trusted only as far as its signature"
+        );
     }
 
     #[test]
