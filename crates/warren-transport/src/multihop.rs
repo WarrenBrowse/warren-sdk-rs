@@ -934,11 +934,17 @@ impl MultihopClientTunnel {
             Ok(Some(
                 WarrenControlMessage::IpRequest { .. }
                 | WarrenControlMessage::IpRequestV7 { .. }
-                | WarrenControlMessage::ExitDraining { .. },
+                | WarrenControlMessage::ExitDraining { .. }
+                | WarrenControlMessage::IpRequestRoute { .. }
+                | WarrenControlMessage::RouteRejected { .. }
+                | WarrenControlMessage::RouteAnchorRequest { .. }
+                | WarrenControlMessage::RouteAnchorAck { .. }
+                | WarrenControlMessage::RouteEnded { .. },
             ))
             | Ok(None) => {
                 // Request-type frames (v6 or v7) are client-to-exit only; a
-                // client receiving one back is an unexpected reply.
+                // client receiving one back is an unexpected reply. This client
+                // never asks for a route, so a route answer is unexpected too.
                 return Err(MultihopError::Setup(SetupError::UnexpectedReply));
             }
             Err(e) => return Err(MultihopError::Setup(SetupError::Control(e))),

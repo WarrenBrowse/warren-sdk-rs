@@ -17,8 +17,8 @@ pub mod multihop;
 pub mod natpmp;
 
 pub use control::{
-    CONTROL_FIRST_BYTE, CONTROL_VERSION_V3, ControlError, PopSignature, WarrenControlMessage,
-    encode_control, try_decode_control,
+    CONTROL_FIRST_BYTE, CONTROL_VERSION_V3, ControlError, PopSignature, SEALED_TO_API_LEN,
+    SealedToApi, WarrenControlMessage, encode_control, try_decode_control,
 };
 pub use handshake::{
     CLIENT_PUBKEY_LEN, DEVICE_ID_LEN, DaitaConfig, MAX_SETUP_FRAME_BYTES, PROTOCOL_VERSION,

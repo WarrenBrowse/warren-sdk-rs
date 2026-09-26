@@ -17,6 +17,9 @@ warren-contract = { workspace = true }
 warren-discovery-core = { workspace = true }
 warren-identity = { path = "../warren-identity" }
 warrenguard-token = { workspace = true }
+# Validates the route KEM key of the token directory's route admission block
+# (warren-core doc 107) as the engine seals to it.
+warrenguard-multihop = { workspace = true }
 # Verifies the port-forward attribution tag minted beside each entitlement,
 # against the key the entitlement directory publishes.
 ed25519-dalek = { workspace = true }

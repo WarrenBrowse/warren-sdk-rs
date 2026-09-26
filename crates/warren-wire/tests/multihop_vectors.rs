@@ -6,8 +6,8 @@
 use serde::Deserialize;
 use warren_wire::multihop::WarrenMultihopFrame;
 use warren_wire::{
-    CONTROL_VERSION_V3, ControlError, DaitaConfig, PopSignature, WarrenControlMessage,
-    encode_control, try_decode_control,
+    CONTROL_VERSION_V3, ControlError, DaitaConfig, PopSignature, SealedToApi, SessionToken,
+    WarrenControlMessage, encode_control, try_decode_control,
 };
 
 fn read(rel: &str) -> String {
@@ -95,6 +95,15 @@ struct ControlVec {
     daita_spec: Option<DaitaSpecVec>,
     deadline_unix_secs: Option<u64>,
     reason_code: Option<u8>,
+    route_locator_hex: Option<String>,
+    sealed_anchor_hex: Option<String>,
+    session_token_hex: Option<String>,
+    status: Option<u8>,
+    max_routes: Option<u16>,
+}
+
+fn sealed(hex_str: &str) -> SealedToApi {
+    SealedToApi::from_slice(&hex::decode(hex_str).expect("hex")).expect("81 bytes")
 }
 
 #[derive(Deserialize)]
@@ -142,6 +151,40 @@ fn message_for(v: &ControlVec) -> WarrenControlMessage {
             deadline_unix_secs: v.deadline_unix_secs.expect("deadline_unix_secs"),
             reason_code: v.reason_code.expect("reason_code"),
         },
+        // Route admission by anchor (warren-core doc 107 section 7): the
+        // variants are appended, so every earlier vector keeps its bytes.
+        "ip_request_route_minimal" | "ip_request_route_full" => {
+            WarrenControlMessage::IpRequestRoute {
+                prefer_ipv4: v.prefer_ipv4,
+                wants_ipv6: v.wants_ipv6,
+                route_locator: sealed(v.route_locator_hex.as_ref().expect("route_locator_hex")),
+                wants_daita: v.wants_daita,
+            }
+        }
+        "route_rejected_anchor_unknown" | "route_rejected_route_limit" => {
+            WarrenControlMessage::RouteRejected {
+                reason_code: v.reason_code.expect("reason_code"),
+            }
+        }
+        "route_anchor_request" | "route_anchor_request_with_token" => {
+            WarrenControlMessage::RouteAnchorRequest {
+                sealed_anchor: sealed(v.sealed_anchor_hex.as_ref().expect("sealed_anchor_hex")),
+                session_token: v.session_token_hex.as_ref().map(|h| {
+                    Box::new(SessionToken(
+                        hex::decode(h).expect("hex").try_into().expect("354 bytes"),
+                    ))
+                }),
+            }
+        }
+        "route_anchor_ack_bound" | "route_anchor_ack_lost" => {
+            WarrenControlMessage::RouteAnchorAck {
+                status: v.status.expect("status"),
+                max_routes: v.max_routes.expect("max_routes"),
+            }
+        }
+        "route_ended_anchor_gone" => WarrenControlMessage::RouteEnded {
+            reason_code: v.reason_code.expect("reason_code"),
+        },
         other => panic!("unknown control vector name: {other}"),
     }
 }
@@ -160,6 +203,12 @@ fn control_vectors_match() {
     assert!(
         f.vectors.iter().any(|v| v.name == "ip_assign_with_daita"),
         "the granted-DAITA IpAssign vector must be replayed"
+    );
+    assert!(
+        f.vectors
+            .iter()
+            .any(|v| v.name == "route_anchor_request_with_token"),
+        "the route admission vectors must be replayed"
     );
     for v in &f.vectors {
         let msg = message_for(v);

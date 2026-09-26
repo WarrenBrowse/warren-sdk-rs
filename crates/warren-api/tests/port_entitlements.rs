@@ -140,6 +140,7 @@ impl FakeIssuer {
             prefetch_epochs: 48,
             keys,
             attribution_verifying_key_hex: published,
+            route_admission: None,
         }
     }
 

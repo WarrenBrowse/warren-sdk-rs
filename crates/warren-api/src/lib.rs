@@ -11,6 +11,7 @@
 
 pub mod client;
 pub mod dto;
+pub mod route_admission;
 pub mod token_blinding;
 pub mod tokens;
 pub mod transport;
@@ -31,6 +32,7 @@ pub use dto::{
     SubscriptionResponse, TokenEpochRequest, TokenEpochResponse, TokenIssueRequest,
     TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey,
 };
+pub use route_admission::{RouteAdmission, RouteAdmissionError};
 pub use token_blinding::{
     BLINDING_PURPOSE_BROWSER_PROXY, BLINDING_PURPOSE_SESSION, BLINDING_SALT, BlindingKey,
 };

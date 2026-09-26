@@ -114,6 +114,7 @@ impl FakeEntitlementIssuer {
                 )
                 .expect("32-byte hex"),
             ),
+            route_admission: None,
         }
     }
 

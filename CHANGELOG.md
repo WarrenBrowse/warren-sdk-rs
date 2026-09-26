@@ -9,6 +9,15 @@ the pre-release `0.0.x` line.
 
 ### Added
 
+- The session token directory's route admission block (warren-core doc 107
+  section 10.2) is read on every refresh: `TokenManager::route_admission()`
+  returns it validated as a `RouteAdmission` (the route KEM key checked as a
+  usable X25519 point under a non-reserved key id, the most routes one anchor
+  admits, and `offers_routes(exit_id)` for the exits that admit routes by
+  anchor). A block that is absent, of another version, or unusable reads as
+  `None` and never fails the refresh, so routes fall back to tokens. The
+  engine, contract and vectors pins move to the route admission release, and
+  the five route control messages are replayed from the shared vectors.
 - A banned wallet gets the same typed refusal from every call that credits
   time (warren-core doc 105 section 5.3): `register` (voucher redemption),
   `init_apple_payment` and `check_apple_payment` now return

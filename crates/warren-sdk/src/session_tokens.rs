@@ -264,8 +264,8 @@ impl DialAuth {
 
     /// A tunnel dialer carrying this admission.
     pub(crate) async fn tunnel(&self) -> MultihopClientTunnel {
-        let tunnel =
-            MultihopClientTunnel::new(self.signing.clone()).with_session_admission(self.admission);
+        let tunnel = MultihopClientTunnel::new(self.signing.clone())
+            .with_session_admission(self.admission.clone());
         match &self.tokens {
             Some(tokens) => tunnel.with_session_tokens(tokens.source().await),
             None => tunnel,

@@ -33,6 +33,7 @@ use zeroize::Zeroizing;
 
 use crate::client::{ClientError, WarrenApiClient};
 use crate::dto::{TokenEpochRequest, TokenIssueRequest, TokenIssuerDirectory};
+use crate::route_admission::RouteAdmission;
 use crate::token_blinding::BlindingKey;
 use crate::transport::HttpTransport;
 
@@ -557,6 +558,18 @@ impl CredentialClass {
     }
 }
 
+/// The usable route admission block of a session directory. An unusable one
+/// reads as none: it must never cost the main session its tokens.
+fn route_admission_of(
+    class: CredentialClass,
+    directory: &TokenIssuerDirectory,
+) -> Option<RouteAdmission> {
+    if class != CredentialClass::Session {
+        return None;
+    }
+    RouteAdmission::from_directory(directory).ok().flatten()
+}
+
 /// Whether a mint failure gives every remaining epoch the same answer, so a
 /// refresh must stop and return it: swallowed, it would read as a refresh that
 /// went fine and stocked nothing. A ban; an issuer whose attribution tags
@@ -591,6 +604,10 @@ struct ManagerState {
     /// (`already_issued`). Transient failures are deliberately NOT recorded so
     /// the next refresh tick retries them; a settled epoch is never re-asked.
     minted: BTreeSet<u64>,
+    /// The route admission block of the last directory fetched, validated.
+    /// `None` until then, and whenever the directory carries none or one this
+    /// build cannot use.
+    route_admission: Option<RouteAdmission>,
 }
 
 /// Keeps a [`TokenStore`] topped up and vends the per-session token stack the
@@ -693,6 +710,7 @@ impl<T: HttpTransport> TokenManager<T> {
                 store: TokenStore::new(),
                 epoch_secs: None,
                 minted: BTreeSet::new(),
+                route_admission: None,
             })),
             mint_horizon: None,
             live: Arc::default(),
@@ -771,6 +789,7 @@ impl<T: HttpTransport> TokenManager<T> {
             st.store.prune_before(current);
             st.minted.retain(|&e| e >= current);
             st.epoch_secs = Some(directory.epoch_secs);
+            st.route_admission = route_admission_of(self.class(), &directory);
             directory
                 .keys
                 .iter()
@@ -828,6 +847,20 @@ impl<T: HttpTransport> TokenManager<T> {
             }
         }
         Ok(())
+    }
+
+    /// The route admission block of the last directory a [`Self::refresh`]
+    /// fetched (warren-core doc 107), validated. `None` before the first
+    /// fetch, when the server has route admission off, and when the block is
+    /// one this build cannot use: routes then run on tokens. Always `None`
+    /// outside the session class.
+    #[must_use]
+    pub fn route_admission(&self) -> Option<RouteAdmission> {
+        self.state
+            .lock()
+            .expect("token manager mutex poisoned")
+            .route_admission
+            .clone()
     }
 
     /// Tokens currently available for `epoch` (test/observability).

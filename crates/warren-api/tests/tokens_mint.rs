@@ -59,6 +59,9 @@ struct FakeIssuer {
     replay_ledger: bool,
     /// The batch that took each epoch, under `replay_ledger`.
     ledger: Mutex<HashMap<u64, Vec<String>>>,
+    /// The raw `route_admission` block the directory serves, when set, so a
+    /// test can serve one the contract cannot read.
+    route_admission: Mutex<Option<serde_json::Value>>,
 }
 
 impl FakeIssuer {
@@ -80,7 +83,12 @@ impl FakeIssuer {
             last_keys_url: Mutex::new(None),
             replay_ledger: false,
             ledger: Mutex::new(HashMap::new()),
+            route_admission: Mutex::new(None),
         }
+    }
+
+    fn serve_route_admission(&self, block: Option<serde_json::Value>) {
+        *self.route_admission.lock().unwrap() = block;
     }
 
     fn directory(&self) -> TokenIssuerDirectory {
@@ -108,6 +116,7 @@ impl FakeIssuer {
             prefetch_epochs: 48,
             keys,
             attribution_verifying_key_hex: None,
+            route_admission: None,
         }
     }
 }
@@ -120,7 +129,11 @@ impl HttpTransport for FakeIssuer {
         {
             *self.last_keys_headers.lock().unwrap() = Some(request.headers.clone());
             *self.last_keys_url.lock().unwrap() = Some(request.url.clone());
-            return ok(serde_json::to_vec(&self.directory()).unwrap());
+            let mut directory = serde_json::to_value(self.directory()).unwrap();
+            if let Some(block) = self.route_admission.lock().unwrap().clone() {
+                directory["route_admission"] = block;
+            }
+            return ok(serde_json::to_vec(&directory).unwrap());
         }
         assert!(
             request.url.ends_with("/v1/tokens/issue")
@@ -744,4 +757,112 @@ async fn a_browser_proxy_key_mints_from_the_browser_proxy_issuer() {
         "{}",
         issue.url
     );
+}
+
+// ---- route admission by anchor (warren-core doc 107 section 10.2) ----
+
+/// The route KEM key a server derives from its signing key, published.
+fn route_kem_hex() -> String {
+    hex::encode(
+        warrenguard_multihop::RouteKemSecretKey::derive(&[0x71; 32], 1)
+            .unwrap()
+            .public_key()
+            .to_bytes(),
+    )
+}
+
+fn route_admission_block(kem_hex: &str) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "kem_key_id": 1,
+        "kem_pubkey_hex": kem_hex,
+        "max_routes_per_anchor": 32,
+        "exit_ids_hex": ["0303030303030303030303030303030303030303", "04040404040404040404040404040404"],
+    })
+}
+
+async fn refreshed_with(block: Option<serde_json::Value>) -> TokenManager<FakeIssuer> {
+    let fake = FakeIssuer::new(&[100]);
+    fake.serve_route_admission(block);
+    let manager = TokenManager::new(std::sync::Arc::new(client(fake)), session_key());
+    manager
+        .refresh(100 * EPOCH_SECS)
+        .await
+        .expect("refresh mints");
+    manager
+}
+
+#[tokio::test]
+async fn a_refresh_hands_out_the_route_admission_the_directory_announces() {
+    let mut block = route_admission_block(&route_kem_hex());
+    block["exit_ids_hex"] = serde_json::json!(["03030303030303030303030303030303"]);
+
+    let manager = refreshed_with(Some(block)).await;
+
+    let admission = manager.route_admission().expect("route admission");
+    assert_eq!(hex::encode(admission.kem().to_bytes()), route_kem_hex());
+    assert_eq!(admission.max_routes_per_anchor(), 32);
+    assert!(admission.offers_routes(&[3; 16]));
+    assert!(!admission.offers_routes(&[4; 16]));
+}
+
+#[tokio::test]
+async fn a_directory_without_route_admission_leaves_routes_on_tokens() {
+    let manager = refreshed_with(None).await;
+
+    assert!(manager.route_admission().is_none());
+    assert_eq!(manager.available(100), QUOTA as usize);
+}
+
+#[tokio::test]
+async fn a_block_the_contract_cannot_read_neither_fails_the_refresh_nor_is_used() {
+    // One exit id is 20 bytes: the contract reads the whole block as absent.
+    let manager = refreshed_with(Some(route_admission_block(&route_kem_hex()))).await;
+
+    assert!(manager.route_admission().is_none());
+    assert_eq!(manager.available(100), QUOTA as usize);
+}
+
+#[tokio::test]
+async fn a_key_no_seal_can_use_neither_fails_the_refresh_nor_is_used() {
+    let mut block = route_admission_block(&"00".repeat(32));
+    block["exit_ids_hex"] = serde_json::json!([]);
+
+    let manager = refreshed_with(Some(block)).await;
+
+    assert!(manager.route_admission().is_none());
+    assert_eq!(manager.available(100), QUOTA as usize);
+}
+
+#[tokio::test]
+async fn route_admission_turned_off_at_the_server_is_forgotten_at_the_next_refresh() {
+    let fake = FakeIssuer::new(&[100]);
+    let mut block = route_admission_block(&route_kem_hex());
+    block["exit_ids_hex"] = serde_json::json!([]);
+    fake.serve_route_admission(Some(block));
+    let client = std::sync::Arc::new(client(fake));
+    let manager = TokenManager::new(std::sync::Arc::clone(&client), session_key());
+    manager.refresh(100 * EPOCH_SECS).await.unwrap();
+    assert!(manager.route_admission().is_some());
+
+    client.transport().serve_route_admission(None);
+    manager.refresh(100 * EPOCH_SECS + 60).await.unwrap();
+
+    assert!(manager.route_admission().is_none());
+}
+
+#[tokio::test]
+async fn a_browser_proxy_manager_never_offers_route_admission() {
+    let fake = FakeIssuer::new(&[100]);
+    let mut block = route_admission_block(&route_kem_hex());
+    block["exit_ids_hex"] = serde_json::json!([]);
+    fake.serve_route_admission(Some(block));
+    let manager = TokenManager::new(
+        std::sync::Arc::new(client(fake)),
+        BlindingKey::browser_proxy(&WALLET_SEED),
+    );
+
+    manager.refresh(100 * EPOCH_SECS).await.expect("refresh");
+
+    assert!(manager.route_admission().is_none());
 }
