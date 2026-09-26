@@ -125,6 +125,17 @@ impl RouteAdmission {
         })
     }
 
+    /// Unix seconds from which the server's signature no longer vouches for
+    /// the key (exclusive): past it, the key must not be sealed to.
+    #[must_use]
+    pub fn valid_until(&self) -> u64 {
+        // `from_info` only builds a value whose signature verified.
+        self.info
+            .kem_signature
+            .as_ref()
+            .map_or(0, |signature| signature.valid_until)
+    }
+
     /// The signed block this was validated from, for a client that keeps it
     /// across a restart: a kept copy is trusted again only through
     /// [`Self::from_info`], its signature and validity checked anew.
@@ -242,6 +253,13 @@ mod tests {
             check(admission.info()).is_ok(),
             "the kept block verifies again, so a copy of it can be trusted only as far as its signature"
         );
+    }
+
+    #[test]
+    fn a_validated_block_is_valid_until_its_signature_ends() {
+        let admission = check(&info()).expect("valid");
+
+        assert_eq!(admission.valid_until(), NOW + 86_400);
     }
 
     #[test]

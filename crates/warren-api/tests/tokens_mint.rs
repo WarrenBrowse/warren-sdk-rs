@@ -899,6 +899,19 @@ async fn a_signature_expired_at_the_refresh_is_not_used() {
 }
 
 #[tokio::test]
+async fn route_admission_is_withdrawn_once_its_signature_ends_even_without_a_refresh() {
+    let block = signed(one_exit(route_admission_block(&route_kem_hex())));
+
+    let manager = refreshed_with(Some(block)).await;
+
+    assert!(manager.route_admission_at(REFRESH_AT + 86_399).is_some());
+    assert!(
+        manager.route_admission_at(REFRESH_AT + 86_400).is_none(),
+        "a directory that cannot be fetched again must not stretch the signature"
+    );
+}
+
+#[tokio::test]
 async fn a_directory_without_route_admission_leaves_routes_on_tokens() {
     let manager = refreshed_with(None).await;
 

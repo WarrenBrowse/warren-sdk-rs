@@ -895,6 +895,16 @@ impl<T: HttpTransport> TokenManager<T> {
             .clone()
     }
 
+    /// [`Self::route_admission`] while its signature still holds at
+    /// `now_unix_secs`: a directory that cannot be fetched again (the API
+    /// unreachable, or blocked on the way) must not stretch the validity the
+    /// server signed.
+    #[must_use]
+    pub fn route_admission_at(&self, now_unix_secs: u64) -> Option<RouteAdmission> {
+        self.route_admission()
+            .filter(|admission| now_unix_secs < admission.valid_until())
+    }
+
     /// Tokens currently available for `epoch` (test/observability).
     #[must_use]
     pub fn available(&self, epoch: u64) -> usize {

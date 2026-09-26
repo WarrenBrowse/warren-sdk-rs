@@ -20,7 +20,9 @@ the pre-release `0.0.x` line.
   never handed a key that whoever serves the directory could have chosen.
   `RouteAdmission::info()` returns the signed block it was validated from, so
   a client can keep it across a restart and trust it again only through
-  `from_info`.
+  `from_info`. `TokenManager::route_admission_at(now)` withdraws the block
+  once its signature ends (`RouteAdmission::valid_until()`), even when no
+  refresh could fetch the directory again.
 
 ### Added
 
