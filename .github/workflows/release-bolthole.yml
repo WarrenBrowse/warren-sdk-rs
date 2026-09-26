@@ -309,7 +309,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
-      - uses: WarrenBrowse/warren-app/.github/actions/codemagic-build@13b7f019c1eba7c6b0702ce2416defc994b39229
+      # The proxy action is in this repo (a copy of warren-app's); nothing
+      # else of the tree is needed to drive the build.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions/codemagic-build
+          persist-credentials: false
+      - uses: ./.github/actions/codemagic-build
         with:
           app-id: ${{ vars.CODEMAGIC_APP_ID }}
           workflow: bolthole-windows
