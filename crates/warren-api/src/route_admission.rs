@@ -9,10 +9,13 @@
 //! is (`RouteAnchorConfig { kem }`); nothing here carries the anchor secret,
 //! which the engine draws and keeps.
 //!
-//! The block is advisory and unsigned beyond TLS: an unreadable one reads as
-//! absent, and every route the block cannot admit falls back to a token
-//! route. So validation never fails the directory, whose tokens every main
-//! session needs.
+//! The block is unsigned beyond TLS, like the issuer keys beside it: an
+//! unreadable one reads as absent, and every route the block cannot admit
+//! falls back to a token route, so validation never fails the directory,
+//! whose tokens every main session needs. Whoever can serve this document can
+//! also serve a key of its own, whose secret then opens the anchors and
+//! locators sealed to it: the key is trusted exactly as far as the TLS
+//! connection to the API is.
 
 use std::collections::BTreeSet;
 
@@ -223,7 +226,10 @@ mod tests {
     fn debug_names_no_exit() {
         let rendered = format!("{:?}", RouteAdmission::from_info(&info()).unwrap());
 
-        assert!(!rendered.contains("0303"), "{rendered}");
+        assert!(
+            !rendered.contains("[3, 3") && !rendered.contains("0303"),
+            "{rendered}"
+        );
         assert!(rendered.contains("exits: 2"), "{rendered}");
     }
 }
