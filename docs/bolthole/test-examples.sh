@@ -14,9 +14,9 @@
 # copy of that same file: a check that cannot fail is not a check, and a
 # template nobody deploys broken is exactly where that rots unnoticed.
 #
-# POSIX shell and awk only, no YAML library: the self-hosted runner that gates
-# this repo is not guaranteed to carry ruby or python, and a test that skips
-# itself on the machine that runs it is not a gate.
+# POSIX shell and awk only, no YAML library: a CI runner is not guaranteed to
+# carry ruby or python with one, and a test that skips itself on the machine
+# that runs it is not a gate.
 
 set -eu
 

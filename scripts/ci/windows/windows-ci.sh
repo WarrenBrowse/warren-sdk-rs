@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 #
-# Codemagic `windows-ci` workflow: the Windows leg of ci.yml's clippy and test
-# gates, in one build so the two share one clone, one toolchain and one
-# compiled tree. Same commands as the Linux and macOS legs.
+# The Windows leg of ci.yml's clippy and test gates (job `windows`), in one job
+# so the two share one clone, one toolchain and one compiled tree. Same
+# commands as the Linux and macOS legs.
 #
-#   scripts/ci/codemagic/windows-ci.sh <prepare|clippy|test>
+#   scripts/ci/windows/windows-ci.sh <prepare|clippy|test>
 #
-# One Codemagic step per phase, so the GitHub job shows which one is running;
-# CARGO_TARGET_DIR comes from codemagic.yaml, outside the clone, where the
-# workflow's cache keeps it.
+# One workflow step per phase, each under scripts/ci/windows/watchdog.sh.
 set -euo pipefail
-source scripts/ci/codemagic/windows-env.sh
+source scripts/ci/windows/windows-env.sh
 
 case "${1:?usage: windows-ci.sh <prepare|clippy|test>}" in
     prepare)
@@ -32,7 +30,6 @@ case "${1:?usage: windows-ci.sh <prepare|clippy|test>}" in
         # loopback tunnel tests can hit a quinn Drop/UDP-bind race on slower
         # machines.
         timed cargo nextest run --locked --workspace --all-targets --all-features --retries 2
-        trim_target "$CARGO_TARGET_DIR" 7
         ;;
     *) echo "unknown phase: $1" >&2; exit 2 ;;
 esac

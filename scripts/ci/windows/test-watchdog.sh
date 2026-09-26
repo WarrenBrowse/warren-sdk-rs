@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Tests for ci/codemagic/watchdog.sh, the guard every Codemagic step runs
-# under. It exists because a build once sat 42 minutes on a process waiting for
+# Tests for scripts/ci/windows/watchdog.sh, the guard every Git Bash step of
+# the Windows jobs runs under. It exists because a build once sat 42 minutes on a process waiting for
 # stdin with nothing to show for it: the guard must kill a silent, idle command
 # quickly, never kill one that is working, and pass the command's own exit
 # status through untouched.
@@ -68,7 +68,7 @@ run idle 60 60 sh -c 'echo failing; exit 3'
 rc=$?
 check "passes the command's own exit status through" "[ $rc -eq 3 ]"
 
-# The Codemagic case: a stdin pipe nobody ever closes.
+# The Codemagic case that started it: a stdin pipe nobody ever closes.
 start=$SECONDS
 run idle 60 60 sh -c 'read -r line; echo "read returned"' < <(sleep 20)
 rc=$?
@@ -105,7 +105,7 @@ check "returns when the command exits, whatever it left running" \
     "[ $rc -eq 0 ] && [ $((SECONDS - start)) -lt 15 ] && grep -q '^started$' '$tmp/out'"
 pkill -f 'sleep 40' 2> /dev/null
 
-# On the Codemagic machine itself, a native Windows tree must die too.
+# On a Windows machine itself, a native Windows tree must die too.
 if case "$(uname -s)" in MINGW* | MSYS*) true ;; *) false ;; esac; then
     start=$SECONDS
     run idle 2 60 powershell.exe -NoProfile -NonInteractive -Command 'Start-Sleep -Seconds 300'
@@ -152,15 +152,16 @@ if case "$(uname -s)" in MINGW* | MSYS*) true ;; *) false ;; esac; then
     check "spares a silent native command that is computing" "[ $rc -eq 0 ]"
 fi
 
-# The guard only protects the steps that go through it: every Git Bash step of
-# this repository's codemagic.yaml must run under watchdog.sh.
+# The guard only protects the steps that go through it: every workflow line
+# that runs one of the Windows entry points must run it under watchdog.sh.
 root="$here"
-while [ "$root" != / ] && [ ! -f "$root/codemagic.yaml" ]; do root="$(dirname "$root")"; done
-yaml="$root/codemagic.yaml"
-steps="$(grep -c "bash.exe'" "$yaml")"
-unguarded="$(grep "bash.exe'" "$yaml" | grep -vc 'codemagic/watchdog.sh ')"
-{ echo "codemagic.yaml: $steps Git Bash step(s)"; grep "bash.exe'" "$yaml" | grep -v 'codemagic/watchdog.sh '; } > "$tmp/out"
-check "every Git Bash step of codemagic.yaml runs under the watchdog" \
+while [ "$root" != / ] && [ ! -d "$root/.github/workflows" ]; do root="$(dirname "$root")"; done
+entry='scripts/ci/windows/(windows-ci|bolthole-windows)\.sh'
+cat "$root"/.github/workflows/*.yml | grep -v '^[[:space:]]*#' | grep -E "$entry" > "$tmp/steps" || true
+steps="$(wc -l < "$tmp/steps" | tr -d ' ')"
+unguarded="$(grep -vc 'scripts/ci/windows/watchdog\.sh ' "$tmp/steps")"
+{ echo "workflows: $steps Windows entry-point step(s)"; grep -v 'scripts/ci/windows/watchdog\.sh ' "$tmp/steps"; } > "$tmp/out"
+check "every Windows entry-point step of the workflows runs under the watchdog" \
     "[ $steps -gt 0 ] && [ $unguarded -eq 0 ]"
 
 [ "$failures" -eq 0 ] || { echo "$failures failure(s)"; exit 1; }

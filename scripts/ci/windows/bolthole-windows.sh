@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# Codemagic `bolthole-windows` workflow: the Windows x86_64 lane of
-# release-bolthole.yml. Builds, tests and packages warren-bolthole as
+# The Windows x86_64 lane of release-bolthole.yml (job `build-windows`).
+# Builds, tests and packages warren-bolthole as
 # warren-bolthole<env_tag>-<version>-windows-x86_64.zip.
 #
-#   scripts/ci/codemagic/bolthole-windows.sh <prepare|build|package>
+#   scripts/ci/windows/bolthole-windows.sh <prepare|build|package>
 set -euo pipefail
-source scripts/ci/codemagic/windows-env.sh
+source scripts/ci/windows/windows-env.sh
 
 export WARREN_PRODUCT_ENV="$WARREN_CHANNEL"
 target=x86_64-pc-windows-msvc

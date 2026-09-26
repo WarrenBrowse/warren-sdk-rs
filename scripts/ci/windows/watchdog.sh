@@ -2,13 +2,13 @@
 #
 # Run a command and kill it when it stops making progress.
 #
-#   ci/codemagic/watchdog.sh <command> [args...]
+#   scripts/ci/windows/watchdog.sh <command> [args...]
 #
-# Every Codemagic step runs under this guard. Codemagic only enforces the
-# workflow's max_build_duration (up to 120 minutes) and cannot show a running
-# step's log, so a hung command would otherwise burn the whole budget in
-# silence: the first release build sat 42 minutes on a PowerShell child
-# waiting for stdin before anyone noticed.
+# Every Git Bash step of the Windows jobs runs under this guard. The job's own
+# timeout is sized for a cold build, so a hung command would otherwise burn
+# that whole budget in silence: the first Windows release build (on Codemagic)
+# sat 42 minutes on a PowerShell child waiting for stdin before anyone
+# noticed.
 #
 # Progress is output. The command is killed, with its whole process tree, when
 #   - it printed nothing for WATCHDOG_IDLE_AFTER seconds (default 300) and its
@@ -28,9 +28,9 @@
 # Killed: exit 124 with a ::error line naming the reason. Otherwise the
 # command's own exit status. The command gets a closed stdin.
 #
-# Canonical copy: warren-app ci/codemagic/watchdog.sh, tested by
-# ci/codemagic/test-watchdog.sh. warren-sdk-rs, warren-sdk-ts and wclaude carry
-# byte-identical copies under scripts/ci/codemagic/; change them together.
+# Tested by scripts/ci/windows/test-watchdog.sh. The logic is warren-app's
+# ci/codemagic/watchdog.sh, which this file was copied from: a fix to one
+# belongs in the other.
 set -uo pipefail
 exec < /dev/null
 

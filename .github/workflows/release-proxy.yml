@@ -4,10 +4,10 @@
 #   proxy-vX.Y.Z       prod  -> assets warren-proxy-<ver>-...,      image :<ver> + :latest
 #   proxy-beta-vX.Y.Z  beta  -> assets warren-proxy-beta-<ver>-..., image :beta-<ver> + :beta
 #
-# Artifacts: static musl binaries for linux x86_64 (built on the Rosetta
-# docker pool, the proven warren-core musl recipe) and linux aarch64 (native
-# arm64 pool), a published GitHub release with SHA256SUMS, and the multi-arch
-# image ghcr.io/warrenbrowse/warren-proxy.
+# Artifacts: static musl binaries for linux x86_64 (ubuntu-24.04) and linux
+# aarch64 (natively on ubuntu-24.04-arm), a published GitHub release with
+# SHA256SUMS, and the multi-arch image ghcr.io/warrenbrowse/warren-proxy. Every
+# job runs on a GitHub-hosted runner.
 #
 # A tag publishes only when its commit is on main and that commit already has a
 # green CI run, so the release inherits the four gates.
@@ -49,7 +49,7 @@ env:
 jobs:
   resolve:
     name: Resolve channel and version
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       channel: ${{ steps.resolve.outputs.channel }}
@@ -113,8 +113,8 @@ jobs:
               -H "Accept: application/vnd.github+json" \
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&status=success&per_page=1") \
               || { echo "refusing ${REF_NAME}: the workflow-runs API is unreadable" >&2; exit 1; }
-            # total_count is the first field of the response, and jq is not on
-            # every runner pool.
+            # total_count is the first field of the response; parsed without
+            # jq so the gate depends on nothing but the shell.
             green=$(printf '%s' "$runs" | tr -d ' \n' | sed -nE 's/^\{"total_count":([0-9]+).*/\1/p')
             if [ "${green:-0}" -lt 1 ]; then
               echo "refusing ${REF_NAME}: no successful CI run on its commit; wait for CI, then re-run this workflow" >&2
@@ -145,24 +145,26 @@ jobs:
         include:
           - arch: x86_64
             target: x86_64-unknown-linux-musl
-            runner: [self-hosted, Linux, X64, libra-docker]
+            runner: ubuntu-24.04
           - arch: aarch64
             target: aarch64-unknown-linux-musl
-            runner: [self-hosted, Linux, ARM64, macstudio-arm64]
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     # Sized so the retry wrapper always outlives its own worst case and the
     # failure carries its diagnosis rather than GitHub's: two invocations
     # (build, test), each allowed two attempts of the 70-minute wedge timeout
     # plus a 15-second back-off, is 280 minutes. A lane reaches that only when
-    # the runner is wedged four times over; the emulated x86_64 lane's real
-    # cold build of the sibling gateway binary was 43 minutes.
+    # the runner is wedged four times over.
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-engine
         with:
           token: ${{ secrets.ENGINE_TOKEN }}
-      - uses: dtolnay/rust-toolchain@1.89.0
+      # The version rust-toolchain.toml pins: that file overrides whatever
+      # toolchain this step makes the default, so the target has to be added
+      # to the pinned one.
+      - uses: dtolnay/rust-toolchain@1.91.0
         with:
           targets: ${{ matrix.target }}
       - name: Install musl toolchain
@@ -182,28 +184,19 @@ jobs:
           CC_aarch64_unknown_linux_musl: musl-gcc
         run: |
           set -euo pipefail
-          # Persistent cache outside _work (the runner GC wipes leaf target/
-          # dirs in _work between jobs), one directory per target: a shared one
-          # lets the retry wrapper's `cargo clean` wipe a sibling lane's tree
-          # mid-build wherever two lanes land on the same host, and serialises
-          # them on one cargo lock.
-          export CARGO_TARGET_DIR="$HOME/warren-sdk-target-$CARGO_TARGET"
-          BIN="$CARGO_TARGET_DIR/$CARGO_TARGET/release/warren-proxy"
-          # That cache is deliberately persistent, so the previous run's binary
-          # is sitting at $BIN: remove it, and no failure downstream can package
-          # a binary that was not compiled from this tag.
-          rm -f "$BIN"
+          BIN="target/$CARGO_TARGET/release/warren-proxy"
           # A rustc that cannot be SPAWNED, one killed mid-compile, and a
           # wedged cargo are the three runner failures this pipeline sees; the
           # classifier retries those and fails anything else on the first
           # attempt (scripts/ci/run-with-runner-retry.sh), which also backs off
           # before retrying into the window it was trying to escape.
           #
-          # 70m, not 40m: the emulated x86_64 pool needed 43 minutes for the
-          # sibling gateway's cold build and a 40-minute limit killed it one
-          # minute short. Two attempts, not three, because a retry here can
-          # cost a full wedge timeout and three would put this job's ceiling
-          # out of reach of any reasonable number.
+          # 70m was sized off the emulated self-hosted pool these lanes used
+          # to run on (a 43-minute cold build of the sibling gateway); a hosted
+          # runner builds natively in minutes, so it only ever fires on a real
+          # wedge. Two attempts, not three, because a retry here can cost a
+          # full wedge timeout and three would put this job's ceiling out of
+          # reach of any reasonable number.
           cargo_ci() {
             WARREN_RETRY_ATTEMPTS=2 \
               bash scripts/ci/run-with-runner-retry.sh timeout -k 60s 70m "$@"
@@ -245,7 +238,7 @@ jobs:
     name: Publish release and image
     needs: [resolve, build]
     if: needs.resolve.outputs.publish == 'true'
-    runs-on: [self-hosted, Linux, X64, libra-docker]
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -288,7 +281,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Set up QEMU
         # The arm64 layer of the image runs `apk add` under emulation on this
-        # x64 docker pool.
+        # x64 runner.
         uses: docker/setup-qemu-action@v3
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3

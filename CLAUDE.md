@@ -66,11 +66,16 @@ grep -E 'warrenguard\.git.*\brev = "' Cargo.toml | grep -v "rev = \"${rev}\"" ||
 - Local fake-device tests are necessary but not sufficient for tunnel features:
   the real behavior is validated against a real exit before claiming it works.
 
-The Windows legs (ci.yml `windows`: clippy and nextest; release-bolthole.yml
-`build-windows`) build on Codemagic from `codemagic.yaml` and
-`scripts/ci/codemagic/`, started through `.github/actions/codemagic-build`, a copy of warren-app's
-proxy kept byte-identical with it, like the watchdog: the `warren-codemagic`
-skill.
+## CI runners
+
+Linux and Windows jobs run on GitHub-hosted runners, on pinned labels
+(`ubuntu-24.04`, `ubuntu-24.04-arm`, `windows-2025`); the macOS legs run on the
+self-hosted macOS ARM64 runners. The Windows jobs (ci.yml `windows`,
+release-bolthole.yml `build-windows`) run `scripts/ci/windows/*.sh` in Git
+Bash, each step under `scripts/ci/windows/watchdog.sh` (the logic of
+warren-app's copy), which `test-watchdog.sh` enforces over the workflow files.
+`Swatinem/rust-cache` is only for hosted jobs: ci.yml's header records why it
+must never go on a self-hosted macOS job.
 
 ## Code style and lints
 

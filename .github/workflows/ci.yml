@@ -1,25 +1,18 @@
 name: CI
 
-# Every job that compiles or runs code from this repo runs on the WarrenBrowse
-# self-hosted runners (libra for Linux, axiomStudio for macOS); the label sets
-# below are matched against the live fleet. Do not move one of those to a
-# GitHub-hosted runner.
+# Linux and Windows jobs run on GitHub-hosted runners (free and unlimited for a
+# public repository), on pinned image labels. The macOS legs run on the
+# WarrenBrowse self-hosted macOS ARM64 runners.
 #
-# The Windows leg is the exception: it compiles and tests on a Codemagic
-# windows_x2 machine (codemagic.yaml), and its GitHub job only drives that
-# build through the API, so it runs on a GitHub-hosted runner.
-#
-# No dependency-cache action here, and adding one back breaks other jobs. Two
-# runner instances share one host and therefore one CARGO_HOME, and
-# Swatinem/rust-cache's post step CLEANS that directory: on 2026-08-16 the
-# macOS clippy job logged "Cleaning cargo registry" then "Cleaning cargo/bin"
-# at 16:39:55Z, and the macOS test job on the sibling instance died ten seconds
-# later with `rustc ... (never executed): No such file or directory (os error
-# 2)`, then `could not parse/generate dep info`, then `cargo: command not
-# found`. That is the spawn flake that cost a rerun on nearly every push for two
-# days. These runners are persistent, so their CARGO_HOME is already warm and
-# the action bought nothing; its own saves were colliding anyway ("Unable to
-# reserve cache with key ..., another job").
+# Swatinem/rust-cache is on the hosted jobs whose cold build is long enough to
+# pay for it, saved from main only (the repository has 10 GB of cache), and
+# must never be added to a self-hosted macOS job. Two runner instances share
+# one host and therefore one CARGO_HOME, and the action's post step CLEANS that
+# directory: on 2026-08-16 the macOS clippy job logged "Cleaning cargo
+# registry" then "Cleaning cargo/bin" at 16:39:55Z, and the macOS test job on
+# the sibling instance died ten seconds later with `rustc ... (never
+# executed): No such file or directory (os error 2)`, then `could not
+# parse/generate dep info`, then `cargo: command not found`.
 
 on:
   push:
@@ -34,18 +27,18 @@ env:
   RUSTFLAGS: "-D warnings"
 
 concurrency:
-  # A single self-hosted Linux runner serves these jobs; cancel superseded runs
-  # on the same ref so a burst of pushes cannot pile up a long serial backlog.
+  # Cancel superseded runs on the same ref so a burst of pushes cannot pile up
+  # a backlog on the self-hosted macOS runners.
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   fmt:
-    # Self-hosted runners must never execute fork code: only same-repo events
-    # reach this job.
+    # Only same-repo events reach this job: a fork's run gets none of the
+    # secrets it needs.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo fmt
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -76,11 +69,11 @@ jobs:
       - run: cargo fmt --all -- --check
 
   anti-refrag:
-    # Self-hosted runners must never execute fork code: only same-repo events
-    # reach this job.
+    # Only same-repo events reach this job: a fork's run gets none of the
+    # secrets it needs.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: anti-refragmentation gate
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -95,8 +88,8 @@ jobs:
         run: bash scripts/ci/anti-refrag.sh
 
   clippy:
-    # Self-hosted runners must never execute fork code: only same-repo events
-    # reach this job.
+    # Only same-repo events reach this job: a fork's run gets none of the
+    # secrets it needs, and the macOS runners must never execute fork code.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo clippy (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
@@ -106,7 +99,7 @@ jobs:
       matrix:
         include:
           - name: linux
-            runner: [self-hosted, Linux, X64, libra]
+            runner: ubuntu-24.04
           - name: macos
             runner: [self-hosted, macOS, ARM64]
     steps:
@@ -130,8 +123,8 @@ jobs:
           cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   test:
-    # Self-hosted runners must never execute fork code: only same-repo events
-    # reach this job.
+    # Only same-repo events reach this job: a fork's run gets none of the
+    # secrets it needs, and the macOS runners must never execute fork code.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo test (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
@@ -141,7 +134,7 @@ jobs:
       matrix:
         include:
           - name: linux
-            runner: [self-hosted, Linux, X64, libra]
+            runner: ubuntu-24.04
           - name: macos
             runner: [self-hosted, macOS, ARM64]
     steps:
@@ -156,6 +149,11 @@ jobs:
         with:
           token: ${{ secrets.ENGINE_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.91.0
+      # Hosted leg only: the header says why never on the macOS runners.
+      - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
@@ -175,61 +173,59 @@ jobs:
           cargo nextest run --locked --workspace --all-targets --all-features --retries 2
 
   windows:
-    # Self-hosted runners must never execute fork code, and a fork's run gets
-    # no Codemagic token: only same-repo events reach this job.
+    # Same-repo events only, like every other job of this workflow.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo clippy + test (windows)
-    # The Windows leg of the clippy and test gates, in one Codemagic build
-    # (codemagic.yaml `windows-ci`, scripts/ci/codemagic/windows-ci.sh) so the
-    # two share one clone and one compiled tree. This job only starts the build,
-    # replays its logs and carries its verdict; it runs no code from the repo,
-    # which is why a GitHub-hosted runner is fine here and keeps a libra slot
-    # free while the build queues on Codemagic's single concurrency.
-    runs-on: ubuntu-latest
-    timeout-minutes: 150
+    # The Windows leg of the clippy and test gates in one job, so the two share
+    # one clone and one compiled tree (scripts/ci/windows/windows-ci.sh). Every
+    # Git Bash step runs under scripts/ci/windows/watchdog.sh, which kills a
+    # step that prints nothing for 5 minutes while its processes are idle, or
+    # for 30 minutes at all; test-watchdog.sh fails the shell gates if a step
+    # of the entry points escapes it.
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      WARREN_SHA: ${{ github.sha }}
+    defaults:
+      run:
+        shell: bash
     steps:
-      # The proxy action is in this repo (a copy of warren-app's); nothing
-      # else of the tree is needed to drive the build.
+      - run: git config --global core.longpaths true
       - uses: actions/checkout@v4
+      - run: bash scripts/ci/windows/watchdog.sh bash scripts/ci/windows/windows-ci.sh prepare
+      - uses: Swatinem/rust-cache@v2
         with:
-          sparse-checkout: .github/actions/codemagic-build
-          persist-credentials: false
-      - uses: ./.github/actions/codemagic-build
-        with:
-          app-id: ${{ vars.CODEMAGIC_APP_ID }}
-          workflow: windows-ci
-          token: ${{ secrets.CODEMAGIC_API_TOKEN }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: bash scripts/ci/windows/watchdog.sh bash scripts/ci/windows/windows-ci.sh clippy
+      - run: bash scripts/ci/windows/watchdog.sh bash scripts/ci/windows/windows-ci.sh test
 
   shell-gates:
-    # Self-hosted runners must never execute fork code: only same-repo events
-    # reach this job.
+    # Same-repo events only, like every other job of this workflow.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: shell gates
     # The shell that CI and the release pipeline run has no compiler to catch
     # it, so what it decides is pinned by tests of its own.
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: runner-retry classifier tests
         run: bash scripts/ci/test-run-with-runner-retry.sh
-      # The guard every Codemagic step runs under, and the check that no step
-      # of codemagic.yaml escapes it.
-      - name: Codemagic step watchdog tests
-        run: bash scripts/ci/codemagic/test-watchdog.sh
-      - name: Codemagic proxy tests
-        run: python3 .github/actions/codemagic-build/test_codemagic_build.py
+      # The guard every Windows step runs under, and the check that no step
+      # of the workflows escapes it.
+      - name: Windows step watchdog tests
+        run: bash scripts/ci/windows/test-watchdog.sh
       # The compose examples are copy-paste templates: whatever they get wrong,
       # users deploy. Nothing else in this repo reads them.
       - name: deployment example tests
         run: sh docs/bolthole/test-examples.sh
 
   bindings:
-    # Self-hosted runners must never execute fork code: only same-repo events
-    # reach this job.
+    # Only same-repo events reach this job: a fork's run gets none of the
+    # secrets it needs.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: uniffi bindings
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -273,16 +269,16 @@ jobs:
           grep -q "async def delete_account" target/bindings/warren_sdk_ffi.py
 
   deny:
-    # Self-hosted runners must never execute fork code: only same-repo events
-    # reach this job.
+    # Only same-repo events reach this job: a fork's run gets none of the
+    # secrets it needs.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo-deny
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      # Install and run directly rather than the container action: the Linux
-      # runners are not guaranteed to expose a usable Docker daemon to jobs.
+      # Install and run directly rather than the container action: one
+      # prebuilt binary, no image pull.
       - uses: ./.github/actions/checkout-engine
         with:
           token: ${{ secrets.ENGINE_TOKEN }}
@@ -297,15 +293,13 @@ jobs:
       - run: cargo deny check
 
   coverage:
-    # Self-hosted runners must never execute fork code: only same-repo events
-    # reach this job.
+    # Only same-repo events reach this job: a fork's run gets none of the
+    # secrets it needs.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo llvm-cov
-    # Native ARM64 Linux, NOT the x86 Rosetta runner: `-C instrument-coverage`
-    # intermittently SIGSEGVs rustc under Rosetta emulation (the plain
-    # test/clippy builds are un-instrumented and fine; only the coverage build
-    # crashes). Native ARM avoids the emulation entirely.
-    runs-on: [self-hosted, Linux, X64, libra]
+    # Never under emulation: `-C instrument-coverage` intermittently SIGSEGVed
+    # rustc under Rosetta on the former self-hosted x86 pool.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       # Coverage runs the test suite, which reads the golden vectors submodule.
@@ -319,6 +313,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.91.0
         with:
           components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@v2
         with:
@@ -339,8 +336,8 @@ jobs:
           cargo llvm-cov nextest --workspace --locked --summary-only --retries 2
 
   bolthole-slow:
-    # Self-hosted runners must never execute fork code: only same-repo events
-    # reach this job.
+    # Only same-repo events reach this job: a fork's run gets none of the
+    # secrets it needs.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: bolthole-core slow lane
     # The two kinds of test the default lane must not carry: one that sleeps
@@ -349,7 +346,7 @@ jobs:
     # that only means anything against an optimised build. Both are `#[ignore]`d
     # so `cargo test` and the coverage run stay fast, and both still run on
     # every push, here.
-    runs-on: [self-hosted, Linux, X64, libra]
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -357,9 +354,9 @@ jobs:
         with:
           token: ${{ secrets.ENGINE_TOKEN }}
       - uses: dtolnay/rust-toolchain@1.91.0
-      # One thread, and no absolute packets-per-second floor here: these runners
-      # are shared and measure a third of an idle machine, so the datapath case
-      # asserts ratios between its own measurements instead. The design's
+      # One thread, and no absolute packets-per-second floor here: hosted
+      # runners are shared VMs whose speed varies from run to run, so the
+      # datapath case asserts ratios between its own measurements instead. The design's
       # absolute floor is produced deliberately, with
       # WARREN_BOLTHOLE_BENCH_FLOOR=1 on a quiet machine.
       - run: >
