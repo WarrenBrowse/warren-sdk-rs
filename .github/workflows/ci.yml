@@ -44,7 +44,7 @@ jobs:
     # reach this job.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo fmt
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -79,7 +79,7 @@ jobs:
     # reach this job.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: anti-refragmentation gate
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -109,7 +109,7 @@ jobs:
       matrix:
         include:
           - name: linux
-            runner: [self-hosted, Linux, ARM64, macstudio-arm64]
+            runner: [self-hosted, Linux, X64, libra]
           - name: windows
             runner: [self-hosted, Windows, macstudio-win]
           - name: macos
@@ -147,7 +147,7 @@ jobs:
       matrix:
         include:
           - name: linux
-            runner: [self-hosted, Linux, ARM64, macstudio-arm64]
+            runner: [self-hosted, Linux, X64, libra]
           - name: windows
             runner: [self-hosted, Windows, macstudio-win]
           - name: macos
@@ -189,7 +189,7 @@ jobs:
     name: shell gates
     # The shell that CI and the release pipeline run has no compiler to catch
     # it, so what it decides is pinned by tests of its own.
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -205,7 +205,7 @@ jobs:
     # reach this job.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: uniffi bindings
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -253,7 +253,7 @@ jobs:
     # reach this job.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: cargo-deny
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -281,7 +281,7 @@ jobs:
     # intermittently SIGSEGVs rustc under Rosetta emulation (the plain
     # test/clippy builds are un-instrumented and fine; only the coverage build
     # crashes). Native ARM avoids the emulation entirely.
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 30
     steps:
       # Coverage runs the test suite, which reads the golden vectors submodule.
@@ -325,7 +325,7 @@ jobs:
     # that only means anything against an optimised build. Both are `#[ignore]`d
     # so `cargo test` and the coverage run stay fast, and both still run on
     # every push, here.
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

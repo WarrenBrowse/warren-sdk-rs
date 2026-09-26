@@ -49,7 +49,7 @@ env:
 jobs:
   resolve:
     name: Resolve channel and version
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 10
     outputs:
       channel: ${{ steps.resolve.outputs.channel }}
@@ -145,7 +145,7 @@ jobs:
         include:
           - arch: x86_64
             target: x86_64-unknown-linux-musl
-            runner: [self-hosted, linux, x64, docker, warren]
+            runner: [self-hosted, Linux, X64, libra-docker]
           - arch: aarch64
             target: aarch64-unknown-linux-musl
             runner: [self-hosted, Linux, ARM64, macstudio-arm64]
@@ -245,7 +245,7 @@ jobs:
     name: Publish release and image
     needs: [resolve, build]
     if: needs.resolve.outputs.publish == 'true'
-    runs-on: [self-hosted, linux, x64, docker, warren]
+    runs-on: [self-hosted, Linux, X64, libra-docker]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4

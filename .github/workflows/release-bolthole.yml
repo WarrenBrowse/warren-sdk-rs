@@ -59,7 +59,7 @@ env:
 jobs:
   resolve:
     name: Resolve channel and version
-    runs-on: [self-hosted, Linux, ARM64, macstudio-arm64]
+    runs-on: [self-hosted, Linux, X64, libra]
     timeout-minutes: 10
     outputs:
       channel: ${{ steps.resolve.outputs.channel }}
@@ -155,7 +155,7 @@ jobs:
         include:
           - lane: linux-x86_64-musl
             target: x86_64-unknown-linux-musl
-            runner: [self-hosted, linux, x64, docker, warren]
+            runner: [self-hosted, Linux, X64, libra-docker]
             asset_os: linux-x86_64-musl
             # A wedged cargo under emulation prints nothing and waits forever;
             # `timeout` is the only thing that ends it. Sized off the measured
@@ -323,7 +323,7 @@ jobs:
     name: Publish release and image
     needs: [resolve, build]
     if: needs.resolve.outputs.publish == 'true'
-    runs-on: [self-hosted, linux, x64, docker, warren]
+    runs-on: [self-hosted, Linux, X64, libra-docker]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
