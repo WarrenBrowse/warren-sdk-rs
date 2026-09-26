@@ -7,6 +7,18 @@ the pre-release `0.0.x` line.
 
 ## [Unreleased]
 
+### Security
+
+- The route KEM key of the token directory's route admission block is used
+  only under the API server key's signature (warren-core doc 107 section 6.5,
+  `warren_contract::route_kem`). `TokenManager::with_server_pubkey_pins` sets
+  the server keys trusted to sign it (the pins the client verifies its relay
+  list and multi-hop directory against), and `RouteAdmission::from_info` and
+  `from_directory` take those pins and the time. A block that is unsigned,
+  signed by no pinned key, expired, or read by a manager with no pin makes
+  `route_admission()` return `None`: routes run on tokens, and the engine is
+  never handed a key that whoever serves the directory could have chosen.
+
 ### Added
 
 - The session token directory's route admission block (warren-core doc 107

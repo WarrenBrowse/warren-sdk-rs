@@ -759,18 +759,35 @@ async fn a_browser_proxy_key_mints_from_the_browser_proxy_issuer() {
     );
 }
 
-// ---- route admission by anchor (warren-core doc 107 section 10.2) ----
+// ---- route admission by anchor (warren-core doc 107 sections 6.5, 10.2) ----
+
+/// The API server key: it signs the route KEM key, which it also derives.
+const SERVER_SEED: [u8; 32] = [0x71; 32];
+const REFRESH_AT: u64 = 100 * EPOCH_SECS;
+
+fn server_pin() -> String {
+    hex::encode(
+        ed25519_dalek::SigningKey::from_bytes(&SERVER_SEED)
+            .verifying_key()
+            .as_bytes(),
+    )
+}
 
 /// The route KEM key a server derives from its signing key, published.
 fn route_kem_hex() -> String {
+    kem_hex_of(&SERVER_SEED)
+}
+
+fn kem_hex_of(seed: &[u8; 32]) -> String {
     hex::encode(
-        warrenguard_multihop::RouteKemSecretKey::derive(&[0x71; 32], 1)
+        warrenguard_multihop::RouteKemSecretKey::derive(seed, 1)
             .unwrap()
             .public_key()
             .to_bytes(),
     )
 }
 
+/// A block as a server with route admission on serves it, unsigned.
 fn route_admission_block(kem_hex: &str) -> serde_json::Value {
     serde_json::json!({
         "version": 1,
@@ -781,21 +798,57 @@ fn route_admission_block(kem_hex: &str) -> serde_json::Value {
     })
 }
 
-async fn refreshed_with(block: Option<serde_json::Value>) -> TokenManager<FakeIssuer> {
-    let fake = FakeIssuer::new(&[100]);
+/// The server key's signature over `kem_hex` (key id 1, block version 1),
+/// valid until `valid_until`, as the block's `kem_signature` field.
+fn kem_signature(kem_hex: &str, valid_until: u64) -> serde_json::Value {
+    let info = warren_contract::dto::RouteAdmissionInfo {
+        version: 1,
+        kem_key_id: 1,
+        kem_pubkey_hex: warren_contract::dto::PubkeyHex::try_from(kem_hex).unwrap(),
+        max_routes_per_anchor: 1,
+        exit_ids_hex: Vec::new(),
+        kem_signature: None,
+    };
+    serde_json::to_value(warren_contract::route_kem::sign(
+        &info,
+        &ed25519_dalek::SigningKey::from_bytes(&SERVER_SEED),
+        valid_until,
+    ))
+    .unwrap()
+}
+
+/// `block` with the server's signature over its key, valid for a day.
+fn signed(mut block: serde_json::Value) -> serde_json::Value {
+    let kem_hex = block["kem_pubkey_hex"].as_str().unwrap().to_owned();
+    block["kem_signature"] = kem_signature(&kem_hex, REFRESH_AT + 86_400);
+    block
+}
+
+fn one_exit(mut block: serde_json::Value) -> serde_json::Value {
+    block["exit_ids_hex"] = serde_json::json!(["03030303030303030303030303030303"]);
+    block
+}
+
+async fn refreshed_at(
+    block: Option<serde_json::Value>,
+    pins: &[String],
+    now: u64,
+) -> TokenManager<FakeIssuer> {
+    let fake = FakeIssuer::new(&[now / EPOCH_SECS]);
     fake.serve_route_admission(block);
-    let manager = TokenManager::new(std::sync::Arc::new(client(fake)), session_key());
+    let manager = TokenManager::new(std::sync::Arc::new(client(fake)), session_key())
+        .with_server_pubkey_pins(pins.iter().cloned());
+    manager.refresh(now).await.expect("refresh mints");
     manager
-        .refresh(100 * EPOCH_SECS)
-        .await
-        .expect("refresh mints");
-    manager
+}
+
+async fn refreshed_with(block: Option<serde_json::Value>) -> TokenManager<FakeIssuer> {
+    refreshed_at(block, &[server_pin()], REFRESH_AT).await
 }
 
 #[tokio::test]
 async fn a_refresh_hands_out_the_route_admission_the_directory_announces() {
-    let mut block = route_admission_block(&route_kem_hex());
-    block["exit_ids_hex"] = serde_json::json!(["03030303030303030303030303030303"]);
+    let block = signed(one_exit(route_admission_block(&route_kem_hex())));
 
     let manager = refreshed_with(Some(block)).await;
 
@@ -804,6 +857,45 @@ async fn a_refresh_hands_out_the_route_admission_the_directory_announces() {
     assert_eq!(admission.max_routes_per_anchor(), 32);
     assert!(admission.offers_routes(&[3; 16]));
     assert!(!admission.offers_routes(&[4; 16]));
+}
+
+#[tokio::test]
+async fn an_unsigned_route_kem_key_is_never_handed_out() {
+    let manager = refreshed_with(Some(one_exit(route_admission_block(&route_kem_hex())))).await;
+
+    assert!(manager.route_admission().is_none());
+    assert_eq!(manager.available(100), QUOTA as usize);
+}
+
+#[tokio::test]
+async fn a_route_kem_key_substituted_in_transit_is_never_handed_out() {
+    // What a TLS interceptor serves: its own key, under the signature the API
+    // made over the real one.
+    let mut block = one_exit(route_admission_block(&kem_hex_of(&[0x72; 32])));
+    block["kem_signature"] = kem_signature(&route_kem_hex(), REFRESH_AT + 86_400);
+
+    let manager = refreshed_with(Some(block)).await;
+
+    assert!(manager.route_admission().is_none());
+    assert_eq!(manager.available(100), QUOTA as usize);
+}
+
+#[tokio::test]
+async fn a_manager_with_no_pinned_server_key_hands_out_no_route_admission() {
+    let block = signed(one_exit(route_admission_block(&route_kem_hex())));
+
+    let manager = refreshed_at(Some(block), &[], REFRESH_AT).await;
+
+    assert!(manager.route_admission().is_none());
+}
+
+#[tokio::test]
+async fn a_signature_expired_at_the_refresh_is_not_used() {
+    let block = signed(one_exit(route_admission_block(&route_kem_hex())));
+
+    let manager = refreshed_at(Some(block), &[server_pin()], REFRESH_AT + 86_400).await;
+
+    assert!(manager.route_admission().is_none());
 }
 
 #[tokio::test]
@@ -817,7 +909,7 @@ async fn a_directory_without_route_admission_leaves_routes_on_tokens() {
 #[tokio::test]
 async fn a_block_the_contract_cannot_read_neither_fails_the_refresh_nor_is_used() {
     // One exit id is 20 bytes: the contract reads the whole block as absent.
-    let manager = refreshed_with(Some(route_admission_block(&route_kem_hex()))).await;
+    let manager = refreshed_with(Some(signed(route_admission_block(&route_kem_hex())))).await;
 
     assert!(manager.route_admission().is_none());
     assert_eq!(manager.available(100), QUOTA as usize);
@@ -825,7 +917,7 @@ async fn a_block_the_contract_cannot_read_neither_fails_the_refresh_nor_is_used(
 
 #[tokio::test]
 async fn a_key_no_seal_can_use_neither_fails_the_refresh_nor_is_used() {
-    let mut block = route_admission_block(&"00".repeat(32));
+    let mut block = signed(route_admission_block(&"00".repeat(32)));
     block["exit_ids_hex"] = serde_json::json!([]);
 
     let manager = refreshed_with(Some(block)).await;
@@ -837,16 +929,17 @@ async fn a_key_no_seal_can_use_neither_fails_the_refresh_nor_is_used() {
 #[tokio::test]
 async fn route_admission_turned_off_at_the_server_is_forgotten_at_the_next_refresh() {
     let fake = FakeIssuer::new(&[100]);
-    let mut block = route_admission_block(&route_kem_hex());
+    let mut block = signed(route_admission_block(&route_kem_hex()));
     block["exit_ids_hex"] = serde_json::json!([]);
     fake.serve_route_admission(Some(block));
     let client = std::sync::Arc::new(client(fake));
-    let manager = TokenManager::new(std::sync::Arc::clone(&client), session_key());
-    manager.refresh(100 * EPOCH_SECS).await.unwrap();
+    let manager = TokenManager::new(std::sync::Arc::clone(&client), session_key())
+        .with_server_pubkey_pins([server_pin()]);
+    manager.refresh(REFRESH_AT).await.unwrap();
     assert!(manager.route_admission().is_some());
 
     client.transport().serve_route_admission(None);
-    manager.refresh(100 * EPOCH_SECS + 60).await.unwrap();
+    manager.refresh(REFRESH_AT + 60).await.unwrap();
 
     assert!(manager.route_admission().is_none());
 }
@@ -854,15 +947,16 @@ async fn route_admission_turned_off_at_the_server_is_forgotten_at_the_next_refre
 #[tokio::test]
 async fn a_browser_proxy_manager_never_offers_route_admission() {
     let fake = FakeIssuer::new(&[100]);
-    let mut block = route_admission_block(&route_kem_hex());
+    let mut block = signed(route_admission_block(&route_kem_hex()));
     block["exit_ids_hex"] = serde_json::json!([]);
     fake.serve_route_admission(Some(block));
     let manager = TokenManager::new(
         std::sync::Arc::new(client(fake)),
         BlindingKey::browser_proxy(&WALLET_SEED),
-    );
+    )
+    .with_server_pubkey_pins([server_pin()]);
 
-    manager.refresh(100 * EPOCH_SECS).await.expect("refresh");
+    manager.refresh(REFRESH_AT).await.expect("refresh");
 
     assert!(manager.route_admission().is_none());
 }

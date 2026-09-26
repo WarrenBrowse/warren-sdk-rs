@@ -558,16 +558,22 @@ impl CredentialClass {
     }
 }
 
-/// The usable route admission block of a session directory. An unusable one
+/// The usable route admission block of a session directory, its KEM key
+/// signed by one of `server_pubkey_pins`. An unusable or unauthenticated one
 /// reads as none: it must never cost the main session its tokens.
 fn route_admission_of(
     class: CredentialClass,
     directory: &TokenIssuerDirectory,
+    server_pubkey_pins: &[String],
+    now_unix_secs: u64,
 ) -> Option<RouteAdmission> {
     if class != CredentialClass::Session {
         return None;
     }
-    RouteAdmission::from_directory(directory).ok().flatten()
+    let pins: Vec<&str> = server_pubkey_pins.iter().map(String::as_str).collect();
+    RouteAdmission::from_directory(directory, &pins, now_unix_secs)
+        .ok()
+        .flatten()
 }
 
 /// Whether a mint failure gives every remaining epoch the same answer, so a
@@ -635,6 +641,9 @@ pub struct TokenManager<T> {
     /// per manager. Every client of a wallet holds the same batch in the same
     /// order, so a fixed start would send all of them to the first serial.
     rotation: usize,
+    /// The API server keys trusted to sign the route KEM key
+    /// ([`Self::with_server_pubkey_pins`]). Empty: no route admission.
+    server_pubkey_pins: Vec<String>,
 }
 
 /// The serials held by the live sessions of one [`TokenManager`].
@@ -715,7 +724,23 @@ impl<T: HttpTransport> TokenManager<T> {
             mint_horizon: None,
             live: Arc::default(),
             rotation: rand::random(),
+            server_pubkey_pins: Vec::new(),
         }
+    }
+
+    /// Trusts `pins` (64-char hex Ed25519 keys, the API server keys the
+    /// client pins for its signed relay list and multi-hop directory) to sign
+    /// the route KEM key of the session directory (warren-core doc 107 section
+    /// 6.5). Without a pin, [`Self::route_admission`] is always `None`: a key
+    /// no pinned server key vouches for is never handed to the engine.
+    #[must_use]
+    pub fn with_server_pubkey_pins<I, S>(mut self, pins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.server_pubkey_pins = pins.into_iter().map(Into::into).collect();
+        self
     }
 
     #[cfg(test)]
@@ -789,7 +814,12 @@ impl<T: HttpTransport> TokenManager<T> {
             st.store.prune_before(current);
             st.minted.retain(|&e| e >= current);
             st.epoch_secs = Some(directory.epoch_secs);
-            st.route_admission = route_admission_of(self.class(), &directory);
+            st.route_admission = route_admission_of(
+                self.class(),
+                &directory,
+                &self.server_pubkey_pins,
+                now_unix_secs,
+            );
             directory
                 .keys
                 .iter()
@@ -850,10 +880,12 @@ impl<T: HttpTransport> TokenManager<T> {
     }
 
     /// The route admission block of the last directory a [`Self::refresh`]
-    /// fetched (warren-core doc 107), validated. `None` before the first
-    /// fetch, when the server has route admission off, and when the block is
-    /// one this build cannot use: routes then run on tokens. Always `None`
-    /// outside the session class.
+    /// fetched (warren-core doc 107), validated at that refresh's time, its
+    /// KEM key signed by a pinned server key. `None` before the first fetch,
+    /// when the server has route admission off, when the block is one this
+    /// build cannot use, and when no pinned server key vouches for its key
+    /// (no pin set, unsigned, badly signed, expired): routes then run on
+    /// tokens. Always `None` outside the session class.
     #[must_use]
     pub fn route_admission(&self) -> Option<RouteAdmission> {
         self.state

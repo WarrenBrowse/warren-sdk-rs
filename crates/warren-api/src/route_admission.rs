@@ -4,22 +4,25 @@
 //! The directory's `route_admission` block tells a client which key to seal
 //! its route anchor to, how many routes one anchor admits, and which exits
 //! admit routes that way. [`RouteAdmission`] is that block once validated:
-//! a version this build implements, a usable X25519 point under a
+//! a version this build implements, a KEM key signed by a server key the
+//! client pins (doc 107 section 6.5), a usable X25519 point under a
 //! non-reserved key id, a non-zero route limit. The engine takes the key as
 //! is (`RouteAnchorConfig { kem }`); nothing here carries the anchor secret,
 //! which the engine draws and keeps.
 //!
-//! The block is unsigned beyond TLS, like the issuer keys beside it: an
-//! unreadable one reads as absent, and every route the block cannot admit
+//! The document travels over TLS only, and whoever could serve a key of its
+//! own would open every anchor and locator sealed to it, linking the device's
+//! main session to its routes across exits. So the key is used only under the
+//! signature of the API server key, the one the client already pins for the
+//! signed relay list and the multi-hop directory; an unsigned or badly signed
+//! block reads as no route admission. Every route the block cannot admit
 //! falls back to a token route, so validation never fails the directory,
-//! whose tokens every main session needs. Whoever can serve this document can
-//! also serve a key of its own, whose secret then opens the anchors and
-//! locators sealed to it: the key is trusted exactly as far as the TLS
-//! connection to the API is.
+//! whose tokens every main session needs.
 
 use std::collections::BTreeSet;
 
 use warren_contract::dto::{ROUTE_ADMISSION_VERSION, RouteAdmissionInfo, TokenIssuerDirectory};
+use warren_contract::route_kem::{self, RouteKemSignatureError};
 use warrenguard_multihop::{RouteKemPublicKey, RouteSealError};
 
 /// Why a directory's route admission block cannot be used.
@@ -32,6 +35,10 @@ pub enum RouteAdmissionError {
         /// The version the block announces.
         version: u32,
     },
+    /// No pinned server key vouches for the route KEM key (unsigned, badly
+    /// signed, expired, or no key pinned).
+    #[error("route admission key is not vouched for by a pinned server key")]
+    Unauthenticated(#[source] RouteKemSignatureError),
     /// The route KEM key uses the reserved key id, or is not a usable
     /// X25519 point.
     #[error("route admission key is unusable")]
@@ -60,28 +67,39 @@ impl RouteAdmission {
     /// See [`Self::from_info`].
     pub fn from_directory(
         directory: &TokenIssuerDirectory,
+        pinned_server_keys: &[&str],
+        now_unix_secs: u64,
     ) -> Result<Option<Self>, RouteAdmissionError> {
         directory
             .route_admission
             .as_ref()
-            .map(Self::from_info)
+            .map(|info| Self::from_info(info, pinned_server_keys, now_unix_secs))
             .transpose()
     }
 
-    /// Validates one block.
+    /// Validates one block, its KEM key signed by one of
+    /// `pinned_server_keys` (64-char hex Ed25519 keys) and still valid at
+    /// `now_unix_secs`.
     ///
     /// # Errors
     ///
     /// [`RouteAdmissionError::UnsupportedVersion`] for a version other than
-    /// [`ROUTE_ADMISSION_VERSION`], [`RouteAdmissionError::UnusableKey`] for a
-    /// key that cannot seal, [`RouteAdmissionError::NoRoutes`] for a zero
-    /// route limit.
-    pub fn from_info(info: &RouteAdmissionInfo) -> Result<Self, RouteAdmissionError> {
+    /// [`ROUTE_ADMISSION_VERSION`], [`RouteAdmissionError::Unauthenticated`]
+    /// for a key no pinned server key vouches for,
+    /// [`RouteAdmissionError::UnusableKey`] for a key that cannot seal,
+    /// [`RouteAdmissionError::NoRoutes`] for a zero route limit.
+    pub fn from_info(
+        info: &RouteAdmissionInfo,
+        pinned_server_keys: &[&str],
+        now_unix_secs: u64,
+    ) -> Result<Self, RouteAdmissionError> {
         if info.version != ROUTE_ADMISSION_VERSION {
             return Err(RouteAdmissionError::UnsupportedVersion {
                 version: info.version,
             });
         }
+        route_kem::verify(info, pinned_server_keys, now_unix_secs)
+            .map_err(RouteAdmissionError::Unauthenticated)?;
         if info.max_routes_per_anchor == 0 {
             return Err(RouteAdmissionError::NoRoutes);
         }
@@ -137,19 +155,41 @@ impl std::fmt::Debug for RouteAdmission {
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::SigningKey;
     use warren_contract::dto::{ExitId, PubkeyHex};
     use warrenguard_multihop::RouteKemSecretKey;
 
     use super::*;
 
+    const SERVER_SEED: [u8; 32] = [0x71; 32];
+    const NOW: u64 = 1_800_000_000;
+
     fn published_key() -> RouteKemPublicKey {
-        RouteKemSecretKey::derive(&[0x71; 32], 1)
+        RouteKemSecretKey::derive(&SERVER_SEED, 1)
             .expect("key id 1")
             .public_key()
             .clone()
     }
 
-    fn info() -> RouteAdmissionInfo {
+    fn server_pin() -> String {
+        hex::encode(
+            SigningKey::from_bytes(&SERVER_SEED)
+                .verifying_key()
+                .as_bytes(),
+        )
+    }
+
+    /// `info` as the server signs it, after any change a test makes.
+    fn signed(mut info: RouteAdmissionInfo) -> RouteAdmissionInfo {
+        info.kem_signature = Some(warren_contract::route_kem::sign(
+            &info,
+            &SigningKey::from_bytes(&SERVER_SEED),
+            NOW + 86_400,
+        ));
+        info
+    }
+
+    fn unsigned() -> RouteAdmissionInfo {
         RouteAdmissionInfo {
             version: ROUTE_ADMISSION_VERSION,
             kem_key_id: 1,
@@ -157,12 +197,21 @@ mod tests {
                 .expect("64 hex"),
             max_routes_per_anchor: 32,
             exit_ids_hex: vec![ExitId::from_bytes([3; 16]), ExitId::from_bytes([4; 16])],
+            kem_signature: None,
         }
+    }
+
+    fn info() -> RouteAdmissionInfo {
+        signed(unsigned())
+    }
+
+    fn check(info: &RouteAdmissionInfo) -> Result<RouteAdmission, RouteAdmissionError> {
+        RouteAdmission::from_info(info, &[server_pin().as_str()], NOW)
     }
 
     #[test]
     fn a_valid_block_carries_the_published_key_limit_and_exits() {
-        let admission = RouteAdmission::from_info(&info()).expect("valid");
+        let admission = check(&info()).expect("valid");
 
         assert_eq!(admission.kem().to_bytes(), published_key().to_bytes());
         assert_eq!(admission.kem().key_id(), 1);
@@ -173,12 +222,64 @@ mod tests {
     }
 
     #[test]
+    fn an_unsigned_key_is_never_used() {
+        assert_eq!(
+            check(&unsigned()).err(),
+            Some(RouteAdmissionError::Unauthenticated(
+                RouteKemSignatureError::Unsigned
+            ))
+        );
+    }
+
+    #[test]
+    fn a_key_substituted_under_the_servers_signature_is_refused() {
+        let mut forged = info();
+        let other = RouteKemSecretKey::derive(&[0x72; 32], 1).expect("key id 1");
+        forged.kem_pubkey_hex =
+            PubkeyHex::try_from(hex::encode(other.public_key().to_bytes()).as_str())
+                .expect("64 hex");
+
+        assert_eq!(
+            check(&forged).err(),
+            Some(RouteAdmissionError::Unauthenticated(
+                RouteKemSignatureError::BadSignature
+            ))
+        );
+    }
+
+    #[test]
+    fn a_key_signed_by_an_unpinned_server_is_refused() {
+        let other_pin = hex::encode(
+            SigningKey::from_bytes(&[0x09; 32])
+                .verifying_key()
+                .as_bytes(),
+        );
+
+        assert_eq!(
+            RouteAdmission::from_info(&info(), &[other_pin.as_str()], NOW).err(),
+            Some(RouteAdmissionError::Unauthenticated(
+                RouteKemSignatureError::BadSignature
+            ))
+        );
+    }
+
+    #[test]
+    fn an_expired_signature_is_refused() {
+        assert_eq!(
+            RouteAdmission::from_info(&info(), &[server_pin().as_str()], NOW + 86_400).err(),
+            Some(RouteAdmissionError::Unauthenticated(
+                RouteKemSignatureError::Expired
+            ))
+        );
+    }
+
+    #[test]
     fn a_later_block_version_is_not_used() {
-        let mut later = info();
+        let mut later = unsigned();
         later.version = ROUTE_ADMISSION_VERSION + 1;
 
         assert_eq!(
-            RouteAdmission::from_info(&later).err(),
+            check(&signed(later)).err(),
             Some(RouteAdmissionError::UnsupportedVersion {
                 version: ROUTE_ADMISSION_VERSION + 1
             })
@@ -187,11 +288,11 @@ mod tests {
 
     #[test]
     fn a_small_order_point_is_refused() {
-        let mut weak = info();
+        let mut weak = unsigned();
         weak.kem_pubkey_hex = PubkeyHex::try_from("00".repeat(32).as_str()).expect("64 hex");
 
         assert_eq!(
-            RouteAdmission::from_info(&weak).err(),
+            check(&signed(weak)).err(),
             Some(RouteAdmissionError::UnusableKey(
                 RouteSealError::InvalidPublicKey
             ))
@@ -200,11 +301,11 @@ mod tests {
 
     #[test]
     fn the_reserved_key_id_is_refused() {
-        let mut reserved = info();
+        let mut reserved = unsigned();
         reserved.kem_key_id = 0;
 
         assert_eq!(
-            RouteAdmission::from_info(&reserved).err(),
+            check(&signed(reserved)).err(),
             Some(RouteAdmissionError::UnusableKey(
                 RouteSealError::ReservedKeyId
             ))
@@ -216,15 +317,12 @@ mod tests {
         let mut none = info();
         none.max_routes_per_anchor = 0;
 
-        assert_eq!(
-            RouteAdmission::from_info(&none).err(),
-            Some(RouteAdmissionError::NoRoutes)
-        );
+        assert_eq!(check(&none).err(), Some(RouteAdmissionError::NoRoutes));
     }
 
     #[test]
     fn debug_names_no_exit() {
-        let rendered = format!("{:?}", RouteAdmission::from_info(&info()).unwrap());
+        let rendered = format!("{:?}", check(&info()).unwrap());
 
         assert!(
             !rendered.contains("[3, 3") && !rendered.contains("0303"),
