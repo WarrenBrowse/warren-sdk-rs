@@ -83,14 +83,18 @@ pub enum FfiError {
         /// Whether the refused request carried an entitlement envelope.
         entitlement_presented: bool,
     },
-    /// The issuer refuses the wallet: it is banned, so no enforcing exit
-    /// grants it a forwarded port until the ban lapses or is lifted.
+    /// The server refuses the wallet because it is banned: issuance (so no
+    /// enforcing exit grants it a forwarded port until the ban lapses or is
+    /// lifted) and every call that credits time, such as
+    /// [`WarrenFfiClient::redeem_voucher`], which leaves the voucher
+    /// unredeemed.
     #[error("the account is banned")]
     Banned {
         /// Why the account is banned.
         reason: FfiBanReason,
         /// When the ban lapses on its own, Unix seconds; `None` when it does
-        /// not.
+        /// not, or when the refusing endpoint does not say (a voucher
+        /// redemption may omit it).
         lapses_at_unix_secs: Option<u64>,
     },
 }
@@ -770,9 +774,11 @@ impl WarrenFfiClient {
     ///
     /// # Errors
     ///
-    /// [`FfiError::ServerStatus`] on a non-2xx reply (e.g. an invalid or spent
-    /// voucher), [`FfiError::Client`] on a transport or other client-side
-    /// failure.
+    /// [`FfiError::Banned`] when the wallet is banned: the voucher stays
+    /// unredeemed, so keep it and redeem it once the ban ends.
+    /// [`FfiError::ServerStatus`] on any other non-2xx reply (e.g. an invalid
+    /// or spent voucher), [`FfiError::Client`] on a transport or other
+    /// client-side failure.
     pub async fn redeem_voucher(&self, voucher_secret: String) -> Result<u64, FfiError> {
         let req = RegisterAccountRequest {
             pubkey_ss58: PubkeySs58::try_from(self.inner.api().address())
@@ -1753,6 +1759,41 @@ mod tests {
             r,
             Err(FfiError::Client { .. }) | Err(FfiError::ServerStatus { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn redeem_voucher_of_a_banned_wallet_is_a_typed_ban() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf).expect("read request");
+            let body = r#"{"error":"banned","reason_code":"port_forwarding_abuse"}"#;
+            let resp = format!(
+                "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).expect("write response");
+        });
+        let id = generate_identity();
+        let client = WarrenFfiClient::new(id.mnemonic, format!("http://{addr}"), "ab".repeat(32))
+            .expect("valid build");
+
+        let r = client.redeem_voucher("voucher-secret".to_owned()).await;
+
+        server.join().expect("server thread");
+        assert!(
+            matches!(
+                r,
+                Err(FfiError::Banned {
+                    reason: FfiBanReason::PortForwardingAbuse,
+                    lapses_at_unix_secs: None,
+                })
+            ),
+            "{r:?}"
+        );
     }
 
     #[tokio::test]

@@ -58,15 +58,18 @@ pub enum ClientError {
     /// The system clock is before the Unix epoch.
     #[error("system clock is before the Unix epoch")]
     BadClock,
-    /// Session-token or port-entitlement issuance refused the wallet because
-    /// it is banned (HTTP 403 `{"error":"banned"}`, warren-core doc 105). The
-    /// app shows the suspension from this answer without dialing an exit.
-    #[error("issuance refused: the account is banned")]
+    /// The server refused the wallet because it is on the CRL (HTTP 403
+    /// `{"error":"banned"}`, warren-core doc 105): session-token and
+    /// port-entitlement issuance, and every call that credits time (a voucher
+    /// redemption, the store payment calls), which refuse before consuming
+    /// anything. The app shows the suspension from this answer without
+    /// dialing an exit.
+    #[error("the account is banned")]
     Banned {
         /// Why the account is banned.
         reason_code: BanReasonCode,
         /// When the ban lapses on its own, Unix seconds. `None` for a ban
-        /// that does not lapse.
+        /// that does not lapse, or when the refusing endpoint does not say.
         lapses_at_unix_secs: Option<u64>,
     },
 }
@@ -203,14 +206,16 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     /// # Errors
     ///
     /// [`ClientError`] on transport failure, a non-2xx status, or a malformed
-    /// response.
+    /// response. A wallet on the revocation list is refused with
+    /// [`ClientError::Banned`] and its voucher stays unredeemed, to be redeemed
+    /// once the ban ends; the lapse may be absent from this unsigned answer.
     pub async fn register(
         &self,
         req: &RegisterAccountRequest,
     ) -> Result<RegisterAccountResponse, ClientError> {
         let body = serialize(req)?;
         let http = self.unsigned_request(Method::Post, "/v1/register", body);
-        self.send_json(http).await
+        self.send_json(http).await.map_err(ban_refusal)
     }
 
     /// Signed `GET /v1/subscription`.
@@ -370,7 +375,7 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     ) -> Result<TokenIssueResponse, ClientError> {
         let body = serialize(req)?;
         let http = self.signed_request(Method::Post, class.issue_path(), body)?;
-        self.send_json(http).await.map_err(issuance_refusal)
+        self.send_json(http).await.map_err(ban_refusal)
     }
 
     /// Signed `DELETE /v1/account`. Deletes the account's subscription.
@@ -390,10 +395,12 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     /// # Errors
     ///
     /// See [`Self::register`]. A `503` status surfaces as
-    /// [`ClientError::ServerStatus`] when Apple payments are not configured.
+    /// [`ClientError::ServerStatus`] when Apple payments are not configured. A
+    /// wallet on the revocation list is refused with [`ClientError::Banned`]
+    /// and no payment session is opened: do not start the StoreKit purchase.
     pub async fn init_apple_payment(&self) -> Result<InitApplePaymentResponse, ClientError> {
         let http = self.signed_request(Method::Post, "/v1/payments/apple/init", Vec::new())?;
-        self.send_json(http).await
+        self.send_json(http).await.map_err(ban_refusal)
     }
 
     /// Signed `POST /v1/payments/apple/check`. Uploads the StoreKit 2 signed
@@ -404,7 +411,10 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     ///
     /// See [`Self::register`]. Notable statuses surface as
     /// [`ClientError::ServerStatus`]: `400` invalid transaction, `404` session
-    /// not found, `403` identity mismatch, `422` unknown product.
+    /// not found, `403` identity mismatch, `422` unknown product. A wallet on
+    /// the revocation list is refused with [`ClientError::Banned`] and the
+    /// transaction is left unclaimed: keep it unfinished so it can be presented
+    /// again once the ban ends.
     pub async fn check_apple_payment(
         &self,
         jws_transaction: &str,
@@ -414,7 +424,7 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         };
         let body = serialize(&req)?;
         let http = self.signed_request(Method::Post, "/v1/payments/apple/check", body)?;
-        self.send_json(http).await
+        self.send_json(http).await.map_err(ban_refusal)
     }
 
     /// Unsigned `POST /v1/checkout/{wpid}/voucher`. Polls for the voucher a
@@ -603,9 +613,10 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     }
 }
 
-/// Types the issuer's ban refusal (403 `{"error":"banned"}`); any other error,
-/// a 403 with another body included, is returned as it came.
-fn issuance_refusal(err: ClientError) -> ClientError {
+/// Types the ban refusal (403 `{"error":"banned"}`) that issuance and every
+/// credit path answer a wallet on the CRL; any other error, a 403 with another
+/// body included, is returned as it came.
+fn ban_refusal(err: ClientError) -> ClientError {
     let ClientError::ServerStatus { status: 403, body } = &err else {
         return err;
     };
@@ -1353,6 +1364,107 @@ mod tests {
             .await
             .expect_err("missing session must error");
         assert!(matches!(err, ClientError::ServerStatus { status: 404, .. }));
+    }
+
+    /// The refusal every credit path answers a wallet on the CRL (warren-core
+    /// doc 105 section 5.3). The unsigned `/v1/register` may omit the lapse.
+    const BANNED_WITH_LAPSE: &str = r#"{"error":"banned","reason_code":"port_forwarding_abuse","lapses_at_unix_secs":1790336000}"#;
+    const BANNED_WITHOUT_LAPSE: &str =
+        r#"{"error":"banned","reason_code":"port_forwarding_abuse"}"#;
+
+    fn a_voucher_registration() -> RegisterAccountRequest {
+        RegisterAccountRequest {
+            pubkey_ss58: a_ss58(),
+            voucher_secret: Some("voucher".to_owned()),
+            referral_code: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn register_of_a_banned_wallet_is_a_typed_ban_even_without_a_lapse() {
+        let c = client(MockTransport::new(403, BANNED_WITHOUT_LAPSE));
+
+        let err = c
+            .register(&a_voucher_registration())
+            .await
+            .expect_err("a banned wallet redeems nothing");
+
+        assert!(
+            matches!(
+                err,
+                ClientError::Banned {
+                    reason_code: BanReasonCode::PortForwardingAbuse,
+                    lapses_at_unix_secs: None,
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_403_with_another_body_stays_a_server_status() {
+        let c = client(MockTransport::new(403, r#"{"error":"forbidden"}"#));
+
+        let err = c
+            .register(&a_voucher_registration())
+            .await
+            .expect_err("403 must error");
+
+        assert!(matches!(err, ClientError::ServerStatus { status: 403, .. }));
+    }
+
+    #[tokio::test]
+    async fn init_apple_payment_of_a_banned_wallet_is_a_typed_ban() {
+        let c = client(MockTransport::new(403, BANNED_WITH_LAPSE));
+
+        let err = c
+            .init_apple_payment()
+            .await
+            .expect_err("a banned wallet opens no store purchase");
+
+        assert!(
+            matches!(
+                err,
+                ClientError::Banned {
+                    reason_code: BanReasonCode::PortForwardingAbuse,
+                    lapses_at_unix_secs: Some(1_790_336_000),
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_apple_payment_of_a_banned_wallet_is_a_typed_ban() {
+        let c = client(MockTransport::new(403, BANNED_WITH_LAPSE));
+
+        let err = c
+            .check_apple_payment("jws")
+            .await
+            .expect_err("a banned wallet's store transaction is not claimed");
+
+        assert!(
+            matches!(
+                err,
+                ClientError::Banned {
+                    reason_code: BanReasonCode::PortForwardingAbuse,
+                    lapses_at_unix_secs: Some(1_790_336_000),
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_apple_payment_identity_mismatch_stays_a_server_status() {
+        let c = client(MockTransport::new(403, "identity mismatch"));
+
+        let err = c
+            .check_apple_payment("jws")
+            .await
+            .expect_err("identity mismatch must error");
+
+        assert!(matches!(err, ClientError::ServerStatus { status: 403, .. }));
     }
 
     const WPID: &str = "0123456789abcdef0123456789abcdef";

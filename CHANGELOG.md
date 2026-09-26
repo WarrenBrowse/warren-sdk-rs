@@ -9,6 +9,18 @@ the pre-release `0.0.x` line.
 
 ### Added
 
+- A banned wallet gets the same typed refusal from every call that credits
+  time (warren-core doc 105 section 5.3): `register` (voucher redemption),
+  `init_apple_payment` and `check_apple_payment` now return
+  `ClientError::Banned { reason_code, lapses_at_unix_secs }` on 403
+  `{"error":"banned"}` instead of `ServerStatus { status: 403 }`, with
+  `lapses_at_unix_secs` `None` when the answer omits it. The server refuses
+  before consuming anything: the voucher stays unredeemed and the store
+  transaction unclaimed, to be presented again once the ban ends. A 403 with
+  another body (the Apple identity mismatch) keeps its `ServerStatus`
+  mapping. Across uniffi, `WarrenFfiClient::redeem_voucher` returns
+  `FfiError::Banned`. `ClientError::Banned` now displays as "the account is
+  banned".
 - Every SDK tunnel is admitted on an anonymous v7 session token when the
   wallet has one (`IpRequestV7`, warren-core doc 64), so the exit no longer
   learns the wallet. `WarrenClient` opens one `TokenManager` per wallet and
