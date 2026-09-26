@@ -28,7 +28,7 @@ use crate::log::Log;
 /// Every forward presents the wallet's port entitlement envelope, drawn on its
 /// own slot of the batch the SDK keeps for the wallet (warren-core doc 105),
 /// so an exit that requires one grants it. A refusal for want of one, and a
-/// suspended account, are logged through [`log_refusals`].
+/// revoked account, are logged through [`log_refusals`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardProto {
     /// TCP only.
@@ -325,8 +325,8 @@ fn refusal_line(outcome: PortFollowOutcome) -> Option<String> {
             lapses_at_unix_secs,
             ..
         } => match lapses_at_unix_secs {
-            Some(at) => format!("the account is suspended until unix time {at}"),
-            None => "the account is suspended".to_owned(),
+            Some(at) => format!("the account is revoked until unix time {at}"),
+            None => "the account is revoked".to_owned(),
         },
         _ => return None,
     };
@@ -358,7 +358,7 @@ pub fn fatal_line(cause: Option<FatalCause>) -> String {
             "the account is not authorized (no active subscription, or not enrolled at this exit)"
         }
         Some(FatalCause::DeviceLimit) => "the account already holds its maximum device count",
-        Some(FatalCause::Banned) => "the account is suspended",
+        Some(FatalCause::Banned) => "the account is revoked",
         Some(FatalCause::PolicyRefused) => {
             "the exit applied a policy refusal, with no reason given"
         }
@@ -401,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn a_ban_names_the_suspension_and_its_lapse() {
+    fn a_ban_names_the_revocation_and_its_lapse() {
         let mut watch = RefusalWatch::default();
 
         let line = watch
@@ -411,7 +411,7 @@ mod tests {
             }))
             .expect("a ban is news");
 
-        assert!(line.contains("suspended"), "{line}");
+        assert!(line.contains("revoked"), "{line}");
         assert!(line.contains("1790000000"), "{line}");
     }
 
@@ -757,7 +757,7 @@ mod tests {
         let lines = [
             (FatalCause::NotAuthorized, "not authorized"),
             (FatalCause::DeviceLimit, "device"),
-            (FatalCause::Banned, "suspended"),
+            (FatalCause::Banned, "revoked"),
             (FatalCause::PolicyRefused, "policy"),
         ];
         let mut seen: Vec<String> = Vec::new();

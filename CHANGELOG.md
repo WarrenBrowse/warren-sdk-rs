@@ -119,7 +119,7 @@ the pre-release `0.0.x` line.
   `ClientError::Banned { reason_code: BanReasonCode, lapses_at_unix_secs }`
   from `issue_tokens` / `issue_tokens_for` when the issuer answers 403
   `{"error":"banned"}`, for session tokens and port entitlements alike, so an
-  app can show the suspension without dialing an exit. Any other status, a 403
+  app can show the revocation without dialing an exit. Any other status, a 403
   with another body included, keeps its `ServerStatus` mapping.
   `TokenManager::refresh` and `PortEntitlementManager::refresh_auto` return the
   ban (wrapped in `TokenClientError::Api`) instead of swallowing it as a

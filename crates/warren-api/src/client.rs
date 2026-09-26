@@ -62,7 +62,7 @@ pub enum ClientError {
     /// `{"error":"banned"}`, warren-core doc 105): session-token and
     /// port-entitlement issuance, and every call that credits time (a voucher
     /// redemption, the store payment calls), which refuse before consuming
-    /// anything. The app shows the suspension from this answer without
+    /// anything. The app shows the revocation from this answer without
     /// dialing an exit.
     #[error("the account is banned")]
     Banned {

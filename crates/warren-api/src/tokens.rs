@@ -1476,7 +1476,7 @@ impl<T: HttpTransport> PortEntitlementManager<T> {
     /// # Errors
     /// As [`TokenManager::refresh`]: a failed directory fetch, a banned wallet
     /// (`TokenClientError::Api(ClientError::Banned { .. })`, which the app
-    /// shows as the suspension), or an issuer whose attribution tags the exit
+    /// shows as the revocation), or an issuer whose attribution tags the exit
     /// would refuse.
     pub async fn refresh_auto(&self, now_unix_secs: u64) -> Result<(), TokenClientError> {
         self.inner.refresh(now_unix_secs).await

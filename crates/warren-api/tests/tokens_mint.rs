@@ -600,7 +600,7 @@ const BANNED_BODY: &str =
 
 #[tokio::test]
 async fn a_banned_wallet_gets_a_typed_refusal_from_token_issuance() {
-    // The app shows the suspension from this answer, without dialing an exit.
+    // The app shows the revocation from this answer, without dialing an exit.
     let fake = FakeIssuer::new(&[100]);
     *fake.issue_refusal.lock().unwrap() = Some((403, BANNED_BODY));
     let c = client(fake);
