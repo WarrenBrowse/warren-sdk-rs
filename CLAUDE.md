@@ -68,8 +68,9 @@ grep -E 'warrenguard\.git.*\brev = "' Cargo.toml | grep -v "rev = \"${rev}\"" ||
 
 The Windows legs (ci.yml `windows`: clippy and nextest; release-bolthole.yml
 `build-windows`) build on Codemagic from `codemagic.yaml` and
-`scripts/ci/codemagic/`, started through warren-app's proxy action pinned by
-SHA: the `warren-codemagic` skill.
+`scripts/ci/codemagic/`, started through `.github/actions/codemagic-build`, a copy of warren-app's
+proxy kept byte-identical with it, like the watchdog: the `warren-codemagic`
+skill.
 
 ## Code style and lints
 

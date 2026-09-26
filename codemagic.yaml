@@ -2,7 +2,8 @@
 #
 # Nothing here triggers on its own: no webhook is installed and no workflow has
 # a `triggering` section. Each build is started by a GitHub Actions job through
-# warren-app's .github/actions/codemagic-build, which passes the job's commit
+# .github/actions/codemagic-build (a copy of warren-app's), which passes the
+# job's commit
 # as `sha`, replays the step logs and publishes the verified outputs itself.
 #
 # Only the PowerShell checkout step comes from the ref Codemagic cloned; the
