@@ -2,10 +2,12 @@
 //! (warren-core doc 64), or on the wallet-signed v6 request.
 //!
 //! Every client of a wallet holds the same tokens, and an exit leases a serial
-//! to one live session in the whole fleet, refusing the others with the same
-//! sealed `Rejected` it answers an invalid token with. A refusal spends
-//! nothing, so a dial walks its stack: it leads with one token, and on a
-//! refusal redials leading with the next. The walk is bounded by the stack.
+//! to one live session in the whole fleet, refusing the others. Asked with the
+//! detailed request, it says whether it refused a token because another
+//! session holds the serial; an exit that predates that request answers every
+//! refusal with the same sealed `Rejected`. A refusal spends nothing, so a
+//! dial walks its stack: it leads with one token, and on a refusal redials
+//! leading with the next. The walk is bounded by the stack.
 //!
 //! The lease is keyed by serial and exit, and an exit renews a serial leased
 //! on itself: a session leading with a token another one holds on the SAME
@@ -107,17 +109,52 @@ impl Admission {
     }
 }
 
-/// Whether a setup failure can be the exit refusing the presented token. The
-/// exit answers an invalid token and a serial leased elsewhere with the same
-/// sealed `Rejected`, or with the bare opaque close when that detail is lost.
+/// Whether a setup failure can be the exit refusing the presented token: the
+/// sealed `TokenRejected` answering a detailed request, the plain `Rejected`
+/// an exit that predates it answers, or the bare opaque close when the detail
+/// is lost.
 pub(crate) fn is_token_refusal(error: &MultihopError) -> bool {
     match error {
-        MultihopError::Setup(SetupError::Rejected) => true,
+        MultihopError::Setup(SetupError::Rejected | SetupError::TokenRejected(_)) => true,
         MultihopError::SetupClosed(close) => {
             warrenguard_transport::multihop::rejection_from_conn_error(close)
                 == Some(RejectionReason::PolicyRefused)
         }
         _ => false,
+    }
+}
+
+/// What a token walk met: how many tokens the exit refused, and how many of
+/// those because another session holds the token's serial.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct TokenWalk {
+    refused: usize,
+    in_use: usize,
+}
+
+impl TokenWalk {
+    /// Records one token refusal, `error` being what the setup failed with.
+    pub(crate) fn refused(&mut self, error: &MultihopError) {
+        self.refused += 1;
+        if matches!(
+            error,
+            MultihopError::Setup(SetupError::TokenRejected(code))
+                if warren_wire::TokenRejectCode::from_code(*code)
+                    == warren_wire::TokenRejectCode::SerialInUse
+        ) {
+            self.in_use += 1;
+        }
+    }
+
+    /// Why the walk admitted nothing: no token was tried, every token was
+    /// refused because another session holds its serial (the wallet's other
+    /// devices hold every slot), or at least one was refused otherwise.
+    pub(crate) fn cause(self) -> NoSessionTokenCause {
+        match self {
+            Self { refused: 0, .. } => NoSessionTokenCause::Empty,
+            Self { refused, in_use } if refused == in_use => NoSessionTokenCause::AllInUse,
+            Self { .. } => NoSessionTokenCause::AllRefused,
+        }
     }
 }
 
@@ -139,6 +176,11 @@ mod tests {
         assert!(is_token_refusal(&MultihopError::Setup(
             SetupError::Rejected
         )));
+        for code in [0, 1, 7] {
+            assert!(is_token_refusal(&MultihopError::Setup(
+                SetupError::TokenRejected(code)
+            )));
+        }
         assert!(is_token_refusal(&closed_with(
             warrenguard_multihop::WARREN_MH_REJECTED
         )));
@@ -156,5 +198,28 @@ mod tests {
         assert!(!is_token_refusal(&MultihopError::SetupClosed(
             quinn::ConnectionError::TimedOut
         )));
+    }
+
+    #[test]
+    fn a_walk_names_the_device_limit_only_when_every_token_was_in_use() {
+        let in_use = MultihopError::Setup(SetupError::TokenRejected(1));
+        let invalid = MultihopError::Setup(SetupError::TokenRejected(0));
+        let plain = MultihopError::Setup(SetupError::Rejected);
+
+        assert_eq!(TokenWalk::default().cause(), NoSessionTokenCause::Empty);
+        let mut all_in_use = TokenWalk::default();
+        all_in_use.refused(&in_use);
+        all_in_use.refused(&in_use);
+        assert_eq!(all_in_use.cause(), NoSessionTokenCause::AllInUse);
+        for other in [&invalid, &plain] {
+            let mut mixed = TokenWalk::default();
+            mixed.refused(&in_use);
+            mixed.refused(other);
+            assert_eq!(
+                mixed.cause(),
+                NoSessionTokenCause::AllRefused,
+                "{other:?} says nothing about the wallet's other devices"
+            );
+        }
     }
 }

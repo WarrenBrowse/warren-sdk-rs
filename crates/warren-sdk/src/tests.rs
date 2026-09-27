@@ -4020,7 +4020,7 @@ mod session_token_dials {
         exit.seen()
             .into_iter()
             .map(|seen| match seen {
-                SeenSetup::Tokens(tokens) => {
+                SeenSetup::Tokens(tokens) | SeenSetup::DetailedTokens(tokens) => {
                     assert_eq!(tokens.len(), 1, "one token per request");
                     tokens[0]
                 }
@@ -4059,7 +4059,7 @@ mod session_token_dials {
         let mut leads: Vec<_> = tokens
             .iter()
             .map(|s| match s {
-                SeenSetup::Tokens(t) => t[0].0,
+                SeenSetup::Tokens(t) | SeenSetup::DetailedTokens(t) => t[0].0,
                 other => panic!("expected a token request, got {other:?}"),
             })
             .collect();

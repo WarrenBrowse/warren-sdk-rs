@@ -200,6 +200,24 @@ fn message_for(v: &ControlVec) -> WarrenControlMessage {
                 status: v.status.expect("status"),
             }
         }
+        // Typed token refusal: the detailed request carries the fields of
+        // `IpRequestV7` under its own tag, and the code stays a plain byte.
+        "ip_request_v7_detailed" => WarrenControlMessage::IpRequestV7Detailed {
+            prefer_ipv4: v.prefer_ipv4,
+            wants_ipv6: v.wants_ipv6,
+            session_tokens: vec![SessionToken(
+                hex::decode(v.session_token_hex.as_ref().expect("session_token_hex"))
+                    .expect("hex")
+                    .try_into()
+                    .expect("354 bytes"),
+            )],
+            wants_daita: v.wants_daita,
+        },
+        "token_rejected_unspecified" | "token_rejected_serial_in_use" => {
+            WarrenControlMessage::TokenRejected {
+                reason_code: v.reason_code.expect("reason_code"),
+            }
+        }
         other => panic!("unknown control vector name: {other}"),
     }
 }

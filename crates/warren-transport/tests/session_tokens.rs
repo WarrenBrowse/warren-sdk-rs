@@ -33,7 +33,14 @@ async fn dial(
         .await
 }
 
+/// The request a token dial sends an exit that decodes the detailed one.
 fn tokens_led_by(fill: u8) -> SeenSetup {
+    SeenSetup::DetailedTokens(vec![token(fill)])
+}
+
+/// The request a token dial sends plainly: a joining leg, or an exit that
+/// predates the detailed request.
+fn tokens_plainly_led_by(fill: u8) -> SeenSetup {
     SeenSetup::Tokens(vec![token(fill)])
 }
 
@@ -103,7 +110,7 @@ async fn every_token_refused_falls_back_to_the_wallet_by_default() {
 async fn tokens_only_with_every_token_refused_fails_typed_and_never_names_the_wallet() {
     let (addr, keys, exit) = exit().await;
     exit.hold_elsewhere(token(1));
-    exit.hold_elsewhere(token(2));
+    exit.refuse_as_invalid(token(2));
     let tunnel = tunnel()
         .with_session_tokens(Arc::new(StaticTokens::new(vec![token(1), token(2)])))
         .with_session_admission(SessionAdmission::TokensOnly);
@@ -121,6 +128,93 @@ async fn tokens_only_with_every_token_refused_fails_typed_and_never_names_the_wa
         result.map(|_| ())
     );
     assert_eq!(exit.seen(), [tokens_led_by(1), tokens_led_by(2)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tokens_only_with_every_token_in_use_reports_the_device_limit() {
+    let (addr, keys, exit) = exit().await;
+    exit.hold_elsewhere(token(1));
+    exit.hold_elsewhere(token(2));
+    let tunnel = tunnel()
+        .with_session_tokens(Arc::new(StaticTokens::new(vec![token(1), token(2)])))
+        .with_session_admission(SessionAdmission::TokensOnly);
+
+    let error = dial(&tunnel, addr, &keys)
+        .await
+        .err()
+        .expect("no token is free");
+
+    assert!(
+        matches!(
+            error,
+            MultihopError::NoSessionToken(NoSessionTokenCause::AllInUse)
+        ),
+        "got {error:?}"
+    );
+    assert_eq!(
+        error.retryability(),
+        warren_transport::Retryability::Fatal(warren_transport::FatalCause::DeviceLimit),
+        "the wallet's other devices hold every slot: the device limit, not an expired subscription"
+    );
+    assert_eq!(exit.seen(), [tokens_led_by(1), tokens_led_by(2)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exit_that_predates_the_detailed_request_gets_the_same_token_plainly() {
+    let (addr, keys, exit) = exit().await;
+    exit.predate_token_detail();
+    let tokens = StaticTokens::new(vec![token(1), token(2)]);
+    let tunnel = tunnel().with_session_tokens(Arc::new(tokens.clone()));
+
+    let session = dial(&tunnel, addr, &keys)
+        .await
+        .expect("admitted on the first token, asked plainly");
+
+    assert_eq!(exit.seen(), [tokens_led_by(1), tokens_plainly_led_by(1)]);
+    assert_eq!(admitted_token(&session), Some(token(1)));
+    drop(session);
+
+    let again = dial(&tunnel, addr, &keys).await.expect("admitted again");
+    assert_eq!(
+        exit.seen()[2],
+        tokens_plainly_led_by(1),
+        "the tunnel remembers the exit and asks it plainly from then on"
+    );
+    drop(again);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exit_that_predates_the_detailed_request_keeps_the_generic_walk() {
+    // Its refusals do not say why, so the walk ends as it always did: on the
+    // wallet by default.
+    let (addr, keys, exit) = exit().await;
+    exit.predate_token_detail();
+    exit.hold_elsewhere(token(1));
+    exit.hold_elsewhere(token(2));
+    let tunnel = tunnel()
+        .with_session_tokens(Arc::new(StaticTokens::new(vec![token(1), token(2)])))
+        .with_session_admission(SessionAdmission::TokensOnly);
+
+    let result = dial(&tunnel, addr, &keys).await;
+
+    assert!(
+        matches!(
+            result,
+            Err(MultihopError::NoSessionToken(
+                NoSessionTokenCause::AllRefused
+            ))
+        ),
+        "got {:?}",
+        result.map(|_| ())
+    );
+    assert_eq!(
+        exit.seen(),
+        [
+            tokens_led_by(1),
+            tokens_plainly_led_by(1),
+            tokens_plainly_led_by(2)
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -205,7 +299,11 @@ async fn a_joining_leg_presents_the_token_its_session_was_admitted_on() {
         .await
         .expect("joined leg");
 
-    assert_eq!(exit.seen(), [tokens_led_by(1), tokens_led_by(1)]);
+    assert_eq!(
+        exit.seen(),
+        [tokens_led_by(1), tokens_plainly_led_by(1)],
+        "a joining leg is never walked, so it asks plainly"
+    );
     assert_eq!(admitted_token(&joined), Some(token(1)));
     drop(first);
     assert_eq!(tokens.held(), [token(1)], "the joined leg keeps the hold");

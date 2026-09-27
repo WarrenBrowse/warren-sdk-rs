@@ -59,6 +59,7 @@ use warren_wire::control::{CONTROL_FIRST_BYTE, WarrenControlMessage, try_decode_
 use warren_wire::multihop::EXIT_ID_LEN;
 use warrenguard_transport::multihop::{
     MultiHopClient, MultiHopError as EngineMultihopError, RekeyPolicy as EngineRekeyPolicy,
+    TokenRequestKind,
 };
 // The rebind escape contract is engine-owned (the dial builds the socket, so it
 // owns how a migration socket must be escaped); re-exported so a consumer names
@@ -68,7 +69,7 @@ pub use warrenguard_transport::multihop::{RebindError, RebindPolicy};
 use crate::client::{QuicDialError, dial_quic, dial_quic_webpki, effective_bind};
 use crate::lease_refresh::{LeaseRefresh, LeaseRefreshSchedule};
 use crate::session_tokens::{
-    Admission, Admitted, NoSessionTokenCause, SessionAdmission, SessionTokenSource,
+    Admission, Admitted, NoSessionTokenCause, SessionAdmission, SessionTokenSource, TokenWalk,
     is_token_refusal,
 };
 use crate::tls;
@@ -198,6 +199,11 @@ impl MultihopError {
         use warrenguard_transport::Retryability;
         match self {
             MultihopError::Setup(e) => e.retryability(),
+            // Other devices of the wallet hold every slot: the device limit,
+            // which the caller reports rather than retries in silence.
+            MultihopError::NoSessionToken(NoSessionTokenCause::AllInUse) => {
+                Retryability::Fatal(warrenguard_transport::FatalCause::DeviceLimit)
+            }
             // Whatever its code: the node that closed during setup has read the
             // exit id, and on a two-hop circuit it is the entry relay, whose
             // word must not choose which exits the client avoids.
@@ -249,6 +255,11 @@ fn setup_reply_refusal(opened: &[u8]) -> Result<(), SetupError> {
         // Kept distinct too: the account's other devices hold every slot,
         // which a renew prompt would misname.
         Ok(Some(WarrenControlMessage::RejectedDeviceLimit)) => Err(SetupError::DeviceLimit),
+        // The answer to a detailed token request: whether another session
+        // holds the token's serial.
+        Ok(Some(WarrenControlMessage::TokenRejected { reason_code })) => {
+            Err(SetupError::TokenRejected(reason_code))
+        }
         Ok(Some(WarrenControlMessage::IpExhausted)) => Err(SetupError::IpExhausted),
         // Request-type frames (v6 or v7) are client-to-exit only; a client
         // receiving one back is an unexpected reply. This client never asks for
@@ -257,6 +268,7 @@ fn setup_reply_refusal(opened: &[u8]) -> Result<(), SetupError> {
         Ok(Some(
             WarrenControlMessage::IpRequest { .. }
             | WarrenControlMessage::IpRequestV7 { .. }
+            | WarrenControlMessage::IpRequestV7Detailed { .. }
             | WarrenControlMessage::ExitDraining { .. }
             | WarrenControlMessage::IpRequestRoute { .. }
             | WarrenControlMessage::RouteRejected { .. }
@@ -499,6 +511,10 @@ pub struct MultihopClientTunnel {
     /// When a session admitted on a token sends its lease refresh requests.
     /// Set via [`Self::with_lease_refresh_schedule`].
     lease_schedule: LeaseRefreshSchedule,
+    /// Exits that answered an `IpRequestV7Detailed` with the plain `Rejected`:
+    /// they predate it, so this tunnel's later token setups there send
+    /// `IpRequestV7`.
+    exits_predating_token_detail: std::sync::Mutex<std::collections::HashSet<[u8; EXIT_ID_LEN]>>,
 }
 
 /// What a bonded leg repeats of the session it joins.
@@ -529,6 +545,7 @@ impl MultihopClientTunnel {
             admission: SessionAdmission::default(),
             join: None,
             lease_schedule: LeaseRefreshSchedule::PRODUCTION,
+            exits_predating_token_detail: std::sync::Mutex::default(),
         }
     }
 
@@ -775,10 +792,13 @@ impl MultihopClientTunnel {
             let placement = Some(join.address);
             return match &join.admission.0 {
                 Admitted::Token { token, hold } => Ok(self
-                    .connect_once(&target, Some(token), placement)
+                    .connect_once(&target, Some(token), placement, TokenRequestKind::Plain)
                     .await?
                     .admitted_on(Admission::on_token(**token, hold.clone()))),
-                Admitted::Wallet => self.connect_on_wallet(&target, 0, placement).await,
+                Admitted::Wallet => {
+                    self.connect_on_wallet(&target, TokenWalk::default(), placement)
+                        .await
+                }
             };
         }
         // An independent session: never co-housed on an address another live
@@ -789,7 +809,7 @@ impl MultihopClientTunnel {
             .as_ref()
             .map(|source| source.stack())
             .unwrap_or_default();
-        let mut refused = 0usize;
+        let mut walk = TokenWalk::default();
         for token in stack.iter().take(MAX_SESSION_TOKENS) {
             let Some(hold) = self
                 .session_tokens
@@ -798,15 +818,15 @@ impl MultihopClientTunnel {
             else {
                 continue;
             };
-            match self.connect_once(&target, Some(token), placement).await {
+            match self.connect_on_token(&target, token, placement).await {
                 Ok(session) => return Ok(session.admitted_on(Admission::on_token(*token, hold))),
                 // A refusal spends nothing: release the token and lead the
                 // next dial with the next one.
-                Err(e) if is_token_refusal(&e) => refused += 1,
+                Err(e) if is_token_refusal(&e) => walk.refused(&e),
                 Err(e) => return Err(e),
             }
         }
-        self.connect_on_wallet(&target, refused, placement).await
+        self.connect_on_wallet(&target, walk, placement).await
     }
 
     /// Starts the lease refresh of `session` when it was admitted on a token
@@ -825,27 +845,61 @@ impl MultihopClientTunnel {
         session
     }
 
-    /// The wallet-signed dial, once the token walk admitted nothing (after
-    /// `refused` refusals), or refused outright under
-    /// [`SessionAdmission::TokensOnly`].
+    /// One token setup leading with `token`: the detailed request, which an
+    /// exit answers with why it refuses the token, unless `target` already
+    /// showed it predates that request. An exit that answers the detailed
+    /// request with the plain `Rejected` refused it unread and spent nothing,
+    /// so it is remembered and asked again with the same token, plainly.
+    async fn connect_on_token(
+        &self,
+        target: &Target,
+        token: &SessionToken,
+        placement: Option<Ipv4Addr>,
+    ) -> Result<MultihopSession, MultihopError> {
+        if self.predates_token_detail(&target.exit_id) {
+            return self
+                .connect_once(target, Some(token), placement, TokenRequestKind::Plain)
+                .await;
+        }
+        match self
+            .connect_once(target, Some(token), placement, TokenRequestKind::Detailed)
+            .await
+        {
+            Err(MultihopError::Setup(SetupError::Rejected)) => {
+                self.exits_predating_token_detail
+                    .lock()
+                    .expect("predating-exit lock")
+                    .insert(target.exit_id);
+                self.connect_once(target, Some(token), placement, TokenRequestKind::Plain)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    fn predates_token_detail(&self, exit_id: &[u8; EXIT_ID_LEN]) -> bool {
+        self.exits_predating_token_detail
+            .lock()
+            .expect("predating-exit lock")
+            .contains(exit_id)
+    }
+
+    /// The wallet-signed dial, once the token `walk` admitted nothing, or
+    /// refused outright under [`SessionAdmission::TokensOnly`].
     async fn connect_on_wallet(
         &self,
         target: &Target,
-        refused: usize,
+        walk: TokenWalk,
         placement: Option<Ipv4Addr>,
     ) -> Result<MultihopSession, MultihopError> {
         match self.admission {
             SessionAdmission::TokensOrWallet => Ok(self
-                .connect_once(target, None, placement)
+                .connect_once(target, None, placement, TokenRequestKind::Plain)
                 .await?
                 .admitted_on(Admission::on_wallet())),
             // Tokens only, and any policy this build does not know: never
             // name the wallet.
-            _ => Err(MultihopError::NoSessionToken(if refused == 0 {
-                NoSessionTokenCause::Empty
-            } else {
-                NoSessionTokenCause::AllRefused
-            })),
+            _ => Err(MultihopError::NoSessionToken(walk.cause())),
         }
     }
 
@@ -856,6 +910,7 @@ impl MultihopClientTunnel {
         target: &Target,
         token: Option<&SessionToken>,
         placement: Option<Ipv4Addr>,
+        kind: TokenRequestKind,
     ) -> Result<MultihopSession, MultihopError> {
         let Target {
             exit_pubkey,
@@ -1025,12 +1080,13 @@ impl MultihopClientTunnel {
         let presented = token.map(std::slice::from_ref);
         let identity = presented.is_none().then_some(&self.signing_key);
         let opened = inner
-            .setup_over_stream_with_options(
+            .setup_over_stream_with_token_request(
                 identity,
                 self.wants_ipv6,
                 self.daita_support,
                 presented,
                 placement,
+                kind,
             )
             .await
             .map_err(map_engine_err)?;

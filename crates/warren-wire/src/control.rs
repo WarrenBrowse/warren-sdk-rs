@@ -6,5 +6,5 @@
 
 pub use warrenguard_multihop::{
     CONTROL_FIRST_BYTE, CONTROL_VERSION_V3, ControlError, PopSignature, SEALED_TO_API_LEN,
-    SealedToApi, WarrenControlMessage, encode_control, try_decode_control,
+    SealedToApi, TokenRejectCode, WarrenControlMessage, encode_control, try_decode_control,
 };

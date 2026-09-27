@@ -28,8 +28,8 @@ use tokio::sync::mpsc;
 use warren_transport::{default_crypto_provider, make_server_config};
 use warren_wire::multihop::{EXIT_ID_LEN, WarrenMultihopFrame};
 use warren_wire::{
-    SessionToken, WARREN_HPKE_AAD_V1, WARREN_HPKE_VERSION_V1, WarrenControlMessage, encode_control,
-    try_decode_control,
+    SessionToken, TokenRejectCode, WARREN_HPKE_AAD_V1, WARREN_HPKE_VERSION_V1,
+    WarrenControlMessage, encode_control, try_decode_control,
 };
 // The fake exit accepts the same single-home ALPN the real client offers.
 use warrenguard_config::ALPN_H3;
@@ -231,6 +231,8 @@ pub enum SeenSetup {
     },
     /// A v7 `IpRequestV7`, its tokens in presentation order.
     Tokens(Vec<SessionToken>),
+    /// A v7 `IpRequestV7Detailed`, its tokens in presentation order.
+    DetailedTokens(Vec<SessionToken>),
 }
 
 /// The setup requests a [`spawn_token_multihop_exit`] exit read, and the
@@ -240,7 +242,11 @@ pub struct TokenExit {
     seen: Arc<std::sync::Mutex<Vec<SeenSetup>>>,
     placements: Arc<std::sync::Mutex<Vec<Option<[u8; 4]>>>>,
     held_elsewhere: Arc<std::sync::Mutex<Vec<SessionToken>>>,
+    invalid: Arc<std::sync::Mutex<Vec<SessionToken>>>,
     exhausted_for: Arc<std::sync::Mutex<Vec<SessionToken>>>,
+    /// Set: the exit predates `IpRequestV7Detailed` and answers every one with
+    /// the plain `Rejected`, as a deployed exit that cannot decode it does.
+    predates_token_detail: Arc<std::sync::atomic::AtomicBool>,
     /// Every `LeaseRefresh` datagram read, in arrival order: the token it
     /// carried, or `None` for the announcement.
     lease_requests: Arc<std::sync::Mutex<Vec<Option<SessionToken>>>>,
@@ -258,7 +264,9 @@ impl Default for TokenExit {
             seen: Arc::default(),
             placements: Arc::default(),
             held_elsewhere: Arc::default(),
+            invalid: Arc::default(),
             exhausted_for: Arc::default(),
+            predates_token_detail: Arc::default(),
             lease_requests: Arc::default(),
             lease_script: Arc::default(),
             downlink: tokio::sync::broadcast::channel(16).0,
@@ -270,6 +278,7 @@ impl Default for TokenExit {
 enum TokenExitReply {
     Assign,
     Rejected,
+    TokenRejected(TokenRejectCode),
     IpExhausted,
 }
 
@@ -280,14 +289,29 @@ impl TokenExit {
         self.seen.lock().expect("seen-setup lock").clone()
     }
 
-    /// From now on, a v7 request leading with `token` is refused with the
-    /// sealed `Rejected`, the way a real exit refuses a serial another session
-    /// holds.
+    /// From now on, a v7 request leading with `token` is refused the way a
+    /// real exit refuses a serial another session holds: with the sealed
+    /// `TokenRejected` (serial in use) for an `IpRequestV7Detailed`, the plain
+    /// `Rejected` for an `IpRequestV7`.
     pub fn hold_elsewhere(&self, token: SessionToken) {
         self.held_elsewhere
             .lock()
             .expect("held-token lock")
             .push(token);
+    }
+
+    /// From now on, a v7 request leading with `token` is refused as a token
+    /// that does not verify: the sealed `TokenRejected` (unspecified) for an
+    /// `IpRequestV7Detailed`, the plain `Rejected` for an `IpRequestV7`.
+    pub fn refuse_as_invalid(&self, token: SessionToken) {
+        self.invalid.lock().expect("invalid-token lock").push(token);
+    }
+
+    /// From now on, the exit answers every `IpRequestV7Detailed` with the
+    /// plain `Rejected`, as a deployed exit that predates it does.
+    pub fn predate_token_detail(&self) {
+        self.predates_token_detail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The placement hint (`prefer_ipv4`) of every setup request read so far,
@@ -368,8 +392,18 @@ impl TokenExit {
                 *prefer_ipv4,
                 session_tokens.first().copied(),
             ),
+            WarrenControlMessage::IpRequestV7Detailed {
+                session_tokens,
+                prefer_ipv4,
+                ..
+            } => (
+                SeenSetup::DetailedTokens(session_tokens.clone()),
+                *prefer_ipv4,
+                session_tokens.first().copied(),
+            ),
             other => panic!("expected a setup request, got {other:?}"),
         };
+        let detailed = matches!(seen, SeenSetup::DetailedTokens(_));
         self.seen.lock().expect("seen-setup lock").push(seen);
         self.placements
             .lock()
@@ -378,13 +412,33 @@ impl TokenExit {
         let Some(lead) = lead else {
             return TokenExitReply::Assign;
         };
-        if self
+        let refusal = |code: TokenRejectCode| {
+            if detailed {
+                TokenExitReply::TokenRejected(code)
+            } else {
+                TokenExitReply::Rejected
+            }
+        };
+        if detailed
+            && self
+                .predates_token_detail
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            TokenExitReply::Rejected
+        } else if self
             .held_elsewhere
             .lock()
             .expect("held-token lock")
             .contains(&lead)
         {
-            TokenExitReply::Rejected
+            refusal(TokenRejectCode::SerialInUse)
+        } else if self
+            .invalid
+            .lock()
+            .expect("invalid-token lock")
+            .contains(&lead)
+        {
+            refusal(TokenRejectCode::Unspecified)
         } else if self
             .exhausted_for
             .lock()
@@ -494,6 +548,9 @@ async fn serve_echo_connection(
         .expect("control present");
     let refusal = match tokens.map(|tokens| tokens.answer(&setup)) {
         Some(TokenExitReply::Rejected) => Some(WarrenControlMessage::Rejected),
+        Some(TokenExitReply::TokenRejected(code)) => Some(WarrenControlMessage::TokenRejected {
+            reason_code: code.code(),
+        }),
         Some(TokenExitReply::IpExhausted) => Some(WarrenControlMessage::IpExhausted),
         Some(TokenExitReply::Assign) => None,
         None => match setup {
