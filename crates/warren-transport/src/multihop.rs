@@ -230,6 +230,91 @@ impl MultihopError {
     }
 }
 
+/// Reads an opened setup reply the way `ClientSession::open_setup_reply` would:
+/// `Ok` for an `IpAssign` (the engine already decoded the assignment as a side
+/// effect), the matching [`SetupError`] for every refusal, and
+/// [`SetupError::UnexpectedReply`] for a message a client never receives. A
+/// refusal opens as cleanly as an assignment, which is why this is read at all.
+fn setup_reply_refusal(opened: &[u8]) -> Result<(), SetupError> {
+    match try_decode_control(opened) {
+        Ok(Some(WarrenControlMessage::IpAssign { .. })) => Ok(()),
+        Ok(Some(WarrenControlMessage::Rejected)) => Err(SetupError::Rejected),
+        // Kept distinct from `Rejected`: a suspended account must surface a
+        // suspension rather than a renew prompt. The product-defined reason
+        // code rides through untouched; the client maps it to a message.
+        Ok(Some(WarrenControlMessage::RejectedBanned { reason_code })) => {
+            Err(SetupError::Banned(reason_code))
+        }
+        // Kept distinct too: the account's other devices hold every slot,
+        // which a renew prompt would misname.
+        Ok(Some(WarrenControlMessage::RejectedDeviceLimit)) => Err(SetupError::DeviceLimit),
+        Ok(Some(WarrenControlMessage::IpExhausted)) => Err(SetupError::IpExhausted),
+        // Request-type frames (v6 or v7) are client-to-exit only; a client
+        // receiving one back is an unexpected reply. This client never asks for
+        // a route, so a route answer is unexpected too.
+        Ok(Some(
+            WarrenControlMessage::IpRequest { .. }
+            | WarrenControlMessage::IpRequestV7 { .. }
+            | WarrenControlMessage::ExitDraining { .. }
+            | WarrenControlMessage::IpRequestRoute { .. }
+            | WarrenControlMessage::RouteRejected { .. }
+            | WarrenControlMessage::RouteAnchorRequest { .. }
+            | WarrenControlMessage::RouteAnchorAck { .. }
+            | WarrenControlMessage::RouteEnded { .. },
+        ))
+        | Ok(None) => Err(SetupError::UnexpectedReply),
+        Err(e) => Err(SetupError::Control(e)),
+    }
+}
+
+#[cfg(test)]
+mod setup_reply_tests {
+    use super::*;
+    use warren_wire::control::encode_control;
+
+    #[test]
+    fn a_device_limit_refusal_is_its_own_fatal_setup_error() {
+        let reply = encode_control(&WarrenControlMessage::RejectedDeviceLimit).unwrap();
+
+        let refusal = setup_reply_refusal(&reply).expect_err("a refusal is not an assignment");
+
+        assert!(matches!(refusal, SetupError::DeviceLimit));
+        assert_eq!(
+            MultihopError::Setup(refusal).retryability(),
+            crate::Retryability::Fatal(crate::FatalCause::DeviceLimit),
+            "the SDK stops with the device limit, not an expired subscription"
+        );
+    }
+
+    #[test]
+    fn an_assignment_is_no_refusal_and_a_request_echoed_back_is_unexpected() {
+        let assign = encode_control(&WarrenControlMessage::IpAssign {
+            ipv4: [10, 66, 0, 2],
+            prefix_len: 24,
+            gateway_ipv4: [10, 66, 0, 1],
+            ipv6: None,
+            prefix_len_v6: 0,
+            gateway_ipv6: None,
+            daita_spec: None,
+        })
+        .unwrap();
+        let echoed = encode_control(&WarrenControlMessage::IpRequest {
+            prefer_ipv4: None,
+            client_pubkey: None,
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+        })
+        .unwrap();
+
+        assert!(setup_reply_refusal(&assign).is_ok());
+        assert!(matches!(
+            setup_reply_refusal(&echoed),
+            Err(SetupError::UnexpectedReply)
+        ));
+    }
+}
+
 #[cfg(test)]
 mod per_packet_tests {
     use super::*;
@@ -912,43 +997,8 @@ impl MultihopClientTunnel {
         // (`MultiHopClient::assignment`); read it back rather than
         // reconstructing it here (`IpAssignment` is `#[non_exhaustive]` outside
         // its defining crate, so this wrapper cannot build one itself).
-        let assignment = match try_decode_control(&opened) {
-            Ok(Some(WarrenControlMessage::IpAssign { .. })) => {
-                inner.assignment().ok_or(MultihopError::MissingAssignment)?
-            }
-            Ok(Some(WarrenControlMessage::Rejected)) => {
-                return Err(MultihopError::Setup(SetupError::Rejected));
-            }
-            // Kept distinct from `Rejected`: a suspended account must surface a
-            // suspension rather than a renew prompt, which is the whole reason
-            // the engine has a separate wire variant for it.
-            // The product-defined reason code rides through untouched, exactly as
-            // the engine's own setup path carries it: the deployer's control
-            // plane assigns its meaning and the client maps it to a message.
-            Ok(Some(WarrenControlMessage::RejectedBanned { reason_code })) => {
-                return Err(MultihopError::Setup(SetupError::Banned(reason_code)));
-            }
-            Ok(Some(WarrenControlMessage::IpExhausted)) => {
-                return Err(MultihopError::Setup(SetupError::IpExhausted));
-            }
-            Ok(Some(
-                WarrenControlMessage::IpRequest { .. }
-                | WarrenControlMessage::IpRequestV7 { .. }
-                | WarrenControlMessage::ExitDraining { .. }
-                | WarrenControlMessage::IpRequestRoute { .. }
-                | WarrenControlMessage::RouteRejected { .. }
-                | WarrenControlMessage::RouteAnchorRequest { .. }
-                | WarrenControlMessage::RouteAnchorAck { .. }
-                | WarrenControlMessage::RouteEnded { .. },
-            ))
-            | Ok(None) => {
-                // Request-type frames (v6 or v7) are client-to-exit only; a
-                // client receiving one back is an unexpected reply. This client
-                // never asks for a route, so a route answer is unexpected too.
-                return Err(MultihopError::Setup(SetupError::UnexpectedReply));
-            }
-            Err(e) => return Err(MultihopError::Setup(SetupError::Control(e))),
-        };
+        setup_reply_refusal(&opened).map_err(MultihopError::Setup)?;
+        let assignment = inner.assignment().ok_or(MultihopError::MissingAssignment)?;
 
         let session = MultihopSession {
             inner,
