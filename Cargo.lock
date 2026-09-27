@@ -3879,6 +3879,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
  "warren-daita",
  "warren-identity",
  "warren-multihop",

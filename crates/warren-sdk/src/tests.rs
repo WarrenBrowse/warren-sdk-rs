@@ -4121,6 +4121,51 @@ mod session_token_dials {
         assert!(tunnel.sink.session().admission().is_anonymous());
     }
 
+    async fn wait_until(what: &str, done: impl Fn() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while !done() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_ended_for_an_expired_lease_is_redialled_on_a_token_and_is_not_fatal() {
+        let (exit, seen) = exit().await;
+        seen.answer_lease_requests([Some(0)]);
+        let client = client(0x7d, minting(), SessionAdmission::default());
+        let cfg = warren_net::ProxyConfig {
+            socks5: "127.0.0.1:0".parse().unwrap(),
+            ..Default::default()
+        };
+        let handle = client
+            .start_proxy_supervised(&Circuit::SingleHop(exit.clone()), &cfg)
+            .await
+            .expect("supervised proxy binds");
+        wait_until("the lease refresh announcement", || {
+            seen.lease_requests() == [None]
+        })
+        .await;
+
+        seen.send_control(
+            warrenguard_multihop::WarrenControlMessage::LeaseRefreshAck { status: 6 },
+            Some(warrenguard_multihop::WARREN_MH_LEASE_EXPIRED),
+        );
+
+        wait_until("the redial", || seen.seen().len() == 2).await;
+        assert_eq!(leads(&seen).len(), 2, "the redial presents a token again");
+        wait_until("the redialled session", || {
+            handle.state() == ConnectionState::Connected
+        })
+        .await;
+        assert!(
+            handle.last_fatal().is_none(),
+            "an expired lease is not a rejection"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_client_whose_issuer_mints_nothing_dials_on_the_wallet() {
         let (exit, seen) = exit().await;

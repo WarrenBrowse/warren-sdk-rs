@@ -235,12 +235,35 @@ pub enum SeenSetup {
 
 /// The setup requests a [`spawn_token_multihop_exit`] exit read, and the
 /// tokens it treats as leased to a session elsewhere in the fleet.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TokenExit {
     seen: Arc<std::sync::Mutex<Vec<SeenSetup>>>,
     placements: Arc<std::sync::Mutex<Vec<Option<[u8; 4]>>>>,
     held_elsewhere: Arc<std::sync::Mutex<Vec<SessionToken>>>,
     exhausted_for: Arc<std::sync::Mutex<Vec<SessionToken>>>,
+    /// Every `LeaseRefresh` datagram read, in arrival order: the token it
+    /// carried, or `None` for the announcement.
+    lease_requests: Arc<std::sync::Mutex<Vec<Option<SessionToken>>>>,
+    /// Answers to the next lease refresh requests, one per request: a
+    /// `LeaseRefreshAck` status, or `None` to stay silent. Empty: silent.
+    lease_script: Arc<std::sync::Mutex<VecDeque<Option<u8>>>>,
+    /// A sealed control datagram for every admitted connection, optionally
+    /// followed by a close with the given application code.
+    downlink: tokio::sync::broadcast::Sender<(WarrenControlMessage, Option<u32>)>,
+}
+
+impl Default for TokenExit {
+    fn default() -> Self {
+        Self {
+            seen: Arc::default(),
+            placements: Arc::default(),
+            held_elsewhere: Arc::default(),
+            exhausted_for: Arc::default(),
+            lease_requests: Arc::default(),
+            lease_script: Arc::default(),
+            downlink: tokio::sync::broadcast::channel(16).0,
+        }
+    }
 }
 
 /// How a [`TokenExit`] answers one setup request.
@@ -281,6 +304,45 @@ impl TokenExit {
             .lock()
             .expect("exhausted-token lock")
             .push(token);
+    }
+
+    /// Every `LeaseRefresh` read so far, in arrival order: the token it
+    /// carried, or `None` for the capability announcement.
+    #[must_use]
+    pub fn lease_requests(&self) -> Vec<Option<SessionToken>> {
+        self.lease_requests
+            .lock()
+            .expect("lease-request lock")
+            .clone()
+    }
+
+    /// Answers the next lease refresh requests in order, one `statuses` item
+    /// per request: `Some(status)` sends a `LeaseRefreshAck` with it, `None`
+    /// stays silent. A request past the script is not answered.
+    pub fn answer_lease_requests(&self, statuses: impl IntoIterator<Item = Option<u8>>) {
+        self.lease_script
+            .lock()
+            .expect("lease-script lock")
+            .extend(statuses);
+    }
+
+    /// Sends `message`, sealed, to every admitted connection, and closes each
+    /// one right after with application code `close` when it is `Some`.
+    pub fn send_control(&self, message: WarrenControlMessage, close: Option<u32>) {
+        let _ = self.downlink.send((message, close));
+    }
+
+    /// Records a lease refresh request and picks its answer.
+    fn lease_answer(&self, session_token: Option<SessionToken>) -> Option<u8> {
+        self.lease_requests
+            .lock()
+            .expect("lease-request lock")
+            .push(session_token);
+        self.lease_script
+            .lock()
+            .expect("lease-script lock")
+            .pop_front()
+            .flatten()
     }
 
     /// Records `request` and picks the answer.
@@ -482,7 +544,33 @@ async fn serve_echo_connection(
     send.finish().expect("finish reply");
 
     let mut reverse_seq: u64 = 1;
-    while let Ok(dg) = conn.read_datagram().await {
+    let mut downlink = tokens.map(|tokens| tokens.downlink.subscribe());
+    loop {
+        let dg = tokio::select! {
+            dg = conn.read_datagram() => match dg {
+                Ok(dg) => dg,
+                Err(_) => break,
+            },
+            Some((message, close)) = next_downlink(downlink.as_mut()) => {
+                let plaintext = encode_control(&message).expect("encode downlink control");
+                let frame = exit_seal(
+                    &ctx,
+                    &exit_id,
+                    request.encapsulated_key,
+                    &plaintext,
+                    request.epoch,
+                    reverse_seq,
+                );
+                reverse_seq += 1;
+                let _ = conn.send_datagram(frame.encode().expect("encode downlink").into());
+                if let Some(code) = close {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    conn.close(quinn::VarInt::from_u32(code), &[]);
+                    return;
+                }
+                continue;
+            }
+        };
         if let Some(seen) = seen_addrs.as_ref() {
             let remote = conn.remote_address();
             let mut seen = seen.lock().expect("seen-address lock");
@@ -499,6 +587,25 @@ async fn serve_echo_connection(
         let Some(ip_packet) = exit_open(&ctx, &exit_id, &frame) else {
             continue;
         };
+        if let (Some(tokens), Ok(Some(WarrenControlMessage::LeaseRefresh { session_token }))) =
+            (tokens, try_decode_control(&ip_packet))
+        {
+            if let Some(status) = tokens.lease_answer(session_token.map(|token| *token)) {
+                let ack = encode_control(&WarrenControlMessage::LeaseRefreshAck { status })
+                    .expect("encode LeaseRefreshAck");
+                let frame = exit_seal(
+                    &ctx,
+                    &exit_id,
+                    request.encapsulated_key,
+                    &ack,
+                    frame.epoch,
+                    reverse_seq,
+                );
+                reverse_seq += 1;
+                let _ = conn.send_datagram(frame.encode().expect("encode ack").into());
+            }
+            continue;
+        }
         let echo = exit_seal(
             &ctx,
             &exit_id,
@@ -514,6 +621,17 @@ async fn serve_echo_connection(
         {
             break;
         }
+    }
+}
+
+/// The next downlink control message a test queued, or never when the exit
+/// has no downlink.
+async fn next_downlink(
+    rx: Option<&mut tokio::sync::broadcast::Receiver<(WarrenControlMessage, Option<u32>)>>,
+) -> Option<(WarrenControlMessage, Option<u32>)> {
+    match rx {
+        Some(rx) => rx.recv().await.ok(),
+        None => std::future::pending().await,
     }
 }
 

@@ -66,6 +66,7 @@ use warrenguard_transport::multihop::{
 pub use warrenguard_transport::multihop::{RebindError, RebindPolicy};
 
 use crate::client::{QuicDialError, dial_quic, dial_quic_webpki, effective_bind};
+use crate::lease_refresh::{LeaseRefresh, LeaseRefreshSchedule};
 use crate::session_tokens::{
     Admission, Admitted, NoSessionTokenCause, SessionAdmission, SessionTokenSource,
     is_token_refusal,
@@ -495,6 +496,9 @@ pub struct MultihopClientTunnel {
     /// The session this leg joins, presented verbatim instead of walking a
     /// stack. Set via [`Self::joining`].
     join: Option<Join>,
+    /// When a session admitted on a token sends its lease refresh requests.
+    /// Set via [`Self::with_lease_refresh_schedule`].
+    lease_schedule: LeaseRefreshSchedule,
 }
 
 /// What a bonded leg repeats of the session it joins.
@@ -524,6 +528,7 @@ impl MultihopClientTunnel {
             session_tokens: None,
             admission: SessionAdmission::default(),
             join: None,
+            lease_schedule: LeaseRefreshSchedule::PRODUCTION,
         }
     }
 
@@ -556,6 +561,20 @@ impl MultihopClientTunnel {
     #[must_use]
     pub fn with_session_admission(mut self, admission: SessionAdmission) -> Self {
         self.admission = admission;
+        self
+    }
+
+    /// Sends the lease refresh requests of a session admitted on a token on
+    /// `schedule` instead of [`LeaseRefreshSchedule::PRODUCTION`].
+    ///
+    /// Every session this tunnel admits on a token from its
+    /// [`Self::with_session_tokens`] source announces to the exit that it
+    /// refreshes its lease, and, when the exit reports the lease of a past
+    /// epoch, moves it onto a token of the current one. A session admitted on
+    /// the wallet holds no lease and never does.
+    #[must_use]
+    pub fn with_lease_refresh_schedule(mut self, schedule: LeaseRefreshSchedule) -> Self {
+        self.lease_schedule = schedule;
         self
     }
 
@@ -744,6 +763,14 @@ impl MultihopClientTunnel {
             exit_id,
             exit_addr,
         };
+        let session = self.connect_admitted(target).await?;
+        Ok(self.refreshing_lease(session))
+    }
+
+    /// The dial of [`Self::connect`]: a bonded leg repeats its session's
+    /// admission, an independent session walks its token stack and falls
+    /// back on the wallet where the policy allows it.
+    async fn connect_admitted(&self, target: Target) -> Result<MultihopSession, MultihopError> {
         if let Some(join) = &self.join {
             let placement = Some(join.address);
             return match &join.admission.0 {
@@ -780,6 +807,22 @@ impl MultihopClientTunnel {
             }
         }
         self.connect_on_wallet(&target, refused, placement).await
+    }
+
+    /// Starts the lease refresh of `session` when it was admitted on a token
+    /// this tunnel's source can follow with tokens of later epochs. A wallet
+    /// session holds no lease; a session with no source to draw from never
+    /// announces a refresh it could not make. Every bonded leg runs its own:
+    /// the exit asks one connection of the session, and the leg asked answers.
+    fn refreshing_lease(&self, mut session: MultihopSession) -> MultihopSession {
+        if let (true, Some(tokens)) = (session.admission.is_anonymous(), &self.session_tokens) {
+            session.lease = Some(LeaseRefresh::start(
+                Arc::downgrade(&session.inner),
+                Arc::clone(tokens),
+                self.lease_schedule,
+            ));
+        }
+        session
     }
 
     /// The wallet-signed dial, once the token walk admitted nothing (after
@@ -1004,13 +1047,14 @@ impl MultihopClientTunnel {
         let assignment = inner.assignment().ok_or(MultihopError::MissingAssignment)?;
 
         let session = MultihopSession {
-            inner,
+            inner: Arc::new(inner),
             conn,
             carrier,
             assignment,
             metrics: Arc::new(MultihopMetrics::new(0)),
             drain_tx: tokio::sync::watch::channel(None).0,
             admission: Admission::on_wallet(),
+            lease: None,
         };
         session.send_first_frame();
         Ok(session)
@@ -1290,10 +1334,12 @@ fn drain_advisory_from_plaintext(plaintext: &[u8]) -> Option<DrainAdvisory> {
 /// the datapath keeps sealing under `&self`. All of the wire protocol (HPKE
 /// seal/open, rekey/epoch, anti-replay) is delegated to the shared engine
 /// [`MultiHopClient`]; this type keeps only the SDK-specific per-session byte
-/// metrics, the drain-advisory watch, and the drop-and-retry resilience contract
-/// of [`Self::recv_packet`].
+/// metrics, the drain-advisory watch, the lease refresh of a session admitted
+/// on a token, and the drop-and-retry resilience contract of
+/// [`Self::recv_packet`].
 pub struct MultihopSession {
-    inner: MultiHopClient,
+    /// Shared with the lease refresh task, which holds it weakly.
+    inner: Arc<MultiHopClient>,
     // A cheap clone of the engine's connection (quinn::Connection is an Arc-backed
     // handle), for `Self::connection`'s `&self -> &Connection` borrow contract:
     // the engine only exposes to-be-cloned or higher-level accessors.
@@ -1311,6 +1357,9 @@ pub struct MultihopSession {
     /// What the exit admitted this session on; a token stays held until the
     /// session drops.
     admission: Admission,
+    /// The lease refresh of a session admitted on a token, ended with the
+    /// session.
+    lease: Option<LeaseRefresh>,
 }
 
 /// The dialed exit, as [`MultihopClientTunnel::connect`] received it.
@@ -1634,13 +1683,22 @@ impl MultihopSession {
                 Err(_) => continue,
             };
             match plaintext.first() {
-                // DAITA padding or a control message: not an IP packet.
-                Some(&DAITA_DUMMY_FIRST_BYTE) | Some(&CONTROL_FIRST_BYTE) => {
-                    // A DAITA dummy is discarded. A control frame on the data
-                    // plane is the ADR 36 maintenance-drain advisory (the
-                    // setup control exchange is already complete): surface it
-                    // on the drain watch so the upper layer can migrate off
-                    // the draining exit before its hard-close deadline.
+                // DAITA padding: not an IP packet, discarded.
+                Some(&DAITA_DUMMY_FIRST_BYTE) => continue,
+                // A control message on the data plane (the setup control
+                // exchange is already complete).
+                Some(&CONTROL_FIRST_BYTE) => {
+                    // The exit's answer to this session's lease refresh.
+                    if let Some(lease) = &self.lease
+                        && let Ok(Some(WarrenControlMessage::LeaseRefreshAck { status })) =
+                            try_decode_control(&plaintext)
+                    {
+                        lease.ack(status);
+                        continue;
+                    }
+                    // The ADR 36 maintenance-drain advisory: surface it on
+                    // the drain watch so the upper layer can migrate off the
+                    // draining exit before its hard-close deadline.
                     if let Some(adv) = drain_advisory_from_plaintext(&plaintext) {
                         // Dedupe: the exit re-emits the same advisory every few
                         // seconds until the deadline. Publish only on a real
@@ -1675,6 +1733,7 @@ impl MultihopSession {
     /// yields `Some(DrainAdvisory)`. An upper layer (the SDK supervisor / FFI
     /// host) reacts by migrating off the draining exit before its hard-close
     /// deadline (make-before-break).
+    #[must_use]
     pub fn watch_drain(&self) -> tokio::sync::watch::Receiver<Option<DrainAdvisory>> {
         self.drain_tx.subscribe()
     }
@@ -1746,7 +1805,7 @@ impl MultihopSession {
         )
         .expect("from_established_connection");
         Self {
-            inner,
+            inner: Arc::new(inner),
             conn,
             // The test constructor dials plain UDP QUIC, never the carrier.
             carrier: Carrier::Udp,
@@ -1754,6 +1813,7 @@ impl MultihopSession {
             metrics: Arc::new(MultihopMetrics::new(0)),
             drain_tx: tokio::sync::watch::channel(None).0,
             admission: Admission::on_wallet(),
+            lease: None,
         }
     }
 }
@@ -2373,6 +2433,24 @@ mod policy_tests {
         assert!(
             matches!(err.retryability(), Retryability::RetrySameTarget),
             "a close during setup must never reselect, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_session_the_exit_ended_for_an_expired_lease_redials_the_same_exit() {
+        // The exit ended a token session whose lease went stale: a token of
+        // the current epoch on the same exit resolves it, so it is neither a
+        // drain to move away from nor a refusal to stop on.
+        use warrenguard_transport::Retryability;
+        let err = MultihopError::ReadDatagram(quinn::ConnectionError::ApplicationClosed(
+            quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(warrenguard_multihop::WARREN_MH_LEASE_EXPIRED),
+                reason: bytes::Bytes::new(),
+            },
+        ));
+        assert!(
+            matches!(err.retryability(), Retryability::RetrySameTarget),
+            "an expired lease redials the same exit, got {err:?}"
         );
     }
 

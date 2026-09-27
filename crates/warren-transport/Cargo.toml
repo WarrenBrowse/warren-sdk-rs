@@ -57,6 +57,8 @@ quinn = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+# The lease refresh logs states and counts, never a token or a serial.
+tracing = { workspace = true }
 # rand_core 0.9 OsRng for the per-session HPKE ephemeral keypair (hpke 0.13
 # expects the 0.9 trait surface, matching warren-multihop).
 rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }

@@ -9,6 +9,7 @@
 
 pub mod client;
 pub mod daita_driver;
+mod lease_refresh;
 pub mod multihop;
 pub mod reconnect;
 pub mod session_tokens;
@@ -28,6 +29,7 @@ pub use warrenguard_pump::idle_cover::{
 // `with_transport_config` without depending on quinn directly. The type is
 // fork-agnostic: identical whether the workspace patches quinn or not.
 pub use daita_driver::{DaitaDriver, DaitaDriverHandle};
+pub use lease_refresh::LeaseRefreshSchedule;
 pub use multihop::{
     Carrier, DrainAdvisory, MultihopClientTunnel, MultihopError, MultihopMetrics,
     MultihopMetricsSnapshot, MultihopSession, PathQuality, RebindError, RebindPolicy, RekeyPolicy,
