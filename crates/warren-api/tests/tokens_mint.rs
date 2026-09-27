@@ -731,6 +731,41 @@ async fn every_client_of_a_wallet_is_served_the_batch_the_issuer_first_signed() 
 }
 
 #[tokio::test]
+async fn a_larger_quota_sends_the_smaller_batch_first_unchanged() {
+    // When the quota grows, warren-api completes an epoch slot held by a
+    // smaller batch only if the larger request starts with that batch, byte
+    // for byte. Every wallet held 3-token batches for its whole horizon when
+    // the device cap went to 5, so this is what spares those wallets an
+    // `already_issued` lockout: each slot derives from the wallet, the class,
+    // the epoch and its own index, never from the batch size.
+    let c = client(FakeIssuer::new(&[100]));
+    let small = c.token_keys().await.unwrap();
+    let mut large = small.clone();
+    large.quota_per_epoch = small.quota_per_epoch + 2;
+    let sent = |c: &WarrenApiClient<FakeIssuer>| {
+        let (_, req) = c.transport().last_issue.lock().unwrap().take().unwrap();
+        req.epochs[0].blinded.clone()
+    };
+
+    mint_tokens(&c, &small, &[100], &session_key())
+        .await
+        .unwrap();
+    let before = sent(&c);
+    let minted = mint_tokens(&c, &large, &[100], &session_key())
+        .await
+        .unwrap();
+    let after = sent(&c);
+
+    assert_eq!(after.len(), large.quota_per_epoch as usize);
+    assert_eq!(minted[0].tokens.len(), after.len());
+    assert_eq!(
+        after[..before.len()],
+        before[..],
+        "the smaller batch must lead the larger one unchanged"
+    );
+}
+
+#[tokio::test]
 async fn a_browser_proxy_key_mints_from_the_browser_proxy_issuer() {
     use std::sync::Arc;
 
