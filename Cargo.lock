@@ -3814,6 +3814,7 @@ dependencies = [
  "warrenguard-config",
  "warrenguard-killswitch-os",
  "warrenguard-route-split",
+ "zeroize",
 ]
 
 [[package]]

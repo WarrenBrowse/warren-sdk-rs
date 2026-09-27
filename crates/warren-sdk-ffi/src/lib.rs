@@ -224,6 +224,10 @@ pub struct WarrenWallet {
     /// the handle is built, so a client built from the handle presents
     /// anonymous tokens while the handle itself never keeps the seed.
     session_blinding: Option<BlindingKey>,
+    /// The wallet's port-entitlement blinding key, for the same reason: a
+    /// client built from the handle mints the batch every client of the
+    /// wallet derives, and is served it after a restart.
+    entitlement_blinding: Option<BlindingKey>,
     // Present only right after `generate`, so the host can read the phrase ONCE
     // for secure-store backup; `reveal_mnemonic_for_backup` takes it and it is
     // zeroized on drop. A wallet restored via `from_mnemonic` carries `None`
@@ -319,12 +323,16 @@ impl WarrenWallet {
 }
 
 impl WarrenWallet {
-    /// A handle over `identity` that keeps the session key and drops the seed.
+    /// A handle over `identity` that keeps the blinding keys and drops the
+    /// seed.
     fn holding(mut identity: WarrenIdentity, backup: Mutex<Option<Zeroizing<String>>>) -> Self {
-        let session_blinding = identity.take_seed().map(|seed| BlindingKey::session(&seed));
+        let seed = identity.take_seed();
         Self {
+            session_blinding: seed.as_ref().map(|seed| BlindingKey::session(seed)),
+            entitlement_blinding: seed
+                .as_ref()
+                .map(|seed| BlindingKey::port_entitlement(seed)),
             identity,
-            session_blinding,
             backup,
         }
     }
@@ -558,6 +566,7 @@ pub struct WarrenFfiClient {
 fn build_client_with_identity(
     identity: WarrenIdentity,
     session_blinding: Option<BlindingKey>,
+    entitlement_blinding: Option<BlindingKey>,
     api_base: String,
     server_pubkey_pin: String,
     options: FfiClientOptions,
@@ -568,6 +577,9 @@ fn build_client_with_identity(
         .server_pubkey_pin(server_pubkey_pin);
     if let Some(key) = session_blinding {
         builder = builder.session_blinding_key(key);
+    }
+    if let Some(key) = entitlement_blinding {
+        builder = builder.port_entitlement_blinding_key(key);
     }
     for root in options.multihop_root_pubkey_pins {
         builder = builder.multihop_root_pubkey_pin(root);
@@ -715,7 +727,7 @@ impl WarrenFfiClient {
     ) -> Result<Arc<Self>, FfiError> {
         let identity =
             WarrenIdentity::from_mnemonic(&mnemonic).map_err(|_| FfiError::InvalidMnemonic)?;
-        build_client_with_identity(identity, None, api_base, server_pubkey_pin, options)
+        build_client_with_identity(identity, None, None, api_base, server_pubkey_pin, options)
     }
 
     /// Builds a client from an opaque [`WarrenWallet`] handle instead of a raw
@@ -740,6 +752,7 @@ impl WarrenFfiClient {
         build_client_with_identity(
             identity,
             wallet.session_blinding.clone(),
+            wallet.entitlement_blinding.clone(),
             api_base,
             server_pubkey_pin,
             options,
@@ -1375,7 +1388,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_wallet_handle_keeps_its_session_key_and_never_its_seed() {
+    fn a_wallet_handle_keeps_its_blinding_keys_and_never_its_seed() {
         let (_, phrase) = WarrenIdentity::generate();
         for wallet in [
             WarrenWallet::generate(),
@@ -1384,6 +1397,11 @@ mod tests {
             let mut wallet = Arc::try_unwrap(wallet).expect("sole handle");
 
             assert!(wallet.session_blinding.is_some());
+            assert_eq!(
+                wallet.entitlement_blinding.as_ref().map(BlindingKey::class),
+                Some(warren_sdk::api::CredentialClass::PortEntitlement),
+                "a client built from the handle forwards on the wallet's batch"
+            );
             assert!(wallet.identity.take_seed().is_none());
         }
     }

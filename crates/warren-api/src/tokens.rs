@@ -11,9 +11,9 @@
 //! challenge context label all come from the self-describing directory, and
 //! the frozen challenge derivation itself lives in the engine
 //! (`TokenChallenge::for_epoch`). The only local inputs are the current time
-//! and the blinding material: derived from the wallet for the session and
-//! browser-proxy classes ([`BlindingKey`], so every client of a wallet sends
-//! the same batch and is served), drawn from the CSPRNG for port entitlements.
+//! and the blinding material, derived from the wallet for every class
+//! ([`BlindingKey`]), so every client of a wallet sends the same batch and is
+//! served.
 //!
 //! Anti-correlation guidance: mint on unlock or on a timer, never at
 //! connect time, so issuance timing does not mirror session timing.
@@ -23,7 +23,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::VerifyingKey;
-use rand010::{CryptoRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use warren_contract::pf_attribution::{AttributionTag, AttributionTagError, EntitlementEnvelope};
 use warrenguard_token::{
@@ -265,34 +264,12 @@ pub async fn mint_tokens<T: HttpTransport>(
     .await
 }
 
-/// [`mint_tokens`] for port entitlements, whose batches are drawn from `rng`:
-/// an entitlement is assigned to one forwarded port, and two clients holding
-/// the same batch would present one credential for two ports.
-///
-/// # Errors
-/// [`TokenClientError`]; see each variant.
-pub async fn mint_port_entitlements<T: HttpTransport, R: CryptoRng + ?Sized>(
-    client: &WarrenApiClient<T>,
-    directory: &TokenIssuerDirectory,
-    epochs: &[u64],
-    rng: &mut R,
-) -> Result<Vec<MintedEpoch>, TokenClientError> {
-    mint_batches(
-        CredentialClass::PortEntitlement,
-        client,
-        directory,
-        epochs,
-        |pk, challenge, _, _| Ok(pk.blind_token(&mut *rng, challenge)?),
-    )
-    .await
-}
-
 async fn mint_batches<T: HttpTransport>(
     class: CredentialClass,
     client: &WarrenApiClient<T>,
     directory: &TokenIssuerDirectory,
     epochs: &[u64],
-    mut blind: impl FnMut(
+    blind: impl Fn(
         &IssuerPublicKey,
         &TokenChallenge,
         u64,
@@ -399,7 +376,7 @@ pub struct TokenStore {
 }
 
 /// A token and, for a port entitlement, the tag minted beside it, stored as
-/// one entry so [`TokenStore::take_envelope`] pops the pair together. The
+/// one entry so [`TokenStore::envelope_at`] reads the pair together. The
 /// bare-token surfaces ([`TokenStore::take`], the snapshot) ignore the tag;
 /// `TokenManager` keeps a port-entitlement store off them.
 struct Stored {
@@ -453,20 +430,18 @@ impl TokenStore {
         self.pop(epoch).map(|entry| entry.token)
     }
 
-    /// Pops one entitlement for `epoch` together with its tag, as the envelope
-    /// the exit takes. An entry without a tag is discarded, never presented:
-    /// every exit refuses a bare entitlement.
-    pub(crate) fn take_envelope(&mut self, epoch: u64) -> Option<EntitlementEnvelope> {
-        while let Some(entry) = self.pop(epoch) {
-            if let Some(tag) = entry.tag {
-                let token = Zeroizing::new(entry.token.serialize());
-                return Some(
-                    EntitlementEnvelope::new(token.as_slice(), tag)
-                        .expect("a minted token has the envelope's token length"),
-                );
-            }
-        }
-        None
+    /// Entitlement `index` of `epoch`'s batch, in mint order, together with
+    /// its tag, as the envelope the exit takes. Left in the store. An entry
+    /// without a tag is never presented: every exit refuses a bare
+    /// entitlement.
+    pub(crate) fn envelope_at(&self, epoch: u64, index: usize) -> Option<EntitlementEnvelope> {
+        let entry = self.per_epoch.get(&epoch)?.get(index)?;
+        let tag = entry.tag.clone()?;
+        let token = Zeroizing::new(entry.token.serialize());
+        Some(
+            EntitlementEnvelope::new(token.as_slice(), tag)
+                .expect("a minted token has the envelope's token length"),
+        )
     }
 
     /// Tokens remaining for `epoch`.
@@ -628,7 +603,7 @@ struct ManagerState {
 /// downgrade; the per-epoch quota bounds concurrent sessions anyway).
 pub struct TokenManager<T> {
     client: Arc<WarrenApiClient<T>>,
-    blinding: Blinding,
+    blinding: BlindingKey,
     state: Arc<Mutex<ManagerState>>,
     /// When set, [`Self::refresh`] mints only `current..=current + horizon`
     /// instead of the whole published window. `None` keeps the full-window
@@ -683,14 +658,6 @@ impl std::fmt::Debug for SerialLease {
     }
 }
 
-/// Where a manager's batches draw their blinding material.
-enum Blinding {
-    /// From the wallet: every client of the wallet sends the same batch.
-    Derived(BlindingKey),
-    /// From the CSPRNG, for port entitlements only.
-    Random,
-}
-
 impl<T: HttpTransport> TokenManager<T> {
     /// Builds a manager over a wallet-signed API client for `key`'s class,
     /// minting the batches `key` derives. Empty until the first
@@ -698,20 +665,14 @@ impl<T: HttpTransport> TokenManager<T> {
     ///
     /// `key` must come from the same wallet as the client's identity: the
     /// issuer serves an account the batch it first signed for that account.
+    ///
+    /// A port-entitlement key gives the manager inside
+    /// [`PortEntitlementManager`]: it mints and counts its batch but vends
+    /// nothing through [`Self::take_current_stack`] or [`Self::session_stack`],
+    /// and never exports or restores a bundle. Those carry bare tokens, and
+    /// every exit refuses an entitlement without its tag.
     #[must_use]
-    pub fn new(client: Arc<WarrenApiClient<T>>, key: BlindingKey) -> Self {
-        Self::with_blinding(client, Blinding::Derived(key))
-    }
-
-    /// The manager inside [`PortEntitlementManager`]. It mints and counts its
-    /// batch but vends nothing through [`Self::take_current_stack`] and never
-    /// exports or restores a bundle: those carry bare tokens, and every exit
-    /// refuses an entitlement without its tag.
-    fn port_entitlements(client: Arc<WarrenApiClient<T>>) -> Self {
-        Self::with_blinding(client, Blinding::Random)
-    }
-
-    fn with_blinding(client: Arc<WarrenApiClient<T>>, blinding: Blinding) -> Self {
+    pub fn new(client: Arc<WarrenApiClient<T>>, blinding: BlindingKey) -> Self {
         Self {
             client,
             blinding,
@@ -750,10 +711,7 @@ impl<T: HttpTransport> TokenManager<T> {
     }
 
     fn class(&self) -> CredentialClass {
-        match &self.blinding {
-            Blinding::Derived(key) => key.class(),
-            Blinding::Random => CredentialClass::PortEntitlement,
-        }
+        self.blinding.class()
     }
 
     /// The epoch `now` falls in, once a refresh (or a restored bundle) has
@@ -829,31 +787,25 @@ impl<T: HttpTransport> TokenManager<T> {
         };
 
         for epoch in targets {
-            let minted = match &self.blinding {
-                Blinding::Derived(key) => {
-                    mint_tokens(&self.client, &directory, &[epoch], key).await
-                }
-                Blinding::Random => {
-                    // Seeded synchronously: the !Send thread rng never crosses
-                    // the await.
-                    let mut rng = rand010::rngs::StdRng::from_rng(&mut rand010::rng());
-                    mint_port_entitlements(&self.client, &directory, &[epoch], &mut rng).await
-                }
-            };
-            match minted {
+            match mint_tokens(&self.client, &directory, &[epoch], &self.blinding).await {
                 Ok(mut batches) => {
                     let mut st = self.state.lock().expect("token manager mutex poisoned");
-                    st.minted.insert(epoch);
-                    if let Some(batch) = batches.pop() {
+                    // Two overlapping refreshes are both served the batch the
+                    // wallet derives: stocking it twice would hold every
+                    // serial twice.
+                    if st.minted.insert(epoch)
+                        && let Some(batch) = batches.pop()
+                    {
                         st.store.insert(batch);
                     }
                 }
                 Err(TokenClientError::EpochRefused { reason, .. })
                     if reason.as_deref() == Some(REJECT_ALREADY_ISSUED) =>
                 {
-                    // The issuer's once-per-account-epoch ledger already holds
-                    // this account (a previous run minted the batch): re-asking
-                    // can never succeed, so settle the epoch and stop asking.
+                    // The issuer's once-per-account-epoch ledger holds another
+                    // batch for this account, one sent by a build that blinds
+                    // otherwise: re-asking can never succeed, so settle the
+                    // epoch and stop asking.
                     self.state
                         .lock()
                         .expect("token manager mutex poisoned")
@@ -983,15 +935,14 @@ impl<T: HttpTransport> TokenManager<T> {
         })
     }
 
-    /// Pops one port entitlement for the epoch `now` falls in, paired with
-    /// its attribution tag. Never mints.
-    fn take_current_envelope(&self, now_unix_secs: u64) -> Option<EntitlementEnvelope> {
-        let mut st = self.state.lock().expect("token manager mutex poisoned");
-        let epoch = st
-            .epoch_secs
-            .filter(|&s| s > 0)
-            .map(|s| now_unix_secs / s)?;
-        st.store.take_envelope(epoch)
+    /// Port entitlement `index` of `epoch`'s batch, paired with its
+    /// attribution tag. Never mints, never consumes.
+    fn envelope_at(&self, epoch: u64, index: usize) -> Option<EntitlementEnvelope> {
+        self.state
+            .lock()
+            .expect("token manager mutex poisoned")
+            .store
+            .envelope_at(epoch, index)
     }
 
     /// Loads a previously exported bundle ([`Self::export_persistable`]) back
@@ -1445,11 +1396,14 @@ mod port_entitlement_guard_tests {
     }
 
     fn entitlements() -> TokenManager<Offline> {
-        TokenManager::port_entitlements(Arc::new(WarrenApiClient::new(
-            "https://api.example.test",
-            WarrenIdentity::from_seed(&[0x51; 32]),
-            Offline,
-        )))
+        TokenManager::new(
+            Arc::new(WarrenApiClient::new(
+                "https://api.example.test",
+                WarrenIdentity::from_seed(&[0x51; 32]),
+                Offline,
+            )),
+            BlindingKey::port_entitlement(&[0x51; 32]),
+        )
     }
 
     fn stocked_entitlements() -> TokenManager<Offline> {
@@ -1514,9 +1468,20 @@ mod port_entitlement_guard_tests {
 /// entitlement needs on top is an ASSIGNMENT. The exit spends a credential the
 /// first time it sees it and renews the spend afterwards, so a rule that
 /// presented a different credential on each mapping refresh would spend the
-/// subscriber's whole batch on one port. Slot `n` therefore keeps its
-/// credential for the whole epoch, and moves to the next epoch's batch when
-/// the current one stops being spendable anywhere.
+/// subscriber's whole batch on one port. Slot `n` therefore keeps its place in
+/// the batch for as long as it lives, and presents the same place of the next
+/// epoch's batch when the current one stops being spendable anywhere.
+///
+/// The batch is derived from the wallet ([`BlindingKey::port_entitlement`]),
+/// so a restarted process, a reinstall and another device of the wallet are
+/// served the batch the account already holds instead of `already_issued`.
+/// Slot `n` takes place `n` when it is free, so a rule that keeps its slot
+/// number across a restart re-presents the entitlement the exit already spent
+/// for its port. Another device of the wallet holds the same batch and hands
+/// out the same places; the exit leases a serial to one port fleet-wide and
+/// refuses the second, and [`Self::mark_refused`] then moves the refused slot
+/// to a place no slot of this process holds. The cap stays the batch: five
+/// ports per subscriber, shared across its devices.
 ///
 /// What a slot presents is the [`EntitlementEnvelope`]: the entitlement and
 /// the attribution tag the issuer minted beside it, verified at mint time.
@@ -1527,21 +1492,85 @@ pub struct PortEntitlementManager<T> {
     assigned: Mutex<Assigned>,
 }
 
+/// Which place of the batch each slot presents.
 #[derive(Default)]
 struct Assigned {
-    /// The epoch `slots` was filled for. A credential verifies against its own
-    /// epoch's issuer key and no other, so the whole map is dead at a boundary.
+    /// The epoch `refused` was recorded in.
     epoch: Option<u64>,
-    slots: BTreeMap<usize, EntitlementEnvelope>,
+    /// Slot to place, until the slot is released. Kept across epochs: a slot
+    /// that moved away from a place another device holds would meet it again
+    /// at every epoch otherwise.
+    places: BTreeMap<usize, usize>,
+    /// Places an exit refused this epoch, left out of the next assignments.
+    refused: BTreeSet<usize>,
+}
+
+impl Assigned {
+    fn enter(&mut self, epoch: u64) {
+        if self.epoch != Some(epoch) {
+            self.epoch = Some(epoch);
+            self.refused.clear();
+        }
+    }
+
+    /// The place `slot` presents out of a batch of `stock`, or `None` while
+    /// the batch is empty (not minted yet; a held place is kept for it).
+    ///
+    /// The place the slot holds, when it lies inside the batch; else place
+    /// `slot` itself; else the lowest place no slot holds and no exit refused.
+    /// When every free place was refused, the refusals are forgotten and the
+    /// lowest free place is tried again: a refusal is often transient (a
+    /// serial held by this client's previous tunnel address until the exit
+    /// reaps it).
+    fn place_of(&mut self, slot: usize, stock: usize) -> Option<usize> {
+        if stock == 0 {
+            return None;
+        }
+        if let Some(&place) = self.places.get(&slot) {
+            if place < stock {
+                return Some(place);
+            }
+            self.places.remove(&slot);
+        }
+        let held: BTreeSet<usize> = self.places.values().copied().collect();
+        let untried = |p: &usize| !held.contains(p) && !self.refused.contains(p);
+        let place = match std::iter::once(slot)
+            .filter(|&p| p < stock)
+            .chain(0..stock)
+            .find(untried)
+        {
+            Some(place) => place,
+            None => {
+                let place = (0..stock).find(|p| !held.contains(p))?;
+                self.refused.clear();
+                place
+            }
+        };
+        self.places.insert(slot, place);
+        Some(place)
+    }
 }
 
 impl<T: HttpTransport> PortEntitlementManager<T> {
-    /// Builds a manager over a wallet-signed API client. Empty until the first
-    /// [`Self::refresh_auto`].
+    /// Builds a manager over a wallet-signed API client, minting the batches
+    /// `key` derives. Empty until the first [`Self::refresh_auto`].
+    ///
+    /// `key` must come from the same wallet as the client's identity: the
+    /// issuer serves an account the batch it first signed for that account.
+    ///
+    /// # Panics
+    /// When `key` is not a [`BlindingKey::port_entitlement`] key. Another
+    /// class's key would mint that class and present nothing, every forward
+    /// refused with nothing to say why.
     #[must_use]
-    pub fn new(client: Arc<WarrenApiClient<T>>) -> Self {
+    pub fn new(client: Arc<WarrenApiClient<T>>, key: BlindingKey) -> Self {
+        assert_eq!(
+            key.class(),
+            CredentialClass::PortEntitlement,
+            "a port-entitlement blinding key is required"
+        );
         Self {
-            inner: TokenManager::port_entitlements(client),
+            inner: TokenManager::new(client, key),
             assigned: Mutex::new(Assigned::default()),
         }
     }
@@ -1557,33 +1586,61 @@ impl<T: HttpTransport> PortEntitlementManager<T> {
         self.inner.refresh(now_unix_secs).await
     }
 
+    fn assigned(&self) -> std::sync::MutexGuard<'_, Assigned> {
+        self.assigned
+            .lock()
+            .expect("port entitlement manager mutex poisoned")
+    }
+
     /// The credential rule `slot` presents right now: the encoded
     /// [`EntitlementEnvelope`], or `None` when the subscriber has none left
     /// for this epoch.
     ///
     /// On `None` the rule's Map request goes out without a credential, which
-    /// the exit refuses. Handing out an already-assigned credential instead
-    /// would make two rules read as one port at the exit.
+    /// the exit refuses. Handing out a place another slot holds instead would
+    /// make two rules read as one port at the exit.
     #[must_use]
     pub fn credential_for_slot(&self, slot: usize, now_unix_secs: u64) -> Option<Vec<u8>> {
         let epoch = self.inner.epoch_at(now_unix_secs)?;
-        let mut assigned = self
-            .assigned
-            .lock()
-            .expect("port entitlement manager mutex poisoned");
-        if assigned.epoch != Some(epoch) {
-            assigned.epoch = Some(epoch);
-            assigned.slots.clear();
+        let stock = self.inner.available(epoch);
+        let place = {
+            let mut assigned = self.assigned();
+            assigned.enter(epoch);
+            assigned.place_of(slot, stock)?
+        };
+        Some(self.inner.envelope_at(epoch, place)?.encode().to_vec())
+    }
+
+    /// Records that an exit refused `presented`, the credential `slot` sent,
+    /// with the verdict of a request that carried one (NAT-PMP
+    /// `NotAuthorized`). When the slot still presents it, its next
+    /// [`Self::credential_for_slot`] presents a place of the batch no slot
+    /// holds and no exit refused this epoch. A refusal of anything else (a
+    /// request sent before an epoch boundary, or before the slot moved) is
+    /// left alone: the slot's present entitlement was never refused.
+    pub fn mark_refused(&self, slot: usize, presented: &[u8], now_unix_secs: u64) {
+        let Some(epoch) = self.inner.epoch_at(now_unix_secs) else {
+            return;
+        };
+        let mut assigned = self.assigned();
+        assigned.enter(epoch);
+        let Some(&place) = assigned.places.get(&slot) else {
+            return;
+        };
+        let still_presented = self
+            .inner
+            .envelope_at(epoch, place)
+            .is_some_and(|envelope| envelope.encode().as_slice() == presented);
+        if still_presented {
+            assigned.places.remove(&slot);
+            assigned.refused.insert(place);
         }
-        if let Some(held) = assigned.slots.get(&slot) {
-            return Some(held.encode().to_vec());
-        }
-        // Popping is what makes "one entitlement, one port" locally true: the
-        // credential leaves the store for good and no other slot can draw it.
-        let envelope = self.inner.take_current_envelope(now_unix_secs)?;
-        let credential = envelope.encode().to_vec();
-        assigned.slots.insert(slot, envelope);
-        Some(credential)
+    }
+
+    /// Frees `slot`'s place once no rule holds the slot, so a refused rule
+    /// can move to it. A released slot taken again starts from place `slot`.
+    pub fn release(&self, slot: usize) {
+        self.assigned().places.remove(&slot);
     }
 }
 
@@ -1630,7 +1687,7 @@ mod attribution_tests {
             attribution_tags: vec![tag],
         });
 
-        let envelope = store.take_envelope(epoch).expect("a paired entitlement");
+        let envelope = store.envelope_at(epoch, 0).expect("a paired entitlement");
 
         assert_eq!(
             envelope.encode().as_slice(),
@@ -1689,7 +1746,7 @@ mod attribution_tests {
     }
 
     #[test]
-    fn an_entitlement_stored_without_its_tag_is_skipped_never_presented() {
+    fn an_entitlement_stored_without_its_tag_is_never_presented() {
         let v = corpus();
         let token = Token::parse(&bytes(&v["envelope"]["token_hex"])).expect("vector token");
         let tag = AttributionTag::from_bytes(&bytes(&v["tag"]["tag_hex"])).expect("vector tag");
@@ -1698,21 +1755,53 @@ mod attribution_tests {
         store.insert(MintedEpoch {
             epoch,
             tokens: vec![token.clone()],
-            attribution_tags: vec![tag],
+            attribution_tags: Vec::new(),
         });
-        // Pushed last, so popped first.
         store.insert(MintedEpoch {
             epoch,
             tokens: vec![token],
-            attribution_tags: Vec::new(),
+            attribution_tags: vec![tag],
         });
 
-        let envelope = store.take_envelope(epoch).expect("the paired entry");
-
+        assert!(store.envelope_at(epoch, 0).is_none());
         assert_eq!(
-            envelope.encode().as_slice(),
+            store
+                .envelope_at(epoch, 1)
+                .expect("the paired entry")
+                .encode()
+                .as_slice(),
             bytes(&v["envelope"]["envelope_hex"]).as_slice()
         );
-        assert!(store.take_envelope(epoch).is_none());
+    }
+}
+
+#[cfg(test)]
+mod assigned_tests {
+    use super::Assigned;
+
+    #[test]
+    fn a_place_beyond_a_smaller_batch_is_given_up_for_one_inside_it() {
+        // A directory that lowers the batch between epochs: a place past it
+        // presents nothing, and a slot presenting nothing is never refused,
+        // so it would stay there for the life of the process.
+        let mut assigned = Assigned::default();
+        assigned.enter(100);
+        assert_eq!(assigned.place_of(4, 5), Some(4));
+        assigned.enter(101);
+
+        assert_eq!(assigned.place_of(4, 2), Some(0));
+    }
+
+    #[test]
+    fn a_batch_not_minted_yet_keeps_the_place_a_slot_moved_to() {
+        // Asked before the next epoch's batch lands, a slot that had moved
+        // away from another device's serial must not lose its place.
+        let mut assigned = Assigned::default();
+        assigned.enter(100);
+        assigned.places.insert(0, 3);
+        assigned.enter(101);
+
+        assert_eq!(assigned.place_of(0, 0), None);
+        assert_eq!(assigned.place_of(0, 5), Some(3));
     }
 }

@@ -134,6 +134,7 @@ pub struct WarrenClientBuilder {
     pub(crate) server_key_store: Option<Arc<dyn ServerKeyStore>>,
     pub(crate) session_admission: SessionAdmission,
     pub(crate) session_blinding_key: Option<warren_api::BlindingKey>,
+    pub(crate) port_entitlement_blinding_key: Option<warren_api::BlindingKey>,
 }
 
 impl WarrenClientBuilder {
@@ -306,6 +307,18 @@ impl WarrenClientBuilder {
         self
     }
 
+    /// Hands the client the wallet's port-entitlement blinding key
+    /// ([`BlindingKey::port_entitlement`](warren_api::BlindingKey::port_entitlement)),
+    /// for an identity built from a bare signing key. Without it, such a
+    /// client's forwards present no entitlement, and an exit enforcing
+    /// warren-core doc 105 refuses them. An identity built from a mnemonic or
+    /// a seed needs none.
+    #[must_use]
+    pub fn port_entitlement_blinding_key(mut self, key: warren_api::BlindingKey) -> Self {
+        self.port_entitlement_blinding_key = Some(key);
+        self
+    }
+
     /// Sets a [`ServerKeyStore`] to enable trust-on-first-use pinning of the
     /// signed-exit-list server key. A TOFU store is itself a valid pinning
     /// strategy, so setting it satisfies the build-time pin requirement.
@@ -324,8 +337,10 @@ impl WarrenClientBuilder {
     /// [`allow_any_server_key`](Self::allow_any_server_key) was set,
     /// [`BuildError::NotASessionBlindingKey`] if the key handed to
     /// [`session_blinding_key`](Self::session_blinding_key) mints another
-    /// class, or [`BuildError::TransportInit`] if the bundled HTTP transport
-    /// cannot initialize (a broken TLS backend).
+    /// class, [`BuildError::NotAPortEntitlementBlindingKey`] likewise for
+    /// [`port_entitlement_blinding_key`](Self::port_entitlement_blinding_key),
+    /// or [`BuildError::TransportInit`] if the bundled HTTP transport cannot
+    /// initialize (a broken TLS backend).
     #[cfg(feature = "reqwest-transport")]
     pub fn build(self) -> Result<WarrenClient<ReqwestTransport>, BuildError> {
         // Fallible construction (no panic across the FFI boundary): a broken TLS
@@ -340,10 +355,11 @@ impl WarrenClientBuilder {
     ///
     /// [`BuildError::MissingIdentity`] if no identity was set,
     /// [`BuildError::UnpinnedServerKey`] if neither a pin nor
-    /// [`allow_any_server_key`](Self::allow_any_server_key) was set, or
+    /// [`allow_any_server_key`](Self::allow_any_server_key) was set,
     /// [`BuildError::NotASessionBlindingKey`] if the key handed to
     /// [`session_blinding_key`](Self::session_blinding_key) mints another
-    /// class.
+    /// class, or [`BuildError::NotAPortEntitlementBlindingKey`] likewise for
+    /// [`port_entitlement_blinding_key`](Self::port_entitlement_blinding_key).
     pub fn build_with_transport<T: HttpTransport + 'static>(
         self,
         transport: T,
@@ -363,15 +379,31 @@ impl WarrenClientBuilder {
         let signing = identity.signing_key();
         // Taken here so the API client, which lives as long as the process
         // keeps this wallet's batches, never holds the seed.
-        let session_blinding = identity
-            .take_seed()
-            .map(|seed| warren_api::BlindingKey::session(&seed))
+        let seed = identity.take_seed();
+        let session_blinding = seed
+            .as_ref()
+            .map(|seed| warren_api::BlindingKey::session(seed))
             .or(self.session_blinding_key);
+        let entitlement_blinding = seed
+            .as_ref()
+            .map(|seed| warren_api::BlindingKey::port_entitlement(seed))
+            .or_else(|| self.port_entitlement_blinding_key.clone());
+        drop(seed);
         if session_blinding
             .as_ref()
             .is_some_and(|key| key.class() != warren_api::CredentialClass::Session)
         {
             return Err(BuildError::NotASessionBlindingKey);
+        }
+        // The handed key is checked even when the seed makes it unused: a
+        // caller wiring the wrong class would find out only on a seedless
+        // identity.
+        if self
+            .port_entitlement_blinding_key
+            .as_ref()
+            .is_some_and(|key| key.class() != warren_api::CredentialClass::PortEntitlement)
+        {
+            return Err(BuildError::NotAPortEntitlementBlindingKey);
         }
         let entitlements_key = format!("{}\n{}", self.api_base, identity.address());
         let api = Arc::new(WarrenApiClient::new_with_fallback(
@@ -383,8 +415,9 @@ impl WarrenClientBuilder {
         let session_tokens = session_blinding.map(|key| {
             crate::session_tokens::SessionTokens::for_wallet(entitlements_key.clone(), &api, key)
         });
-        let port_entitlements =
-            crate::entitlements::PortEntitlements::for_wallet(entitlements_key, &api);
+        let port_entitlements = entitlement_blinding.map(|key| {
+            crate::entitlements::PortEntitlements::for_wallet(entitlements_key, &api, key)
+        });
         Ok(WarrenClient {
             api,
             port_entitlements,
@@ -418,8 +451,9 @@ pub struct WarrenClient<T> {
     pub(crate) api: Arc<WarrenApiClient<T>>,
     /// The wallet's port entitlements, shared with every client of the same
     /// wallet and API in the process: every forward of every datapath this
-    /// client starts presents one (warren-core doc 105).
-    pub(crate) port_entitlements: crate::entitlements::PortEntitlements,
+    /// client starts presents one (warren-core doc 105). `None` for an
+    /// identity that carries no seed and was handed no entitlement key.
+    pub(crate) port_entitlements: Option<crate::entitlements::PortEntitlements>,
     /// The wallet key, the wallet's session tokens and the admission policy
     /// every tunnel of this client dials with.
     pub(crate) auth: crate::session_tokens::DialAuth,
@@ -473,6 +507,7 @@ impl WarrenClient<()> {
             server_key_store: None,
             session_admission: SessionAdmission::default(),
             session_blinding_key: None,
+            port_entitlement_blinding_key: None,
         }
     }
 }
@@ -1115,7 +1150,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         let (local_ip, prefix, gateway, ipv6) = addressing_from_session(sink.session());
         let mut handle = serve_proxy_over_sink(sink, local_ip, prefix, gateway, ipv6, cfg).await?;
         handle.metrics = Some(metrics);
-        handle.entitlements = Some(self.port_entitlements.clone());
+        handle.entitlements = self.port_entitlements.clone();
         Ok(handle)
     }
 
@@ -1184,7 +1219,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         let bond = warren_net::BondedPacketSink::new(sinks);
         let mut handle = serve_proxy_over_sink(bond, local_ip, prefix, gateway, ipv6, cfg).await?;
         handle.metrics = Some(metrics);
-        handle.entitlements = Some(self.port_entitlements.clone());
+        handle.entitlements = self.port_entitlements.clone();
         Ok(handle)
     }
 
@@ -1552,7 +1587,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                     device,
                     addressing_tx,
                     datapath_stats,
-                    Some(entitlements),
+                    entitlements,
                 ),
                 crate::supervisor::SupervisorOutputs {
                     state_tx,
@@ -1626,7 +1661,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             supervise_proxy(
                 listeners,
                 dns_server,
-                Some(entitlements),
+                entitlements,
                 crate::supervisor::SupervisorOutputs {
                     state_tx,
                     forwarder_tx,

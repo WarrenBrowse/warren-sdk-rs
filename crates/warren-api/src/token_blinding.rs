@@ -15,6 +15,18 @@
 //! unpredictable to the issuer and to the exit, which is where unlinkability
 //! lives.
 //!
+//! Every class derives under its own purpose, so the session, browser-proxy
+//! and port-entitlement batches of one wallet and epoch are unrelated: holding
+//! one class's tokens says nothing of another's. The same holds for port
+//! entitlements as for session tokens: the issuer signs blinded messages it
+//! cannot tell from random, so a spent entitlement is unlinkable to the
+//! issuance that bought it. What derivation adds is that every client of the
+//! wallet holds the same entitlements, so an exit or the API seeing one serial
+//! presented from two tunnel addresses learns that both belong to one
+//! subscriber, as it does for session tokens. The attribution tag beside each
+//! entitlement is minted afresh at every service, so two clients of the
+//! wallet present different tags for one entitlement.
+//!
 //! The derivation is frozen by `vectors/token_blinding_v1.json` and shared with
 //! the TypeScript SDK (`blindingKeyFromSeed`, `deterministicTokenRandom`). The
 //! number and order of the draws a slot makes are part of it.
@@ -42,6 +54,11 @@ pub const BLINDING_PURPOSE_SESSION: &str = "session/v1";
 /// The blinding purpose of the [`CredentialClass::BrowserProxy`] class, the
 /// label the browser extension derives with.
 pub const BLINDING_PURPOSE_BROWSER_PROXY: &str = "browser-proxy/v1";
+
+/// The blinding purpose of the [`CredentialClass::PortEntitlement`] class.
+/// Its own label, so the entitlement batch is unrelated to the session batch
+/// of the same wallet and epoch.
+pub const BLINDING_PURPOSE_PORT_ENTITLEMENT: &str = "port-entitlement/v1";
 
 /// The token nonce, the first draw of a slot.
 const NONCE_DRAW: usize = 32;
@@ -86,6 +103,16 @@ impl BlindingKey {
             seed,
             CredentialClass::BrowserProxy,
             BLINDING_PURPOSE_BROWSER_PROXY,
+        )
+    }
+
+    /// The [`CredentialClass::PortEntitlement`] key of the wallet `seed`.
+    #[must_use]
+    pub fn port_entitlement(seed: &[u8; 32]) -> Self {
+        Self::derive(
+            seed,
+            CredentialClass::PortEntitlement,
+            BLINDING_PURPOSE_PORT_ENTITLEMENT,
         )
     }
 
@@ -350,6 +377,28 @@ mod vector_tests {
 
             assert_eq!(key.key.as_slice(), bytes(&entry["key_hex"]), "{purpose}");
         }
+    }
+
+    #[test]
+    fn the_port_entitlement_class_derives_the_vector_blinding_key() {
+        // Its own file: the purpose set of token_blinding_v1.json is pinned
+        // exactly by its replays. Same wallet, salt and batch derivation.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../vectors/token_blinding_port_entitlement_v1.json"
+        );
+        let body = std::fs::read_to_string(path).expect("the vectors submodule is checked out");
+        let v: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(v["purpose"], BLINDING_PURPOSE_PORT_ENTITLEMENT);
+        assert_eq!(
+            v["salt_utf8"].as_str().map(str::as_bytes),
+            Some(BLINDING_SALT)
+        );
+
+        let key = BlindingKey::port_entitlement(&seed(&v));
+
+        assert_eq!(key.key.as_slice(), bytes(&v["key_hex"]));
+        assert_eq!(key.class(), CredentialClass::PortEntitlement);
     }
 
     #[test]

@@ -4209,6 +4209,49 @@ mod session_token_dials {
         ));
     }
 
+    #[test]
+    fn a_port_entitlement_key_of_another_class_is_refused_at_build() {
+        let result = WarrenClient::builder()
+            .identity(WarrenIdentity::from_signing_key(
+                warren_identity::derive_node_key(&[0x7b; 32]),
+            ))
+            .port_entitlement_blinding_key(warren_api::BlindingKey::session(&[0x7b; 32]))
+            .api_base("https://api.example.test")
+            .allow_any_server_key()
+            .build_with_transport(minting());
+
+        assert!(matches!(
+            result,
+            Err(crate::error::BuildError::NotAPortEntitlementBlindingKey)
+        ));
+    }
+
+    #[test]
+    fn a_client_of_a_bare_signing_key_forwards_on_the_entitlement_key_it_is_handed() {
+        // The FFI wallet handle keeps the derived keys, never the seed.
+        let build = |key: Option<warren_api::BlindingKey>| {
+            let mut builder = WarrenClient::builder()
+                .identity(WarrenIdentity::from_signing_key(
+                    warren_identity::derive_node_key(&[0x7c; 32]),
+                ))
+                .api_base("https://api.example.test")
+                .allow_any_server_key();
+            if let Some(key) = key {
+                builder = builder.port_entitlement_blinding_key(key);
+            }
+            builder.build_with_transport(minting()).expect("build")
+        };
+
+        let handed = build(Some(warren_api::BlindingKey::port_entitlement(&[0x7c; 32])));
+        let bare = build(None);
+
+        assert!(handed.port_entitlements.is_some());
+        assert!(
+            bare.port_entitlements.is_none(),
+            "no seed and no key: nothing to derive the wallet's batch from"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_client_built_from_a_signing_key_dials_on_the_wallet() {
         // No seed, no blinding key: nothing to mint the wallet's batch with.

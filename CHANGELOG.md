@@ -26,6 +26,39 @@ the pre-release `0.0.x` line.
 
 ### Added
 
+- Port-entitlement batches are derived from the wallet like the session
+  batches, under their own purpose (`BlindingKey::port_entitlement(seed)`,
+  `BLINDING_PURPOSE_PORT_ENTITLEMENT` = `port-entitlement/v1`, frozen by
+  `vectors/token_blinding_port_entitlement_v1.json`), instead of the CSPRNG.
+  The issuer re-serves an account's epoch batch to whoever sends it bit for
+  bit, with freshly minted attribution tags, so a restarted process, a
+  reinstall and a second device are served the entitlements the account
+  holds instead of `already_issued` for the rest of the 48 h prefetch
+  window, during which an exit refusing credential-less Map requests
+  (warren-core doc 105) refused every forward. Slot `n` takes place `n` of
+  the batch when it is free, so a rule that keeps its slot number across a
+  restart (warren-app numbers them) re-presents what the exit already spent
+  for its port. `PortEntitlementManager::mark_refused(slot, presented, now)`
+  records an exit's refusal of the credential a slot presented and moves the
+  slot to a place no slot holds and no exit refused this epoch: another
+  device of the wallet holds the same batch, and the exit leases a serial to
+  one port fleet-wide. A refusal of a credential the slot no longer presents
+  (sent before an epoch boundary) moves nothing. A slot keeps the place it
+  moved to across epochs until `PortEntitlementManager::release(slot)`,
+  which a rule's end calls; once every free place was refused, the slot
+  starts over. The cap stays five ports per subscriber, shared across its
+  devices. Two overlapping refreshes stock the re-served batch once. The
+  SDK's own forwards mark a refused entitlement and release their slot's
+  place, so a forward asked again presents another one.
+  Breaking: `PortEntitlementManager::new(client, key)` takes the key and
+  panics on another class's; `mint_port_entitlements` is gone
+  (`mint_tokens` with the port-entitlement key mints that class).
+  `WarrenClientBuilder::port_entitlement_blinding_key` hands the key to a
+  client built from a bare signing key
+  (`BuildError::NotAPortEntitlementBlindingKey` for another class, checked
+  even when the identity carries a seed); without a seed or that key, the
+  client's forwards present no entitlement. The FFI wallet handle keeps the
+  key beside the session one.
 - The session token directory's route admission block (warren-core doc 107
   section 10.2) is read on every refresh: `TokenManager::route_admission()`
   returns it validated as a `RouteAdmission` (the route KEM key checked as a

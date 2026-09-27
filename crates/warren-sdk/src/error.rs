@@ -159,4 +159,10 @@ pub enum BuildError {
     /// credentials no exit admits a tunnel on.
     #[error("the blinding key does not derive session tokens")]
     NotASessionBlindingKey,
+    /// The blinding key handed to
+    /// [`WarrenClientBuilder::port_entitlement_blinding_key`](crate::WarrenClientBuilder::port_entitlement_blinding_key)
+    /// derives another credential class than port entitlements: it would mint
+    /// credentials no exit forwards a port on.
+    #[error("the blinding key does not derive port entitlements")]
+    NotAPortEntitlementBlindingKey,
 }

@@ -20,6 +20,7 @@ warren-daita = { path = "../warren-daita" }
 # constants (gateway IP, pool prefix, initial MTU) the datapath addresses with,
 # so the SDK imports them rather than re-declaring drifting copies.
 warren-contract = { workspace = true }
+zeroize = { workspace = true }
 warrenguard-config = { workspace = true }
 # Privileged TUN device open for the experimental `start_tun_multihop` facade
 # (feature-gated; the default build pulls none of it and stays unsafe-free).

@@ -14,14 +14,15 @@
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use warren_api::{
-    BanReasonCode, ClientError, HttpTransport, PortEntitlementManager, TokenClientError,
+    BanReasonCode, BlindingKey, ClientError, HttpTransport, PortEntitlementManager,
+    TokenClientError,
 };
 use warren_net::{CredentialProvider, PortForwardError};
+use zeroize::Zeroizing;
 
 use crate::error::SdkError;
 
@@ -39,12 +40,22 @@ type RefreshFuture<'a> = Pin<Box<dyn Future<Output = Result<(), TokenClientError
 /// non-generic forwarders can carry it.
 trait EntitlementSource: Send + Sync {
     fn credential_for_slot(&self, slot: usize, now_unix_secs: u64) -> Option<Vec<u8>>;
+    fn mark_refused(&self, slot: usize, presented: &[u8], now_unix_secs: u64);
+    fn release(&self, slot: usize);
     fn refresh(&self, now_unix_secs: u64) -> RefreshFuture<'_>;
 }
 
 impl<T: HttpTransport + 'static> EntitlementSource for PortEntitlementManager<T> {
     fn credential_for_slot(&self, slot: usize, now_unix_secs: u64) -> Option<Vec<u8>> {
         PortEntitlementManager::credential_for_slot(self, slot, now_unix_secs)
+    }
+
+    fn mark_refused(&self, slot: usize, presented: &[u8], now_unix_secs: u64) {
+        PortEntitlementManager::mark_refused(self, slot, presented, now_unix_secs);
+    }
+
+    fn release(&self, slot: usize) {
+        PortEntitlementManager::release(self, slot);
     }
 
     fn refresh(&self, now_unix_secs: u64) -> RefreshFuture<'_> {
@@ -172,20 +183,22 @@ static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Inner>>>> = OnceLock::new();
 
 impl PortEntitlements {
     /// The entitlements of the wallet `api` signs for, against the API it
-    /// talks to: one batch per wallet and API, opened at the first slot claim
-    /// and kept for the life of the process from then on, as warren-app keeps
-    /// its managers.
+    /// talks to, minting the batches `key` (the wallet's
+    /// [`BlindingKey::port_entitlement`]) derives: one batch per wallet and
+    /// API, opened at the first slot claim and kept for the life of the
+    /// process from then on, as warren-app keeps its managers.
     ///
-    /// Kept rather than dropped with the last client because issuance is
-    /// once per account and epoch, across the whole prefetch window: a batch
-    /// dropped and reopened is answered `already_issued` for every epoch the
-    /// first one prefetched, and the wallet's forwards would be refused until
-    /// that window ran out. The cost is that a wallet which forwarded a port
-    /// keeps its API client, and so its signing key, in memory until the
-    /// process exits; its refresh stops once no rule holds a slot.
+    /// One batch per wallet and API because its slot table is what keeps two
+    /// clients of the wallet in this process off one entitlement: two batches
+    /// would hand both of them the same places. A wallet which forwarded a
+    /// port keeps its API client, and so its signing key, in memory until the
+    /// process exits; its refresh stops once no rule holds a slot. A batch
+    /// opened again after a restart is served again by the issuer, since the
+    /// wallet derives it.
     pub(crate) fn for_wallet<T: HttpTransport + 'static>(
         registry_key: String,
         api: &Arc<warren_api::WarrenApiClient<T>>,
+        key: BlindingKey,
     ) -> Self {
         let api = Arc::clone(api);
         Self {
@@ -197,7 +210,7 @@ impl PortEntitlements {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     Arc::clone(registry.entry(registry_key.clone()).or_insert_with(|| {
                         Inner::new(
-                            Arc::new(PortEntitlementManager::new(Arc::clone(&api))),
+                            Arc::new(PortEntitlementManager::new(Arc::clone(&api), key.clone())),
                             Arc::new(now_unix_secs),
                         )
                     }))
@@ -239,7 +252,7 @@ impl PortEntitlements {
         SlotLease {
             slot,
             owner,
-            presented: AtomicBool::new(false),
+            presented: Mutex::new(None),
         }
     }
 
@@ -272,13 +285,15 @@ fn next_issuance(state: Issuance, answer: &Result<(), TokenClientError>) -> Issu
     }
 }
 
-/// A rule's hold on one slot. Dropping it frees the slot.
+/// A rule's hold on one slot. Dropping it frees the slot and its place in
+/// the batch.
 pub(crate) struct SlotLease {
     slot: usize,
     owner: Arc<Inner>,
-    /// Whether the last credential asked for this slot existed, so a refusal
-    /// can tell "presented nothing" from "presented one the exit refused".
-    presented: AtomicBool,
+    /// The last credential asked for this slot, so a refusal can tell
+    /// "presented nothing" from "presented one the exit refused", and name the
+    /// one it refused.
+    presented: Mutex<Option<Zeroizing<Vec<u8>>>>,
 }
 
 impl SlotLease {
@@ -291,11 +306,22 @@ impl SlotLease {
                 .owner
                 .source
                 .credential_for_slot(lease.slot, (lease.owner.clock)());
-            lease
+            *lease
                 .presented
-                .store(credential.is_some(), Ordering::SeqCst);
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                credential.clone().map(Zeroizing::new);
             credential
         })
+    }
+}
+
+impl SlotLease {
+    fn presented(&self) -> Option<Zeroizing<Vec<u8>>> {
+        self.presented
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -306,6 +332,7 @@ impl Drop for SlotLease {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.slot);
+        self.owner.source.release(self.slot);
     }
 }
 
@@ -346,6 +373,11 @@ impl RuleSlot {
 /// no entitlement, or one the exit would not spend. When the issuer has
 /// answered that the wallet is banned, the ban is the reason and is what the
 /// caller sees; otherwise the refusal says whether anything was presented.
+///
+/// A refused entitlement also moves the rule's slot to another one of the
+/// batch ([`PortEntitlementManager::mark_refused`]): another device of the
+/// wallet may hold that serial for as long as its port lives, and the next
+/// attempt would meet it again.
 pub(crate) fn forward_error(
     err: PortForwardError,
     entitlements: Option<&PortEntitlements>,
@@ -360,8 +392,15 @@ pub(crate) fn forward_error(
             lapses_at_unix_secs: ban.lapses_at_unix_secs,
         });
     }
+    let presented = lease.and_then(|l| Some((l, l.presented()?)));
+    if let Some((lease, credential)) = &presented {
+        lease
+            .owner
+            .source
+            .mark_refused(lease.slot, credential, (lease.owner.clock)());
+    }
     SdkError::PortForwardRefused {
-        entitlement_presented: lease.is_some_and(|l| l.presented.load(Ordering::SeqCst)),
+        entitlement_presented: presented.is_some(),
     }
 }
 
@@ -373,7 +412,7 @@ mod tests {
     //! behind an authority that requires a credential.
 
     use std::net::{Ipv4Addr, SocketAddr};
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use bytes::Bytes;
     use tokio::net::UdpSocket;
@@ -451,7 +490,10 @@ mod tests {
         ));
         let clock = Arc::clone(clock);
         let entitlements = PortEntitlements::unregistered(
-            Arc::new(PortEntitlementManager::new(Arc::clone(&api))),
+            Arc::new(PortEntitlementManager::new(
+                Arc::clone(&api),
+                BlindingKey::port_entitlement(&[0x61; 32]),
+            )),
             Arc::new(move || clock.load(Ordering::SeqCst)),
         );
         (entitlements, api)
@@ -598,6 +640,54 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_forward_asked_again_presents_another_entitlement() {
+        // Another device of the wallet holds the same batch, and its first
+        // rule presents what this one's first rule presents: the exit leases
+        // that serial to one port. Retried on the same serial, this forward
+        // would be refused for as long as the other device's port lives.
+        let (entitlements, _api) =
+            wallet(FakeEntitlementIssuer::new(&[EPOCH], 5), &at_epoch(EPOCH));
+        let server = EngineNatPmp::spawn_granting(0).await;
+        let fwd = forwarder(&server, &entitlements);
+        let _ = fwd
+            .forward_port_with_suggested(MapProto::Tcp, 8080, 0)
+            .await
+            .expect_err("the exit refuses the entitlement");
+
+        let _ = fwd
+            .forward_port_with_suggested(MapProto::Tcp, 8080, 0)
+            .await
+            .expect_err("still refused by this exit");
+
+        let presented = server.presented();
+        assert_eq!(presented.len(), 2, "one request per attempt");
+        assert_ne!(presented[0], presented[1]);
+    }
+
+    #[tokio::test]
+    async fn a_rule_gone_leaves_its_entitlement_to_a_refused_one() {
+        // Held by a rule that is gone, the place would leave the refused rule
+        // only places further up the batch, or none at all once the others
+        // are held too.
+        let clock = at_epoch(EPOCH);
+        let now = clock.load(Ordering::SeqCst);
+        let (entitlements, _api) = wallet(FakeEntitlementIssuer::new(&[EPOCH], 5), &clock);
+        let (first, lease) = RuleSlot::default()
+            .provider(Some(&entitlements))
+            .await
+            .expect("slot");
+        let gone_rule = RuleSlot::default();
+        let (gone, _) = gone_rule.provider(Some(&entitlements)).await.expect("slot");
+        let freed = gone().expect("the second rule's entitlement");
+        drop((gone, gone_rule));
+        let refused = first().expect("the first rule's entitlement");
+
+        lease.owner.source.mark_refused(lease.slot, &refused, now);
+
+        assert_eq!(first(), Some(freed));
     }
 
     #[test]
@@ -782,13 +872,17 @@ mod tests {
         ))
     }
 
+    fn wallet_key() -> BlindingKey {
+        BlindingKey::port_entitlement(&[0x62; 32])
+    }
+
     #[tokio::test]
     async fn a_client_that_never_forwards_opens_no_batch() {
         // Nothing of the wallet outlives a client that never forwarded, and
         // no batch is taken from the wallet's other devices.
         let key = "never-forwards".to_owned();
         let api = api_for(FakeEntitlementIssuer::new(&[EPOCH], 5));
-        let entitlements = PortEntitlements::for_wallet(key.clone(), &api);
+        let entitlements = PortEntitlements::for_wallet(key.clone(), &api, wallet_key());
 
         assert!(!registered(&key), "opened before any forward");
         let _lease = entitlements.claim();
@@ -797,15 +891,19 @@ mod tests {
 
     #[tokio::test]
     async fn two_clients_of_one_wallet_share_one_batch() {
-        // A second manager for the wallet would be answered already_issued
-        // and hold nothing: every client of the wallet draws from one batch.
+        // Two batches of one wallet hold the same entitlements in the same
+        // places: two slot tables would hand both clients' first rules one.
         let key = "shared-wallet".to_owned();
         let first = PortEntitlements::for_wallet(
             key.clone(),
             &api_for(FakeEntitlementIssuer::new(&[EPOCH], 5)),
+            wallet_key(),
         );
-        let second =
-            PortEntitlements::for_wallet(key, &api_for(FakeEntitlementIssuer::new(&[EPOCH], 5)));
+        let second = PortEntitlements::for_wallet(
+            key,
+            &api_for(FakeEntitlementIssuer::new(&[EPOCH], 5)),
+            wallet_key(),
+        );
 
         let a = first.claim();
         let b = second.claim();
@@ -821,7 +919,7 @@ mod tests {
         let api = api_for(FakeEntitlementIssuer::new(&[EPOCH], 5));
         let clock = at_epoch(EPOCH);
         let entitlements = PortEntitlements::unregistered(
-            Arc::new(PortEntitlementManager::new(Arc::clone(&api))),
+            Arc::new(PortEntitlementManager::new(Arc::clone(&api), wallet_key())),
             Arc::new(move || clock.load(Ordering::SeqCst)),
         );
         let rule = RuleSlot::default();
@@ -862,7 +960,7 @@ mod tests {
         let api = api_for(FakeEntitlementIssuer::new(&[EPOCH], 5));
         let clock = at_epoch(EPOCH);
         let entitlements = PortEntitlements::unregistered(
-            Arc::new(PortEntitlementManager::new(Arc::clone(&api))),
+            Arc::new(PortEntitlementManager::new(Arc::clone(&api), wallet_key())),
             Arc::new(move || clock.load(Ordering::SeqCst)),
         );
         let rule = RuleSlot::default();

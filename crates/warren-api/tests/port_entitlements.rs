@@ -11,8 +11,8 @@
 //! refuses a bare token.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signer, SigningKey};
@@ -20,10 +20,9 @@ use rand010::SeedableRng;
 use rand010::rngs::StdRng;
 use warren_api::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_api::{
-    AttributionTag, BanReasonCode, ClientError, CredentialClass, EntitlementEnvelope,
+    AttributionTag, BanReasonCode, BlindingKey, ClientError, CredentialClass, EntitlementEnvelope,
     PortEntitlementManager, PubkeyHex, TokenClientError, TokenEpochResponse, TokenIssueRequest,
-    TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey, WarrenApiClient,
-    mint_port_entitlements,
+    TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey, WarrenApiClient, mint_tokens,
 };
 use warren_contract::pf_attribution::{
     CIPHERTEXT_LEN, ENVELOPE_LEN, NONCE_LEN, TAG_VERSION, signing_preimage,
@@ -70,6 +69,10 @@ fn tag_for(key: &SigningKey, epoch: u64, filler: u8) -> AttributionTag {
 /// Serves the ENTITLEMENT endpoints only. Answering `/v1/tokens/*` here would
 /// hide the bug this suite exists to catch: a client pointed at the session
 /// class mints against the wrong key and every exit refuses it.
+///
+/// It keeps warren-api's issuance ledger: the first batch sent for an epoch
+/// takes it, the SAME batch sent again is signed again with freshly minted
+/// tags, and any other batch is refused `already_issued`.
 struct FakeIssuer {
     keys: HashMap<u64, IssuerSecretKey>,
     attribution_key: SigningKey,
@@ -78,6 +81,8 @@ struct FakeIssuer {
     banned_body: Option<&'static str>,
     issue_calls: AtomicUsize,
     last_paths: Mutex<Vec<String>>,
+    /// The batch that took each epoch.
+    ledger: Mutex<HashMap<u64, Vec<String>>>,
 }
 
 impl FakeIssuer {
@@ -97,6 +102,7 @@ impl FakeIssuer {
             banned_body: None,
             issue_calls: AtomicUsize::new(0),
             last_paths: Mutex::new(Vec::new()),
+            ledger: Mutex::new(HashMap::new()),
         }
     }
 
@@ -144,7 +150,10 @@ impl FakeIssuer {
         }
     }
 
-    fn tags(&self, epoch: u64, count: usize) -> Vec<AttributionTag> {
+    /// `count` tags for `epoch`, their filler drawn from `call` so that a
+    /// re-served batch carries other tags than the first service, as warren-api
+    /// mints a fresh nonce per tag.
+    fn tags(&self, epoch: u64, count: usize, call: usize) -> Vec<AttributionTag> {
         let foreign = SigningKey::from_bytes(&[0x43; 32]);
         let (signer, tag_epoch, count) = match self.fault {
             TagFault::DropOne => (&self.attribution_key, epoch, count - 1),
@@ -153,13 +162,22 @@ impl FakeIssuer {
             _ => (&self.attribution_key, epoch, count),
         };
         (0..count)
-            .map(|i| tag_for(signer, tag_epoch, u8::try_from(i).unwrap()))
+            .map(|i| {
+                tag_for(
+                    signer,
+                    tag_epoch,
+                    u8::try_from((call * 16 + i) % 256).unwrap(),
+                )
+            })
             .collect()
     }
 }
 
 impl HttpTransport for FakeIssuer {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+        // A real transport suspends here, which is what lets two refreshes
+        // of one manager overlap.
+        tokio::task::yield_now().await;
         self.last_paths.lock().unwrap().push(request.url.clone());
         if request.url.ends_with("/v1/port-entitlements/keys") {
             return Ok(HttpResponse {
@@ -172,7 +190,7 @@ impl HttpTransport for FakeIssuer {
             "the client must never reach {} for an entitlement",
             request.url
         );
-        self.issue_calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.issue_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(body) = self.banned_body {
             return Ok(HttpResponse {
                 status: 403,
@@ -184,6 +202,23 @@ impl HttpTransport for FakeIssuer {
             .epochs
             .iter()
             .map(|e| {
+                let taken_by_another_batch = self
+                    .ledger
+                    .lock()
+                    .unwrap()
+                    .entry(e.epoch)
+                    .or_insert_with(|| e.blinded.clone())
+                    != &e.blinded;
+                if taken_by_another_batch {
+                    return TokenEpochResponse {
+                        epoch: e.epoch,
+                        issued: false,
+                        blind_signatures: Vec::new(),
+                        token_key_id: None,
+                        reject_reason: Some("already_issued".to_owned()),
+                        attribution_tags: Vec::new(),
+                    };
+                }
                 let sk = self.keys.get(&e.epoch).expect("key for requested epoch");
                 TokenEpochResponse {
                     epoch: e.epoch,
@@ -198,7 +233,7 @@ impl HttpTransport for FakeIssuer {
                         .collect(),
                     token_key_id: Some(sk.public_key().key_id().to_hex()),
                     reject_reason: None,
-                    attribution_tags: self.tags(e.epoch, e.blinded.len()),
+                    attribution_tags: self.tags(e.epoch, e.blinded.len(), call),
                 }
             })
             .collect();
@@ -209,27 +244,52 @@ impl HttpTransport for FakeIssuer {
     }
 }
 
+/// The wallet every client here signs as.
+const WALLET_SEED: [u8; 32] = [0x51; 32];
+
 fn client(issuer: FakeIssuer) -> WarrenApiClient<FakeIssuer> {
     WarrenApiClient::new(
         "https://api.example.test",
-        WarrenIdentity::from_seed(&[0x51; 32]),
+        WarrenIdentity::from_seed(&WALLET_SEED),
         issuer,
     )
 }
 
+fn entitlement_key() -> BlindingKey {
+    BlindingKey::port_entitlement(&WALLET_SEED)
+}
+
+fn manager_over(api: &Arc<WarrenApiClient<FakeIssuer>>) -> PortEntitlementManager<FakeIssuer> {
+    PortEntitlementManager::new(Arc::clone(api), entitlement_key())
+}
+
 fn manager(epochs: &[u64]) -> PortEntitlementManager<FakeIssuer> {
-    PortEntitlementManager::new(std::sync::Arc::new(client(FakeIssuer::new(epochs))))
+    manager_over(&Arc::new(client(FakeIssuer::new(epochs))))
 }
 
 /// Mints epoch 100 against an issuer answering with `fault`.
 async fn mint_with(fault: TagFault) -> (Result<usize, TokenClientError>, usize) {
     let api = client(FakeIssuer::with_fault(&[100], fault));
     let directory = api.transport().directory();
-    let mut rng = StdRng::seed_from_u64(7);
-    let minted = mint_port_entitlements(&api, &directory, &[100], &mut rng)
+    let minted = mint_tokens(&api, &directory, &[100], &entitlement_key())
         .await
         .map(|batches| batches.iter().map(|b| b.tokens.len()).sum());
     (minted, api.transport().issue_calls.load(Ordering::SeqCst))
+}
+
+/// The exit refuses what `slot` presents at `now`.
+fn refuse(m: &PortEntitlementManager<FakeIssuer>, slot: usize, now: u64) {
+    let presented = m.credential_for_slot(slot, now).expect("an entitlement");
+    m.mark_refused(slot, &presented, now);
+}
+
+/// The entitlement token slot `slot` presents at `now`, without its tag.
+fn token_at(m: &PortEntitlementManager<FakeIssuer>, slot: usize, now: u64) -> Vec<u8> {
+    let credential = m.credential_for_slot(slot, now).expect("an entitlement");
+    EntitlementEnvelope::parse(&credential)
+        .expect("an envelope")
+        .token()
+        .to_vec()
 }
 
 #[tokio::test]
@@ -240,7 +300,7 @@ async fn a_slot_presents_an_envelope_whose_token_and_tag_both_verify() {
     let issuer = FakeIssuer::new(&[100]);
     let token_key = issuer.keys[&100].public_key();
     let attribution_key = issuer.attribution_key.verifying_key();
-    let m = PortEntitlementManager::new(std::sync::Arc::new(client(issuer)));
+    let m = manager_over(&Arc::new(client(issuer)));
     m.refresh_auto(100 * EPOCH_SECS).await.unwrap();
 
     let credential = m.credential_for_slot(0, 100 * EPOCH_SECS).unwrap();
@@ -334,7 +394,7 @@ async fn an_attribution_key_that_is_not_an_ed25519_point_fails_before_the_epoch_
 async fn a_refresh_surfaces_a_directory_without_an_attribution_key() {
     // Swallowed, this reads as a refresh that went fine and stocked nothing,
     // and every rule's request then goes out bare and is refused.
-    let m = PortEntitlementManager::new(std::sync::Arc::new(client(FakeIssuer::with_fault(
+    let m = manager_over(&Arc::new(client(FakeIssuer::with_fault(
         &[100],
         TagFault::NoPublishedKey,
     ))));
@@ -352,7 +412,7 @@ async fn a_refresh_surfaces_a_directory_without_an_attribution_key() {
 
 #[tokio::test]
 async fn a_refresh_surfaces_a_batch_whose_tags_fail_the_checks() {
-    let m = PortEntitlementManager::new(std::sync::Arc::new(client(FakeIssuer::with_fault(
+    let m = manager_over(&Arc::new(client(FakeIssuer::with_fault(
         &[100],
         TagFault::DropOne,
     ))));
@@ -375,7 +435,7 @@ async fn a_refresh_surfaces_a_batch_whose_tags_fail_the_checks() {
 async fn a_banned_wallet_gets_a_typed_refusal_from_entitlement_issuance() {
     let mut issuer = FakeIssuer::new(&[100]);
     issuer.banned_body = Some(r#"{"error":"banned","reason_code":"other"}"#);
-    let m = PortEntitlementManager::new(std::sync::Arc::new(client(issuer)));
+    let m = manager_over(&Arc::new(client(issuer)));
 
     let err = m
         .refresh_auto(100 * EPOCH_SECS)
@@ -495,4 +555,172 @@ fn the_browser_proxy_class_names_its_own_endpoints() {
             other.issue_path()
         );
     }
+}
+
+// ---- the batch derived from the wallet (warren-core doc 99 section 4 ter) --
+
+const NOW: u64 = 100 * EPOCH_SECS + 5;
+
+#[tokio::test]
+async fn a_restarted_manager_is_served_the_batch_its_wallet_already_holds() {
+    // The issuer takes an account's epoch with the first batch it signs and
+    // re-serves only that batch. A batch the restarted process could not
+    // rebuild would be refused `already_issued`, and every forward refused
+    // until the whole prefetch window (48 h) had run out.
+    let api = Arc::new(client(FakeIssuer::new(&[100])));
+    let before = manager_over(&api);
+    before.refresh_auto(NOW).await.unwrap();
+    let mut held: Vec<Vec<u8>> = (0..QUOTA as usize)
+        .map(|s| token_at(&before, s, NOW))
+        .collect();
+    drop(before);
+
+    let restarted = manager_over(&api);
+    restarted.refresh_auto(NOW).await.unwrap();
+
+    let mut served: Vec<Vec<u8>> = (0..QUOTA as usize)
+        .map(|s| token_at(&restarted, s, NOW))
+        .collect();
+    held.sort_unstable();
+    served.sort_unstable();
+    assert_eq!(served, held, "the restart holds the account's entitlements");
+}
+
+#[tokio::test]
+async fn a_slot_presents_the_same_entitlement_in_every_manager_of_the_wallet() {
+    // A rule rebuilt by a restarted process re-presents what the exit already
+    // spent for its port, whatever order the rules come back in, so the exit
+    // renews that lease instead of spending a second entitlement.
+    let api = Arc::new(client(FakeIssuer::new(&[100])));
+    let first = manager_over(&api);
+    let second = manager_over(&api);
+    first.refresh_auto(NOW).await.unwrap();
+    second.refresh_auto(NOW).await.unwrap();
+    let in_first: Vec<Vec<u8>> = (0..QUOTA as usize)
+        .map(|s| token_at(&first, s, NOW))
+        .collect();
+
+    let mut in_second: Vec<Vec<u8>> = (0..QUOTA as usize)
+        .rev()
+        .map(|s| token_at(&second, s, NOW))
+        .collect();
+
+    in_second.reverse();
+    assert_eq!(in_second, in_first);
+}
+
+#[tokio::test]
+#[should_panic(expected = "port-entitlement blinding key")]
+async fn a_manager_refuses_a_key_of_another_class() {
+    // A session key would mint the session class and present nothing, every
+    // forward then refused with no error anywhere to explain it.
+    let api = Arc::new(client(FakeIssuer::new(&[100])));
+
+    let _ = PortEntitlementManager::new(api, BlindingKey::session(&WALLET_SEED));
+}
+
+#[tokio::test]
+async fn a_slot_the_exit_refused_moves_to_an_entitlement_no_other_slot_holds() {
+    // Another device of the wallet holds the same batch, so its first rule
+    // presents what this one's first rule presents, and the exit leases a
+    // serial to one port fleet-wide. The refused slot moves on rather than
+    // presenting the held serial again at every retry.
+    let m = manager(&[100]);
+    m.refresh_auto(NOW).await.unwrap();
+    let refused = token_at(&m, 0, NOW);
+    let other = token_at(&m, 1, NOW);
+
+    refuse(&m, 0, NOW);
+
+    let moved = token_at(&m, 0, NOW);
+    assert_ne!(moved, refused, "the slot presents the refused serial again");
+    assert_ne!(moved, other, "two slots now present one serial");
+    assert_eq!(token_at(&m, 0, NOW), moved, "the slot keeps its new one");
+}
+
+#[tokio::test]
+async fn a_slot_that_moved_keeps_its_place_in_the_next_epoch() {
+    // Back at the first place at every epoch, the slot would meet the other
+    // device's serial again and be refused once an hour.
+    let api = Arc::new(client(FakeIssuer::new(&[100, 101])));
+    let m = manager_over(&api);
+    m.refresh_auto(NOW).await.unwrap();
+    refuse(&m, 0, NOW);
+    let _ = token_at(&m, 0, NOW);
+    let reference = manager_over(&api);
+    reference.refresh_auto(NOW).await.unwrap();
+
+    let next = NOW + EPOCH_SECS;
+    assert_eq!(token_at(&m, 0, next), token_at(&reference, 1, next));
+}
+
+#[tokio::test]
+async fn once_every_free_entitlement_was_refused_the_slot_starts_over() {
+    // A refusal is often transient (the serial is held by this client's
+    // previous tunnel address until the exit reaps it), so a slot that ran
+    // out of untried entitlements tries them again rather than none.
+    let m = manager(&[100]);
+    m.refresh_auto(NOW).await.unwrap();
+    let first = token_at(&m, 0, NOW);
+    for _ in 0..QUOTA {
+        refuse(&m, 0, NOW);
+    }
+
+    assert_eq!(token_at(&m, 0, NOW), first);
+}
+
+#[tokio::test]
+async fn a_refusal_of_what_the_slot_no_longer_presents_moves_nothing() {
+    // The refusal of a request sent before an epoch boundary arrives after it:
+    // the slot's entitlement of the new epoch was never refused.
+    let m = manager(&[100, 101]);
+    m.refresh_auto(NOW).await.unwrap();
+    let old = m.credential_for_slot(0, NOW).expect("epoch 100");
+    let next = NOW + EPOCH_SECS;
+    let current = token_at(&m, 0, next);
+
+    m.mark_refused(0, &old, next);
+
+    assert_eq!(token_at(&m, 0, next), current);
+}
+
+#[tokio::test]
+async fn a_released_slot_leaves_its_place_to_a_refused_one() {
+    // Five rules lived, four are gone, and another device takes the first
+    // place. Held by the dead slots, the four free places would leave the
+    // live rule nothing to move to but the refused one.
+    let m = manager(&[100]);
+    m.refresh_auto(NOW).await.unwrap();
+    let places: Vec<Vec<u8>> = (0..QUOTA as usize).map(|s| token_at(&m, s, NOW)).collect();
+    for slot in 1..QUOTA as usize {
+        m.release(slot);
+    }
+
+    refuse(&m, 0, NOW);
+
+    assert_eq!(token_at(&m, 0, NOW), places[1]);
+}
+
+#[tokio::test]
+async fn two_overlapping_refreshes_stock_the_batch_once() {
+    // Both are served the same batch, since the wallet derives it. Stocked
+    // twice, the batch would hold every serial twice and two slots would
+    // present one.
+    let m = manager(&[100]);
+
+    let (a, b) = tokio::join!(m.refresh_auto(NOW), m.refresh_auto(NOW));
+
+    a.unwrap();
+    b.unwrap();
+    let presented: std::collections::HashSet<Vec<u8>> = (0..)
+        .map_while(|slot| m.credential_for_slot(slot, NOW))
+        .map(|credential| {
+            EntitlementEnvelope::parse(&credential)
+                .expect("an envelope")
+                .token()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(presented.len(), QUOTA as usize);
+    assert_eq!(m.credential_for_slot(QUOTA as usize, NOW), None);
 }

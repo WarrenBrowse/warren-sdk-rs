@@ -34,11 +34,12 @@ pub use dto::{
 };
 pub use route_admission::{RouteAdmission, RouteAdmissionError};
 pub use token_blinding::{
-    BLINDING_PURPOSE_BROWSER_PROXY, BLINDING_PURPOSE_SESSION, BLINDING_SALT, BlindingKey,
+    BLINDING_PURPOSE_BROWSER_PROXY, BLINDING_PURPOSE_PORT_ENTITLEMENT, BLINDING_PURPOSE_SESSION,
+    BLINDING_SALT, BlindingKey,
 };
 pub use tokens::{
     CredentialClass, MintedEpoch, PersistedTokens, PortEntitlementManager, SerialLease,
-    TokenClientError, TokenManager, TokenStore, current_epoch, mint_port_entitlements, mint_tokens,
+    TokenClientError, TokenManager, TokenStore, current_epoch, mint_tokens,
 };
 pub use transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 /// The port-forward attribution tag and the entitlement envelope a
