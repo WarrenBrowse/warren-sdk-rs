@@ -9,14 +9,19 @@
 //!   - whether the production exit runs a NAT-PMP gateway at all;
 //!   - if it does, that the full map exchange (request, retransmission, parse)
 //!     completes and yields an allocated external port;
-//!   - the INBOUND leg end to end: this host doubles as the external internet
-//!     peer by dialing the exit's public `ip:external_port` directly (a distinct
-//!     network path from the in-process tunnel client), and the payload must
-//!     round-trip through the tunnel to the local server.
+//!   - the INBOUND leg, as far as this host can test it: it dials the exit's
+//!     public `ip:external_port` directly and the payload must round-trip
+//!     through the tunnel to the local server.
+//!
+//! The self-dial only proves the inbound leg when it succeeds. An exit running
+//! the Port Fail guard (`WARREN_NATPMP_PORTFAIL_GUARD`) drops new connections
+//! from any connected subscriber's own public IP, re-synced every 15 s, so once
+//! this host's address enters that set every dial from it times out while the
+//! exit still forwards the port. A failed self-dial is therefore inconclusive:
+//! hold the mapping and dial it from a host with no session on that exit.
 //!
 //! A clean "gateway disabled / no reply" is reported as a non-fatal outcome, not
-//! a crash; if the grant succeeds but the inbound dial does not round-trip, that
-//! is reported too (the grant itself is still validated).
+//! a crash; the grant itself is validated either way.
 
 use std::net::SocketAddr;
 
@@ -126,9 +131,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if !relayed {
                 println!(
-                    "(Mapping was granted, but a direct dial to {inbound_target} did not \
-                     round-trip: the exit may not actually relay inbound forwarded ports, or the \
-                     port is filtered on the path. The grant itself is validated.)"
+                    "(Mapping was granted, but a direct dial to {inbound_target} from this host \
+                     did not round-trip. Inconclusive: an exit running the Port Fail guard drops \
+                     new connections from a connected subscriber's own public IP. Dial the port \
+                     from a host with no session on that exit. The grant itself is validated.)"
                 );
             }
 
