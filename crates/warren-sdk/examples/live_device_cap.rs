@@ -23,6 +23,15 @@
 //! directory than the quota. Each session is held only for the handshake and
 //! the next dial, then closed.
 //!
+//! `wallet`: holds `DEVICE_CAP_WALLET_SESSIONS` (default 6) wallet-signed
+//! sessions of the wallet at once, round-robin over the exits of the
+//! directory (or all on exit `DEVICE_CAP_EXIT`, an index into the directory),
+//! each presenting no token, so each is the v6 login with a session-fresh
+//! placement hint. With the fleet capping wallet sessions at five per
+//! account, the sixth is refused with the device limit, wherever it lands.
+//! Then it closes every held session and dials one more, which is admitted
+//! once the releases reached the API.
+//!
 //! Every line carries a unix timestamp. Nothing printed names a token, a
 //! serial or the wallet: the digests only let two runs be compared.
 
@@ -82,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match step.as_str() {
         "mint" => mint(&client, &seed).await,
         "admit" => admit(&client, &seed, &api_base, phrase.trim()).await,
+        "wallet" => wallet_sessions(&seed, &api_base, phrase.trim()).await,
         other => Err(format!("unknown DEVICE_CAP_STEP {other}").into()),
     }
 }
@@ -243,6 +253,113 @@ async fn admit(
 
 /// One tunnel admitted on `stack` only, dialed the way the SDK's own dials
 /// take a verified exit.
+async fn wallet_sessions(
+    seed: &[u8; 32],
+    api_base: &str,
+    phrase: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let count: usize = std::env::var("DEVICE_CAP_WALLET_SESSIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6);
+    let wallet = WarrenClient::builder()
+        .identity(WarrenIdentity::from_mnemonic(phrase)?)
+        .api_base(api_base.to_owned())
+        .server_pubkey_pin(warren_sdk::product::SERVER_PUBKEY_HEX)
+        .build()?;
+    let mut exits = wallet.fetch_multihop_directory().await?;
+    if let Some(i) = std::env::var("DEVICE_CAP_EXIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        let one = exits
+            .get(i)
+            .cloned()
+            .ok_or("DEVICE_CAP_EXIT is out of range")?;
+        exits = vec![one];
+    }
+    if exits.is_empty() {
+        return Err("the directory lists no exit".into());
+    }
+    println!(
+        "{} {count} wallet-signed session(s) over {} exit(s)",
+        now_unix_secs(),
+        exits.len()
+    );
+
+    let mut held = Vec::new();
+    for i in 0..count {
+        let exit = &exits[i % exits.len()];
+        match dial_wallet(seed, exit).await {
+            Ok(session) => {
+                println!(
+                    "{} wallet session {} ADMITTED on {} / {}",
+                    now_unix_secs(),
+                    i + 1,
+                    exit.country,
+                    exit.city
+                );
+                held.push(session);
+            }
+            Err(e) => println!(
+                "{} wallet session {} REFUSED on {} / {} ({e})",
+                now_unix_secs(),
+                i + 1,
+                exit.country,
+                exit.city
+            ),
+        }
+    }
+
+    for session in held {
+        session.connection().close(0u32.into(), b"");
+    }
+    println!("{} every held session closed", now_unix_secs());
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let exit = &exits[count % exits.len()];
+    match dial_wallet(seed, exit).await {
+        Ok(session) => {
+            session.connection().close(0u32.into(), b"");
+            println!(
+                "{} control: ADMITTED on {} / {} once the others closed",
+                now_unix_secs(),
+                exit.country,
+                exit.city
+            );
+        }
+        Err(e) => println!(
+            "{} control: refused on {} / {} ({e})",
+            now_unix_secs(),
+            exit.country,
+            exit.city
+        ),
+    }
+    Ok(())
+}
+
+/// One wallet-signed session: no token to present, so the default admission
+/// sends the v6 login, with the session-fresh placement hint every dial sends.
+async fn dial_wallet(
+    seed: &[u8; 32],
+    exit: &VerifiedExit,
+) -> Result<MultihopSession, Box<dyn std::error::Error>> {
+    let session = MultihopClientTunnel::new(WarrenIdentity::from_seed(seed).signing_key())
+        .with_cover_domain(exit.cover_domain.clone())
+        .with_tcp_fallback(exit.tcp_fallback)
+        .with_alt_endpoint(exit.endpoint_v6)
+        .with_exit_mlkem768(exit.exit_mlkem768_pubkey.clone())
+        .with_session_tokens(Arc::new(Stack(Vec::new())))
+        .with_session_admission(SessionAdmission::TokensOrWallet)
+        .connect(
+            exit.exit_ed25519_pubkey,
+            exit.exit_x25519_multihop_pubkey,
+            exit.exit_id,
+            exit.endpoint,
+        )
+        .await?;
+    Ok(session)
+}
+
 async fn dial(
     seed: &[u8; 32],
     exit: &VerifiedExit,
