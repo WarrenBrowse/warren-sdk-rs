@@ -557,7 +557,7 @@ fn the_browser_proxy_class_names_its_own_endpoints() {
     }
 }
 
-// ---- the batch derived from the wallet (warren-core doc 99 section 4 ter) --
+// ---- the batch derived from the wallet (warren-core doc 99 section 4 bis) --
 
 const NOW: u64 = 100 * EPOCH_SECS + 5;
 
