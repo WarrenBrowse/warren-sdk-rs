@@ -20,8 +20,13 @@
 //! so no session can fall back to the wallet-signed login), and finally
 //! dials one more exit with the whole batch, which every exit must refuse
 //! since each serial is leased elsewhere. Needs one more exit in the
-//! directory than the quota. Each session is held only for the handshake and
-//! the next dial, then closed.
+//! directory than the quota, or two exits with `DEVICE_CAP_HOLD_EXIT` (an
+//! index into the directory): every session is then held on that exit and the
+//! last dial goes to another one. An exit that tells the client why it refused
+//! a token ends that dial with "every token is in use by another session"
+//! (the device limit); an exit that predates it, with "every token was
+//! refused". Each session is held only for the handshake and the next dial,
+//! then closed.
 //!
 //! `wallet`: holds `DEVICE_CAP_WALLET_SESSIONS` (default 6) wallet-signed
 //! sessions of the wallet at once, round-robin over the exits of the
@@ -175,12 +180,33 @@ async fn admit(
         tokens.len(),
         exits.len()
     );
-    if exits.len() <= tokens.len() {
-        return Err("the directory needs one more exit than the batch has tokens".into());
-    }
+    let hold_on: Option<usize> = std::env::var("DEVICE_CAP_HOLD_EXIT")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let (holders, extra): (Vec<&VerifiedExit>, &VerifiedExit) = match hold_on {
+        Some(i) => {
+            let holder = exits.get(i).ok_or("DEVICE_CAP_HOLD_EXIT is out of range")?;
+            let other = exits
+                .iter()
+                .enumerate()
+                .find(|(j, _)| *j != i)
+                .map(|(_, e)| e)
+                .ok_or("the directory needs a second exit")?;
+            (vec![holder; tokens.len()], other)
+        }
+        None => {
+            if exits.len() <= tokens.len() {
+                return Err("the directory needs one more exit than the batch has tokens".into());
+            }
+            (
+                exits.iter().take(tokens.len()).collect(),
+                &exits[tokens.len()],
+            )
+        }
+    };
 
     let mut held = Vec::new();
-    for (i, (token, exit)) in tokens.iter().zip(&exits).enumerate() {
+    for (i, (token, exit)) in tokens.iter().zip(holders).enumerate() {
         match dial(seed, exit, vec![*token]).await {
             Ok(session) => {
                 println!(
@@ -202,7 +228,6 @@ async fn admit(
         }
     }
 
-    let extra = &exits[tokens.len()];
     match dial(seed, extra, tokens.clone()).await {
         Ok(session) => {
             session.connection().close(0u32.into(), b"");
