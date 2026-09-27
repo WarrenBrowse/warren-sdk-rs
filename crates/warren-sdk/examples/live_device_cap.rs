@@ -193,25 +193,51 @@ async fn admit(
     }
 
     let extra = &exits[tokens.len()];
-    let verdict = match dial(seed, extra, tokens.clone()).await {
+    match dial(seed, extra, tokens.clone()).await {
         Ok(session) => {
             session.connection().close(0u32.into(), b"");
-            "ADMITTED (the cap did not hold)"
+            println!(
+                "{} session {} ADMITTED on {} / {} with the whole batch: the cap did not hold",
+                now_unix_secs(),
+                tokens.len() + 1,
+                extra.country,
+                extra.city
+            );
         }
-        Err(_) => "REFUSED",
-    };
-    println!(
-        "{} session {} on {} / {} with the whole batch: {verdict}",
-        now_unix_secs(),
-        tokens.len() + 1,
-        extra.country,
-        extra.city
-    );
+        Err(e) => println!(
+            "{} session {} REFUSED on {} / {} with the whole batch ({e})",
+            now_unix_secs(),
+            tokens.len() + 1,
+            extra.country,
+            extra.city
+        ),
+    }
 
     for session in held {
         session.connection().close(0u32.into(), b"");
     }
     println!("{} every held session closed", now_unix_secs());
+
+    // Control: the same dial once the serials are free, so the refusal above
+    // reads as the cap and not as an exit that admits nobody.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    match dial(seed, extra, tokens).await {
+        Ok(session) => {
+            session.connection().close(0u32.into(), b"");
+            println!(
+                "{} control: ADMITTED on {} / {} once the others closed",
+                now_unix_secs(),
+                extra.country,
+                extra.city
+            );
+        }
+        Err(e) => println!(
+            "{} control: refused on {} / {} ({e})",
+            now_unix_secs(),
+            extra.country,
+            extra.city
+        ),
+    }
     Ok(())
 }
 
