@@ -81,6 +81,18 @@ name = "live_tun"
 required-features = ["experimental-tun"]
 
 [dev-dependencies]
+# The route admission probe (example `live_route_admission`) drives the engine
+# supervisors directly and runs its own HTTPS echo over the SDK netstack.
+warrenguard-transport = { workspace = true }
+warrenguard-multihop = { workspace = true }
+warrenguard-wire = { workspace = true }
+warrenguard-backoff = { workspace = true }
+warren-discovery-core = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+webpki-roots = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rand = { workspace = true }
 # `test-util` enables `start_paused` for the egress-probe scheduler tests.
 tokio = { workspace = true, features = ["test-util"] }
 ed25519-dalek = { workspace = true }
