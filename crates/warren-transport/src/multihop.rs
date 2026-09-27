@@ -251,7 +251,8 @@ fn setup_reply_refusal(opened: &[u8]) -> Result<(), SetupError> {
         Ok(Some(WarrenControlMessage::IpExhausted)) => Err(SetupError::IpExhausted),
         // Request-type frames (v6 or v7) are client-to-exit only; a client
         // receiving one back is an unexpected reply. This client never asks for
-        // a route, so a route answer is unexpected too.
+        // a route, so a route answer is unexpected too, and a lease refresh
+        // belongs to the live session's datagrams, never to its setup.
         Ok(Some(
             WarrenControlMessage::IpRequest { .. }
             | WarrenControlMessage::IpRequestV7 { .. }
@@ -260,7 +261,9 @@ fn setup_reply_refusal(opened: &[u8]) -> Result<(), SetupError> {
             | WarrenControlMessage::RouteRejected { .. }
             | WarrenControlMessage::RouteAnchorRequest { .. }
             | WarrenControlMessage::RouteAnchorAck { .. }
-            | WarrenControlMessage::RouteEnded { .. },
+            | WarrenControlMessage::RouteEnded { .. }
+            | WarrenControlMessage::LeaseRefresh { .. }
+            | WarrenControlMessage::LeaseRefreshAck { .. },
         ))
         | Ok(None) => Err(SetupError::UnexpectedReply),
         Err(e) => Err(SetupError::Control(e)),
