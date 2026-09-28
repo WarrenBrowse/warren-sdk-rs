@@ -585,6 +585,9 @@ struct ManagerState {
     /// (`already_issued`). Transient failures are deliberately NOT recorded so
     /// the next refresh tick retries them; a settled epoch is never re-asked.
     minted: BTreeSet<u64>,
+    /// The settled epochs the issuer refused as `already_issued`: another
+    /// batch of the account holds them, and this manager never will.
+    issued_elsewhere: BTreeSet<u64>,
     /// The route admission block of the last directory fetched, validated.
     /// `None` until then, and whenever the directory carries none or one this
     /// build cannot use.
@@ -680,6 +683,7 @@ impl<T: HttpTransport> TokenManager<T> {
                 store: TokenStore::new(),
                 epoch_secs: None,
                 minted: BTreeSet::new(),
+                issued_elsewhere: BTreeSet::new(),
                 route_admission: None,
             })),
             mint_horizon: None,
@@ -771,6 +775,7 @@ impl<T: HttpTransport> TokenManager<T> {
             let mut st = self.state.lock().expect("token manager mutex poisoned");
             st.store.prune_before(current);
             st.minted.retain(|&e| e >= current);
+            st.issued_elsewhere.retain(|&e| e >= current);
             st.epoch_secs = Some(directory.epoch_secs);
             st.route_admission = route_admission_of(
                 self.class(),
@@ -806,11 +811,9 @@ impl<T: HttpTransport> TokenManager<T> {
                     // batch for this account, one sent by a build that blinds
                     // otherwise: re-asking can never succeed, so settle the
                     // epoch and stop asking.
-                    self.state
-                        .lock()
-                        .expect("token manager mutex poisoned")
-                        .minted
-                        .insert(epoch);
+                    let mut st = self.state.lock().expect("token manager mutex poisoned");
+                    st.minted.insert(epoch);
+                    st.issued_elsewhere.insert(epoch);
                 }
                 // The failed epoch stays unsettled: a lifted ban mints at the
                 // next tick, and an epoch the issuer did record is settled
@@ -855,6 +858,20 @@ impl<T: HttpTransport> TokenManager<T> {
     pub fn route_admission_at(&self, now_unix_secs: u64) -> Option<RouteAdmission> {
         self.route_admission()
             .filter(|admission| now_unix_secs < admission.valid_until())
+    }
+
+    /// Whether the issuer refused `epoch` as `already_issued`: another batch
+    /// of the account holds it, such as one a device of the wallet on a
+    /// release that blinds otherwise sent first, so this manager will hold no
+    /// token of it. A caller waiting for the epoch's tokens stops waiting, and
+    /// can say why it has none.
+    #[must_use]
+    pub fn issued_to_another_batch(&self, epoch: u64) -> bool {
+        self.state
+            .lock()
+            .expect("token manager mutex poisoned")
+            .issued_elsewhere
+            .contains(&epoch)
     }
 
     /// Tokens currently available for `epoch` (test/observability).
@@ -1584,6 +1601,17 @@ impl<T: HttpTransport> PortEntitlementManager<T> {
     /// would refuse.
     pub async fn refresh_auto(&self, now_unix_secs: u64) -> Result<(), TokenClientError> {
         self.inner.refresh(now_unix_secs).await
+    }
+
+    /// Whether the issuer served the epoch `now_unix_secs` falls in to
+    /// another batch of the account ([`TokenManager::issued_to_another_batch`]):
+    /// every slot then presents nothing until that epoch ends, and the exit
+    /// refuses every forward.
+    #[must_use]
+    pub fn issued_to_another_batch(&self, now_unix_secs: u64) -> bool {
+        self.inner
+            .epoch_at(now_unix_secs)
+            .is_some_and(|epoch| self.inner.issued_to_another_batch(epoch))
     }
 
     fn assigned(&self) -> std::sync::MutexGuard<'_, Assigned> {

@@ -493,6 +493,40 @@ async fn a_definitive_already_issued_refusal_settles_the_epoch() {
     );
 }
 
+#[tokio::test]
+async fn an_epoch_refused_as_already_issued_reads_as_issued_to_another_batch() {
+    use std::sync::Arc;
+    use warren_api::TokenManager;
+
+    // Another client of the wallet, blinding otherwise (a release older than
+    // the wallet-derived batch), took epoch 100 first. A caller waiting for
+    // this epoch's tokens must learn that none will come.
+    let mut fake = FakeIssuer::new(&[100]);
+    fake.refuse.push(100);
+    fake.refuse_reason = "already_issued".to_owned();
+    let manager = TokenManager::new(Arc::new(client(fake)), session_key());
+    let now = 100 * EPOCH_SECS + 5;
+
+    manager.refresh(now).await.expect("refused refresh");
+
+    assert!(manager.issued_to_another_batch(100));
+}
+
+#[tokio::test]
+async fn an_epoch_refused_for_a_reason_that_can_heal_is_not_issued_to_another_batch() {
+    use std::sync::Arc;
+    use warren_api::TokenManager;
+
+    let mut fake = FakeIssuer::new(&[100]);
+    fake.refuse.push(100);
+    let manager = TokenManager::new(Arc::new(client(fake)), session_key());
+    let now = 100 * EPOCH_SECS + 5;
+
+    manager.refresh(now).await.expect("refused refresh");
+
+    assert!(!manager.issued_to_another_batch(100));
+}
+
 /// A well-formed serialized token for persistence-path tests: the codec never
 /// verifies, only the byte layout matters. `marker` distinguishes tokens.
 fn fake_token_bytes(marker: u8) -> [u8; warrenguard_token::TOKEN_LEN] {

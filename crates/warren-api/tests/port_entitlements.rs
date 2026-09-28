@@ -587,6 +587,23 @@ async fn a_restarted_manager_is_served_the_batch_its_wallet_already_holds() {
 }
 
 #[tokio::test]
+async fn a_batch_another_client_of_the_wallet_took_reads_as_issued_to_another_batch() {
+    // A device of the wallet on a release that blinds otherwise takes every
+    // epoch first: this manager is then refused `already_issued` and presents
+    // nothing, which its caller must be able to tell from an empty refresh.
+    let api = Arc::new(client(FakeIssuer::new(&[100])));
+    let older_device =
+        PortEntitlementManager::new(Arc::clone(&api), BlindingKey::port_entitlement(&[0x52; 32]));
+    older_device.refresh_auto(NOW).await.unwrap();
+    let this_device = manager_over(&api);
+
+    this_device.refresh_auto(NOW).await.unwrap();
+
+    assert!(this_device.issued_to_another_batch(NOW));
+    assert!(!older_device.issued_to_another_batch(NOW));
+}
+
+#[tokio::test]
 async fn a_slot_presents_the_same_entitlement_in_every_manager_of_the_wallet() {
     // A rule rebuilt by a restarted process re-presents what the exit already
     // spent for its port, whatever order the rules come back in, so the exit
