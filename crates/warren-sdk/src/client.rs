@@ -1281,7 +1281,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         self.spawn_supervised(
             listeners.clone(),
             dns_server,
-            move || {
+            move |attempt: crate::supervisor::ConnectAttempt| {
                 let auth = auth.clone();
                 let exit = exit.clone();
                 let transport_config = transport_config.clone();
@@ -1294,6 +1294,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                         wants_ipv6,
                         transport_config,
                         rtt_cache,
+                        attempt,
                     )
                     .await
                 }
@@ -1358,7 +1359,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         self.spawn_supervised(
             listeners,
             cfg.dns_server,
-            move || {
+            move |attempt: crate::supervisor::ConnectAttempt| {
                 let auth = auth.clone();
                 let exits = exits.clone();
                 let cursor = Arc::clone(&cursor);
@@ -1382,6 +1383,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                         wants_ipv6,
                         transport_config,
                         rtt_cache,
+                        attempt,
                     )
                     .await
                     {
@@ -1437,7 +1439,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         self.spawn_supervised_packet(
             device,
             cfg,
-            move || {
+            move |attempt: crate::supervisor::ConnectAttempt| {
                 let auth = auth.clone();
                 let exit = exit.clone();
                 let transport_config = transport_config.clone();
@@ -1451,6 +1453,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                         transport_config,
                         rtt_cache,
                         socket_bypass,
+                        attempt,
                     )
                     .await
                 }
@@ -1501,7 +1504,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         self.spawn_supervised_packet(
             device,
             cfg,
-            move || {
+            move |attempt: crate::supervisor::ConnectAttempt| {
                 let auth = auth.clone();
                 let exits = exits.clone();
                 let cursor = Arc::clone(&cursor);
@@ -1526,6 +1529,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                         transport_config,
                         rtt_cache,
                         socket_bypass,
+                        attempt,
                     )
                     .await
                     {
@@ -1563,7 +1567,7 @@ impl<T: HttpTransport> WarrenClient<T> {
     ) -> Result<SupervisedPacketHandle, SdkError>
     where
         D: warren_net::EpochPacketDevice,
-        F: FnMut() -> Fut + Send + 'static,
+        F: FnMut(crate::supervisor::ConnectAttempt) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<EstablishedTunnel<MultihopPacketSink>, SdkError>>
             + Send,
         DR: Fn() + Send + 'static,
@@ -1639,7 +1643,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         on_drain: D,
     ) -> Result<SupervisedProxyHandle, SdkError>
     where
-        F: FnMut() -> Fut + Send + 'static,
+        F: FnMut(crate::supervisor::ConnectAttempt) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<EstablishedTunnel<MultihopPacketSink>, SdkError>>
             + Send,
         D: Fn() + Send + 'static,
