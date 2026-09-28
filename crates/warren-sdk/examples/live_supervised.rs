@@ -10,6 +10,17 @@
 //! The drop-triggered automatic reconnect needs a forced mid-session tunnel drop
 //! (not reproducible here); the rebuild-from-fresh-IpAssign path it reuses is
 //! validated by `live_reconnect`.
+//!
+//! Optional environment, to watch a reconnect across an exit restart:
+//!
+//! - `WARREN_MNEMONIC_FILE`: read the 12 words from this file instead of
+//!   `WARREN_MNEMONIC` (a leading `~` is the home directory).
+//! - `WARREN_API_URL`: the API to use instead of the build's product API (the
+//!   staging API shares the pinned server key).
+//! - `SUPERVISED_EXIT`: country (or `country/city`) prefix of the exit to dial.
+//! - `SUPERVISED_HOLD_SECS`: after the egress proof, keep the proxy up this
+//!   long and print every connection state change with a unix timestamp in
+//!   milliseconds, so a reconnect can be timed against an exit's log.
 
 use std::net::SocketAddr;
 
@@ -23,14 +34,22 @@ const SERVER_PUBKEY_PIN: &str = "4c2c9253c426ae4db4cc88703f9ac802a020420c7fea647
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let phrase = std::env::var("WARREN_MNEMONIC")
-        .map_err(|_| "set WARREN_MNEMONIC to a subscribed account's 12 words")?;
+    let phrase = match std::env::var("WARREN_MNEMONIC_FILE") {
+        Ok(file) => std::fs::read_to_string(file.replacen('~', &std::env::var("HOME")?, 1))?,
+        Err(_) => std::env::var("WARREN_MNEMONIC").map_err(
+            |_| "set WARREN_MNEMONIC or WARREN_MNEMONIC_FILE to a subscribed account's 12 words",
+        )?,
+    };
     let identity = WarrenIdentity::from_mnemonic(phrase.trim())?;
-    println!("client identity: {}", identity.address());
+    drop(phrase);
+    let api_base = std::env::var("WARREN_API_URL").unwrap_or_else(|_| API_BASE.to_owned());
+    let wanted_exit = std::env::var("SUPERVISED_EXIT")
+        .unwrap_or_default()
+        .to_lowercase();
 
     let client = WarrenClient::builder()
         .identity(identity)
-        .api_base(API_BASE)
+        .api_base(&api_base)
         .server_pubkey_pin(SERVER_PUBKEY_PIN)
         .build()?;
 
@@ -43,6 +62,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .relays()
                 .iter()
                 .any(|r| r.endpoint_id() == e.exit_ed25519_pubkey)
+                && format!("{}/{}", e.country, e.city)
+                    .to_lowercase()
+                    .starts_with(&wanted_exit)
         })
         .ok_or("no cross-checked multihop exit")?;
     println!("exit: {} / {}  {}", exit.country, exit.city, exit.endpoint);
@@ -105,6 +127,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("SUPERVISED PROXY VALIDATED: stable address, reached Connected, egress confirmed.");
+    if let Some(hold) = std::env::var("SUPERVISED_HOLD_SECS")
+        .ok()
+        .and_then(|secs| secs.parse::<u64>().ok())
+    {
+        let watch = async {
+            loop {
+                if state_rx.changed().await.is_err() {
+                    return;
+                }
+                let state = *state_rx.borrow_and_update();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis());
+                println!("{now} state: {state:?}");
+            }
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(hold), watch).await;
+    }
     handle.shutdown();
     Ok(())
 }
