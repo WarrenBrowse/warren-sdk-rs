@@ -383,18 +383,27 @@ async fn a_proof_request_to_a_dead_port_is_an_io_error() {
 
 /// A client that connects and never authenticates is dropped once the
 /// handshake deadline passes, so silent connections cannot pile up.
+///
+/// The client arms no timer of its own. On the paused clock the server's
+/// handshake deadline is then the only timer, so time jumps to it and to
+/// nothing earlier; a client-side timeout raced the accept, which is real I/O
+/// the paused clock does not wait for, and fired first. A server that never
+/// closes is caught in real time, on a thread tokio does not know about.
 async fn assert_silent_client_is_dropped(addr: SocketAddr) {
     let mut client = TcpStream::connect(addr).await.unwrap();
     let mut got = Vec::new();
-    let closed = tokio::time::timeout(
-        warren_net::proxy::HANDSHAKE_TIMEOUT * 3,
-        client.read_to_end(&mut got),
-    )
-    .await;
-    assert!(
-        matches!(closed, Ok(Ok(0))),
-        "a silent client must be closed after the handshake deadline: {closed:?}"
-    );
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        let _ = bound_tx.send(());
+    });
+    tokio::select! {
+        closed = client.read_to_end(&mut got) => assert!(
+            matches!(closed, Ok(0)),
+            "a silent client must be closed after the handshake deadline: {closed:?}"
+        ),
+        _ = bound_rx => panic!("a silent client was still open 30 s later"),
+    }
 }
 
 #[tokio::test(start_paused = true)]
