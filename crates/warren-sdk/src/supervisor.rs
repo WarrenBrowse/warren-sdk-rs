@@ -1734,7 +1734,7 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
     on_drain: D,
 ) where
     S: warren_net::PacketSink + 'static,
-    F: FnMut(ConnectAttempt) -> Fut,
+    F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<EstablishedTunnel<S>, SdkError>>,
     D: Fn(),
 {
@@ -1749,14 +1749,6 @@ pub(crate) async fn supervise_proxy<S, F, Fut, D>(
         on_drain,
     )
     .await;
-}
-
-/// What the supervisor asks of one (re)connect it hands its `connect` closure.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ConnectAttempt {
-    /// How long the dial may run before it is abandoned for the next attempt:
-    /// set on the fast schedule that follows an exit restart, `None` otherwise.
-    pub(crate) dial_bound: Option<std::time::Duration>,
 }
 
 /// Supervises a datapath across tunnel rebuilds: it establishes a tunnel, runs
@@ -1774,7 +1766,7 @@ pub(crate) async fn supervise_datapath<S, P, F, Fut, D>(
 ) where
     S: warren_net::PacketSink + 'static,
     P: EpochDatapath<S>,
-    F: FnMut(ConnectAttempt) -> Fut,
+    F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<EstablishedTunnel<S>, SdkError>>,
     // Invoked once per drain advisory, BEFORE the proactive reconnect (ADR 36).
     // The failover datapath wires this to advance its rotation cursor so the
@@ -1792,9 +1784,6 @@ pub(crate) async fn supervise_datapath<S, P, F, Fut, D>(
     // wave) plus the healthy-vs-flapping session verdict, both single-homed in
     // `warren_transport::redial_policy`.
     let mut backoff = warren_transport::redial_policy::REDIAL_BACKOFF.forever();
-    // The fast schedule an exit's operational close starts: its attempts
-    // replace the backoff until one connects or its window is spent.
-    let mut operational: Option<warren_transport::redial_policy::OperationalRedial> = None;
     let mut first = true;
     // Bumped for every epoch, so a device that keeps state across reconnects can
     // tell this epoch's sink from the one it replaced. Starts at 1: generation
@@ -1813,26 +1802,7 @@ pub(crate) async fn supervise_datapath<S, P, F, Fut, D>(
             ConnectionState::Reconnecting
         });
         first = false;
-        let attempt = match operational
-            .as_mut()
-            .and_then(|schedule| schedule.next_attempt(std::time::Instant::now()))
-        {
-            Some(fast) => {
-                tokio::time::sleep_until(fast.start_at.into()).await;
-                ConnectAttempt {
-                    dial_bound: Some(fast.dial_bound),
-                }
-            }
-            None => {
-                // A fast schedule that just ran out hands over to the backoff,
-                // whose first draw stands for the attempt that failed last.
-                if operational.take().is_some() {
-                    tokio::time::sleep(backoff.next_delay()).await;
-                }
-                ConnectAttempt::default()
-            }
-        };
-        match connect(attempt).await {
+        match connect().await {
             Ok(est) => {
                 let gateway = est.gateway;
                 // ADR 36: grab the drain watch before the sink is moved into the
@@ -1851,14 +1821,6 @@ pub(crate) async fn supervise_datapath<S, P, F, Fut, D>(
                     .as_ref()
                     .map(Arc::downgrade)
                     .unwrap_or_default();
-                // What the fast-redial verdict needs of this epoch's session once
-                // it is gone: the datapath drops the session as soon as it stops
-                // serving, so the weak reference above no longer reaches its
-                // close. The handle is released with the verdict, before the
-                // next dial, so it holds nothing open past the epoch's end.
-                let mut epoch_connection = sink
-                    .multihop_session()
-                    .map(|session| (session.connection().clone(), session.is_over_carrier()));
                 generation += 1;
                 let addressing = warren_net::EpochAddressing {
                     epoch: warren_net::EpochId {
@@ -2064,29 +2026,6 @@ pub(crate) async fn supervise_datapath<S, P, F, Fut, D>(
                     .and_then(|s| s.connection().close_reason())
                     .as_ref()
                     .map(warren_transport::close_label);
-                // An exit that closed the session to restart is redialled on the
-                // fast schedule, so the client is back within a cadence of the
-                // new listener rather than a QUIC retransmission later.
-                operational = match (cause, epoch_connection.take()) {
-                    (EpochEndCause::SessionClosed, Some((connection, over_carrier))) => {
-                        connection.close_reason().and_then(|reason| {
-                            warren_transport::redial_policy::OperationalRedial::after_session(
-                                up_since.elapsed(),
-                                &reason,
-                                std::time::Instant::now(),
-                                connection.rtt(),
-                                over_carrier
-                                    .then(warrenguard_config::knobs::tcp_fallback_race_delay),
-                            )
-                        })
-                    }
-                    _ => None,
-                };
-                if operational.is_some() {
-                    tracing::info!(
-                        "exit closed the session to restart; redialling on the fast schedule"
-                    );
-                }
                 // Feed the carrier-first dial verdict: a UDP epoch that a
                 // watchdog killed within a minute of coming up is one
                 // post-handshake kill, and enough of them in a row make the
@@ -2158,18 +2097,13 @@ pub(crate) async fn supervise_datapath<S, P, F, Fut, D>(
                         // fault, but redialing THIS exit re-hits it: advance the
                         // failover cursor (no-op for a single pinned exit) so the
                         // next attempt reselects a different exit, then back off.
-                        // A refusal is no restart: the fast schedule ends here.
-                        operational = None;
                         on_drain();
                         tokio::time::sleep(backoff.next_delay()).await;
                     }
                     // RetrySameTarget, and any future verdict: a transient failure,
-                    // retry the same target after a backoff, or on the fast
-                    // schedule's next slot while it runs.
+                    // retry the same target after a backoff.
                     _ => {
-                        if operational.is_none() {
-                            tokio::time::sleep(backoff.next_delay()).await;
-                        }
+                        tokio::time::sleep(backoff.next_delay()).await;
                     }
                 }
             }
@@ -2218,7 +2152,6 @@ pub(crate) async fn establish_multihop(
     wants_ipv6: bool,
     transport_config: Option<std::sync::Arc<warren_transport::TransportConfig>>,
     rtt_cache: std::sync::Arc<std::sync::Mutex<warren_discovery::RttCache>>,
-    attempt: ConnectAttempt,
 ) -> Result<EstablishedTunnel<MultihopPacketSink>, SdkError> {
     // The userland proxy installs no OS tunnel, so its carrier socket has
     // nothing to escape from.
@@ -2230,7 +2163,6 @@ pub(crate) async fn establish_multihop(
         transport_config,
         rtt_cache,
         None,
-        attempt,
     )
     .await
 }
@@ -2240,7 +2172,6 @@ pub(crate) async fn establish_multihop(
 /// gateway whose peers route everything into it): the QUIC socket is marked or
 /// bound to the physical link BEFORE its first send, so the tunnel cannot
 /// swallow its own carrier.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn establish_multihop_with_bypass(
     auth: crate::session_tokens::DialAuth,
     exit: &VerifiedExit,
@@ -2249,7 +2180,6 @@ pub(crate) async fn establish_multihop_with_bypass(
     transport_config: Option<std::sync::Arc<warren_transport::TransportConfig>>,
     rtt_cache: std::sync::Arc<std::sync::Mutex<warren_discovery::RttCache>>,
     socket_bypass: Option<warren_transport::SocketBypass>,
-    attempt: ConnectAttempt,
 ) -> Result<EstablishedTunnel<MultihopPacketSink>, SdkError> {
     let tunnel = multihop_dial(
         auth.tunnel().await,
@@ -2258,8 +2188,7 @@ pub(crate) async fn establish_multihop_with_bypass(
         wants_ipv6,
         transport_config,
         socket_bypass,
-    )
-    .with_dial_bound(attempt.dial_bound);
+    );
     connect_established(tunnel, exit, rtt_cache).await
 }
 

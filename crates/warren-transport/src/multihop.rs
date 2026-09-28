@@ -163,11 +163,6 @@ pub enum MultihopError {
     /// [`SessionAdmission::TokensOnly`]). Carries no token material.
     #[error("no usable session token: {0}")]
     NoSessionToken(NoSessionTokenCause),
-    /// The dial did not complete its handshake within the bound set with
-    /// [`MultihopClientTunnel::with_dial_bound`], and was abandoned before any
-    /// setup was sent.
-    #[error("dial abandoned: no handshake within its bound")]
-    DialBoundElapsed,
 }
 
 impl From<QuicDialError> for MultihopError {
@@ -482,9 +477,6 @@ pub struct MultihopClientTunnel {
     /// ServerIP fix). `None` (default) for the userland proxy (no OS tunnel) and
     /// mobile (`VpnService.protect`). Set via [`Self::with_socket_bypass`].
     socket_bypass: Option<SocketBypass>,
-    /// How long a dial may run before it is abandoned, `None` for no bound
-    /// beyond the handshake's own. Set via [`Self::with_dial_bound`].
-    dial_bound: Option<Duration>,
     /// The dialed hop's address on the OTHER family, when the directory
     /// published one. A network that hands out no IPv4 can reach the hop only
     /// here, and the choice between the two is made by
@@ -545,7 +537,6 @@ impl MultihopClientTunnel {
             cover_domain: None,
             tcp_fallback: false,
             socket_bypass: None,
-            dial_bound: None,
             alt_endpoint: None,
             daita_support: false,
             #[cfg(feature = "pq-hpke")]
@@ -740,16 +731,6 @@ impl MultihopClientTunnel {
     #[must_use]
     pub fn with_socket_bypass(mut self, bypass: SocketBypass) -> Self {
         self.socket_bypass = Some(bypass);
-        self
-    }
-
-    /// Abandons a dial whose handshake has not completed within `bound`, with
-    /// [`MultihopError::DialBoundElapsed`]; `None` leaves the dial to its own
-    /// deadlines. Only the dial is bounded: once the handshake completes, the
-    /// setup runs to its own end, so a token it presents is never cut off.
-    #[must_use]
-    pub fn with_dial_bound(mut self, bound: Option<Duration>) -> Self {
-        self.dial_bound = bound;
         self
     }
 
@@ -963,80 +944,68 @@ impl MultihopClientTunnel {
         )
         .ok_or(MultihopError::NoRouteToHop)?;
         let bind = effective_bind(self.bind_local_ip, self.auto_local_ip, exit_addr);
-        let dial = async {
-            Ok::<_, MultihopError>(if let Some(ref domain) = self.cover_domain {
-                if self.tcp_fallback {
-                    // Carrier armed (roster v10): race the UDP/QUIC handshake against
-                    // the cover-domain TLS-over-TCP carrier on the entry's :443/tcp, so
-                    // a UDP-blocked network still connects. Both legs use the WebPKI
-                    // cover posture; the relay identity is proven in-band below exactly
-                    // as the plain webpki dial. The policy gate folds the armed signal
-                    // (opt-in + advertised, decided by the caller) with the cover domain
-                    // we are already inside; a disabled policy would make the fallback
-                    // dial the plain `dial_quic_webpki` verbatim.
-                    let policy = crate::tcp_fallback::resolve_fallback_policy(
-                        self.tcp_fallback,
-                        self.tcp_fallback,
-                        Some(domain),
-                    );
-                    let cover = policy
-                        .tcp_fallback_enabled
-                        .then(|| -> Result<_, MultihopError> {
-                            Ok(crate::tcp_fallback::CoverTls {
-                                addr: SocketAddr::new(
-                                    exit_addr.ip(),
-                                    crate::tcp_fallback::COVER_TCP_PORT,
-                                ),
-                                domain,
-                                client_config: crate::client::cover_tls_client_config()
-                                    .map_err(MultihopError::Tls)?,
-                            })
+        let (endpoint, conn, carrier) = if let Some(ref domain) = self.cover_domain {
+            if self.tcp_fallback {
+                // Carrier armed (roster v10): race the UDP/QUIC handshake against
+                // the cover-domain TLS-over-TCP carrier on the entry's :443/tcp, so
+                // a UDP-blocked network still connects. Both legs use the WebPKI
+                // cover posture; the relay identity is proven in-band below exactly
+                // as the plain webpki dial. The policy gate folds the armed signal
+                // (opt-in + advertised, decided by the caller) with the cover domain
+                // we are already inside; a disabled policy would make the fallback
+                // dial the plain `dial_quic_webpki` verbatim.
+                let policy = crate::tcp_fallback::resolve_fallback_policy(
+                    self.tcp_fallback,
+                    self.tcp_fallback,
+                    Some(domain),
+                );
+                let cover = policy
+                    .tcp_fallback_enabled
+                    .then(|| -> Result<_, MultihopError> {
+                        Ok(crate::tcp_fallback::CoverTls {
+                            addr: SocketAddr::new(
+                                exit_addr.ip(),
+                                crate::tcp_fallback::COVER_TCP_PORT,
+                            ),
+                            domain,
+                            client_config: crate::client::cover_tls_client_config()
+                                .map_err(MultihopError::Tls)?,
                         })
-                        .transpose()?;
-                    // A process that has watched UDP sessions establish and die
-                    // right after the handshake tries the carrier before racing it:
-                    // the race alone never reaches the carrier when the handshake
-                    // itself passes (the 2026-09-07 Kaliningrad pattern).
-                    match warrenguard_transport::udp_hostility::preference() {
-                        warrenguard_tcp_fallback::DialPreference::CarrierFirst => {
-                            crate::tcp_fallback::dial_quic_webpki_carrier_first(
-                                domain,
-                                exit_addr,
-                                bind,
-                                transport_config,
-                                self.socket_bypass,
-                                &policy,
-                                cover,
-                            )
-                            .await?
-                        }
-                        warrenguard_tcp_fallback::DialPreference::Race => {
-                            crate::tcp_fallback::dial_quic_webpki_with_fallback(
-                                domain,
-                                exit_addr,
-                                bind,
-                                transport_config,
-                                self.socket_bypass,
-                                &policy,
-                                cover,
-                            )
-                            .await?
-                        }
+                    })
+                    .transpose()?;
+                // A process that has watched UDP sessions establish and die
+                // right after the handshake tries the carrier before racing it:
+                // the race alone never reaches the carrier when the handshake
+                // itself passes (the 2026-09-07 Kaliningrad pattern).
+                match warrenguard_transport::udp_hostility::preference() {
+                    warrenguard_tcp_fallback::DialPreference::CarrierFirst => {
+                        crate::tcp_fallback::dial_quic_webpki_carrier_first(
+                            domain,
+                            exit_addr,
+                            bind,
+                            transport_config,
+                            self.socket_bypass,
+                            &policy,
+                            cover,
+                        )
+                        .await?
                     }
-                } else {
-                    let (endpoint, conn) = dial_quic_webpki(
-                        domain,
-                        exit_addr,
-                        bind,
-                        transport_config,
-                        self.socket_bypass,
-                    )
-                    .await?;
-                    (endpoint, conn, Carrier::Udp)
+                    warrenguard_tcp_fallback::DialPreference::Race => {
+                        crate::tcp_fallback::dial_quic_webpki_with_fallback(
+                            domain,
+                            exit_addr,
+                            bind,
+                            transport_config,
+                            self.socket_bypass,
+                            &policy,
+                            cover,
+                        )
+                        .await?
+                    }
                 }
             } else {
-                let (endpoint, conn) = dial_quic(
-                    exit_pubkey,
+                let (endpoint, conn) = dial_quic_webpki(
+                    domain,
                     exit_addr,
                     bind,
                     transport_config,
@@ -1044,15 +1013,17 @@ impl MultihopClientTunnel {
                 )
                 .await?;
                 (endpoint, conn, Carrier::Udp)
-            })
-        };
-        // A bounded dial is abandoned whole, before any setup is sent: nothing
-        // has been presented to the exit, so no token or lease can be lost.
-        let (endpoint, conn, carrier) = match self.dial_bound {
-            Some(bound) => tokio::time::timeout(bound, dial)
-                .await
-                .map_err(|_| MultihopError::DialBoundElapsed)??,
-            None => dial.await?,
+            }
+        } else {
+            let (endpoint, conn) = dial_quic(
+                exit_pubkey,
+                exit_addr,
+                bind,
+                transport_config,
+                self.socket_bypass,
+            )
+            .await?;
+            (endpoint, conn, Carrier::Udp)
         };
 
         // X.509 cover-domain mode (ADR-0004): `exit_pubkey` doubles as the
@@ -2806,37 +2777,6 @@ mod migration_tests {
                 Some(quinn::ConnectionError::LocallyClosed)
             ),
             "the close must be local, so the redial path treats it as transient"
-        );
-    }
-}
-
-#[cfg(test)]
-mod dial_bound_tests {
-    use super::*;
-
-    /// A dial whose handshake never completes (the port is held by a socket
-    /// that answers nothing, which is how a dropped or queued Initial looks
-    /// from the client) is abandoned at its bound, before any setup is sent.
-    #[tokio::test]
-    async fn a_bounded_dial_that_gets_no_handshake_is_abandoned_at_its_bound() {
-        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("a loopback socket binds");
-        let addr = silent.local_addr().expect("local addr");
-        let bound = Duration::from_millis(200);
-        let started = std::time::Instant::now();
-        let result = MultihopClientTunnel::new(SigningKey::from_bytes(&[7; 32]))
-            .with_dial_bound(Some(bound))
-            .connect([1; 32], [2; 32], [3; EXIT_ID_LEN], addr)
-            .await;
-        let took = started.elapsed();
-        assert!(
-            matches!(result, Err(MultihopError::DialBoundElapsed)),
-            "a dial with no handshake must end on its bound"
-        );
-        assert!(
-            took >= bound && took < bound + Duration::from_millis(500),
-            "the dial must end at its bound, took {took:?}"
         );
     }
 }

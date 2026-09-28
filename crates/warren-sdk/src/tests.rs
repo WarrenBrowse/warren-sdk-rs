@@ -145,7 +145,7 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
                     network_watch: None,
                     ..Default::default()
                 },
-                move |_| {
+                move || {
                     let kill_tx = kill_tx.clone();
                     let cycles = Arc::clone(&cycles);
                     async move {
@@ -234,7 +234,7 @@ async fn network_path_change_redials_immediately_without_rotating() {
                     }),
                     ..Default::default()
                 },
-                move |_| {
+                move || {
                     let kill_tx = kill_tx.clone();
                     async move {
                         let close = Arc::new(tokio::sync::Notify::new());
@@ -339,14 +339,14 @@ async fn spawn_migration_harness(exit: VerifiedExit) -> MigrationHarness {
                     }),
                     ..Default::default()
                 },
-                move |attempt| {
+                move || {
                     let auth = auth.clone();
                     let exit = exit.clone();
                     let rtt_cache = Arc::clone(&rtt_cache);
                     let connects = Arc::clone(&connects);
                     async move {
                         let est = crate::supervisor::establish_multihop(
-                            auth, &exit, false, false, None, rtt_cache, attempt,
+                            auth, &exit, false, false, None, rtt_cache,
                         )
                         .await?;
                         connects.fetch_add(1, Ordering::SeqCst);
@@ -386,100 +386,6 @@ async fn await_connected(
     })
     .await
     .expect("the supervised datapath must connect to the loopback exit");
-}
-
-/// Runs a supervised proxy on a healthy session to a restartable exit,
-/// restarts the exit so that its successor listens `down_for` after the close,
-/// and returns how long after the close the client dialled it again.
-async fn back_after_a_restart(key_fill: u8, down_for: Duration) -> Duration {
-    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[key_fill; 32]);
-    let (addr, keys, exit) = warren_test_support::spawn_restartable_multihop_exit(exit_key).await;
-    let verified = fake_verified_exit(addr, &keys);
-    let (identity, _mnemonic) = WarrenIdentity::generate();
-    let auth = crate::session_tokens::DialAuth::wallet(identity.signing_key());
-    let rtt_cache = Arc::new(std::sync::Mutex::new(warren_discovery::RttCache::new()));
-    let (state_tx, mut state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
-    let socks_listener = socks_only_listeners().await;
-    let task = tokio::spawn(async move {
-        supervise_proxy(
-            socks_listener,
-            None,
-            None,
-            crate::supervisor::SupervisorOutputs {
-                // The fake exit runs no resolver.
-                egress_probe: crate::supervisor::EgressProbeArm::Off,
-                reconnect_request: Arc::new(tokio::sync::Notify::new()),
-                epoch_end_tx: tokio::sync::watch::channel(None).0,
-                state_tx,
-                forwarder_tx: tokio::sync::watch::channel(None).0,
-                metrics_tx: tokio::sync::watch::channel(None).0,
-                migration_tx: tokio::sync::watch::channel(None).0,
-                fatal_tx: tokio::sync::watch::channel(None).0,
-            },
-            crate::supervisor::EpochGuards::default(),
-            move |attempt| {
-                let auth = auth.clone();
-                let exit = verified.clone();
-                let rtt_cache = Arc::clone(&rtt_cache);
-                async move {
-                    crate::supervisor::establish_multihop(
-                        auth, &exit, false, false, None, rtt_cache, attempt,
-                    )
-                    .await
-                }
-            },
-            || {},
-        )
-        .await;
-    });
-    await_connected(&mut state_rx, Duration::from_secs(10)).await;
-    // A healthy session: only one that served this long is redialled at once.
-    tokio::time::sleep(warren_transport::redial_policy::MIN_HEALTHY_UPTIME).await;
-
-    let closed_at = exit.restart(down_for).await;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while exit.accepted_at().len() < 2 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the client dials the restarted exit");
-    let back_after = exit.accepted_at()[1] - closed_at;
-    task.abort();
-    back_after
-}
-
-/// An exit that stops closes its clients with the operational code, keeps
-/// refusing while its closes drain, and listens again once its successor has
-/// bound the port. A supervised client told of the stop must be back within
-/// about one redial cadence of the new listener: with the ordinary schedule a
-/// redial drawn into the gap before the bind waited a whole QUIC Initial
-/// retransmission (warren-core doc 107 section 23.10).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_exit_restart_is_redialled_within_a_cadence_of_its_new_listener() {
-    let back_after = back_after_a_restart(0x2E, Duration::from_secs(1)).await;
-
-    assert!(
-        back_after <= Duration::from_millis(1200),
-        "a client told of an exit restart must be back within 1.2 s of the close \
-         when the new listener binds at 1 s, got {back_after:?}"
-    );
-}
-
-/// A fast attempt whose Initial was lost before the successor bound is
-/// abandoned at its dial bound for a fresh one, rather than left to wait for
-/// the Initial's retransmission a second later and two seconds after that.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fast_redial_whose_initial_was_lost_does_not_wait_for_its_retransmission() {
-    let down_for = Duration::from_millis(1600);
-    let back_after = back_after_a_restart(0x2F, down_for).await;
-
-    let within = down_for + warren_transport::redial_policy::OPERATIONAL_REDIAL_CADENCE * 2;
-    assert!(
-        back_after <= within,
-        "a client must be back within two cadences of a listener that binds at \
-         {down_for:?}, got {back_after:?}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -742,7 +648,7 @@ async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
                     network_watch: None,
                     ..Default::default()
                 },
-                move |_| {
+                move || {
                     let attempts = Arc::clone(&attempts);
                     async move {
                         attempts.fetch_add(1, Ordering::SeqCst);
@@ -828,7 +734,7 @@ async fn supervisor_reselects_on_an_exhaustion_refusal_without_going_fatal() {
                     network_watch: None,
                     ..Default::default()
                 },
-                |_| async {
+                || async {
                     Err::<EstablishedTunnel<ClosableSink>, SdkError>(SdkError::Multihop(
                         MultihopError::Setup(SetupError::IpExhausted),
                     ))
@@ -896,7 +802,7 @@ async fn supervisor_metrics_probe_reads_the_live_epoch_and_never_outlives_it() {
                 network_watch: None,
                 ..Default::default()
             },
-            move |_| {
+            move || {
                 let kill_tx = kill_tx.clone();
                 async move {
                     let close = Arc::new(tokio::sync::Notify::new());
@@ -993,7 +899,7 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
                 network_watch: None,
                 ..Default::default()
             },
-            move |_| {
+            move || {
                 let kill_tx = kill_tx.clone();
                 let gate = Arc::clone(&connect_gate);
                 async move {
@@ -1749,7 +1655,7 @@ async fn supervisor_serves_both_socks_and_http_listeners() {
                 network_watch: None,
                 ..Default::default()
             },
-            move |_| {
+            move || {
                 let keep_open = Arc::clone(&keep_open);
                 async move {
                     Ok::<_, SdkError>(EstablishedTunnel {
@@ -1805,7 +1711,7 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
                 network_watch: None,
                 ..Default::default()
             },
-            move |_| {
+            move || {
                 let cursor = Arc::clone(&cursor);
                 let ok_tx = ok_tx.clone();
                 let keep_open = Arc::clone(&keep_open);
@@ -1877,7 +1783,7 @@ async fn supervisor_failover_rotates_on_drain() {
                 network_watch: None,
                 ..Default::default()
             },
-            move |_| {
+            move || {
                 let cursor = Arc::clone(&cursor);
                 let used_tx = used_tx.clone();
                 let keep_open = Arc::clone(&keep_open);
@@ -1958,7 +1864,7 @@ async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
                 network_watch: None,
                 ..Default::default()
             },
-            move |_| {
+            move || {
                 let cursor = Arc::clone(&cursor);
                 let used_tx = used_tx.clone();
                 let close_tx = close_tx.clone();
@@ -2042,7 +1948,7 @@ async fn supervisor_retries_past_failed_attempts_then_connects() {
                     network_watch: None,
                     ..Default::default()
                 },
-                move |_| {
+                move || {
                     let attempts = Arc::clone(&attempts);
                     let keep_open = Arc::clone(&keep_open);
                     async move {
@@ -2122,7 +2028,7 @@ async fn supervisor_emits_structured_migration_events_on_drain() {
                 network_watch: None,
                 ..Default::default()
             },
-            move |_| {
+            move || {
                 let cursor = Arc::clone(&cursor);
                 let keep_open = Arc::clone(&keep_open);
                 async move {
@@ -2235,7 +2141,7 @@ async fn supervisor_gate_veto_cancels_the_migration_and_keeps_serving() {
                     network_watch: None,
                     ..Default::default()
                 },
-                move |_| {
+                move || {
                     let connects = Arc::clone(&connects);
                     let keep_open = Arc::clone(&keep_open);
                     async move {
@@ -2326,7 +2232,7 @@ async fn supervisor_gate_approval_lets_the_migration_proceed() {
                 network_watch: None,
                 ..Default::default()
             },
-            move |_| {
+            move || {
                 let cursor = Arc::clone(&cursor);
                 let used_tx = used_tx.clone();
                 let keep_open = Arc::clone(&keep_open);
@@ -2858,7 +2764,7 @@ async fn a_dead_datapath_is_reported_as_a_session_close_with_its_transport_reaso
                 network_watch: None,
                 ..Default::default()
             },
-            move |_| {
+            move || {
                 let kill_tx = kill_tx.clone();
                 async move {
                     let close = Arc::new(tokio::sync::Notify::new());
@@ -2938,7 +2844,7 @@ async fn an_egress_probe_conviction_is_reported_as_such_not_as_a_session_close()
                 network_watch: None,
                 ..Default::default()
             },
-            move |_| {
+            move || {
                 let kill_tx = kill_tx.clone();
                 async move {
                     let close = Arc::new(tokio::sync::Notify::new());
@@ -3016,7 +2922,7 @@ async fn a_host_requested_rebuild_ends_the_epoch_without_dropping_the_listener()
                 network_watch: None,
                 ..Default::default()
             },
-            move |_| {
+            move || {
                 let kill_tx = kill_tx.clone();
                 async move {
                     let close = Arc::new(tokio::sync::Notify::new());
@@ -3161,7 +3067,7 @@ async fn supervise_datapath_starts_a_fresh_epoch_per_tunnel_and_stamps_it() {
                 network_watch: None,
                 ..Default::default()
             },
-            move |_| async move {
+            move || async move {
                 Ok::<_, SdkError>(EstablishedTunnel {
                     sink: ClosableSink {
                         close: Arc::new(tokio::sync::Notify::new()),
@@ -3249,7 +3155,7 @@ async fn supervise_datapath_ends_the_epoch_on_a_host_request() {
                 network_watch: None,
                 ..Default::default()
             },
-            move |_| async move {
+            move || async move {
                 Ok::<_, SdkError>(EstablishedTunnel {
                     sink: ClosableSink {
                         close: Arc::new(tokio::sync::Notify::new()),
@@ -3320,7 +3226,7 @@ async fn supervise_datapath_never_starts_a_datapath_on_a_fatal_verdict() {
                 network_watch: None,
                 ..Default::default()
             },
-            move |_| async move {
+            move || async move {
                 Err::<EstablishedTunnel<ClosableSink>, SdkError>(SdkError::Multihop(
                     MultihopError::Setup(SetupError::Rejected),
                 ))
@@ -4207,7 +4113,6 @@ mod session_token_dials {
             false,
             None,
             Arc::clone(&client.rtt_cache),
-            crate::supervisor::ConnectAttempt::default(),
         )
         .await
         .expect("admitted");
