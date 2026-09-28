@@ -9,8 +9,7 @@ use crate::transport::{HttpRequest, HttpResponse, HttpTransport, Method, Transpo
 
 /// A reqwest-backed transport.
 ///
-/// Holds two clients: one that sends the TLS SNI extension and one that omits it
-/// (`tls_sni(false)`). The fallback sequence in [`WarrenApiClient`] uses the
+/// Holds two clients: one that sends the TLS SNI extension and one that omits it. The fallback sequence in [`WarrenApiClient`] uses the
 /// SNI-less client for its final attempt to defeat SNI-based blocking. The
 /// no-SNI client still verifies the server certificate against the requested
 /// host name (standard verification), so it is no weaker than the default path.
@@ -34,11 +33,17 @@ impl ReqwestTransport {
     /// backend; never happens with a working ring/rustls build). The reqwest
     /// cause is not propagated (no-log discipline).
     pub fn try_new() -> Result<Self, TransportError> {
+        Self::with_roots(&rustls::RootCertStore::from_iter(
+            webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+        ))
+    }
+
+    fn with_roots(roots: &rustls::RootCertStore) -> Result<Self, TransportError> {
         let build = |sni: bool| -> Result<reqwest::Client, TransportError> {
             reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(15))
-                .tls_sni(sni)
+                .use_preconfigured_tls(client_config(roots.clone(), sni)?)
                 .build()
                 .map_err(|_| TransportError::Io("tls/http client initialization failed".to_owned()))
         };
@@ -65,6 +70,29 @@ impl Default for ReqwestTransport {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The rustls config of both clients. reqwest's own keeps session tickets and
+/// resumes with them, which lets a server link a client's connections across
+/// time and across the addresses it came from; the marked transport and the
+/// engine already refuse resumption. A preconfigured config replaces every TLS
+/// option of the builder, so SNI is set here, and the ALPN list is the one
+/// reqwest offers with its HTTP/2 feature on.
+fn client_config(
+    roots: rustls::RootCertStore,
+    sni: bool,
+) -> Result<rustls::ClientConfig, TransportError> {
+    let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|_| TransportError::Io("tls client config initialization failed".to_owned()))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    config.resumption = rustls::client::Resumption::disabled();
+    config.enable_sni = sni;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
 }
 
 fn to_reqwest_method(method: Method) -> reqwest::Method {
@@ -119,6 +147,101 @@ impl HttpTransport for ReqwestTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use rustls::{HandshakeKind, ServerConfig};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const CA: &[u8] = include_bytes!("testdata/tls-test-ca.cert.pem");
+    const CERT: &[u8] = include_bytes!("testdata/tls-localhost.cert.pem");
+    const KEY: &[u8] = include_bytes!("testdata/tls-localhost.key.pem");
+
+    /// What the server saw of one TLS handshake.
+    struct Seen {
+        sni: Option<String>,
+        kind: Option<HandshakeKind>,
+    }
+
+    /// A TLS server that issues session tickets and would resume on them, so a
+    /// client that resumes shows up as a resumed handshake.
+    async fn server() -> (u16, tokio::sync::mpsc::UnboundedReceiver<Seen>) {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from_pem_slice(CERT).unwrap()],
+                PrivateKeyDer::from_pem_slice(KEY).unwrap(),
+            )
+            .unwrap();
+        config.ticketer = rustls::crypto::ring::Ticketer::new().unwrap();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    continue;
+                };
+                let (_, connection) = tls.get_ref();
+                let _ = tx.send(Seen {
+                    sni: connection.server_name().map(str::to_owned),
+                    kind: connection.handshake_kind(),
+                });
+                let mut request = [0u8; 1024];
+                let _ = tls.read(&mut request).await;
+                let _ = tls
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                let _ = tls.shutdown().await;
+            }
+        });
+        (port, rx)
+    }
+
+    async fn two_requests(use_sni: bool) -> Vec<Seen> {
+        let (port, mut seen) = server().await;
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(CA).unwrap())
+            .unwrap();
+        let transport = ReqwestTransport::with_roots(&roots).unwrap();
+
+        let mut handshakes = Vec::new();
+        for _ in 0..2 {
+            let request = HttpRequest {
+                method: Method::Get,
+                url: format!("https://localhost:{port}/"),
+                headers: Vec::new(),
+                body: Vec::new(),
+                use_sni,
+            };
+            let response = transport.execute(request).await.unwrap();
+            assert_eq!(response.status, 200);
+            handshakes.push(seen.recv().await.unwrap());
+        }
+        handshakes
+    }
+
+    #[tokio::test]
+    async fn a_second_connection_does_not_resume_the_first_session() {
+        let handshakes = two_requests(true).await;
+
+        assert_eq!(handshakes[1].kind, Some(HandshakeKind::Full));
+    }
+
+    #[tokio::test]
+    async fn the_no_sni_client_sends_no_sni() {
+        let handshakes = two_requests(false).await;
+
+        assert!(handshakes.iter().all(|seen| seen.sni.is_none()));
+    }
 
     #[test]
     fn try_new_builds_a_transport_in_a_working_environment() {

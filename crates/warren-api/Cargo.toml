@@ -68,7 +68,7 @@ warrenguard-tun-core = { workspace = true, optional = true }
 
 [features]
 default = []
-reqwest-transport = ["dep:reqwest"]
+reqwest-transport = ["dep:reqwest", "dep:rustls", "dep:webpki-roots"]
 marked-transport = [
     "dep:hyper",
     "dep:hyper-util",
@@ -85,7 +85,10 @@ marked-transport = [
 ]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util"] }
+# A local TLS server that issues session tickets, for the reqwest transport's
+# no-resumption test.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
 [lints]
 workspace = true
