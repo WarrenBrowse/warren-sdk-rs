@@ -511,7 +511,7 @@ mod tests {
         (base, peers)
     }
 
-    #[cfg(feature = "reqwest-transport")]
+    #[cfg(all(unix, feature = "reqwest-transport"))]
     fn loopback_route() -> HostRoute {
         let name = if cfg!(target_os = "macos") {
             "lo0"
@@ -526,7 +526,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "reqwest-transport")]
+    #[cfg(all(unix, feature = "reqwest-transport"))]
     #[tokio::test]
     async fn the_system_check_reads_the_verdict_over_the_given_route() {
         let (warren, peers) = check_server(r#"{"ip":"37.27.217.153","is_exit":true}"#).await;
@@ -550,7 +550,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "reqwest-transport")]
+    #[cfg(all(unix, feature = "reqwest-transport"))]
     #[tokio::test]
     async fn a_check_that_cannot_be_sent_over_the_route_is_not_warren() {
         let (warren, peers) = check_server(r#"{"is_exit":true}"#).await;
@@ -569,7 +569,7 @@ mod tests {
 
     /// On a host whose route leaves by a physical card (every CI runner, and a
     /// Mac without the app), the system route is no tunnel route.
-    #[cfg(feature = "reqwest-transport")]
+    #[cfg(all(unix, feature = "reqwest-transport"))]
     #[test]
     fn the_system_route_is_only_ever_a_route_this_host_holds_on_a_tunnel() {
         let Some(route) = SystemHostRoute::new("http://unused").route() else {

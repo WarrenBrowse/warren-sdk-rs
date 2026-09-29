@@ -2687,6 +2687,9 @@ mod host_route_tests {
         ProxyCredentials::new("warren", "test-secret").expect("valid credentials")
     }
 
+    /// The loopback interface as a host route: a real interface the serve test
+    /// can bind to.
+    #[cfg(unix)]
     fn loopback_route() -> crate::host_route::HostRoute {
         let name = if cfg!(target_os = "macos") {
             "lo0"
@@ -2759,6 +2762,16 @@ mod host_route_tests {
         }
     }
 
+    /// A verdict for the gate tests, which never bind anything to it.
+    fn any_route() -> crate::host_route::HostRoute {
+        crate::host_route::HostRoute {
+            source: std::net::Ipv4Addr::new(10, 66, 0, 79),
+            interface: std::num::NonZeroU32::new(14).expect("non-zero"),
+            name: "utun14".into(),
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_proxy_standing_aside_serves_through_the_host_route_until_the_verdict_goes() {
         let target = echo().await;
@@ -2810,7 +2823,7 @@ mod host_route_tests {
 
     #[tokio::test]
     async fn a_reconnect_is_held_while_the_host_route_is_warren_and_released_after() {
-        let (verdict_tx, verdict_rx) = tokio::sync::watch::channel(Some(loopback_route()));
+        let (verdict_tx, verdict_rx) = tokio::sync::watch::channel(Some(any_route()));
         let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Reconnecting);
         let gate = tokio::spawn(async move {
             stand_aside_while_host_route_is_warren(verdict_rx, &state_tx).await;
