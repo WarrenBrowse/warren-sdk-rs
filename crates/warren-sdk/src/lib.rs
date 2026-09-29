@@ -83,6 +83,7 @@ pub mod egress;
 mod egress_probe;
 mod entitlements;
 mod error;
+mod host_route;
 /// One-shot in-tunnel egress proof for a datapath that has no local listener
 /// to probe through (see [`socks_egress`] for the proxy datapath's own).
 pub mod packet_egress;

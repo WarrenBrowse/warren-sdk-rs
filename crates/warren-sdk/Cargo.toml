@@ -44,8 +44,18 @@ tokio = { workspace = true }
 # Parse the am.i.warren egress-oracle verdict (control-plane leak self-check).
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The host-route check: an HTTPS request bound to the route's source address,
+# which the api transport cannot express. Already in the graph through warren-api.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "json"] }
 # Frame the in-tunnel egress-probe DNS query into the netstack UDP send path.
 bytes = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Tells a tunnel interface (up, point-to-point) from a physical one, so the
+# host-route verdict can never name an address a LAN gateway routes. nix reads
+# getifaddrs(3) as the system reports it; the `getifaddrs` crate dropped the
+# Warren utun beside a Tailscale one (2026-09-29). Already in the graph.
+nix = { version = "0.31", default-features = false, features = ["net"] }
 
 [features]
 # Bundle the reqwest transport so an app can build a working client with one
@@ -53,7 +63,7 @@ bytes = { workspace = true }
 # `pq-hpke` is on by default so the multihop dial prefers the post-quantum
 # X-Wing seal (inert until an exit advertises a signed ML-KEM key).
 default = ["reqwest-transport", "pq-hpke"]
-reqwest-transport = ["warren-api/reqwest-transport"]
+reqwest-transport = ["warren-api/reqwest-transport", "dep:reqwest"]
 # Forwards the post-quantum X-Wing multihop seal preference to the transport.
 pq-hpke = ["warren-transport/pq-hpke"]
 # Socket-marked control-plane transport for the privileged daemon (warrend): its

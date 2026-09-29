@@ -33,6 +33,9 @@ bytes = { workspace = true }
 tokio = { workspace = true }
 tokio-util = "0.7"
 rand = { workspace = true }
+# Binds the host-route sockets to the tunnel interface (IP_BOUND_IF / SO_BINDTOIFINDEX),
+# not only to its address. Already in the graph through warren-api.
+socket2 = { version = "0.6", features = ["all"] }
 thiserror = { workspace = true }
 # Local proxy access control (`proxy_auth`): constant-time credential checks,
 # the HMAC proof a listener answers so a client can tell it from a squatter,
@@ -60,6 +63,10 @@ smoltcp = { version = "0.14", default-features = false, features = [
     # UDP socket for DNS-over-tunnel resolution to the gateway forwarder.
     "socket-udp",
 ], optional = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+# Resolves an interface name to the index the host-route tests bind to.
+nix = { version = "0.31", default-features = false, features = ["net"] }
 
 [features]
 # The non-root proxy datapath is always available. `tun` and `killswitch` pull

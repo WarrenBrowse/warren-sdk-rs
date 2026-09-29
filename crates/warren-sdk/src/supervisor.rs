@@ -915,6 +915,111 @@ pub(crate) async fn serve_epoch(
     }
 }
 
+/// How often a proxy standing aside asks a running epoch of its own tunnel to
+/// end. Repeated because the request only reaches an epoch that is waiting on
+/// it: one that comes up during the stand-aside (a dial already in flight when
+/// the verdict arrived) is ended by the next nudge.
+pub(crate) const STAND_ASIDE_NUDGE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Serves the stable listeners through the host route while `verdict` names a
+/// source proven to exit through Warren (see [`crate::host_route`]), every flow
+/// bound to that source and every name resolved by `resolver` from it. Ends each
+/// running epoch of the proxy's own tunnel through `end_epoch` meanwhile, stops
+/// accepting the moment the verdict changes, and then raises `wake` so the own
+/// tunnel redials at once. Returns when the verdict's sender is gone.
+pub(crate) async fn serve_through_host_route(
+    listeners: crate::proxy::ProxyListeners,
+    mut verdict: tokio::sync::watch::Receiver<Option<crate::host_route::HostRoute>>,
+    resolver: std::net::SocketAddr,
+    end_epoch: Arc<tokio::sync::Notify>,
+    wake: Arc<tokio::sync::Notify>,
+) {
+    let socks_listener = listeners.socks_listener();
+    let http_listener = listeners.http_listener();
+    let credentials = listeners.credentials().clone();
+    loop {
+        let route = loop {
+            if let Some(route) = verdict.borrow_and_update().clone() {
+                break route;
+            }
+            if verdict.changed().await.is_err() {
+                return;
+            }
+        };
+        let (run_tx, run_rx) = tokio::sync::watch::channel(true);
+        let connector = warren_net::BoundHostConnector::new(route.source, resolver)
+            .on_interface(route.interface);
+        let socks = warren_net::Socks5Proxy::new(connector, credentials.clone());
+        let http = http_listener
+            .as_ref()
+            .map(|_| warren_net::HttpConnectProxy::new(connector, credentials.clone()));
+        let serving = async {
+            match (&http, http_listener.as_deref()) {
+                (Some(http), Some(listener)) => {
+                    tokio::select! {
+                        _ = socks.serve_until(&socks_listener, run_rx.clone()) => {}
+                        _ = http.serve_until(listener, run_rx.clone()) => {}
+                    }
+                }
+                _ => {
+                    let _ = socks.serve_until(&socks_listener, run_rx.clone()).await;
+                }
+            }
+        };
+        let withdrawn = async {
+            loop {
+                if verdict.changed().await.is_err() || verdict.borrow().as_ref() != Some(&route) {
+                    return;
+                }
+            }
+        };
+        let nudging = async {
+            loop {
+                end_epoch.notify_waiters();
+                tokio::time::sleep(STAND_ASIDE_NUDGE).await;
+            }
+        };
+        let accept_failed = tokio::select! {
+            () = serving => true,
+            () = withdrawn => false,
+            () = nudging => false,
+        };
+        let _ = run_tx.send(false);
+        if !accept_failed {
+            // The system tunnel is gone: the proxy's own tunnel must come back
+            // now, not after a backoff earned while it stood aside.
+            wake.notify_one();
+        }
+        if accept_failed {
+            // A listener that fails to accept would spin this loop: wait for
+            // the verdict to move before serving again.
+            if verdict.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Holds a (re)connect of the proxy's own tunnel while `verdict` says the host
+/// route already exits through Warren, reporting the proxy connected meanwhile
+/// (its clients are served through that route) and reconnecting once the
+/// verdict is withdrawn.
+pub(crate) async fn stand_aside_while_host_route_is_warren(
+    mut verdict: tokio::sync::watch::Receiver<Option<crate::host_route::HostRoute>>,
+    state_tx: &tokio::sync::watch::Sender<ConnectionState>,
+) {
+    if verdict.borrow_and_update().is_none() {
+        return;
+    }
+    let _ = state_tx.send(ConnectionState::Connected);
+    while verdict.borrow_and_update().is_some() {
+        if verdict.changed().await.is_err() {
+            break;
+        }
+    }
+    let _ = state_tx.send(ConnectionState::Reconnecting);
+}
+
 /// The async reserve-then-switch gate the supervisor consults when a drain
 /// advisory arrives, BEFORE tearing the current session down: it pre-flights
 /// the migration candidates (reserving every pinned forwarded port) and
@@ -1424,6 +1529,11 @@ pub(crate) struct SupervisorOutputs<Fw> {
     /// transition it precedes so a host reading both sees the cause of the
     /// death it is about to record.
     pub(crate) epoch_end_tx: tokio::sync::watch::Sender<Option<EpochEnd>>,
+    /// Cuts a redial backoff short and resets it: raised when the network the
+    /// failures were measured on is gone (a proxy that stood aside behind a
+    /// system Warren tunnel sees it disconnect), so the next dial does not sit
+    /// out a delay earned on a network that no longer exists.
+    pub(crate) wake: Arc<tokio::sync::Notify>,
 }
 
 /// What one epoch's datapath hands back to the supervisor.
@@ -2071,11 +2181,13 @@ pub(crate) async fn supervise_datapath<S, P, F, Fut, D>(
                     // The engine redial verdict: a healthy run resets the
                     // schedule and reconnects at once; a flap (died almost
                     // immediately) backs off first.
-                    tokio::time::sleep(warren_transport::redial_policy::delay_after_session(
+                    let delay = warren_transport::redial_policy::delay_after_session(
                         up_since.elapsed(),
                         &mut backoff,
-                    ))
-                    .await;
+                    );
+                    if sleep_unless_woken(delay, &outputs.wake).await {
+                        backoff.reset();
+                    }
                 }
             }
             Err(e) => {
@@ -2098,16 +2210,28 @@ pub(crate) async fn supervise_datapath<S, P, F, Fut, D>(
                         // failover cursor (no-op for a single pinned exit) so the
                         // next attempt reselects a different exit, then back off.
                         on_drain();
-                        tokio::time::sleep(backoff.next_delay()).await;
+                        if sleep_unless_woken(backoff.next_delay(), &outputs.wake).await {
+                            backoff.reset();
+                        }
                     }
                     // RetrySameTarget, and any future verdict: a transient failure,
                     // retry the same target after a backoff.
                     _ => {
-                        tokio::time::sleep(backoff.next_delay()).await;
+                        if sleep_unless_woken(backoff.next_delay(), &outputs.wake).await {
+                            backoff.reset();
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+/// Sleeps `delay`, unless `wake` is raised first; returns whether it was.
+async fn sleep_unless_woken(delay: std::time::Duration, wake: &tokio::sync::Notify) -> bool {
+    tokio::select! {
+        () = tokio::time::sleep(delay) => false,
+        () = wake.notified() => true,
     }
 }
 
@@ -2546,5 +2670,214 @@ mod post_handshake_kill_tests {
             Some("timed_out")
         ));
         assert!(!post_handshake_kill(EpochEndCause::HostRequested, None));
+    }
+}
+
+#[cfg(test)]
+mod host_route_tests {
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use warren_net::ProxyCredentials;
+
+    use super::*;
+
+    fn creds() -> ProxyCredentials {
+        ProxyCredentials::new("warren", "test-secret").expect("valid credentials")
+    }
+
+    fn loopback_route() -> crate::host_route::HostRoute {
+        let name = if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        };
+        crate::host_route::HostRoute {
+            source: std::net::Ipv4Addr::LOCALHOST,
+            interface: std::num::NonZeroU32::new(
+                nix::net::if_::if_nametoindex(name).expect("loopback"),
+            )
+            .expect("non-zero"),
+            name: name.into(),
+        }
+    }
+
+    async fn listeners() -> crate::proxy::ProxyListeners {
+        crate::proxy::ProxyListeners::bind(&warren_net::ProxyConfig {
+            socks5: "127.0.0.1:0".parse().expect("literal"),
+            http: Some("127.0.0.1:0".parse().expect("literal")),
+            dns_server: None,
+            credentials: Some(creds()),
+        })
+        .await
+        .expect("bind listeners")
+    }
+
+    async fn echo() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = sock.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Sends a CONNECT through the HTTP listener; `None` when nothing answers
+    /// within `within`.
+    async fn http_connect(
+        proxy: std::net::SocketAddr,
+        target: std::net::SocketAddr,
+        within: Duration,
+    ) -> Option<(String, TcpStream)> {
+        let mut client = TcpStream::connect(proxy).await.expect("reach the listener");
+        let request = format!(
+            "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: {}\r\n\r\n",
+            &*creds().basic_authorization()
+        );
+        client.write_all(request.as_bytes()).await.expect("write");
+        let mut head = Vec::new();
+        let read = tokio::time::timeout(within, async {
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if client.read(&mut byte).await.ok()? == 0 {
+                    return None;
+                }
+                head.push(byte[0]);
+            }
+            Some(())
+        })
+        .await;
+        match read {
+            Ok(Some(())) => Some((String::from_utf8(head).expect("ascii"), client)),
+            _ => None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proxy_standing_aside_serves_through_the_host_route_until_the_verdict_goes() {
+        let target = echo().await;
+        let listeners = listeners().await;
+        let http = listeners.http_addr().expect("http listener");
+        let (verdict_tx, verdict_rx) = tokio::sync::watch::channel(Some(loopback_route()));
+        let end_epoch = Arc::new(tokio::sync::Notify::new());
+        let asked_to_end = end_epoch.notified();
+        tokio::pin!(asked_to_end);
+        asked_to_end.as_mut().enable();
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let served = tokio::spawn(serve_through_host_route(
+            listeners,
+            verdict_rx,
+            "127.0.0.1:53".parse().expect("literal"),
+            Arc::clone(&end_epoch),
+            Arc::clone(&wake),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(3), asked_to_end)
+            .await
+            .expect("a running epoch of the own tunnel is asked to end");
+        let (head, mut stream) = http_connect(http, target, Duration::from_secs(3))
+            .await
+            .expect("the listener is served through the host route");
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        stream.write_all(b"aside").await.expect("write");
+        let mut got = [0u8; 5];
+        stream.read_exact(&mut got).await.expect("echo");
+        assert_eq!(&got, b"aside");
+
+        verdict_tx.send(None).expect("receiver alive");
+        tokio::time::timeout(Duration::from_secs(1), wake.notified())
+            .await
+            .expect("the own tunnel is woken to redial at once");
+        assert!(
+            http_connect(http, target, Duration::from_millis(500))
+                .await
+                .is_none(),
+            "once the verdict is withdrawn nothing is served through the host route"
+        );
+
+        drop(verdict_tx);
+        tokio::time::timeout(Duration::from_secs(2), served)
+            .await
+            .expect("returns once the verdict's sender is gone")
+            .expect("join");
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_is_held_while_the_host_route_is_warren_and_released_after() {
+        let (verdict_tx, verdict_rx) = tokio::sync::watch::channel(Some(loopback_route()));
+        let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Reconnecting);
+        let gate = tokio::spawn(async move {
+            stand_aside_while_host_route_is_warren(verdict_rx, &state_tx).await;
+            state_tx
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !gate.is_finished(),
+            "no dial while the host route is Warren"
+        );
+        assert_eq!(*state_rx.borrow(), ConnectionState::Connected);
+
+        verdict_tx.send(None).expect("receiver alive");
+        let _state_tx = tokio::time::timeout(Duration::from_secs(1), gate)
+            .await
+            .expect("released once withdrawn")
+            .expect("join");
+        assert_eq!(*state_rx.borrow(), ConnectionState::Reconnecting);
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_without_a_verdict_goes_ahead_untouched() {
+        let (_verdict_tx, verdict_rx) = tokio::sync::watch::channel(None);
+        let (state_tx, state_rx) = tokio::sync::watch::channel(ConnectionState::Connecting);
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            stand_aside_while_host_route_is_warren(verdict_rx, &state_tx),
+        )
+        .await
+        .expect("returns at once");
+
+        assert_eq!(*state_rx.borrow(), ConnectionState::Connecting);
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_raised_wake_cuts_the_backoff_short() {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let raise = Arc::clone(&wake);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            raise.notify_one();
+        });
+        let started = tokio::time::Instant::now();
+
+        let woken = sleep_unless_woken(Duration::from_secs(15), &wake).await;
+
+        assert!(woken);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_a_wake_the_backoff_is_slept_in_full() {
+        let wake = tokio::sync::Notify::new();
+        let started = tokio::time::Instant::now();
+
+        let woken = sleep_unless_woken(Duration::from_secs(15), &wake).await;
+
+        assert!(!woken);
+        assert!(started.elapsed() >= Duration::from_secs(15));
     }
 }

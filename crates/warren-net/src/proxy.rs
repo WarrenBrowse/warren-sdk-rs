@@ -80,6 +80,27 @@ async fn within_handshake<T>(
         .map_err(|_| NetError::ProxyAuth)?
 }
 
+/// Runs one accepted connection of an `..._until` loop until it ends or `run`
+/// goes `false` (or its sender is dropped). A relay still open when its loop
+/// stops rides a path that is going away, a dead tunnel or a system tunnel that
+/// disconnected: dropping it closes both sockets at once, so the client reopens
+/// on the new path instead of waiting on a dead connection until it times out.
+async fn until_stopped(
+    mut run: tokio::sync::watch::Receiver<bool>,
+    connection: impl std::future::Future<Output = ()>,
+) {
+    tokio::select! {
+        () = connection => {}
+        () = async {
+            while *run.borrow_and_update() {
+                if run.changed().await.is_err() {
+                    return;
+                }
+            }
+        } => {}
+    }
+}
+
 /// The SOCKS5 greeting, authentication and request. `None` when the client
 /// only asked for a proof, which it has been given.
 async fn socks_handshake(
@@ -224,6 +245,43 @@ impl<C: Connector> Socks5Proxy<C> {
             });
         }
     }
+
+    /// Like [`serve`](Self::serve) but accepts on a *borrowed* listener until
+    /// `run` goes `false`, for a connector that carries no UDP: `UDP ASSOCIATE`
+    /// is refused as unsupported. `run` starting `false` (or its sender dropped)
+    /// returns at once.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Io`] only if accepting on the listener fails.
+    pub async fn serve_until(
+        &self,
+        listener: &TcpListener,
+        mut run: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), NetError> {
+        loop {
+            if !*run.borrow_and_update() {
+                return Ok(());
+            }
+            tokio::select! {
+                biased;
+                changed = run.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                }
+                accepted = accept(listener) => {
+                    let client = accepted?;
+                    let connector = Arc::clone(&self.connector);
+                    let credentials = Arc::clone(&self.credentials);
+                    let stop = run.clone();
+                    tokio::spawn(until_stopped(stop, async move {
+                        let _ = handle_connection(client, connector.as_ref(), &credentials).await;
+                    }));
+                }
+            }
+        }
+    }
 }
 
 /// Opens the upstream flow for a `CONNECT` target and relays bytes both ways,
@@ -318,9 +376,10 @@ impl<C: UdpConnector> Socks5Proxy<C> {
                     let client = accepted?;
                     let connector = Arc::clone(&self.connector);
                     let credentials = Arc::clone(&self.credentials);
-                    tokio::spawn(async move {
+                    let stop = run.clone();
+                    tokio::spawn(until_stopped(stop, async move {
                         let _ = handle_with_udp(client, connector.as_ref(), &credentials).await;
-                    });
+                    }));
                 }
             }
         }
@@ -650,9 +709,10 @@ impl<C: Connector> HttpConnectProxy<C> {
                     let client = accepted?;
                     let connector = Arc::clone(&self.connector);
                     let credentials = Arc::clone(&self.credentials);
-                    tokio::spawn(async move {
+                    let stop = run.clone();
+                    tokio::spawn(until_stopped(stop, async move {
                         let _ = handle_connect(client, connector.as_ref(), &credentials).await;
-                    });
+                    }));
                 }
             }
         }

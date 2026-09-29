@@ -33,6 +33,8 @@ pub mod device;
 pub mod dns;
 pub mod error;
 #[cfg(feature = "proxy")]
+pub mod host_egress;
+#[cfg(feature = "proxy")]
 mod http_forward;
 pub mod killswitch;
 pub mod mode;
@@ -56,6 +58,8 @@ pub use device::{EXIT_ID_LEN, EpochAddressing, EpochId, EpochPacketDevice, ExitI
 #[cfg(feature = "proxy")]
 pub use dns::{DnsError, RecordType, encode_query, parse_response};
 pub use error::NetError;
+#[cfg(feature = "proxy")]
+pub use host_egress::BoundHostConnector;
 pub use killswitch::{KillSwitch, KillSwitchLevel, ProxyOnlyKillSwitch};
 pub use mode::ProxyConfig;
 #[cfg(feature = "proxy")]

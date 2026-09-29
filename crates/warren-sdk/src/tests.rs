@@ -131,6 +131,7 @@ async fn supervisor_reconnects_on_drop_keeping_a_stable_listener() {
                 None,
                 None,
                 crate::supervisor::SupervisorOutputs {
+                    wake: Default::default(),
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
                     reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                     epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -217,6 +218,7 @@ async fn network_path_change_redials_immediately_without_rotating() {
                 None,
                 None,
                 crate::supervisor::SupervisorOutputs {
+                    wake: Default::default(),
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
                     reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                     epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -320,6 +322,7 @@ async fn spawn_migration_harness(exit: VerifiedExit) -> MigrationHarness {
                 None,
                 None,
                 crate::supervisor::SupervisorOutputs {
+                    wake: Default::default(),
                     // The fake exit runs no resolver, so the in-tunnel egress
                     // probe would report a dead path it cannot answer for.
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
@@ -634,6 +637,7 @@ async fn supervisor_stops_and_surfaces_the_fatal_cause_on_a_policy_rejection() {
                 None,
                 None,
                 crate::supervisor::SupervisorOutputs {
+                    wake: Default::default(),
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
                     reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                     epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -720,6 +724,7 @@ async fn supervisor_reselects_on_an_exhaustion_refusal_without_going_fatal() {
                 None,
                 None,
                 crate::supervisor::SupervisorOutputs {
+                    wake: Default::default(),
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
                     reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                     epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -788,6 +793,7 @@ async fn supervisor_metrics_probe_reads_the_live_epoch_and_never_outlives_it() {
             None,
             None,
             crate::supervisor::SupervisorOutputs {
+                wake: Default::default(),
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                 epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -885,6 +891,7 @@ async fn supervisor_publishes_a_forwarder_while_connected_and_clears_it_on_death
             None,
             None,
             crate::supervisor::SupervisorOutputs {
+                wake: Default::default(),
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                 epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -1641,6 +1648,7 @@ async fn supervisor_serves_both_socks_and_http_listeners() {
             None,
             None,
             crate::supervisor::SupervisorOutputs {
+                wake: Default::default(),
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                 epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -1697,6 +1705,7 @@ async fn supervisor_failover_rotates_past_a_broken_exit() {
             None,
             None,
             crate::supervisor::SupervisorOutputs {
+                wake: Default::default(),
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                 epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -1769,6 +1778,7 @@ async fn supervisor_failover_rotates_on_drain() {
             None,
             None,
             crate::supervisor::SupervisorOutputs {
+                wake: Default::default(),
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                 epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -1850,6 +1860,7 @@ async fn supervisor_failover_sticks_with_a_working_exit_across_a_drop() {
             None,
             None,
             crate::supervisor::SupervisorOutputs {
+                wake: Default::default(),
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                 epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -1934,6 +1945,7 @@ async fn supervisor_retries_past_failed_attempts_then_connects() {
                 None,
                 None,
                 crate::supervisor::SupervisorOutputs {
+                    wake: Default::default(),
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
                     reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                     epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -2014,6 +2026,7 @@ async fn supervisor_emits_structured_migration_events_on_drain() {
             None,
             None,
             crate::supervisor::SupervisorOutputs {
+                wake: Default::default(),
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                 epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -2127,6 +2140,7 @@ async fn supervisor_gate_veto_cancels_the_migration_and_keeps_serving() {
                 None,
                 None,
                 crate::supervisor::SupervisorOutputs {
+                    wake: Default::default(),
                     egress_probe: crate::supervisor::EgressProbeArm::Off,
                     reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                     epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -2218,6 +2232,7 @@ async fn supervisor_gate_approval_lets_the_migration_proceed() {
             None,
             None,
             crate::supervisor::SupervisorOutputs {
+                wake: Default::default(),
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                 epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -2750,6 +2765,7 @@ async fn a_dead_datapath_is_reported_as_a_session_close_with_its_transport_reaso
             None,
             None,
             crate::supervisor::SupervisorOutputs {
+                wake: Default::default(),
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                 state_tx,
@@ -2830,6 +2846,7 @@ async fn an_egress_probe_conviction_is_reported_as_such_not_as_a_session_close()
             None,
             None,
             crate::supervisor::SupervisorOutputs {
+                wake: Default::default(),
                 egress_probe: crate::supervisor::EgressProbeArm::Publish(escalate_tx),
                 reconnect_request: std::sync::Arc::new(tokio::sync::Notify::new()),
                 state_tx,
@@ -2908,6 +2925,7 @@ async fn a_host_requested_rebuild_ends_the_epoch_without_dropping_the_listener()
             None,
             None,
             crate::supervisor::SupervisorOutputs {
+                wake: Default::default(),
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request,
                 state_tx,
@@ -3053,6 +3071,7 @@ async fn supervise_datapath_starts_a_fresh_epoch_per_tunnel_and_stamps_it() {
         crate::supervisor::supervise_datapath(
             datapath,
             crate::supervisor::SupervisorOutputs {
+                wake: Default::default(),
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request: Arc::new(tokio::sync::Notify::new()),
                 epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -3141,6 +3160,7 @@ async fn supervise_datapath_ends_the_epoch_on_a_host_request() {
         crate::supervisor::supervise_datapath(
             datapath,
             crate::supervisor::SupervisorOutputs {
+                wake: Default::default(),
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request: reconnect,
                 epoch_end_tx,
@@ -3212,6 +3232,7 @@ async fn supervise_datapath_never_starts_a_datapath_on_a_fatal_verdict() {
         crate::supervisor::supervise_datapath(
             datapath,
             crate::supervisor::SupervisorOutputs {
+                wake: Default::default(),
                 egress_probe: crate::supervisor::EgressProbeArm::Off,
                 reconnect_request: Arc::new(tokio::sync::Notify::new()),
                 epoch_end_tx: tokio::sync::watch::channel(None).0,
@@ -4314,4 +4335,24 @@ mod session_token_dials {
 
         assert_eq!(seen.seen(), [SeenSetup::Wallet { names_pubkey: true }]);
     }
+}
+
+/// Standing aside is opt-in and checks the host route against the client's own
+/// API: a proxy not built for it never stands aside.
+#[test]
+fn only_a_client_built_to_stand_aside_checks_the_host_route() {
+    let (id, _m) = WarrenIdentity::generate();
+    let aside = WarrenClient::builder()
+        .identity(id)
+        .api_base("https://api.example.test")
+        .allow_any_server_key()
+        .stand_aside_behind_system_warren()
+        .build()
+        .expect("build");
+
+    assert_eq!(
+        aside.stand_aside_api_base.as_deref(),
+        Some("https://api.example.test")
+    );
+    assert_eq!(test_client().stand_aside_api_base, None);
 }

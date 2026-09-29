@@ -102,6 +102,118 @@ async fn socks5_connect_relays_bytes_to_upstream() {
     assert_eq!(&got, b"warren-proxy");
 }
 
+/// A borrowed listener serves CONNECT until `run` goes false, then the loop
+/// returns and the listener stays bound for whoever serves it next.
+#[tokio::test(flavor = "multi_thread")]
+async fn socks5_serve_until_relays_on_a_borrowed_listener_then_stops() {
+    let echo = spawn_echo().await;
+    let listener = std::sync::Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let addr = listener.local_addr().unwrap();
+    let (run_tx, run_rx) = tokio::sync::watch::channel(true);
+    let served = {
+        let listener = std::sync::Arc::clone(&listener);
+        tokio::spawn(async move {
+            Socks5Proxy::new(DirectConnector, creds())
+                .serve_until(&listener, run_rx)
+                .await
+        })
+    };
+
+    let mut client = TcpStream::connect(addr).await.expect("connect proxy");
+    authenticate(&mut client).await;
+    let std::net::SocketAddr::V4(echo_v4) = echo else {
+        panic!("echo is v4")
+    };
+    client
+        .write_all(&connect_request_v4(echo_v4))
+        .await
+        .unwrap();
+    let mut reply = [0u8; 10];
+    client.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0x00, "CONNECT succeeded");
+    client.write_all(b"borrowed").await.unwrap();
+    let mut got = [0u8; 8];
+    client.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"borrowed");
+
+    run_tx.send(false).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), served)
+        .await
+        .expect("the loop returns once run goes false")
+        .expect("join")
+        .expect("no accept error");
+    assert_eq!(
+        listener.local_addr().unwrap(),
+        addr,
+        "the listener stays bound"
+    );
+}
+
+/// A relay still open when its serve loop stops rides a path that is going
+/// away (a dead tunnel, a system tunnel that disconnected): it is closed at
+/// once, so the client reopens on the new path instead of waiting on a dead
+/// connection until its own timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn relays_open_when_serve_until_stops_are_closed_at_once() {
+    let echo = spawn_echo().await;
+    let socks_listener = std::sync::Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let http_listener = std::sync::Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let socks_addr = socks_listener.local_addr().unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    let (run_tx, run_rx) = tokio::sync::watch::channel(true);
+    {
+        let (listener, run) = (std::sync::Arc::clone(&socks_listener), run_rx.clone());
+        tokio::spawn(async move {
+            Socks5Proxy::new(DirectConnector, creds())
+                .serve_until(&listener, run)
+                .await
+        });
+        let (listener, run) = (std::sync::Arc::clone(&http_listener), run_rx.clone());
+        tokio::spawn(async move {
+            HttpConnectProxy::new(DirectConnector, creds())
+                .serve_until(&listener, run)
+                .await
+        });
+    }
+    let std::net::SocketAddr::V4(echo_v4) = echo else {
+        panic!("echo is v4")
+    };
+    let mut socks = TcpStream::connect(socks_addr).await.unwrap();
+    authenticate(&mut socks).await;
+    socks.write_all(&connect_request_v4(echo_v4)).await.unwrap();
+    let mut reply = [0u8; 10];
+    socks.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0x00);
+    let mut http = TcpStream::connect(http_addr).await.unwrap();
+    http.write_all(
+        format!(
+            "CONNECT {echo} HTTP/1.1\r\nHost: {echo}\r\n{}\r\n",
+            auth_header()
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut head = [0u8; 12];
+    http.read_exact(&mut head).await.unwrap();
+    assert_eq!(&head, b"HTTP/1.1 200");
+
+    run_tx.send(false).unwrap();
+
+    for (name, stream) in [("socks", &mut socks), ("http", &mut http)] {
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut rest),
+        )
+        .await;
+        assert!(
+            closed.is_ok(),
+            "the {name} relay is closed when its loop stops"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn socks5_rejects_unsupported_command() {
     let proxy = spawn_proxy().await;

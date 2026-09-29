@@ -135,6 +135,7 @@ pub struct WarrenClientBuilder {
     pub(crate) session_admission: SessionAdmission,
     pub(crate) session_blinding_key: Option<warren_api::BlindingKey>,
     pub(crate) port_entitlement_blinding_key: Option<warren_api::BlindingKey>,
+    pub(crate) stand_aside: bool,
 }
 
 impl WarrenClientBuilder {
@@ -194,6 +195,21 @@ impl WarrenClientBuilder {
     #[must_use]
     pub fn auto_local_ip(mut self) -> Self {
         self.auto_local_ip = true;
+        self
+    }
+
+    /// Makes every supervised proxy stand aside while the host's own route exits
+    /// through Warren (the Warren app connected): its listeners are then served
+    /// through that route, every flow bound to the route's source address so it
+    /// can never leave by another one, instead of by a second tunnel stacked on
+    /// the first, which the app's kill switch walls. Its own tunnel resumes once
+    /// the host route stops exiting through Warren. Off by default: for a proxy
+    /// that shares its host with the Warren app, such as the browser extension's
+    /// helper. Needs the `reqwest-transport` feature, without which it does
+    /// nothing.
+    #[must_use]
+    pub fn stand_aside_behind_system_warren(mut self) -> Self {
+        self.stand_aside = true;
         self
     }
 
@@ -405,6 +421,7 @@ impl WarrenClientBuilder {
         {
             return Err(BuildError::NotAPortEntitlementBlindingKey);
         }
+        let stand_aside_api_base = self.stand_aside.then(|| self.api_base.clone());
         let entitlements_key = format!("{}\n{}", self.api_base, identity.address());
         let api = Arc::new(WarrenApiClient::new_with_fallback(
             self.api_base,
@@ -437,6 +454,7 @@ impl WarrenClientBuilder {
             multihop_generation_store: self.multihop_generation_store,
             server_key_store: self.server_key_store,
             rtt_cache: Arc::new(Mutex::new(RttCache::new())),
+            stand_aside_api_base,
         })
     }
 }
@@ -484,6 +502,9 @@ pub struct WarrenClient<T> {
     /// populate it. Empty until the first connect, so selection is
     /// weight-only until real measurements accumulate.
     pub(crate) rtt_cache: Arc<Mutex<RttCache>>,
+    /// The API base a supervised proxy checks the host route against, when it
+    /// was built to stand aside behind a system Warren tunnel.
+    pub(crate) stand_aside_api_base: Option<String>,
 }
 
 impl WarrenClient<()> {
@@ -506,6 +527,7 @@ impl WarrenClient<()> {
             multihop_generation_store: Arc::new(InMemoryGenerationStore::default()),
             server_key_store: None,
             session_admission: SessionAdmission::default(),
+            stand_aside: false,
             session_blinding_key: None,
             port_entitlement_blinding_key: None,
         }
@@ -1598,6 +1620,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                     epoch_end_tx,
                     egress_probe: crate::supervisor::EgressProbeArm::Spawn,
                     reconnect_request: supervisor_reconnect,
+                    wake: Default::default(),
                 },
                 crate::supervisor::EpochGuards {
                     // Reserve-then-switch is off by default, as on the proxy
@@ -1657,7 +1680,32 @@ impl<T: HttpTransport> WarrenClient<T> {
         let reconnect_request = std::sync::Arc::new(tokio::sync::Notify::new());
         let supervisor_reconnect = std::sync::Arc::clone(&reconnect_request);
         let entitlements = self.port_entitlements.clone();
+        let stand_aside_api_base = self.stand_aside_api_base.clone();
         let task = tokio::spawn(async move {
+            // The verdict stays `None` for a proxy not built to stand aside, which
+            // lets every (re)connect through the gate untouched.
+            let (verdict_tx, verdict_rx) = tokio::sync::watch::channel(None);
+            let wake = Arc::new(tokio::sync::Notify::new());
+            let _stand_aside = spawn_stand_aside(
+                stand_aside_api_base.as_deref(),
+                verdict_tx,
+                &listeners,
+                &verdict_rx,
+                &supervisor_reconnect,
+                &wake,
+            );
+            let gate_state = state_tx.clone();
+            let mut connect = connect;
+            let connect = move || {
+                let verdict = verdict_rx.clone();
+                let state = gate_state.clone();
+                let attempt = connect();
+                async move {
+                    crate::supervisor::stand_aside_while_host_route_is_warren(verdict, &state)
+                        .await;
+                    attempt.await
+                }
+            };
             supervise_proxy(
                 listeners,
                 dns_server,
@@ -1671,6 +1719,7 @@ impl<T: HttpTransport> WarrenClient<T> {
                     epoch_end_tx,
                     egress_probe: crate::supervisor::EgressProbeArm::Spawn,
                     reconnect_request: supervisor_reconnect,
+                    wake,
                 },
                 crate::supervisor::EpochGuards {
                     // Reserve-then-switch is OFF by default: the pre-migrate
@@ -1709,6 +1758,60 @@ impl<T: HttpTransport> WarrenClient<T> {
             task,
         })
     }
+}
+
+/// Arms the stand-aside of a supervised proxy: the host-route watcher, and the
+/// server that carries the listeners through that route while it exits through
+/// Warren. `None` (not built to stand aside, or no transport to check with)
+/// arms nothing and keeps `verdict_tx` alive, so the verdict stays `None`.
+fn spawn_stand_aside(
+    api_base: Option<&str>,
+    verdict_tx: tokio::sync::watch::Sender<Option<crate::host_route::HostRoute>>,
+    listeners: &crate::proxy::ProxyListeners,
+    verdict_rx: &tokio::sync::watch::Receiver<Option<crate::host_route::HostRoute>>,
+    end_epoch: &Arc<tokio::sync::Notify>,
+    wake: &Arc<tokio::sync::Notify>,
+) -> StandAside {
+    #[cfg(feature = "reqwest-transport")]
+    if let Some(api_base) = api_base {
+        let watcher = tokio::spawn(crate::host_route::watch_host_route(
+            crate::host_route::SystemHostRoute::new(api_base),
+            verdict_tx,
+        ));
+        let server = tokio::spawn(crate::supervisor::serve_through_host_route(
+            listeners.clone(),
+            verdict_rx.clone(),
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(warrenguard_config::TUNNEL_GATEWAY_IP),
+                53,
+            ),
+            Arc::clone(end_epoch),
+            Arc::clone(wake),
+        ));
+        return StandAside {
+            _tasks: Some((
+                crate::supervisor::AbortOnDrop(watcher),
+                crate::supervisor::AbortOnDrop(server),
+            )),
+            _idle_verdict: None,
+        };
+    }
+    let _ = (api_base, listeners, verdict_rx, end_epoch, wake);
+    StandAside {
+        _tasks: None,
+        _idle_verdict: Some(verdict_tx),
+    }
+}
+
+/// What [`spawn_stand_aside`] keeps alive for the life of the supervisor: the
+/// watcher and the server when armed, else the verdict's sender, whose drop
+/// would read as a verdict gone rather than one never given.
+struct StandAside {
+    _tasks: Option<(
+        crate::supervisor::AbortOnDrop,
+        crate::supervisor::AbortOnDrop,
+    )>,
+    _idle_verdict: Option<tokio::sync::watch::Sender<Option<crate::host_route::HostRoute>>>,
 }
 
 #[cfg(feature = "reqwest-transport")]
