@@ -84,7 +84,6 @@ mod egress_probe;
 mod entitlements;
 mod error;
 mod host_route;
-pub use host_route::SystemExit;
 /// One-shot in-tunnel egress proof for a datapath that has no local listener
 /// to probe through (see [`socks_egress`] for the proxy datapath's own).
 pub mod packet_egress;
@@ -108,6 +107,7 @@ pub use client::{
     ServerKeyStore, WarrenClient, WarrenClientBuilder,
 };
 pub use error::{BuildError, SdkError};
+pub use host_route::SystemExit;
 pub use portfollow::{
     AvoidSet, DEFAULT_AVOID_TTL, DEFAULT_PREFLIGHT_TIMEOUT, MigrationDecision, MigrationEvent,
     MigrationOutcome, PortFollowConfig, PortFollowOutcome, PortFollowPolicy, plan_migration,

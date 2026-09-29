@@ -50,12 +50,45 @@ pub(crate) struct HostRoute {
 
 /// Where the system Warren tunnel the host routes through comes out, as the
 /// API's check placed the request it received over that tunnel.
+///
+/// Named for display only: the check that proved the route is what protects,
+/// and a system tunnel that moves to another exit is renamed at the next
+/// recheck, up to [`RECHECK_WARREN`] later.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SystemExit {
-    /// The exit's country, ISO 3166-1 alpha-2, when the check named one.
+    /// The exit's country, ISO 3166-1 alpha-2, upper-case, when the check
+    /// named a well-formed one.
     pub country: Option<String>,
     /// The exit's city, when the check named one.
     pub city: Option<String>,
+}
+
+/// The longest city name kept from a check.
+const MAX_CITY_CHARS: usize = 64;
+
+impl SystemExit {
+    /// The exit as a check named it. The answer is only as trusted as its TLS
+    /// session and is rendered to the member, so anything that is not a
+    /// two-letter country is dropped, and the city loses its control
+    /// characters and is capped.
+    #[must_use]
+    pub fn new(country: Option<&str>, city: Option<&str>) -> Self {
+        let country = country
+            .filter(|c| c.len() == 2 && c.bytes().all(|b| b.is_ascii_alphabetic()))
+            .map(str::to_ascii_uppercase);
+        let city = city
+            .map(|c| {
+                c.chars()
+                    .filter(|ch| !ch.is_control())
+                    .take(MAX_CITY_CHARS)
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            })
+            .filter(|c| !c.is_empty());
+        Self { country, city }
+    }
 }
 
 /// One IPv4 address of one interface, as far as [`tunnel_route`] needs it.
@@ -234,13 +267,16 @@ fn interface_addresses() -> Vec<InterfaceAddress> {
 
 /// The GUID the Warren desktop app always creates its Windows tunnel adapter
 /// with (warren-app `talpid-tunnel` `ADAPTER_GUID`, kept stable so Windows does
-/// not see a new network on every connect).
+/// not see a new network on every connect). Inherited from Mullvad, whose own
+/// adapter carries it too: a Mullvad tunnel can pass this and the pool test,
+/// and it is the API check (`is_exit`) that refuses it.
 const WARREN_ADAPTER_GUID: &str = "{AFE43773-E1F8-4EBB-8536-576AB86AFE9A}";
 
-/// Whether an adapter is the Warren app's tunnel, by the GUID Windows names it
-/// with. Windows reports no point-to-point flag for a Wintun adapter and has
-/// tunnel-typed adapters of its own (Teredo, IP-HTTPS, 6to4), so neither the
-/// flag nor the type can stand in for this.
+/// Whether an adapter is a Wintun tunnel of the Warren app's lineage, by the
+/// GUID Windows names it with. Windows reports no point-to-point flag for a
+/// Wintun adapter and has tunnel-typed adapters of its own (Teredo, IP-HTTPS,
+/// 6to4), so neither the flag nor the type can stand in for this; creating an
+/// adapter with a chosen GUID takes administrator rights.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn is_warren_adapter(adapter_name: &str) -> bool {
     adapter_name.eq_ignore_ascii_case(WARREN_ADAPTER_GUID)
@@ -318,10 +354,9 @@ impl HostRouteIo for SystemHostRoute {
             let client = builder.build().ok()?;
             let response = client.get(&self.check_url).send().await.ok()?;
             let check = response.json::<Check>().await.ok()?;
-            check.is_exit.then_some(SystemExit {
-                country: check.exit_country,
-                city: check.exit_city,
-            })
+            check
+                .is_exit
+                .then(|| SystemExit::new(check.exit_country.as_deref(), check.exit_city.as_deref()))
         })
     }
 }
@@ -408,9 +443,30 @@ mod tests {
     }
 
     /// Windows reports no point-to-point flag for a Wintun adapter, and has
-    /// tunnel-typed adapters of its own (Teredo, IP-HTTPS, 6to4): the Warren
-    /// app's adapter is recognised by the GUID it is always created with, and
-    /// by nothing else.
+    /// tunnel-typed adapters of its own (Teredo, IP-HTTPS, 6to4): only the
+    /// adapter GUID of the app's lineage is a candidate.
+    #[test]
+    fn a_check_answer_is_kept_only_in_a_shape_the_popup_can_show() {
+        assert_eq!(
+            SystemExit::new(Some("fi"), Some("Helsinki")),
+            helsinki(),
+            "the country is upper-cased"
+        );
+        let hostile = SystemExit::new(Some("FIN"), Some("Hel\u{1b}[31msinki\n"));
+        assert_eq!(hostile.country, None, "not a two-letter country");
+        assert_eq!(hostile.city.as_deref(), Some("Hel[31msinki"));
+        assert_eq!(
+            SystemExit::new(None, Some(&"x".repeat(500)))
+                .city
+                .map(|c| c.chars().count()),
+            Some(MAX_CITY_CHARS)
+        );
+        assert_eq!(
+            SystemExit::new(Some("F1"), Some(" \t ")),
+            SystemExit::default()
+        );
+    }
+
     #[test]
     fn only_the_warren_app_adapter_is_a_windows_tunnel() {
         assert!(is_warren_adapter("{AFE43773-E1F8-4EBB-8536-576AB86AFE9A}"));

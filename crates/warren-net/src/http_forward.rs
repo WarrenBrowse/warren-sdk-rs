@@ -93,14 +93,22 @@ enum BodyLength {
 }
 
 /// A request rewritten for its origin.
-#[derive(Debug)]
 pub(crate) struct ForwardRequest {
     target: Target,
-    /// The origin-form head, terminated, with no hop-by-hop field.
-    head: Vec<u8>,
+    /// The origin-form head, terminated, with no hop-by-hop field. It can carry
+    /// the origin's cookies and credentials, and may wait for a path: wiped
+    /// when it goes.
+    head: Zeroizing<Vec<u8>>,
     body: BodyLength,
     /// A `HEAD` request: its response carries no body whatever it declares.
     head_only: bool,
+}
+
+impl std::fmt::Debug for ForwardRequest {
+    // Never the head or the target: a destination and its credentials.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForwardRequest").finish_non_exhaustive()
+    }
 }
 
 /// Whether a request target is an absolute `http` URL, the form a client uses
@@ -264,7 +272,7 @@ pub(crate) fn rewrite_request(head: &str) -> Result<ForwardRequest, Malformed> {
     out.push_str("Connection: close\r\n\r\n");
     Ok(ForwardRequest {
         target,
-        head: out.into_bytes(),
+        head: Zeroizing::new(out.into_bytes()),
         body,
         head_only: method == "HEAD",
     })
@@ -772,7 +780,7 @@ mod tests {
         let request = rewrite_request(head).expect("forwardable");
         (
             request.target,
-            String::from_utf8(request.head).unwrap(),
+            String::from_utf8(request.head.to_vec()).unwrap(),
             request.body,
         )
     }

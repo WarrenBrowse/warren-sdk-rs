@@ -68,21 +68,23 @@ impl BoundHostConnector {
 
     /// A socket of `kind`, bound to the interface and the source address.
     ///
-    /// A bind that fails means the host no longer holds that interface or that
-    /// address: the system tunnel went away. It is reported as
+    /// A bind refused because the host no longer holds that interface or that
+    /// address means the system tunnel went away. It is reported as
     /// [`NetError::EngineStopped`], a path that is gone, so a proxy keeps the
     /// request for its next path instead of refusing it as if the target had.
+    /// Any other bind failure (a missing privilege, no free port) stays an
+    /// [`NetError::Io`]: another path would not cure it.
     fn bound_socket(&self, kind: Type, protocol: Protocol) -> Result<Socket, NetError> {
         let socket = Socket::new(Domain::IPV4, kind, Some(protocol)).map_err(NetError::Io)?;
         if let Some(index) = self.interface {
             bind_interface(&socket, index).map_err(|e| match e {
-                NetError::Io(_) => NetError::EngineStopped,
+                NetError::Io(io) => path_gone_or(io),
                 other => other,
             })?;
         }
         socket
             .bind(&SocketAddr::new(IpAddr::V4(self.source), 0).into())
-            .map_err(|_| NetError::EngineStopped)?;
+            .map_err(path_gone_or)?;
         socket.set_nonblocking(true).map_err(NetError::Io)?;
         Ok(socket)
     }
@@ -147,6 +149,24 @@ impl Connector for BoundHostConnector {
     }
 }
 
+/// ENXIO and ENODEV, what binding to an interface index that no longer exists
+/// answers on the Unix systems that support it.
+const NO_SUCH_DEVICE: [i32; 2] = [6, 19];
+
+/// [`NetError::EngineStopped`] for a bind refused because the interface or the
+/// address is gone, the error itself otherwise.
+fn path_gone_or(e: std::io::Error) -> NetError {
+    let gone = e.kind() == std::io::ErrorKind::AddrNotAvailable
+        || (cfg!(unix)
+            && e.raw_os_error()
+                .is_some_and(|c| NO_SUCH_DEVICE.contains(&c)));
+    if gone {
+        NetError::EngineStopped
+    } else {
+        NetError::Io(e)
+    }
+}
+
 #[cfg(any(
     target_os = "macos",
     target_os = "ios",
@@ -163,7 +183,10 @@ fn bind_interface(socket: &Socket, index: NonZeroU32) -> Result<(), NetError> {
 /// [`BoundHostConnector::on_interface`]); the index adds nothing Windows would
 /// enforce without an option this crate cannot set safely.
 #[cfg(windows)]
-#[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "one signature for every platform's binding"
+)]
 fn bind_interface(_socket: &Socket, _index: NonZeroU32) -> Result<(), NetError> {
     Ok(())
 }
@@ -327,6 +350,28 @@ mod tests {
         assert!(by_name.is_err(), "got {by_name:?}");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn only_a_gone_interface_or_address_reads_as_a_gone_path() {
+        for gone in [
+            std::io::Error::from(std::io::ErrorKind::AddrNotAvailable),
+            std::io::Error::from_raw_os_error(if cfg!(unix) { 6 } else { 10049 }),
+        ] {
+            assert!(
+                matches!(path_gone_or(gone), NetError::EngineStopped),
+                "a vanished interface or address is a gone path"
+            );
+        }
+        for other in [
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            std::io::Error::from(std::io::ErrorKind::AddrInUse),
+        ] {
+            assert!(
+                matches!(path_gone_or(other), NetError::Io(_)),
+                "no other path would cure this"
+            );
+        }
     }
 
     #[tokio::test]
