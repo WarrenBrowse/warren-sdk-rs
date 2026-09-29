@@ -2677,12 +2677,16 @@ mod post_handshake_kill_tests {
 mod host_route_tests {
     use std::time::Duration;
 
+    #[cfg(unix)]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(unix)]
     use tokio::net::{TcpListener, TcpStream};
+    #[cfg(unix)]
     use warren_net::ProxyCredentials;
 
     use super::*;
 
+    #[cfg(unix)]
     fn creds() -> ProxyCredentials {
         ProxyCredentials::new("warren", "test-secret").expect("valid credentials")
     }
@@ -2706,6 +2710,7 @@ mod host_route_tests {
         }
     }
 
+    #[cfg(unix)]
     async fn listeners() -> crate::proxy::ProxyListeners {
         crate::proxy::ProxyListeners::bind(&warren_net::ProxyConfig {
             socks5: "127.0.0.1:0".parse().expect("literal"),
@@ -2717,6 +2722,7 @@ mod host_route_tests {
         .expect("bind listeners")
     }
 
+    #[cfg(unix)]
     async fn echo() -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
         let addr = listener.local_addr().expect("addr");
@@ -2733,6 +2739,7 @@ mod host_route_tests {
 
     /// Sends a CONNECT through the HTTP listener; `None` when nothing answers
     /// within `within`.
+    #[cfg(unix)]
     async fn http_connect(
         proxy: std::net::SocketAddr,
         target: std::net::SocketAddr,

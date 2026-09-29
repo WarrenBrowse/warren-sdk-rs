@@ -487,7 +487,7 @@ mod tests {
     }
 
     /// Answers every request with `body` as JSON, and records the peer address.
-    #[cfg(feature = "reqwest-transport")]
+    #[cfg(all(unix, feature = "reqwest-transport"))]
     async fn check_server(body: &'static str) -> (String, Arc<Mutex<Vec<std::net::IpAddr>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
