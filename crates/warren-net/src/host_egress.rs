@@ -104,10 +104,10 @@ impl BoundHostConnector {
         }
         let socket = self.bound_socket(Type::DGRAM, Protocol::UDP)?;
         let socket = UdpSocket::from_std(socket.into()).map_err(NetError::Io)?;
-        socket.connect(self.resolver).await.map_err(NetError::Io)?;
+        socket.connect(self.resolver).await.map_err(path_gone_or)?;
         let id: u16 = rand::random();
         let query = encode_query(host, id, RecordType::A).map_err(|_| NetError::ConnectFailed)?;
-        socket.send(&query).await.map_err(NetError::Io)?;
+        socket.send(&query).await.map_err(path_gone_or)?;
         let mut buf = [0u8; 1500];
         let len = tokio::time::timeout(RESOLVE_TIMEOUT, socket.recv(&mut buf))
             .await
@@ -142,10 +142,13 @@ impl Connector for BoundHostConnector {
         };
         let socket = self.bound_socket(Type::STREAM, Protocol::TCP)?;
         let socket = TcpSocket::from_std_stream(socket.into());
+        // A network unreachable reported by the exit's side would read as a
+        // gone path too, and wait out the proxy's handover before its refusal:
+        // rare over a tunnel, where the local one is what a disconnect raises.
         tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(SocketAddr::V4(addr)))
             .await
             .map_err(|_| NetError::ConnectTimeout)?
-            .map_err(NetError::Io)
+            .map_err(path_gone_or)
     }
 }
 
@@ -153,13 +156,19 @@ impl Connector for BoundHostConnector {
 /// answers on the Unix systems that support it.
 const NO_SUCH_DEVICE: [i32; 2] = [6, 19];
 
-/// [`NetError::EngineStopped`] for a bind refused because the interface or the
-/// address is gone, the error itself otherwise.
+/// [`NetError::EngineStopped`] for a socket refused because the interface or
+/// the address is gone, the error itself otherwise. A network unreachable
+/// straight from the local stack counts: a socket bound to the system tunnel
+/// gets it the moment that tunnel's routes are removed, before its address
+/// goes (measured on Windows at the app's disconnect), and a request refused
+/// then would never have met its target.
 fn path_gone_or(e: std::io::Error) -> NetError {
-    let gone = e.kind() == std::io::ErrorKind::AddrNotAvailable
-        || (cfg!(unix)
-            && e.raw_os_error()
-                .is_some_and(|c| NO_SUCH_DEVICE.contains(&c)));
+    let gone = matches!(
+        e.kind(),
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::NetworkUnreachable
+    ) || (cfg!(unix)
+        && e.raw_os_error()
+            .is_some_and(|c| NO_SUCH_DEVICE.contains(&c)));
     if gone {
         NetError::EngineStopped
     } else {
@@ -356,6 +365,7 @@ mod tests {
     fn only_a_gone_interface_or_address_reads_as_a_gone_path() {
         for gone in [
             std::io::Error::from(std::io::ErrorKind::AddrNotAvailable),
+            std::io::Error::from(std::io::ErrorKind::NetworkUnreachable),
             std::io::Error::from_raw_os_error(if cfg!(unix) { 6 } else { 10049 }),
         ] {
             assert!(
