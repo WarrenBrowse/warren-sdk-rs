@@ -1932,9 +1932,12 @@ mod tests {
             .write_all(connect_request(&credentials, closed).as_bytes())
             .await
             .expect("write");
-        let head = tokio::time::timeout(std::time::Duration::from_secs(2), read_head(&mut client))
+        // Windows retries a SYN to a closed loopback port for about two seconds
+        // before it reports the refusal: the bound is the handover deadline,
+        // which a request kept for another path would wait out.
+        let head = tokio::time::timeout(HANDOVER_DEADLINE / 2, read_head(&mut client))
             .await
-            .expect("answered at once");
+            .expect("answered without waiting for another path");
         assert!(head.starts_with("HTTP/1.1 502 "), "{head}");
         assert_eq!(handover.len(), 0, "nothing waits for another path");
     }
