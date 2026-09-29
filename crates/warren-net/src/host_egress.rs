@@ -55,8 +55,11 @@ impl BoundHostConnector {
     }
 
     /// Binds every socket to the interface with this index as well, so a flow
-    /// can only ever leave through it. Supported on macOS, iOS, Linux and
-    /// Android; elsewhere every flow fails with [`NetError::Unsupported`].
+    /// can only ever leave through it. On macOS, iOS, Linux and Android the
+    /// socket is bound to the device. On Windows the source address does it:
+    /// its strong host model sends a socket bound to an adapter's address out
+    /// of that adapter only, and the bind fails once the adapter is gone.
+    /// Elsewhere every flow fails with [`NetError::Unsupported`].
     #[must_use]
     pub fn on_interface(mut self, index: NonZeroU32) -> Self {
         self.interface = Some(index);
@@ -64,14 +67,22 @@ impl BoundHostConnector {
     }
 
     /// A socket of `kind`, bound to the interface and the source address.
+    ///
+    /// A bind that fails means the host no longer holds that interface or that
+    /// address: the system tunnel went away. It is reported as
+    /// [`NetError::EngineStopped`], a path that is gone, so a proxy keeps the
+    /// request for its next path instead of refusing it as if the target had.
     fn bound_socket(&self, kind: Type, protocol: Protocol) -> Result<Socket, NetError> {
         let socket = Socket::new(Domain::IPV4, kind, Some(protocol)).map_err(NetError::Io)?;
         if let Some(index) = self.interface {
-            bind_interface(&socket, index)?;
+            bind_interface(&socket, index).map_err(|e| match e {
+                NetError::Io(_) => NetError::EngineStopped,
+                other => other,
+            })?;
         }
         socket
             .bind(&SocketAddr::new(IpAddr::V4(self.source), 0).into())
-            .map_err(NetError::Io)?;
+            .map_err(|_| NetError::EngineStopped)?;
         socket.set_nonblocking(true).map_err(NetError::Io)?;
         Ok(socket)
     }
@@ -148,11 +159,21 @@ fn bind_interface(socket: &Socket, index: NonZeroU32) -> Result<(), NetError> {
         .map_err(NetError::Io)
 }
 
+/// The source address the socket is bound to next pins the adapter (see
+/// [`BoundHostConnector::on_interface`]); the index adds nothing Windows would
+/// enforce without an option this crate cannot set safely.
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+fn bind_interface(_socket: &Socket, _index: NonZeroU32) -> Result<(), NetError> {
+    Ok(())
+}
+
 #[cfg(not(any(
     target_os = "macos",
     target_os = "ios",
     target_os = "linux",
-    target_os = "android"
+    target_os = "android",
+    windows
 )))]
 fn bind_interface(_socket: &Socket, _index: NonZeroU32) -> Result<(), NetError> {
     Err(NetError::Unsupported("binding a socket to an interface"))
@@ -228,9 +249,12 @@ mod tests {
 
         let result = connector.connect(Target::Ip(target)).await;
 
+        // Failing as a path that went away, not as a target that refused: the
+        // proxy then keeps the request for the next path instead of showing
+        // the member an error for the second the system tunnel dropped.
         assert!(
-            matches!(result, Err(NetError::Io(_))),
-            "binding to an address the host does not hold must fail, got {result:?}"
+            matches!(result, Err(NetError::EngineStopped)),
+            "binding to an address the host does not hold must fail as a gone path, got {result:?}"
         );
     }
 
@@ -243,7 +267,10 @@ mod tests {
             .connect(Target::Domain("upstream.example".into(), 443))
             .await;
 
-        assert!(matches!(result, Err(NetError::Io(_))), "got {result:?}");
+        assert!(
+            matches!(result, Err(NetError::EngineStopped)),
+            "got {result:?}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             queries.load(std::sync::atomic::Ordering::SeqCst),

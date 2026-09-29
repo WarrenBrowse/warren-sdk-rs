@@ -33,6 +33,9 @@ pub struct ProxyListeners {
     http_addr: Option<SocketAddr>,
     credentials: ProxyCredentials,
     serving: Arc<tokio::sync::Mutex<()>>,
+    /// Shared by every path that serves these listeners, so a request one
+    /// path accepted and could not answer is carried by the next.
+    handover: warren_net::Handover,
 }
 
 impl ProxyListeners {
@@ -64,6 +67,7 @@ impl ProxyListeners {
             http_addr,
             credentials: session_credentials(cfg),
             serving: Arc::new(tokio::sync::Mutex::new(())),
+            handover: warren_net::Handover::new(),
         })
     }
 
@@ -91,6 +95,10 @@ impl ProxyListeners {
 
     pub(crate) fn http_listener(&self) -> Option<Arc<tokio::net::TcpListener>> {
         self.http.clone()
+    }
+
+    pub(crate) fn handover(&self) -> warren_net::Handover {
+        self.handover.clone()
     }
 
     /// Waits until no other datapath serves these listeners, and holds them

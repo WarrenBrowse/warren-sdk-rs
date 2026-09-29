@@ -91,13 +91,356 @@ async fn until_stopped(
 ) {
     tokio::select! {
         () = connection => {}
-        () = async {
-            while *run.borrow_and_update() {
-                if run.changed().await.is_err() {
-                    return;
+        () = stopped(&mut run) => {}
+    }
+}
+
+/// Resolves once `run` goes `false` or its sender is dropped.
+async fn stopped(run: &mut tokio::sync::watch::Receiver<bool>) {
+    while *run.borrow_and_update() {
+        if run.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// How long a request whose path went away before it was answered waits for
+/// the next path. A browser gives a proxy about this long before it shows an
+/// error of its own; past it the request is refused as a dead tunnel always was.
+pub const HANDOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Requests accepted on the stable listeners whose path went away before they
+/// were answered, kept for the next path.
+///
+/// A path (an epoch of the proxy's own tunnel, or the host route while the
+/// proxy stands aside) serves the listeners for a while, then is given up. A
+/// request it had accepted but not yet answered has sent nothing to its target,
+/// so it belongs to no path: dropping it with its path showed the member an
+/// error for a request any later path would have carried. That was every page
+/// opened in the second the Warren app connected, while the proxy's own tunnel
+/// was already walled by the app's kill switch and not yet given up. Every
+/// server of the same listeners shares one `Handover` and takes up what it holds,
+/// each through its own connector. A request that has started relaying stays
+/// bound to its path and closes with it.
+#[derive(Clone)]
+pub struct Handover {
+    inner: Arc<HandoverInner>,
+}
+
+struct HandoverInner {
+    queue: std::sync::Mutex<std::collections::VecDeque<Pending>>,
+    ready: tokio::sync::Notify,
+    deadline: std::time::Duration,
+}
+
+impl std::fmt::Debug for Handover {
+    // Never the targets: a waiting request is a destination.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Handover")
+            .field("waiting", &self.len())
+            .finish()
+    }
+}
+
+impl Default for Handover {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Handover {
+    /// A handover whose requests wait up to [`HANDOVER_DEADLINE`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_deadline(HANDOVER_DEADLINE)
+    }
+
+    /// A handover whose requests wait up to `deadline` from when they were read.
+    #[must_use]
+    pub fn with_deadline(deadline: std::time::Duration) -> Self {
+        Self {
+            inner: Arc::new(HandoverInner {
+                queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                ready: tokio::sync::Notify::new(),
+                deadline,
+            }),
+        }
+    }
+
+    /// How many requests are waiting for a path.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.queue().len()
+    }
+
+    /// Whether no request is waiting for a path.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn queue(&self) -> std::sync::MutexGuard<'_, std::collections::VecDeque<Pending>> {
+        // A poisoned lock only means a holder panicked between two plain
+        // queue operations, which leave the queue consistent.
+        self.inner
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn expiry_from_now(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.inner.deadline
+    }
+
+    /// Keeps `pending` for the next path, or refuses it if its time is up.
+    fn hold(&self, pending: Pending) {
+        let expires = pending.expires;
+        if expires <= tokio::time::Instant::now() {
+            tokio::spawn(pending.refuse(NetError::EngineStopped));
+            return;
+        }
+        self.queue().push_back(pending);
+        self.inner.ready.notify_one();
+        let handover = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(expires).await;
+            handover.refuse_expired();
+        });
+    }
+
+    fn refuse_expired(&self) {
+        let now = tokio::time::Instant::now();
+        let expired: std::collections::VecDeque<Pending> = {
+            let mut queue = self.queue();
+            let (expired, kept) = std::mem::take(&mut *queue)
+                .into_iter()
+                .partition(|p: &Pending| p.expires <= now);
+            *queue = kept;
+            expired
+        };
+        for pending in expired {
+            tokio::spawn(pending.refuse(NetError::EngineStopped));
+        }
+    }
+
+    /// The next waiting request still within its deadline.
+    async fn take(&self) -> Pending {
+        loop {
+            let notified = self.inner.ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let next = {
+                let mut queue = self.queue();
+                let next = queue.pop_front();
+                if !queue.is_empty() {
+                    // Another server of the same listeners may be waiting too.
+                    self.inner.ready.notify_one();
                 }
+                next
+            };
+            match next {
+                Some(p) if p.expires > tokio::time::Instant::now() => return p,
+                Some(p) => {
+                    tokio::spawn(p.refuse(NetError::EngineStopped));
+                }
+                None => notified.await,
             }
-        } => {}
+        }
+    }
+}
+
+/// What an accepted client asked for, read and authorized, not yet answered.
+enum Request {
+    Socks(Target),
+    Connect {
+        target: Target,
+        early_data: Zeroizing<Vec<u8>>,
+    },
+    Forward {
+        request: http_forward::ForwardRequest,
+        early_data: Zeroizing<Vec<u8>>,
+    },
+}
+
+impl Request {
+    fn target(&self) -> Target {
+        match self {
+            Self::Socks(target) | Self::Connect { target, .. } => target.clone(),
+            Self::Forward { request, .. } => request.target(),
+        }
+    }
+}
+
+/// A client whose request no path has answered yet.
+struct Pending {
+    client: TcpStream,
+    request: Request,
+    /// When the member stops being served better by waiting than by an error.
+    expires: tokio::time::Instant,
+}
+
+impl Pending {
+    /// Answers the client the way its protocol reports a CONNECT this proxy
+    /// could not carry.
+    async fn refuse(mut self, err: NetError) {
+        let _ = match self.request {
+            Request::Socks(_) => write_reply(&mut self.client, connect_failure_reply(&err)).await,
+            Request::Connect { .. } | Request::Forward { .. } => self
+                .client
+                .write_all(&connect_failure_response(&err))
+                .await
+                .map_err(NetError::Io),
+        };
+    }
+}
+
+/// The path a request is served on: the signal that gives it up, and where a
+/// request it could not answer goes. Neither for a plain `serve` loop.
+#[derive(Default)]
+struct PathScope {
+    stop: Option<tokio::sync::watch::Receiver<bool>>,
+    handover: Option<Handover>,
+}
+
+impl PathScope {
+    fn new(stop: tokio::sync::watch::Receiver<bool>, handover: Option<Handover>) -> Self {
+        Self {
+            stop: Some(stop),
+            handover,
+        }
+    }
+
+    fn pending(&self, client: TcpStream, request: Request) -> Pending {
+        let expires = self
+            .handover
+            .as_ref()
+            .map_or_else(tokio::time::Instant::now, Handover::expiry_from_now);
+        Pending {
+            client,
+            request,
+            expires,
+        }
+    }
+}
+
+/// How a dial ended.
+enum Dial<S> {
+    Up(S),
+    /// The path went away, or was given up, before the dial finished: the
+    /// target is not to blame, and another path may carry the request.
+    PathGone,
+    /// The target (or its name) could not be reached over a working path.
+    Failed(NetError),
+}
+
+async fn dial<C: Connector>(
+    connector: &C,
+    target: Target,
+    stop: Option<&mut tokio::sync::watch::Receiver<bool>>,
+) -> Dial<C::Stream> {
+    let outcome = |dialed: Result<C::Stream, NetError>| match dialed {
+        Ok(stream) => Dial::Up(stream),
+        Err(NetError::EngineStopped) => Dial::PathGone,
+        Err(e) => Dial::Failed(e),
+    };
+    let Some(stop) = stop else {
+        return outcome(connector.connect(target).await);
+    };
+    if !*stop.borrow_and_update() {
+        return Dial::PathGone;
+    }
+    tokio::select! {
+        biased;
+        () = stopped(stop) => Dial::PathGone,
+        dialed = connector.connect(target) => outcome(dialed),
+    }
+}
+
+/// Answers one request over `connector`: dials its target, replies, and relays
+/// until either side closes or the path is given up. A request whose path goes
+/// away before it is answered is handed over to the next path when the scope
+/// has a [`Handover`], and refused otherwise.
+async fn answer<C: Connector>(pending: Pending, connector: &C, mut scope: PathScope) {
+    let Pending {
+        mut client,
+        request,
+        expires,
+    } = pending;
+    let upstream = match dial(connector, request.target(), scope.stop.as_mut()).await {
+        Dial::Up(upstream) => upstream,
+        Dial::PathGone => {
+            let pending = Pending {
+                client,
+                request,
+                expires,
+            };
+            match &scope.handover {
+                Some(handover) => handover.hold(pending),
+                None => pending.refuse(NetError::EngineStopped).await,
+            }
+            return;
+        }
+        Dial::Failed(e) => {
+            Pending {
+                client,
+                request,
+                expires,
+            }
+            .refuse(e)
+            .await;
+            return;
+        }
+    };
+    let relay = async move {
+        let _ = relay(&mut client, upstream, request).await;
+    };
+    match scope.stop {
+        Some(stop) => until_stopped(stop, relay).await,
+        None => relay.await,
+    }
+}
+
+/// Tells the client its request is carried, then relays bytes both ways.
+async fn relay<S>(client: &mut TcpStream, mut upstream: S, request: Request) -> Result<(), NetError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match request {
+        Request::Socks(_) => {
+            write_reply(client, Reply::Succeeded).await?;
+        }
+        Request::Connect { early_data, .. } => {
+            client
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .map_err(NetError::Io)?;
+            // A pipelining client may have sent tunnel bytes right after the
+            // head; they were read while scanning for the terminator, so
+            // forward them before the bidirectional copy takes over.
+            if !early_data.is_empty() {
+                upstream
+                    .write_all(&early_data)
+                    .await
+                    .map_err(NetError::Io)?;
+            }
+        }
+        Request::Forward {
+            request,
+            early_data,
+        } => return http_forward::forward(client, &early_data, upstream, request).await,
+    }
+    tokio::io::copy_bidirectional(client, &mut upstream)
+        .await
+        .map_err(NetError::Io)?;
+    Ok(())
+}
+
+/// The next request handed over by a path that went away, or never when this
+/// server takes none.
+async fn handed_over(handover: Option<&Handover>) -> Pending {
+    match handover {
+        Some(handover) => handover.take().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -216,6 +559,7 @@ impl Connector for DirectConnector {
 pub struct Socks5Proxy<C> {
     connector: Arc<C>,
     credentials: Arc<ProxyCredentials>,
+    handover: Option<Handover>,
 }
 
 impl<C: Connector> Socks5Proxy<C> {
@@ -225,7 +569,18 @@ impl<C: Connector> Socks5Proxy<C> {
         Self {
             connector: Arc::new(connector),
             credentials: Arc::new(credentials),
+            handover: None,
         }
+    }
+
+    /// Shares `handover` with the other servers of the same listeners: in its
+    /// `..._until` loops, a `CONNECT` whose path is given up before it is
+    /// answered waits there for the next path instead of failing, and this
+    /// server takes up what the others hand over. See [`Handover`].
+    #[must_use]
+    pub fn with_handover(mut self, handover: Handover) -> Self {
+        self.handover = Some(handover);
+        self
     }
 
     /// Accepts connections on `listener` until it errors, handling each on its
@@ -241,7 +596,13 @@ impl<C: Connector> Socks5Proxy<C> {
             let connector = Arc::clone(&self.connector);
             let credentials = Arc::clone(&self.credentials);
             tokio::spawn(async move {
-                let _ = handle_connection(client, connector.as_ref(), &credentials).await;
+                handle_connection(
+                    client,
+                    connector.as_ref(),
+                    &credentials,
+                    PathScope::default(),
+                )
+                .await;
             });
         }
     }
@@ -270,60 +631,43 @@ impl<C: Connector> Socks5Proxy<C> {
                         return Ok(());
                     }
                 }
+                pending = handed_over(self.handover.as_ref()) => {
+                    let connector = Arc::clone(&self.connector);
+                    let scope = PathScope::new(run.clone(), self.handover.clone());
+                    tokio::spawn(async move { answer(pending, connector.as_ref(), scope).await });
+                }
                 accepted = accept(listener) => {
                     let client = accepted?;
                     let connector = Arc::clone(&self.connector);
                     let credentials = Arc::clone(&self.credentials);
-                    let stop = run.clone();
-                    tokio::spawn(until_stopped(stop, async move {
-                        let _ = handle_connection(client, connector.as_ref(), &credentials).await;
-                    }));
+                    let scope = PathScope::new(run.clone(), self.handover.clone());
+                    tokio::spawn(async move {
+                        handle_connection(client, connector.as_ref(), &credentials, scope).await;
+                    });
                 }
             }
         }
     }
 }
 
-/// Opens the upstream flow for a `CONNECT` target and relays bytes both ways,
-/// replying success, or the RFC 1928 code naming the local condition that
-/// refused it ([`connect_failure_reply`]). Shared by the plain and UDP-capable
-/// SOCKS5 handlers so the CONNECT leg lives in one place.
-async fn relay_connect<C: Connector>(
-    client: &mut TcpStream,
-    connector: &C,
-    target: Target,
-) -> Result<(), NetError> {
-    let mut upstream = match connector.connect(target).await {
-        Ok(s) => s,
-        Err(e) => {
-            write_reply(client, connect_failure_reply(&e)).await?;
-            return Err(e);
-        }
-    };
-    write_reply(client, Reply::Succeeded).await?;
-    tokio::io::copy_bidirectional(client, &mut upstream)
-        .await
-        .map_err(NetError::Io)?;
-    Ok(())
-}
-
-/// Drives one client through the SOCKS5 handshake, then relays bytes both ways.
+/// Drives one client through the SOCKS5 handshake, then answers its `CONNECT`.
 async fn handle_connection<C: Connector>(
     mut client: TcpStream,
     connector: &C,
     credentials: &ProxyCredentials,
-) -> Result<(), NetError> {
-    let Some((command, target)) =
-        within_handshake(socks_handshake(&mut client, credentials)).await?
+    scope: PathScope,
+) {
+    let Ok(Some((command, target))) =
+        within_handshake(socks_handshake(&mut client, credentials)).await
     else {
-        return Ok(());
+        return;
     };
-
     if !command.is_supported() {
-        write_reply(&mut client, Reply::CommandNotSupported).await?;
-        return Ok(());
+        let _ = write_reply(&mut client, Reply::CommandNotSupported).await;
+        return;
     }
-    relay_connect(&mut client, connector, target).await
+    let pending = scope.pending(client, Request::Socks(target));
+    answer(pending, connector, scope).await;
 }
 
 impl<C: UdpConnector> Socks5Proxy<C> {
@@ -341,7 +685,13 @@ impl<C: UdpConnector> Socks5Proxy<C> {
             let connector = Arc::clone(&self.connector);
             let credentials = Arc::clone(&self.credentials);
             tokio::spawn(async move {
-                let _ = handle_with_udp(client, connector.as_ref(), &credentials).await;
+                handle_with_udp(
+                    client,
+                    connector.as_ref(),
+                    &credentials,
+                    PathScope::default(),
+                )
+                .await;
             });
         }
     }
@@ -372,37 +722,55 @@ impl<C: UdpConnector> Socks5Proxy<C> {
                         return Ok(());
                     }
                 }
+                pending = handed_over(self.handover.as_ref()) => {
+                    let connector = Arc::clone(&self.connector);
+                    let scope = PathScope::new(run.clone(), self.handover.clone());
+                    tokio::spawn(async move { answer(pending, connector.as_ref(), scope).await });
+                }
                 accepted = accept(listener) => {
                     let client = accepted?;
                     let connector = Arc::clone(&self.connector);
                     let credentials = Arc::clone(&self.credentials);
-                    let stop = run.clone();
-                    tokio::spawn(until_stopped(stop, async move {
-                        let _ = handle_with_udp(client, connector.as_ref(), &credentials).await;
-                    }));
+                    let scope = PathScope::new(run.clone(), self.handover.clone());
+                    tokio::spawn(async move {
+                        handle_with_udp(client, connector.as_ref(), &credentials, scope).await;
+                    });
                 }
             }
         }
     }
 }
 
-/// SOCKS5 handler that supports `CONNECT` and `UDP ASSOCIATE`.
+/// SOCKS5 handler that supports `CONNECT` and `UDP ASSOCIATE`. An association
+/// lives and dies with its path: its datagrams have no single request to hand
+/// over, and the client reopens it on the next one.
 async fn handle_with_udp<C: UdpConnector>(
     mut client: TcpStream,
     connector: &C,
     credentials: &ProxyCredentials,
-) -> Result<(), NetError> {
-    let Some((command, target)) =
-        within_handshake(socks_handshake(&mut client, credentials)).await?
+    scope: PathScope,
+) {
+    let Ok(Some((command, target))) =
+        within_handshake(socks_handshake(&mut client, credentials)).await
     else {
-        return Ok(());
+        return;
     };
     match command {
-        Command::Connect => relay_connect(&mut client, connector, target).await,
-        Command::UdpAssociate => udp_associate(client, connector, &target).await,
+        Command::Connect => {
+            let pending = scope.pending(client, Request::Socks(target));
+            answer(pending, connector, scope).await;
+        }
+        Command::UdpAssociate => {
+            let association = async move {
+                let _ = udp_associate(client, connector, &target).await;
+            };
+            match scope.stop {
+                Some(stop) => until_stopped(stop, association).await,
+                None => association.await,
+            }
+        }
         Command::Bind => {
-            write_reply(&mut client, Reply::CommandNotSupported).await?;
-            Ok(())
+            let _ = write_reply(&mut client, Reply::CommandNotSupported).await;
         }
     }
 }
@@ -654,6 +1022,7 @@ const HEAD_START: usize = 1024;
 pub struct HttpConnectProxy<C> {
     connector: Arc<C>,
     credentials: Arc<ProxyCredentials>,
+    handover: Option<Handover>,
 }
 
 impl<C: Connector> HttpConnectProxy<C> {
@@ -663,7 +1032,16 @@ impl<C: Connector> HttpConnectProxy<C> {
         Self {
             connector: Arc::new(connector),
             credentials: Arc::new(credentials),
+            handover: None,
         }
+    }
+
+    /// Shares `handover` with the other servers of the same listeners, as
+    /// [`Socks5Proxy::with_handover`] does.
+    #[must_use]
+    pub fn with_handover(mut self, handover: Handover) -> Self {
+        self.handover = Some(handover);
+        self
     }
 
     /// Accepts connections on `listener` until it errors, one task each.
@@ -677,7 +1055,13 @@ impl<C: Connector> HttpConnectProxy<C> {
             let connector = Arc::clone(&self.connector);
             let credentials = Arc::clone(&self.credentials);
             tokio::spawn(async move {
-                let _ = handle_connect(client, connector.as_ref(), &credentials).await;
+                handle_connect(
+                    client,
+                    connector.as_ref(),
+                    &credentials,
+                    PathScope::default(),
+                )
+                .await;
             });
         }
     }
@@ -705,14 +1089,19 @@ impl<C: Connector> HttpConnectProxy<C> {
                         return Ok(());
                     }
                 }
+                pending = handed_over(self.handover.as_ref()) => {
+                    let connector = Arc::clone(&self.connector);
+                    let scope = PathScope::new(run.clone(), self.handover.clone());
+                    tokio::spawn(async move { answer(pending, connector.as_ref(), scope).await });
+                }
                 accepted = accept(listener) => {
                     let client = accepted?;
                     let connector = Arc::clone(&self.connector);
                     let credentials = Arc::clone(&self.credentials);
-                    let stop = run.clone();
-                    tokio::spawn(until_stopped(stop, async move {
-                        let _ = handle_connect(client, connector.as_ref(), &credentials).await;
-                    }));
+                    let scope = PathScope::new(run.clone(), self.handover.clone());
+                    tokio::spawn(async move {
+                        handle_connect(client, connector.as_ref(), &credentials, scope).await;
+                    });
                 }
             }
         }
@@ -816,12 +1205,16 @@ async fn handle_connect<C: Connector>(
     mut client: TcpStream,
     connector: &C,
     credentials: &ProxyCredentials,
-) -> Result<(), NetError> {
-    let Some((head, early_data)) = within_handshake(read_request_head(&mut client)).await? else {
+    scope: PathScope,
+) {
+    let Ok(read) = within_handshake(read_request_head(&mut client)).await else {
+        return;
+    };
+    let Some((head, early_data)) = read else {
         let _ = client
             .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
             .await;
-        return Ok(());
+        return;
     };
     let mut lines = head.split("\r\n");
     let mut request_line = lines.next().unwrap_or("").split_whitespace();
@@ -832,7 +1225,7 @@ async fn handle_connect<C: Connector>(
         && let Some(response) = proof_response(credentials, argument)
     {
         let _ = client.write_all(&response).await;
-        return Ok(());
+        return;
     }
     let authorized = lines
         .filter_map(|line| line.split_once(':'))
@@ -840,54 +1233,32 @@ async fn handle_connect<C: Connector>(
         .is_some_and(|(_, value)| credentials.matches_basic(value));
     if !authorized {
         let _ = client.write_all(PROXY_AUTH_REQUIRED).await;
-        return Err(NetError::ProxyAuth);
+        return;
     }
-    if method != "CONNECT" && http_forward::is_absolute_http(argument) {
-        return match http_forward::rewrite_request(&head) {
-            Ok(request) => {
-                http_forward::forward(&mut client, &early_data, connector, request).await
-            }
+    let request = if method != "CONNECT" && http_forward::is_absolute_http(argument) {
+        match http_forward::rewrite_request(&head) {
+            Ok(request) => Request::Forward {
+                request,
+                early_data,
+            },
             Err(_) => {
                 let _ = client.write_all(http_forward::BAD_REQUEST).await;
-                Ok(())
+                return;
             }
-        };
-    }
-    let target = match (method, parse_authority(argument)) {
-        ("CONNECT", Some(target)) => target,
-        _ => {
-            let _ = client
-                .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
-                .await;
-            return Ok(());
+        }
+    } else {
+        match (method, parse_authority(argument)) {
+            ("CONNECT", Some(target)) => Request::Connect { target, early_data },
+            _ => {
+                let _ = client
+                    .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+                    .await;
+                return;
+            }
         }
     };
-
-    let mut upstream = match connector.connect(target).await {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = client.write_all(&connect_failure_response(&e)).await;
-            return Err(e);
-        }
-    };
-
-    client
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await
-        .map_err(NetError::Io)?;
-    // A pipelining client may have sent tunnel bytes right after the head; they
-    // were read while scanning for the terminator, so forward them before the
-    // bidirectional copy takes over.
-    if !early_data.is_empty() {
-        upstream
-            .write_all(&early_data)
-            .await
-            .map_err(NetError::Io)?;
-    }
-    tokio::io::copy_bidirectional(&mut client, &mut upstream)
-        .await
-        .map_err(NetError::Io)?;
-    Ok(())
+    let pending = scope.pending(client, request);
+    answer(pending, connector, scope).await;
 }
 
 /// Reads a request head and returns it (without its terminating blank line)
@@ -1100,10 +1471,11 @@ mod tests {
         let server_credentials = credentials.clone();
         let server = tokio::spawn(async move {
             let (client, _) = listener.accept().await.expect("accept");
-            let _ = handle_connect(
+            handle_connect(
                 client,
                 &DeadConnector(NetError::EngineStopped),
                 &server_credentials,
+                PathScope::default(),
             )
             .await;
         });
@@ -1129,6 +1501,209 @@ mod tests {
             !text.contains("example.com"),
             "the response may never echo the target back: {text}"
         );
+    }
+
+    /// A connector whose connect never completes: the dial a walled tunnel
+    /// makes, which neither answers nor fails before the path is given up.
+    struct HangingConnector;
+
+    impl Connector for HangingConnector {
+        type Stream = tokio::net::TcpStream;
+
+        async fn connect(&self, _target: Target) -> Result<Self::Stream, NetError> {
+            std::future::pending().await
+        }
+    }
+
+    /// A local echo server, the upstream a request reaches once a path takes it.
+    async fn echo_server() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
+        let addr = listener.local_addr().expect("echo addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = stream.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn connect_request(credentials: &ProxyCredentials, target: SocketAddr) -> String {
+        format!(
+            "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: {}\r\n\r\n",
+            &*credentials.basic_authorization()
+        )
+    }
+
+    /// Reads an HTTP response head (through its blank line) off `stream`.
+    async fn read_head(stream: &mut TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).await.expect("read head") == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        String::from_utf8(head).expect("ascii head")
+    }
+
+    #[tokio::test]
+    async fn a_connect_whose_path_ends_before_it_is_answered_is_answered_by_the_next_path() {
+        // The defect this pins: at the instant the Warren app connects, the
+        // helper's own tunnel is walled by the app's kill switch. A CONNECT the
+        // browser sent just then was accepted by that dying path, and when the
+        // path was given up the client socket was closed with no answer, which
+        // the browser shows as ERR_TUNNEL_CONNECTION_FAILED. Nothing had left
+        // for the target yet, so the next path must carry it instead.
+        let echo = echo_server().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let credentials = ProxyCredentials::generate();
+        let handover = Handover::new();
+
+        let (run_a, rx_a) = tokio::sync::watch::channel(true);
+        let dying = HttpConnectProxy::new(HangingConnector, credentials.clone())
+            .with_handover(handover.clone());
+        let listener = Arc::new(listener);
+        let first = {
+            let listener = Arc::clone(&listener);
+            tokio::spawn(async move { dying.serve_until(&listener, rx_a).await })
+        };
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(connect_request(&credentials, echo).as_bytes())
+            .await
+            .expect("write");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let _ = run_a.send(false);
+        first.await.expect("join").expect("first path served");
+
+        let (_run_b, rx_b) = tokio::sync::watch::channel(true);
+        let next = HttpConnectProxy::new(DirectConnector, credentials.clone())
+            .with_handover(handover.clone());
+        let _second = {
+            let listener = Arc::clone(&listener);
+            tokio::spawn(async move { next.serve_until(&listener, rx_b).await })
+        };
+
+        let head = tokio::time::timeout(std::time::Duration::from_secs(5), read_head(&mut client))
+            .await
+            .expect("the next path answers the waiting request");
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        client.write_all(b"ping").await.expect("write through");
+        let mut echoed = [0u8; 4];
+        client.read_exact(&mut echoed).await.expect("read through");
+        assert_eq!(&echoed, b"ping");
+    }
+
+    #[tokio::test]
+    async fn a_socks_connect_whose_path_ends_before_it_is_answered_is_answered_by_the_next_path() {
+        let echo = echo_server().await;
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind"));
+        let addr = listener.local_addr().expect("addr");
+        let credentials = ProxyCredentials::generate();
+        let handover = Handover::new();
+
+        let (run_a, rx_a) = tokio::sync::watch::channel(true);
+        let dying =
+            Socks5Proxy::new(HangingConnector, credentials.clone()).with_handover(handover.clone());
+        let first = {
+            let listener = Arc::clone(&listener);
+            tokio::spawn(async move { dying.serve_until(&listener, rx_a).await })
+        };
+        let client_credentials = credentials.clone();
+        let client = tokio::spawn(async move {
+            crate::proxy_auth::socks5_connect(addr, &client_credentials, &Target::Ip(echo)).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let _ = run_a.send(false);
+        first.await.expect("join").expect("first path served");
+
+        let (_run_b, rx_b) = tokio::sync::watch::channel(true);
+        let next =
+            Socks5Proxy::new(DirectConnector, credentials.clone()).with_handover(handover.clone());
+        let _second = {
+            let listener = Arc::clone(&listener);
+            tokio::spawn(async move { next.serve_until(&listener, rx_b).await })
+        };
+
+        let mut stream = tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .expect("the next path answers the waiting request")
+            .expect("join")
+            .expect("the SOCKS reply is a success");
+        stream.write_all(b"ping").await.expect("write through");
+        let mut echoed = [0u8; 4];
+        stream.read_exact(&mut echoed).await.expect("read through");
+        assert_eq!(&echoed, b"ping");
+    }
+
+    #[tokio::test]
+    async fn a_request_no_path_takes_up_is_refused_at_its_deadline() {
+        // Held, not dropped: a request is kept only as long as a browser would
+        // wait for it, then answered the way a dead tunnel always was.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let credentials = ProxyCredentials::generate();
+        let handover = Handover::with_deadline(std::time::Duration::from_millis(400));
+        let (run, rx) = tokio::sync::watch::channel(true);
+        let dying = HttpConnectProxy::new(HangingConnector, credentials.clone())
+            .with_handover(handover.clone());
+        let server = tokio::spawn(async move { dying.serve_until(&listener, rx).await });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(connect_request(&credentials, "127.0.0.1:9".parse().unwrap()).as_bytes())
+            .await
+            .expect("write");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = run.send(false);
+        server.await.expect("join").expect("served");
+
+        let started = std::time::Instant::now();
+        let head = tokio::time::timeout(std::time::Duration::from_secs(5), read_head(&mut client))
+            .await
+            .expect("the request is answered, not left hanging");
+        assert!(head.starts_with("HTTP/1.1 502 "), "{head}");
+        assert!(head.contains("tunnel-gone"), "{head}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "refused at its deadline, not at some later timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_that_refuses_is_answered_at_once_and_never_handed_over() {
+        // Only a path that went away earns a second chance. A target that
+        // refuses would refuse on the next path too, and a member waiting for
+        // it to fail again would be waiting for nothing.
+        let closed = {
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            l.local_addr().expect("addr")
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let credentials = ProxyCredentials::generate();
+        let handover = Handover::new();
+        let (_run, rx) = tokio::sync::watch::channel(true);
+        let proxy = HttpConnectProxy::new(DirectConnector, credentials.clone())
+            .with_handover(handover.clone());
+        let _server = tokio::spawn(async move { proxy.serve_until(&listener, rx).await });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(connect_request(&credentials, closed).as_bytes())
+            .await
+            .expect("write");
+        let head = tokio::time::timeout(std::time::Duration::from_secs(2), read_head(&mut client))
+            .await
+            .expect("answered at once");
+        assert!(head.starts_with("HTTP/1.1 502 "), "{head}");
+        assert_eq!(handover.len(), 0, "nothing waits for another path");
     }
 
     #[test]

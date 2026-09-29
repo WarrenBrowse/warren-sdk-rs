@@ -88,6 +88,9 @@ pub struct SupervisedProxyHandle {
     /// supervisor's own epoch enders. Handle-level rather than per-epoch: a host
     /// holds it for the life of the datapath, across every rebuild.
     pub(crate) reconnect_request: Arc<tokio::sync::Notify>,
+    /// Where the system Warren tunnel comes out while the proxy stands aside
+    /// behind it, `None` while the proxy carries its clients itself.
+    pub(crate) system_exit_rx: tokio::sync::watch::Receiver<Option<crate::SystemExit>>,
     pub(crate) task: tokio::task::JoinHandle<()>,
 }
 
@@ -123,6 +126,17 @@ impl SupervisedProxyHandle {
     #[must_use]
     pub fn watch_state(&self) -> tokio::sync::watch::Receiver<ConnectionState> {
         self.state_rx.clone()
+    }
+
+    /// Where the traffic of this proxy's clients comes out while the proxy
+    /// stands aside behind a system Warren tunnel (see
+    /// [`WarrenClientBuilder::stand_aside_behind_system_warren`](crate::WarrenClientBuilder::stand_aside_behind_system_warren)),
+    /// and `None` while the proxy carries them over its own tunnel. The state
+    /// reads `Connected` either way: this says whose tunnel, and so which exit,
+    /// a host should name.
+    #[must_use]
+    pub fn watch_system_exit(&self) -> tokio::sync::watch::Receiver<Option<crate::SystemExit>> {
+        self.system_exit_rx.clone()
     }
 
     /// Why the most recent serving epoch ended, or `None` while the first one is
@@ -885,6 +899,7 @@ pub(crate) async fn serve_epoch(
     socks_listener: &tokio::net::TcpListener,
     http_listener: Option<&tokio::net::TcpListener>,
     credentials: &warren_net::ProxyCredentials,
+    handover: &warren_net::Handover,
     connector: warren_net::TunnelConnector,
     alive_rx: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -896,14 +911,16 @@ pub(crate) async fn serve_epoch(
         wait_until_dead(alive_rx).await;
         let _ = run_tx.send(false);
     }));
-    let socks = warren_net::Socks5Proxy::new(connector.clone(), credentials.clone());
+    let socks = warren_net::Socks5Proxy::new(connector.clone(), credentials.clone())
+        .with_handover(handover.clone());
     // `select!`, not `join!`: the first loop to return ends the epoch. On tunnel
     // death the bridge flips `run` and whichever loop sees it first returns; if an
     // accept loop instead fails on its own, that also ends the epoch (a `join!`
     // would hang waiting on the still-running sibling while the tunnel is alive).
     match http_listener {
         Some(http_listener) => {
-            let http = warren_net::HttpConnectProxy::new(connector, credentials.clone());
+            let http = warren_net::HttpConnectProxy::new(connector, credentials.clone())
+                .with_handover(handover.clone());
             tokio::select! {
                 _ = socks.serve_with_udp_until(socks_listener, run_rx.clone()) => {}
                 _ = http.serve_until(http_listener, run_rx) => {}
@@ -937,6 +954,7 @@ pub(crate) async fn serve_through_host_route(
     let socks_listener = listeners.socks_listener();
     let http_listener = listeners.http_listener();
     let credentials = listeners.credentials().clone();
+    let handover = listeners.handover();
     loop {
         let route = loop {
             if let Some(route) = verdict.borrow_and_update().clone() {
@@ -949,10 +967,12 @@ pub(crate) async fn serve_through_host_route(
         let (run_tx, run_rx) = tokio::sync::watch::channel(true);
         let connector = warren_net::BoundHostConnector::new(route.source, resolver)
             .on_interface(route.interface);
-        let socks = warren_net::Socks5Proxy::new(connector, credentials.clone());
-        let http = http_listener
-            .as_ref()
-            .map(|_| warren_net::HttpConnectProxy::new(connector, credentials.clone()));
+        let socks = warren_net::Socks5Proxy::new(connector, credentials.clone())
+            .with_handover(handover.clone());
+        let http = http_listener.as_ref().map(|_| {
+            warren_net::HttpConnectProxy::new(connector, credentials.clone())
+                .with_handover(handover.clone())
+        });
         let serving = async {
             match (&http, http_listener.as_deref()) {
                 (Some(http), Some(listener)) => {
@@ -1634,6 +1654,7 @@ impl<S: warren_net::PacketSink + 'static> EpochDatapath<S> for ProxyDatapath {
         let socks = self.listeners.socks_listener();
         let http = self.listeners.http_listener();
         let credentials = self.listeners.credentials().clone();
+        let handover = self.listeners.handover();
         EpochRun {
             forwarder,
             probe: Box::new(move |escalate, acks, rtt, rx| {
@@ -1647,7 +1668,15 @@ impl<S: warren_net::PacketSink + 'static> EpochDatapath<S> for ProxyDatapath {
                 )
             }),
             served: Box::pin(async move {
-                serve_epoch(&socks, http.as_deref(), &credentials, connector, alive_rx).await;
+                serve_epoch(
+                    &socks,
+                    http.as_deref(),
+                    &credentials,
+                    &handover,
+                    connector,
+                    alive_rx,
+                )
+                .await;
             }),
         }
     }
@@ -2826,6 +2855,46 @@ mod host_route_tests {
             .await
             .expect("returns once the verdict's sender is gone")
             .expect("join");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_whose_path_went_away_unanswered_is_carried_by_the_next_path() {
+        // The second a system tunnel goes away (or comes up while the proxy's
+        // own tunnel is walled), a request already accepted has sent nothing
+        // to its target. It must reach the member through the next path, not
+        // as an error page.
+        let target = echo().await;
+        let listeners = listeners().await;
+        let http = listeners.http_addr().expect("http listener");
+        let gone = crate::host_route::HostRoute {
+            source: std::net::Ipv4Addr::new(192, 0, 2, 1),
+            ..loopback_route()
+        };
+        let (verdict_tx, verdict_rx) = tokio::sync::watch::channel(Some(gone));
+        let _served = tokio::spawn(serve_through_host_route(
+            listeners,
+            verdict_rx,
+            "127.0.0.1:53".parse().expect("literal"),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+
+        let client = tokio::spawn(http_connect(http, target, Duration::from_secs(5)));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        verdict_tx
+            .send(Some(loopback_route()))
+            .expect("receiver alive");
+
+        let (head, mut stream) = client
+            .await
+            .expect("join")
+            .expect("the request is answered by the next path");
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        stream.write_all(b"again").await.expect("write");
+        let mut got = [0u8; 5];
+        stream.read_exact(&mut got).await.expect("echo");
+        assert_eq!(&got, b"again");
     }
 
     #[tokio::test]

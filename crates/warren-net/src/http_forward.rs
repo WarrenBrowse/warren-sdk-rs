@@ -33,7 +33,7 @@ use tokio::net::TcpStream;
 use zeroize::Zeroizing;
 
 use crate::error::NetError;
-use crate::proxy::{Connector, connect_failure_response, parse_authority};
+use crate::proxy::parse_authority;
 use crate::socks5::Target;
 
 /// Fields that describe one connection rather than the message (RFC 9110
@@ -371,29 +371,32 @@ enum UploadStop {
     Origin,
 }
 
-/// Carries `request` to its origin through `connector` and relays the answer.
-/// `early_data` is what the client sent after the head while it was read.
+impl ForwardRequest {
+    /// The origin the request is for.
+    pub(crate) fn target(&self) -> Target {
+        self.target.clone()
+    }
+}
+
+/// Carries `request` to its origin over `upstream`, already connected to
+/// [`ForwardRequest::target`], and relays the answer. `early_data` is what the
+/// client sent after the head while it was read.
 ///
 /// # Errors
 ///
-/// A [`NetError`] when the origin cannot be reached (the client is told so by
-/// this proxy first), when either side fails mid-exchange, or
+/// A [`NetError`] when either side fails mid-exchange, or
 /// [`NetError::MalformedHttp`] when the client's body or the origin's answer
 /// breaks HTTP/1.1 framing (the client is answered `400` or `502` when no
 /// byte of an answer had reached it yet).
-pub(crate) async fn forward<C: Connector>(
+pub(crate) async fn forward<S>(
     client: &mut TcpStream,
     early_data: &[u8],
-    connector: &C,
+    mut upstream: S,
     request: ForwardRequest,
-) -> Result<(), NetError> {
-    let mut upstream = match connector.connect(request.target).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            let _ = client.write_all(&connect_failure_response(&e)).await;
-            return Err(e);
-        }
-    };
+) -> Result<(), NetError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     if let Err(e) = upstream.write_all(&request.head).await {
         let _ = client.write_all(BAD_GATEWAY).await;
         return Err(NetError::Io(e));

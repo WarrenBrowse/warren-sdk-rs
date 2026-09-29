@@ -74,7 +74,10 @@ pub use portforward::{
     relay_to_local, run_refresh, serve_inbound,
 };
 #[cfg(feature = "proxy")]
-pub use proxy::{Connector, DirectConnector, HttpConnectProxy, Socks5Proxy, UdpConnector, UdpFlow};
+pub use proxy::{
+    Connector, DirectConnector, HANDOVER_DEADLINE, Handover, HttpConnectProxy, Socks5Proxy,
+    UdpConnector, UdpFlow,
+};
 pub use proxy_auth::{
     CredentialsError, ListenerKind, ListenerProofError, ProxyCredentials, Socks5ClientError,
     prove_http_listener, prove_socks5_listener, socks5_connect,

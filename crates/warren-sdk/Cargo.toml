@@ -50,6 +50,10 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 # Frame the in-tunnel egress-probe DNS query into the netstack UDP send path.
 bytes = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# The adapters and their GUIDs, read without unsafe code (the workspace forbids it).
+if-addrs = "0.15"
+
 [target.'cfg(unix)'.dependencies]
 # Tells a tunnel interface (up, point-to-point) from a physical one, so the
 # host-route verdict can never name an address a LAN gateway routes. nix reads

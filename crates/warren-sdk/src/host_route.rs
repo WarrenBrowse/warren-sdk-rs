@@ -48,6 +48,16 @@ pub(crate) struct HostRoute {
     pub(crate) name: String,
 }
 
+/// Where the system Warren tunnel the host routes through comes out, as the
+/// API's check placed the request it received over that tunnel.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SystemExit {
+    /// The exit's country, ISO 3166-1 alpha-2, when the check named one.
+    pub country: Option<String>,
+    /// The exit's city, when the check named one.
+    pub city: Option<String>,
+}
+
 /// One IPv4 address of one interface, as far as [`tunnel_route`] needs it.
 #[derive(Debug, Clone)]
 pub(crate) struct InterfaceAddress {
@@ -100,32 +110,45 @@ pub(crate) trait HostRouteIo: Send + Sync + 'static {
     /// tunnel interface, else `None`.
     fn route(&self) -> Option<HostRoute>;
 
-    /// Whether a check sent over `route` reached the API from a Warren exit's
-    /// egress. Any failure answers `false`.
-    fn exits_through_warren<'a>(
+    /// The Warren exit a check sent over `route` reached the API from, or
+    /// `None` when it did not come from a Warren exit's egress. Any failure
+    /// answers `None`.
+    fn warren_exit<'a>(
         &'a self,
         route: &'a HostRoute,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Option<SystemExit>> + Send + 'a>>;
 }
 
 /// Publishes on `tx` a host route proven to exit through Warren, or `None`,
-/// until every receiver is gone.
+/// until every receiver is gone, and on `exit_tx` where that route comes out.
+/// The exit is published before the route it belongs to and cleared after it,
+/// so a reader that sees a route always finds its exit.
 pub(crate) async fn watch_host_route<I: HostRouteIo>(
     io: I,
     tx: tokio::sync::watch::Sender<Option<HostRoute>>,
+    exit_tx: tokio::sync::watch::Sender<Option<SystemExit>>,
 ) {
+    let withdraw = || {
+        tx.send_replace(None);
+        exit_tx.send_replace(None);
+    };
     let mut verdict: Option<(HostRoute, Instant)> = None;
     let mut refused: Option<(HostRoute, Instant)> = None;
     while !tx.is_closed() {
         let route = io.route();
         if let Some((proven, at)) = verdict.take() {
             if route.as_ref() != Some(&proven) {
-                tx.send_replace(None);
+                withdraw();
             } else if at.elapsed() >= RECHECK_WARREN {
-                if confirmed(&io, &proven).await {
+                if let Some(exit) = confirmed(&io, &proven).await {
+                    exit_tx.send_if_modified(|current| {
+                        let moved = current.as_ref() != Some(&exit);
+                        *current = Some(exit);
+                        moved
+                    });
                     verdict = Some((proven, Instant::now()));
                 } else {
-                    tx.send_replace(None);
+                    withdraw();
                 }
             } else {
                 verdict = Some((proven, at));
@@ -138,7 +161,8 @@ pub(crate) async fn watch_host_route<I: HostRouteIo>(
                 .as_ref()
                 .is_none_or(|(r, at)| *r != candidate || at.elapsed() >= RECHECK_REFUSED);
             if due {
-                if confirmed(&io, &candidate).await {
+                if let Some(exit) = confirmed(&io, &candidate).await {
+                    exit_tx.send_replace(Some(exit));
                     tx.send_replace(Some(candidate.clone()));
                     verdict = Some((candidate, Instant::now()));
                     refused = None;
@@ -208,57 +232,106 @@ fn interface_addresses() -> Vec<InterfaceAddress> {
         .collect()
 }
 
-/// No interface is read off Unix, so no verdict is ever given there.
-#[cfg(not(unix))]
+/// The GUID the Warren desktop app always creates its Windows tunnel adapter
+/// with (warren-app `talpid-tunnel` `ADAPTER_GUID`, kept stable so Windows does
+/// not see a new network on every connect).
+const WARREN_ADAPTER_GUID: &str = "{AFE43773-E1F8-4EBB-8536-576AB86AFE9A}";
+
+/// Whether an adapter is the Warren app's tunnel, by the GUID Windows names it
+/// with. Windows reports no point-to-point flag for a Wintun adapter and has
+/// tunnel-typed adapters of its own (Teredo, IP-HTTPS, 6to4), so neither the
+/// flag nor the type can stand in for this.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_warren_adapter(adapter_name: &str) -> bool {
+    adapter_name.eq_ignore_ascii_case(WARREN_ADAPTER_GUID)
+}
+
+/// Every IPv4 address of every adapter of the host. Only the Warren app's own
+/// adapter counts as a tunnel.
+#[cfg(windows)]
+fn interface_addresses() -> Vec<InterfaceAddress> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    interfaces
+        .into_iter()
+        .filter_map(|i| {
+            let if_addrs::IfAddr::V4(v4) = &i.addr else {
+                return None;
+            };
+            Some(InterfaceAddress {
+                address: v4.ip,
+                index: i.index,
+                up: i.is_oper_up(),
+                point_to_point: is_warren_adapter(&i.adapter_name),
+                name: i.name,
+            })
+        })
+        .collect()
+}
+
+/// No interface is read elsewhere, so no verdict is ever given there.
+#[cfg(not(any(unix, windows)))]
 fn interface_addresses() -> Vec<InterfaceAddress> {
     Vec::new()
 }
 
 #[cfg(feature = "reqwest-transport")]
 impl HostRouteIo for SystemHostRoute {
-    /// Windows is left out until a Warren tunnel adapter there is proven to
-    /// report as point-to-point: without that proof no verdict is ever given, and
-    /// the proxy keeps its own tunnel.
+    /// Only where the tunnel interface can be told from a physical card:
+    /// macOS and Linux by their point-to-point flag, Windows by the Warren
+    /// app's adapter GUID. Elsewhere no verdict is ever given, and the proxy
+    /// keeps its own tunnel.
     fn route(&self) -> Option<HostRoute> {
-        if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
+        if cfg!(not(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        ))) {
             return None;
         }
         tunnel_route(route_source()?, interface_addresses())
     }
 
-    fn exits_through_warren<'a>(
+    fn warren_exit<'a>(
         &'a self,
         route: &'a HostRoute,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Option<SystemExit>> + Send + 'a>> {
         #[derive(serde::Deserialize)]
         struct Check {
             #[serde(default)]
             is_exit: bool,
+            #[serde(default)]
+            exit_country: Option<String>,
+            #[serde(default)]
+            exit_city: Option<String>,
         }
         Box::pin(async move {
             let builder = reqwest::Client::builder()
                 .local_address(std::net::IpAddr::V4(route.source))
                 .timeout(CHECK_TIMEOUT);
+            // Windows has no per-socket interface option here; its strong host
+            // model sends a socket bound to the adapter's address out of that
+            // adapter only.
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             let builder = builder.interface(&route.name);
-            let Ok(client) = builder.build() else {
-                return false;
-            };
-            let Ok(response) = client.get(&self.check_url).send().await else {
-                return false;
-            };
-            response
-                .json::<Check>()
-                .await
-                .is_ok_and(|check| check.is_exit)
+            let client = builder.build().ok()?;
+            let response = client.get(&self.check_url).send().await.ok()?;
+            let check = response.json::<Check>().await.ok()?;
+            check.is_exit.then_some(SystemExit {
+                country: check.exit_country,
+                city: check.exit_city,
+            })
         })
     }
 }
 
-/// A check over `route` says Warren AND the host still routes through it once
-/// the answer is in: a route that moved during the check proves nothing.
-async fn confirmed<I: HostRouteIo>(io: &I, route: &HostRoute) -> bool {
-    io.exits_through_warren(route).await && io.route().as_ref() == Some(route)
+/// The exit a check over `route` placed it at, when that says Warren AND the
+/// host still routes through it once the answer is in: a route that moved
+/// during the check proves nothing.
+async fn confirmed<I: HostRouteIo>(io: &I, route: &HostRoute) -> Option<SystemExit> {
+    let exit = io.warren_exit(route).await?;
+    (io.route().as_ref() == Some(route)).then_some(exit)
 }
 
 #[cfg(test)]
@@ -334,6 +407,24 @@ mod tests {
         );
     }
 
+    /// Windows reports no point-to-point flag for a Wintun adapter, and has
+    /// tunnel-typed adapters of its own (Teredo, IP-HTTPS, 6to4): the Warren
+    /// app's adapter is recognised by the GUID it is always created with, and
+    /// by nothing else.
+    #[test]
+    fn only_the_warren_app_adapter_is_a_windows_tunnel() {
+        assert!(is_warren_adapter("{AFE43773-E1F8-4EBB-8536-576AB86AFE9A}"));
+        assert!(is_warren_adapter("{afe43773-e1f8-4ebb-8536-576ab86afe9a}"));
+        for other in [
+            "{93123211-9629-4E04-82F0-EA2E4F221468}",
+            "{E287C945-01BC-4B45-AF7E-FF150F2BFBF2}",
+            "AFE43773-E1F8-4EBB-8536-576AB86AFE9A",
+            "",
+        ] {
+            assert!(!is_warren_adapter(other), "{other}");
+        }
+    }
+
     #[test]
     fn a_down_tunnel_or_an_address_nobody_holds_is_no_route() {
         assert_eq!(
@@ -353,6 +444,7 @@ mod tests {
     struct Fake {
         route: Mutex<Option<HostRoute>>,
         warren: Mutex<Vec<Ipv4Addr>>,
+        exit: Mutex<SystemExit>,
         checks: Mutex<Vec<Ipv4Addr>>,
     }
 
@@ -364,20 +456,43 @@ mod tests {
             self.0.route.lock().unwrap().clone()
         }
 
-        fn exits_through_warren<'a>(
+        fn warren_exit<'a>(
             &'a self,
             route: &'a HostRoute,
-        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Option<SystemExit>> + Send + 'a>> {
             self.0.checks.lock().unwrap().push(route.source);
-            let answer = self.0.warren.lock().unwrap().contains(&route.source);
+            let answer = self
+                .0
+                .warren
+                .lock()
+                .unwrap()
+                .contains(&route.source)
+                .then(|| self.0.exit.lock().unwrap().clone());
             Box::pin(async move { answer })
         }
     }
 
+    fn helsinki() -> SystemExit {
+        SystemExit {
+            country: Some("FI".into()),
+            city: Some("Helsinki".into()),
+        }
+    }
+
     fn start(fake: &Arc<Fake>) -> tokio::sync::watch::Receiver<Option<HostRoute>> {
+        start_with_exit(fake).0
+    }
+
+    fn start_with_exit(
+        fake: &Arc<Fake>,
+    ) -> (
+        tokio::sync::watch::Receiver<Option<HostRoute>>,
+        tokio::sync::watch::Receiver<Option<SystemExit>>,
+    ) {
         let (tx, rx) = tokio::sync::watch::channel(None);
-        tokio::spawn(watch_host_route(Io(Arc::clone(fake)), tx));
-        rx
+        let (exit_tx, exit_rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(watch_host_route(Io(Arc::clone(fake)), tx, exit_tx));
+        (rx, exit_rx)
     }
 
     fn route(fake: &Fake, route: Option<HostRoute>) {
@@ -398,6 +513,39 @@ mod tests {
         settle().await;
 
         assert_eq!(*rx.borrow(), Some(tunnel(SYSTEM_TUNNEL)));
+    }
+
+    /// What the extension shows while its helper stands aside: the exit the
+    /// member's traffic actually leaves by, which is the app's, never the one
+    /// the helper would have picked.
+    #[tokio::test(start_paused = true)]
+    async fn the_exit_of_a_verdict_is_published_with_it_and_cleared_with_it() {
+        let fake = Arc::new(Fake::default());
+        route(&fake, Some(tunnel(SYSTEM_TUNNEL)));
+        fake.warren.lock().unwrap().push(SYSTEM_TUNNEL);
+        *fake.exit.lock().unwrap() = helsinki();
+
+        let (rx, exit_rx) = start_with_exit(&fake);
+        settle().await;
+        assert_eq!(*rx.borrow(), Some(tunnel(SYSTEM_TUNNEL)));
+        assert_eq!(*exit_rx.borrow(), Some(helsinki()));
+
+        let stockholm = SystemExit {
+            country: Some("SE".into()),
+            city: Some("Stockholm".into()),
+        };
+        *fake.exit.lock().unwrap() = stockholm.clone();
+        tokio::time::sleep(RECHECK_WARREN + ROUTE_POLL * 2).await;
+        assert_eq!(
+            *exit_rx.borrow(),
+            Some(stockholm),
+            "the app moved to another exit: the recheck says so"
+        );
+
+        route(&fake, None);
+        tokio::time::sleep(ROUTE_POLL + Duration::from_millis(10)).await;
+        assert_eq!(*rx.borrow(), None);
+        assert_eq!(*exit_rx.borrow(), None, "no exit outlives its route");
     }
 
     #[tokio::test(start_paused = true)]
@@ -529,25 +677,23 @@ mod tests {
     #[cfg(all(unix, feature = "reqwest-transport"))]
     #[tokio::test]
     async fn the_system_check_reads_the_verdict_over_the_given_route() {
-        let (warren, peers) = check_server(r#"{"ip":"37.27.217.153","is_exit":true}"#).await;
+        let (warren, peers) = check_server(
+            r#"{"ip":"37.27.217.153","is_exit":true,"exit_country":"FI","exit_city":"Helsinki"}"#,
+        )
+        .await;
         let (plain, _) = check_server(r#"{"ip":"192.0.2.9","is_exit":false}"#).await;
         let route = loopback_route();
 
-        assert!(
-            SystemHostRoute::new(&warren)
-                .exits_through_warren(&route)
-                .await
+        assert_eq!(
+            SystemHostRoute::new(&warren).warren_exit(&route).await,
+            Some(helsinki())
         );
         assert_eq!(
             peers.lock().unwrap().as_slice(),
             &[std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)],
             "the check leaves from the source it vouches for"
         );
-        assert!(
-            !SystemHostRoute::new(&plain)
-                .exits_through_warren(&route)
-                .await
-        );
+        assert_eq!(SystemHostRoute::new(&plain).warren_exit(&route).await, None);
     }
 
     #[cfg(all(unix, feature = "reqwest-transport"))]
@@ -559,12 +705,60 @@ mod tests {
             ..loopback_route()
         };
 
-        let verdict = SystemHostRoute::new(&warren)
-            .exits_through_warren(&gone)
-            .await;
+        let verdict = SystemHostRoute::new(&warren).warren_exit(&gone).await;
 
-        assert!(!verdict, "a source the host does not hold proves nothing");
+        assert_eq!(
+            verdict, None,
+            "a source the host does not hold proves nothing"
+        );
         assert!(peers.lock().unwrap().is_empty());
+    }
+
+    /// The real thing, run by hand on a host whose Warren desktop app is
+    /// connected (the Windows proof of the stand-aside):
+    /// `cargo test -p warren-sdk --lib live_system_route -- --ignored --nocapture`,
+    /// with `WARREN_LIVE_API` naming the app's API when it is not the build's.
+    #[cfg(feature = "reqwest-transport")]
+    #[tokio::test]
+    #[ignore = "needs the Warren desktop app connected on this host"]
+    async fn live_system_route_is_found_checked_and_carries_a_bound_flow() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use warren_net::proxy::Connector;
+        let api =
+            std::env::var("WARREN_LIVE_API").unwrap_or_else(|_| crate::product::API_URL.into());
+        let io = SystemHostRoute::new(&api);
+
+        let route = io
+            .route()
+            .expect("the host routes through the Warren app's tunnel adapter");
+        let exit = io
+            .warren_exit(&route)
+            .await
+            .expect("a check over that adapter is placed at a Warren exit");
+        println!(
+            "tunnel interface {} exits in {:?}",
+            route.name, exit.country
+        );
+
+        let connector = warren_net::BoundHostConnector::new(
+            route.source,
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(warrenguard_config::TUNNEL_GATEWAY_IP),
+                53,
+            ),
+        )
+        .on_interface(route.interface);
+        let mut stream = connector
+            .connect(warren_net::socks5::Target::Domain("example.com".into(), 80))
+            .await
+            .expect("a flow bound to the adapter resolves and connects");
+        stream
+            .write_all(b"HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write");
+        let mut head = [0u8; 12];
+        stream.read_exact(&mut head).await.expect("read");
+        assert!(head.starts_with(b"HTTP/1.1 "), "{head:?}");
     }
 
     /// On a host whose route leaves by a physical card (every CI runner, and a

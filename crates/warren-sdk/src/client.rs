@@ -1681,6 +1681,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         let supervisor_reconnect = std::sync::Arc::clone(&reconnect_request);
         let entitlements = self.port_entitlements.clone();
         let stand_aside_api_base = self.stand_aside_api_base.clone();
+        let (system_exit_tx, system_exit_rx) = tokio::sync::watch::channel(None);
         let task = tokio::spawn(async move {
             // The verdict stays `None` for a proxy not built to stand aside, which
             // lets every (re)connect through the gate untouched.
@@ -1689,6 +1690,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             let _stand_aside = spawn_stand_aside(
                 stand_aside_api_base.as_deref(),
                 verdict_tx,
+                system_exit_tx,
                 &listeners,
                 &verdict_rx,
                 &supervisor_reconnect,
@@ -1755,6 +1757,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             fatal_rx,
             epoch_end_rx,
             reconnect_request,
+            system_exit_rx,
             task,
         })
     }
@@ -1767,6 +1770,7 @@ impl<T: HttpTransport> WarrenClient<T> {
 fn spawn_stand_aside(
     api_base: Option<&str>,
     verdict_tx: tokio::sync::watch::Sender<Option<crate::host_route::HostRoute>>,
+    exit_tx: tokio::sync::watch::Sender<Option<crate::SystemExit>>,
     listeners: &crate::proxy::ProxyListeners,
     verdict_rx: &tokio::sync::watch::Receiver<Option<crate::host_route::HostRoute>>,
     end_epoch: &Arc<tokio::sync::Notify>,
@@ -1777,6 +1781,7 @@ fn spawn_stand_aside(
         let watcher = tokio::spawn(crate::host_route::watch_host_route(
             crate::host_route::SystemHostRoute::new(api_base),
             verdict_tx,
+            exit_tx,
         ));
         let server = tokio::spawn(crate::supervisor::serve_through_host_route(
             listeners.clone(),
@@ -1796,7 +1801,7 @@ fn spawn_stand_aside(
             _idle_verdict: None,
         };
     }
-    let _ = (api_base, listeners, verdict_rx, end_epoch, wake);
+    let _ = (api_base, exit_tx, listeners, verdict_rx, end_epoch, wake);
     StandAside {
         _tasks: None,
         _idle_verdict: Some(verdict_tx),
