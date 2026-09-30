@@ -75,8 +75,8 @@ pub use portforward::{
 };
 #[cfg(feature = "proxy")]
 pub use proxy::{
-    Connector, DirectConnector, HANDOVER_DEADLINE, Handover, HttpConnectProxy, Socks5Proxy,
-    UdpConnector, UdpFlow,
+    Connector, DirectConnector, HANDOVER_DEADLINE, Handover, HttpConnectProxy, LiveConnections,
+    Socks5Proxy, UdpConnector, UdpFlow,
 };
 pub use proxy_auth::{
     CredentialsError, ListenerKind, ListenerProofError, ProxyCredentials, Socks5ClientError,

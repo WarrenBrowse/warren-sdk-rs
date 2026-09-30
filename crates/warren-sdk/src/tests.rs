@@ -609,6 +609,7 @@ fn the_escape_policy_decides_how_the_migration_socket_is_bound() {
         MigrationPolicy {
             bypass: Some(bypass),
             carrier_host_route: None,
+            nest: None,
         }
         .rebind_policy(),
         warren_transport::RebindPolicy::Bypass(_)

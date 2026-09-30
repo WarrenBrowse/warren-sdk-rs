@@ -36,6 +36,10 @@ pub struct ProxyListeners {
     /// Shared by every path that serves these listeners, so a request one
     /// path accepted and could not answer is carried by the next.
     handover: warren_net::Handover,
+    /// Whether the proxy's own tunnel takes new connections. Off while the
+    /// proxy stands aside behind a system Warren tunnel: another server takes
+    /// them then, and an epoch of the own tunnel only finishes what it carries.
+    own_accepting: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl ProxyListeners {
@@ -68,6 +72,7 @@ impl ProxyListeners {
             credentials: session_credentials(cfg),
             serving: Arc::new(tokio::sync::Mutex::new(())),
             handover: warren_net::Handover::new(),
+            own_accepting: Arc::new(tokio::sync::watch::channel(true).0),
         })
     }
 
@@ -99,6 +104,16 @@ impl ProxyListeners {
 
     pub(crate) fn handover(&self) -> warren_net::Handover {
         self.handover.clone()
+    }
+
+    /// Whether the proxy's own tunnel takes new connections, as it changes.
+    pub(crate) fn own_accepting(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.own_accepting.subscribe()
+    }
+
+    /// Lets the proxy's own tunnel take new connections, or not.
+    pub(crate) fn set_own_accepting(&self, accepting: bool) {
+        self.own_accepting.send_replace(accepting);
     }
 
     /// Waits until no other datapath serves these listeners, and holds them

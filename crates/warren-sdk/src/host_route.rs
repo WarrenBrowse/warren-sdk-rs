@@ -208,6 +208,32 @@ pub(crate) async fn watch_host_route<I: HostRouteIo>(
     }
 }
 
+/// How a socket is carried inside the tunnel `route` leaves by: bound to its
+/// interface on macOS (`IP_BOUND_IF`) and Windows (`IP_UNICAST_IF`). `None` on
+/// Linux, whose routing already sends every socket but the system tunnel's own
+/// into that tunnel, and elsewhere.
+fn bypass_into(route: &HostRoute) -> Option<warren_transport::SocketBypass> {
+    let index = route.interface.get();
+    if cfg!(target_os = "macos") {
+        Some(warren_transport::SocketBypass::BoundIf(index))
+    } else if cfg!(windows) {
+        Some(warren_transport::SocketBypass::UnicastIf(index))
+    } else {
+        None
+    }
+}
+
+/// The binding that carries a socket inside the system Warren tunnel the host
+/// routes through right now, or `None` when it routes through none. Read by
+/// the proxy's own tunnel when it migrates: its relay is one the system
+/// tunnel's kill switch admits only the system tunnel to, so a fresh socket
+/// following the routing table would be refused, and one inside the system
+/// tunnel reaches it. The session is encrypted end to end whatever carries
+/// it, so no check of the tunnel's exit is needed for this.
+pub(crate) fn system_tunnel_bypass() -> Option<warren_transport::SocketBypass> {
+    bypass_into(&tunnel_route(route_source()?, interface_addresses())?)
+}
+
 /// Any global address: [`SystemHostRoute::route`] only asks the routing table
 /// which source it would use toward it, nothing is sent.
 const ROUTE_PROBE: std::net::SocketAddr =
@@ -478,6 +504,18 @@ mod tests {
             "",
         ] {
             assert!(!is_warren_adapter(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_socket_is_carried_inside_the_system_tunnel_by_binding_its_interface() {
+        let bypass = bypass_into(&tunnel(SYSTEM_TUNNEL));
+        if cfg!(target_os = "macos") {
+            assert_eq!(bypass, Some(warren_transport::SocketBypass::BoundIf(14)));
+        } else if cfg!(windows) {
+            assert_eq!(bypass, Some(warren_transport::SocketBypass::UnicastIf(14)));
+        } else {
+            assert_eq!(bypass, None, "routing already carries it there");
         }
     }
 

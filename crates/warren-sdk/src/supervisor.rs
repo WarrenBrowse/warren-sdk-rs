@@ -895,60 +895,120 @@ impl Drop for AbortOnDrop {
 /// Serves SOCKS5 (and optional HTTP CONNECT) on the *borrowed* stable listeners
 /// using `connector`, until the tunnel dies (or an accept loop fails). Returns so
 /// the supervisor can rebuild and resume on the same listeners.
-pub(crate) async fn serve_epoch(
+///
+/// While `accepting` reads `false` (the proxy stands aside behind a system
+/// Warren tunnel) the epoch takes no new connection and drains: what it already
+/// relays goes on over its tunnel, which the migration watchdog has moved inside
+/// the system tunnel, and the epoch ends once the last of it closes. Accepting
+/// again resumes serving on the same tunnel.
+pub(crate) async fn serve_epoch<C>(
     socks_listener: &tokio::net::TcpListener,
     http_listener: Option<&tokio::net::TcpListener>,
     credentials: &warren_net::ProxyCredentials,
     handover: &warren_net::Handover,
-    connector: warren_net::TunnelConnector,
+    connector: C,
     alive_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    // `run` gates both accept loops; the bridge flips it off when the tunnel dies.
-    // Wrapped in `AbortOnDrop` so cancelling this future (handle dropped mid-epoch)
-    // does not leak the bridge task: it is aborted whether we return or are dropped.
-    let (run_tx, run_rx) = tokio::sync::watch::channel(true);
+    mut accepting: tokio::sync::watch::Receiver<bool>,
+) where
+    C: warren_net::UdpConnector + Clone,
+{
+    // `path` ends every relay of the epoch when the tunnel dies. Wrapped in
+    // `AbortOnDrop` so cancelling this future (handle dropped mid-epoch) does
+    // not leak the bridge task, and dropping `path_tx` with it closes every
+    // relay still open.
+    let (path_tx, path_rx) = tokio::sync::watch::channel(true);
     let _bridge = AbortOnDrop(tokio::spawn(async move {
         wait_until_dead(alive_rx).await;
-        let _ = run_tx.send(false);
+        let _ = path_tx.send(false);
     }));
+    let live = warren_net::LiveConnections::new();
     let socks = warren_net::Socks5Proxy::new(connector.clone(), credentials.clone())
-        .with_handover(handover.clone());
-    // `select!`, not `join!`: the first loop to return ends the epoch. On tunnel
-    // death the bridge flips `run` and whichever loop sees it first returns; if an
-    // accept loop instead fails on its own, that also ends the epoch (a `join!`
-    // would hang waiting on the still-running sibling while the tunnel is alive).
-    match http_listener {
-        Some(http_listener) => {
-            let http = warren_net::HttpConnectProxy::new(connector, credentials.clone())
-                .with_handover(handover.clone());
-            tokio::select! {
-                _ = socks.serve_with_udp_until(socks_listener, run_rx.clone()) => {}
-                _ = http.serve_until(http_listener, run_rx) => {}
+        .with_handover(handover.clone())
+        .with_path(path_rx.clone())
+        .counting(live.clone());
+    let http = http_listener.map(|_| {
+        warren_net::HttpConnectProxy::new(connector, credentials.clone())
+            .with_handover(handover.clone())
+            .with_path(path_rx.clone())
+            .counting(live.clone())
+    });
+    loop {
+        if *accepting.borrow_and_update() {
+            // `run` gates both accept loops for as long as the epoch accepts.
+            let (run_tx, run_rx) = tokio::sync::watch::channel(true);
+            // `select!`, not `join!`: an accept loop that fails on its own ends
+            // the epoch (a `join!` would hang on the still-running sibling).
+            let serving = async {
+                match (&http, http_listener) {
+                    (Some(http), Some(listener)) => {
+                        tokio::select! {
+                            _ = socks.serve_with_udp_until(socks_listener, run_rx.clone()) => {}
+                            _ = http.serve_until(listener, run_rx.clone()) => {}
+                        }
+                    }
+                    _ => {
+                        let _ = socks
+                            .serve_with_udp_until(socks_listener, run_rx.clone())
+                            .await;
+                    }
+                }
+            };
+            let mut path = path_rx.clone();
+            let stop_accepting = async {
+                while *accepting.borrow_and_update() {
+                    if accepting.changed().await.is_err() {
+                        // Nobody will ever say otherwise: keep accepting.
+                        std::future::pending::<()>().await;
+                    }
+                }
+            };
+            let ends = tokio::select! {
+                () = serving => true,
+                () = stopped(&mut path) => true,
+                () = stop_accepting => false,
+            };
+            let _ = run_tx.send(false);
+            if ends {
+                return;
             }
         }
-        None => {
-            let _ = socks.serve_with_udp_until(socks_listener, run_rx).await;
+        let mut path = path_rx.clone();
+        tokio::select! {
+            () = live.drained() => return,
+            () = stopped(&mut path) => return,
+            changed = accepting.changed() => {
+                if changed.is_err() {
+                    // Drain to the end: nothing will ask this epoch back.
+                    tokio::select! {
+                        () = live.drained() => return,
+                        () = stopped(&mut path) => return,
+                    }
+                }
+            }
         }
     }
 }
 
-/// How often a proxy standing aside asks a running epoch of its own tunnel to
-/// end. Repeated because the request only reaches an epoch that is waiting on
-/// it: one that comes up during the stand-aside (a dial already in flight when
-/// the verdict arrived) is ended by the next nudge.
-pub(crate) const STAND_ASIDE_NUDGE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Resolves once `run` goes `false` or its sender is dropped.
+async fn stopped(run: &mut tokio::sync::watch::Receiver<bool>) {
+    while *run.borrow_and_update() {
+        if run.changed().await.is_err() {
+            return;
+        }
+    }
+}
 
 /// Serves the stable listeners through the host route while `verdict` names a
 /// source proven to exit through Warren (see [`crate::host_route`]), every flow
-/// bound to that source and every name resolved by `resolver` from it. Ends each
-/// running epoch of the proxy's own tunnel through `end_epoch` meanwhile, stops
-/// accepting the moment the verdict changes, and then raises `wake` so the own
-/// tunnel redials at once. Returns when the verdict's sender is gone.
+/// bound to that source and every name resolved by `resolver` from it. The own
+/// tunnel's epochs take no new connection meanwhile and drain (see
+/// [`serve_epoch`]); this stops accepting the moment the verdict changes, hands
+/// new connections back to the own tunnel, and raises `wake` so it redials at
+/// once if it had drained. Returns when the verdict's sender is gone.
 pub(crate) async fn serve_through_host_route(
     listeners: crate::proxy::ProxyListeners,
     mut verdict: tokio::sync::watch::Receiver<Option<crate::host_route::HostRoute>>,
     resolver: std::net::SocketAddr,
-    end_epoch: Arc<tokio::sync::Notify>,
     wake: Arc<tokio::sync::Notify>,
 ) {
     let socks_listener = listeners.socks_listener();
@@ -964,6 +1024,7 @@ pub(crate) async fn serve_through_host_route(
                 return;
             }
         };
+        listeners.set_own_accepting(false);
         let (run_tx, run_rx) = tokio::sync::watch::channel(true);
         let connector = warren_net::BoundHostConnector::new(route.source, resolver)
             .on_interface(route.interface);
@@ -993,18 +1054,12 @@ pub(crate) async fn serve_through_host_route(
                 }
             }
         };
-        let nudging = async {
-            loop {
-                end_epoch.notify_waiters();
-                tokio::time::sleep(STAND_ASIDE_NUDGE).await;
-            }
-        };
         let accept_failed = tokio::select! {
             () = serving => true,
             () = withdrawn => false,
-            () = nudging => false,
         };
         let _ = run_tx.send(false);
+        listeners.set_own_accepting(true);
         if !accept_failed {
             // The system tunnel is gone: the proxy's own tunnel must come back
             // now, not after a backoff earned while it stood aside.
@@ -1132,12 +1187,22 @@ pub(crate) struct MigrationPolicy {
     /// installable route the rebind is refused and the cycle redials:
     /// fail-closed, never nested.
     pub(crate) carrier_host_route: Option<(std::net::IpAddr, String)>,
+    /// The userland proxy standing aside behind a system Warren tunnel: the
+    /// socket binding that carries a fresh migration socket inside that tunnel
+    /// while the host routes through it, read at rebind time. Unset, and
+    /// answering `None`, leaves the rebind to the other fields.
+    pub(crate) nest: Option<fn() -> Option<warren_transport::SocketBypass>>,
 }
 
 impl MigrationPolicy {
-    /// The rebind policy this datapath hands the engine: a per-socket bypass
-    /// when the platform escapes by socket, the plain wildcard bind otherwise.
+    /// The rebind policy this datapath hands the engine: inside the system
+    /// Warren tunnel when the proxy nests and the host routes through one, a
+    /// per-socket bypass when the platform escapes by socket, the plain
+    /// wildcard bind otherwise.
     pub(crate) fn rebind_policy(&self) -> warren_transport::RebindPolicy {
+        if let Some(bypass) = self.nest.and_then(|nest| nest()) {
+            return warren_transport::RebindPolicy::Bypass(bypass);
+        }
         match self.bypass {
             Some(bypass) => warren_transport::RebindPolicy::Bypass(bypass),
             None => warren_transport::RebindPolicy::Plain,
@@ -1655,6 +1720,7 @@ impl<S: warren_net::PacketSink + 'static> EpochDatapath<S> for ProxyDatapath {
         let http = self.listeners.http_listener();
         let credentials = self.listeners.credentials().clone();
         let handover = self.listeners.handover();
+        let own_accepting = self.listeners.own_accepting();
         EpochRun {
             forwarder,
             probe: Box::new(move |escalate, acks, rtt, rx| {
@@ -1675,6 +1741,7 @@ impl<S: warren_net::PacketSink + 'static> EpochDatapath<S> for ProxyDatapath {
                     &handover,
                     connector,
                     alive_rx,
+                    own_accepting,
                 )
                 .await;
             }),
@@ -2486,6 +2553,7 @@ mod migration_io_tests {
             policy: MigrationPolicy {
                 bypass: None,
                 carrier_host_route: Some((exit_ip, gateway.clone())),
+                nest: None,
             },
         };
         let capture = LogCapture::default();
@@ -2504,6 +2572,48 @@ mod migration_io_tests {
             !logs.contains("192.0.2.77") && !logs.contains(&gateway),
             "a migration trace must never carry the exit IP or the gateway: {logs}"
         );
+    }
+}
+
+#[cfg(test)]
+mod nest_policy_tests {
+    use super::*;
+
+    fn system_tunnel() -> Option<warren_transport::SocketBypass> {
+        Some(warren_transport::SocketBypass::BoundIf(14))
+    }
+
+    fn no_system_tunnel() -> Option<warren_transport::SocketBypass> {
+        None
+    }
+
+    /// The proxy's own tunnel dies the moment the Warren app connects if its
+    /// fresh migration socket follows the route the app pins to the relay for
+    /// itself: the app's kill switch lets only the app through there. Bound to
+    /// the app's tunnel instead, the session moves inside it and keeps every
+    /// connection it carries.
+    #[test]
+    fn a_rebind_nests_in_the_system_tunnel_while_the_host_routes_through_it() {
+        let policy = MigrationPolicy {
+            nest: Some(system_tunnel),
+            ..MigrationPolicy::default()
+        };
+        assert!(matches!(
+            policy.rebind_policy(),
+            warren_transport::RebindPolicy::Bypass(warren_transport::SocketBypass::BoundIf(14))
+        ));
+    }
+
+    #[test]
+    fn a_rebind_is_plain_when_the_host_routes_through_no_system_tunnel() {
+        let policy = MigrationPolicy {
+            nest: Some(no_system_tunnel),
+            ..MigrationPolicy::default()
+        };
+        assert!(matches!(
+            policy.rebind_policy(),
+            warren_transport::RebindPolicy::Plain
+        ));
     }
 }
 
@@ -2814,22 +2924,22 @@ mod host_route_tests {
         let listeners = listeners().await;
         let http = listeners.http_addr().expect("http listener");
         let (verdict_tx, verdict_rx) = tokio::sync::watch::channel(Some(loopback_route()));
-        let end_epoch = Arc::new(tokio::sync::Notify::new());
-        let asked_to_end = end_epoch.notified();
-        tokio::pin!(asked_to_end);
-        asked_to_end.as_mut().enable();
+        let mut own_accepting = listeners.own_accepting();
         let wake = Arc::new(tokio::sync::Notify::new());
         let served = tokio::spawn(serve_through_host_route(
             listeners,
             verdict_rx,
             "127.0.0.1:53".parse().expect("literal"),
-            Arc::clone(&end_epoch),
             Arc::clone(&wake),
         ));
 
-        tokio::time::timeout(Duration::from_secs(3), asked_to_end)
-            .await
-            .expect("a running epoch of the own tunnel is asked to end");
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            own_accepting.wait_for(|accepting| !accepting),
+        )
+        .await
+        .expect("the own tunnel stops taking new connections")
+        .expect("sender alive");
         let (head, mut stream) = http_connect(http, target, Duration::from_secs(3))
             .await
             .expect("the listener is served through the host route");
@@ -2843,6 +2953,10 @@ mod host_route_tests {
         tokio::time::timeout(Duration::from_secs(1), wake.notified())
             .await
             .expect("the own tunnel is woken to redial at once");
+        assert!(
+            *own_accepting.borrow_and_update(),
+            "the own tunnel takes new connections again"
+        );
         assert!(
             http_connect(http, target, Duration::from_millis(500))
                 .await
@@ -2877,7 +2991,6 @@ mod host_route_tests {
             verdict_rx,
             "127.0.0.1:53".parse().expect("literal"),
             Arc::new(tokio::sync::Notify::new()),
-            Arc::new(tokio::sync::Notify::new()),
         ));
 
         let client = tokio::spawn(http_connect(http, target, Duration::from_secs(5)));
@@ -2895,6 +3008,179 @@ mod host_route_tests {
         let mut got = [0u8; 5];
         stream.read_exact(&mut got).await.expect("echo");
         assert_eq!(&got, b"again");
+    }
+
+    /// A connector over the local stack, for serving an epoch with no tunnel:
+    /// TCP only, which is all the drain tests relay.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    struct LocalUdpless;
+
+    #[cfg(unix)]
+    struct NoFlow;
+
+    #[cfg(unix)]
+    impl warren_net::UdpFlow for NoFlow {
+        async fn send_to(
+            &self,
+            _data: bytes::Bytes,
+            _dst: std::net::SocketAddr,
+        ) -> Result<(), warren_net::NetError> {
+            Err(warren_net::NetError::EngineStopped)
+        }
+
+        async fn recv_from(&mut self) -> Option<(bytes::Bytes, std::net::SocketAddr)> {
+            None
+        }
+    }
+
+    #[cfg(unix)]
+    impl warren_net::Connector for LocalUdpless {
+        type Stream = TcpStream;
+
+        async fn connect(
+            &self,
+            target: warren_net::socks5::Target,
+        ) -> Result<TcpStream, warren_net::NetError> {
+            warren_net::DirectConnector.connect(target).await
+        }
+    }
+
+    #[cfg(unix)]
+    impl warren_net::UdpConnector for LocalUdpless {
+        type Flow = NoFlow;
+
+        async fn open_udp(&self) -> Result<NoFlow, warren_net::NetError> {
+            Err(warren_net::NetError::EngineStopped)
+        }
+
+        async fn resolve_host(
+            &self,
+            _host: &str,
+        ) -> Result<std::net::IpAddr, warren_net::NetError> {
+            Err(warren_net::NetError::EngineStopped)
+        }
+
+        fn supports_ipv6(&self) -> bool {
+            false
+        }
+    }
+
+    /// Starts an epoch of the proxy's own tunnel over `listeners`, returning
+    /// the sender that kills its tunnel.
+    #[cfg(unix)]
+    fn own_epoch(
+        listeners: &crate::proxy::ProxyListeners,
+    ) -> (
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (alive_tx, alive_rx) = tokio::sync::watch::channel(true);
+        let listeners = listeners.clone();
+        let served = tokio::spawn(async move {
+            let socks = listeners.socks_listener();
+            let http = listeners.http_listener();
+            serve_epoch(
+                &socks,
+                http.as_deref(),
+                listeners.credentials(),
+                &listeners.handover(),
+                LocalUdpless,
+                alive_rx,
+                listeners.own_accepting(),
+            )
+            .await;
+        });
+        (alive_tx, served)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_epoch_told_to_stop_accepting_keeps_its_relays_and_ends_once_drained() {
+        // The helper stands aside the moment the Warren app's tunnel carries
+        // the host. Its own tunnel, carried inside the app's by then, still
+        // holds whatever it was relaying: those go on until they end, and
+        // only then does the epoch let the tunnel go.
+        let target = echo().await;
+        let listeners = listeners().await;
+        let http = listeners.http_addr().expect("http listener");
+        let (_alive_tx, served) = own_epoch(&listeners);
+        let (head, mut stream) = http_connect(http, target, Duration::from_secs(3))
+            .await
+            .expect("served by the own tunnel");
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+        listeners.set_own_accepting(false);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stream.write_all(b"after").await.expect("write");
+        let mut got = [0u8; 5];
+        stream
+            .read_exact(&mut got)
+            .await
+            .expect("the relay goes on");
+        assert_eq!(&got, b"after");
+        assert!(
+            !served.is_finished(),
+            "an epoch with a live relay does not end"
+        );
+        assert!(
+            http_connect(http, target, Duration::from_millis(500))
+                .await
+                .is_none(),
+            "a new request is left to whoever serves the listeners now"
+        );
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(2), served)
+            .await
+            .expect("the epoch ends once its last relay is gone")
+            .expect("join");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_draining_epoch_serves_again_when_the_proxy_stops_standing_aside() {
+        let target = echo().await;
+        let listeners = listeners().await;
+        let http = listeners.http_addr().expect("http listener");
+        let (_alive_tx, served) = own_epoch(&listeners);
+        let (_head, _held) = http_connect(http, target, Duration::from_secs(3))
+            .await
+            .expect("served");
+
+        listeners.set_own_accepting(false);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        listeners.set_own_accepting(true);
+
+        let (head, _stream) = http_connect(http, target, Duration::from_secs(3))
+            .await
+            .expect("the epoch accepts again");
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(!served.is_finished());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_draining_epoch_whose_tunnel_dies_closes_its_relays_and_ends() {
+        let target = echo().await;
+        let listeners = listeners().await;
+        let http = listeners.http_addr().expect("http listener");
+        let (alive_tx, served) = own_epoch(&listeners);
+        let (_head, mut stream) = http_connect(http, target, Duration::from_secs(3))
+            .await
+            .expect("served");
+        listeners.set_own_accepting(false);
+
+        let _ = alive_tx.send(false);
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut rest))
+            .await
+            .expect("the relay closes with its tunnel")
+            .expect("read");
+        tokio::time::timeout(Duration::from_secs(2), served)
+            .await
+            .expect("the epoch ends with its tunnel")
+            .expect("join");
     }
 
     #[tokio::test]

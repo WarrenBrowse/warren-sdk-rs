@@ -1086,6 +1086,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             // instead of failing on a gateway that no longer exists.
             bypass: None,
             carrier_host_route: Some((exit_ip, phys_gateway.clone())),
+            nest: None,
         };
         #[cfg(target_os = "linux")]
         let migration_policy = crate::supervisor::MigrationPolicy {
@@ -1093,6 +1094,7 @@ impl<T: HttpTransport> WarrenClient<T> {
             // own, so the fresh socket only has to carry the same mark.
             bypass: socket_bypass,
             carrier_host_route: None,
+            nest: None,
         };
         // Unreachable (the bypass resolution above already returned Err on any
         // other target), but it keeps this datapath type-checking there.
@@ -1681,6 +1683,7 @@ impl<T: HttpTransport> WarrenClient<T> {
         let supervisor_reconnect = std::sync::Arc::clone(&reconnect_request);
         let entitlements = self.port_entitlements.clone();
         let stand_aside_api_base = self.stand_aside_api_base.clone();
+        let stand_aside_nests = stand_aside_api_base.is_some();
         let (system_exit_tx, system_exit_rx) = tokio::sync::watch::channel(None);
         let task = tokio::spawn(async move {
             // The verdict stays `None` for a proxy not built to stand aside, which
@@ -1693,7 +1696,6 @@ impl<T: HttpTransport> WarrenClient<T> {
                 system_exit_tx,
                 &listeners,
                 &verdict_rx,
-                &supervisor_reconnect,
                 &wake,
             );
             let gate_state = state_tx.clone();
@@ -1738,7 +1740,17 @@ impl<T: HttpTransport> WarrenClient<T> {
                     // The userland proxy captures no host route, so the fresh
                     // migration socket needs no escape: it is an ordinary
                     // application socket following the system routing table.
-                    migration: crate::supervisor::MigrationPolicy::default(),
+                    // A proxy that stands aside keeps its own tunnel's live
+                    // connections when the system tunnel comes up: the
+                    // session migrates inside that tunnel instead of dying
+                    // behind its kill switch.
+                    migration: crate::supervisor::MigrationPolicy {
+                        nest: stand_aside_nests.then_some(
+                            crate::host_route::system_tunnel_bypass
+                                as fn() -> Option<warren_transport::SocketBypass>,
+                        ),
+                        ..crate::supervisor::MigrationPolicy::default()
+                    },
                 },
                 connect,
                 on_drain,
@@ -1773,7 +1785,6 @@ fn spawn_stand_aside(
     exit_tx: tokio::sync::watch::Sender<Option<crate::SystemExit>>,
     listeners: &crate::proxy::ProxyListeners,
     verdict_rx: &tokio::sync::watch::Receiver<Option<crate::host_route::HostRoute>>,
-    end_epoch: &Arc<tokio::sync::Notify>,
     wake: &Arc<tokio::sync::Notify>,
 ) -> StandAside {
     #[cfg(feature = "reqwest-transport")]
@@ -1790,7 +1801,6 @@ fn spawn_stand_aside(
                 std::net::IpAddr::V4(warrenguard_config::TUNNEL_GATEWAY_IP),
                 53,
             ),
-            Arc::clone(end_epoch),
             Arc::clone(wake),
         ));
         return StandAside {
@@ -1801,7 +1811,7 @@ fn spawn_stand_aside(
             _idle_verdict: None,
         };
     }
-    let _ = (api_base, exit_tx, listeners, verdict_rx, end_epoch, wake);
+    let _ = (api_base, exit_tx, listeners, verdict_rx, wake);
     StandAside {
         _tasks: None,
         _idle_verdict: Some(verdict_tx),
@@ -1862,6 +1872,7 @@ pub(crate) fn packet_migration_policy(
     crate::supervisor::MigrationPolicy {
         bypass: cfg.socket_bypass,
         carrier_host_route: None,
+        nest: None,
     }
 }
 

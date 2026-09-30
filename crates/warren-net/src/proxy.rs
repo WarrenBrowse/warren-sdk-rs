@@ -258,6 +258,101 @@ impl Handover {
     }
 }
 
+/// How many connections a server is handling, and when the last one ends.
+///
+/// A server that stops accepting while its path lives on (the helper standing
+/// aside behind the Warren app, its own tunnel carried inside the app's) keeps
+/// relaying what it already carries: this says when it has nothing left, so
+/// its path can be let go without cutting anyone.
+#[derive(Clone, Default)]
+pub struct LiveConnections {
+    inner: Arc<LiveInner>,
+}
+
+#[derive(Default)]
+struct LiveInner {
+    count: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+impl std::fmt::Debug for LiveConnections {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveConnections")
+            .field("count", &self.count())
+            .finish()
+    }
+}
+
+impl LiveConnections {
+    /// A counter at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The connections being handled right now.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.inner.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolves once no connection is being handled.
+    pub async fn drained(&self) {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.count() == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn enter(&self) -> LiveGuard {
+        self.inner
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        LiveGuard(self.clone())
+    }
+}
+
+/// One connection being handled; counted out when dropped.
+struct LiveGuard(LiveConnections);
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.0
+            .inner
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.inner.changed.notify_waiters();
+    }
+}
+
+/// What a server's `..._until` loop gives each connection it starts: the
+/// signal that ends its relay, and the counter it is part of.
+#[derive(Clone, Default)]
+struct ServeLifetime {
+    /// Ends every relay when set; the accept signal does otherwise.
+    path: Option<tokio::sync::watch::Receiver<bool>>,
+    live: Option<LiveConnections>,
+}
+
+impl ServeLifetime {
+    fn scope(
+        &self,
+        run: &tokio::sync::watch::Receiver<bool>,
+        handover: Option<&Handover>,
+    ) -> (PathScope, Option<LiveGuard>) {
+        let stop = self.path.clone().unwrap_or_else(|| run.clone());
+        (
+            PathScope::new(stop, handover.cloned()),
+            self.live.as_ref().map(LiveConnections::enter),
+        )
+    }
+}
+
 /// What an accepted client asked for, read and authorized, not yet answered.
 enum Request {
     Socks(Target),
@@ -605,6 +700,7 @@ pub struct Socks5Proxy<C> {
     connector: Arc<C>,
     credentials: Arc<ProxyCredentials>,
     handover: Option<Handover>,
+    lifetime: ServeLifetime,
 }
 
 impl<C: Connector> Socks5Proxy<C> {
@@ -615,6 +711,7 @@ impl<C: Connector> Socks5Proxy<C> {
             connector: Arc::new(connector),
             credentials: Arc::new(credentials),
             handover: None,
+            lifetime: ServeLifetime::default(),
         }
     }
 
@@ -625,6 +722,22 @@ impl<C: Connector> Socks5Proxy<C> {
     #[must_use]
     pub fn with_handover(mut self, handover: Handover) -> Self {
         self.handover = Some(handover);
+        self
+    }
+
+    /// Ends the connections this server starts when `path` goes `false`,
+    /// instead of when its accept signal does: a server that stops accepting
+    /// keeps relaying on a path that lives on.
+    #[must_use]
+    pub fn with_path(mut self, path: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.lifetime.path = Some(path);
+        self
+    }
+
+    /// Counts the connections this server handles in `live`.
+    #[must_use]
+    pub fn counting(mut self, live: LiveConnections) -> Self {
+        self.lifetime.live = Some(live);
         self
     }
 
@@ -678,15 +791,19 @@ impl<C: Connector> Socks5Proxy<C> {
                 }
                 pending = handed_over(self.handover.as_ref()) => {
                     let connector = Arc::clone(&self.connector);
-                    let scope = PathScope::new(run.clone(), self.handover.clone());
-                    tokio::spawn(async move { answer(pending, connector.as_ref(), scope).await });
+                    let (scope, live) = self.lifetime.scope(&run, self.handover.as_ref());
+                    tokio::spawn(async move {
+                        let _live = live;
+                        answer(pending, connector.as_ref(), scope).await;
+                    });
                 }
                 accepted = accept(listener) => {
                     let client = accepted?;
                     let connector = Arc::clone(&self.connector);
                     let credentials = Arc::clone(&self.credentials);
-                    let scope = PathScope::new(run.clone(), self.handover.clone());
+                    let (scope, live) = self.lifetime.scope(&run, self.handover.as_ref());
                     tokio::spawn(async move {
+                        let _live = live;
                         handle_connection(client, connector.as_ref(), &credentials, scope).await;
                     });
                 }
@@ -769,15 +886,19 @@ impl<C: UdpConnector> Socks5Proxy<C> {
                 }
                 pending = handed_over(self.handover.as_ref()) => {
                     let connector = Arc::clone(&self.connector);
-                    let scope = PathScope::new(run.clone(), self.handover.clone());
-                    tokio::spawn(async move { answer(pending, connector.as_ref(), scope).await });
+                    let (scope, live) = self.lifetime.scope(&run, self.handover.as_ref());
+                    tokio::spawn(async move {
+                        let _live = live;
+                        answer(pending, connector.as_ref(), scope).await;
+                    });
                 }
                 accepted = accept(listener) => {
                     let client = accepted?;
                     let connector = Arc::clone(&self.connector);
                     let credentials = Arc::clone(&self.credentials);
-                    let scope = PathScope::new(run.clone(), self.handover.clone());
+                    let (scope, live) = self.lifetime.scope(&run, self.handover.as_ref());
                     tokio::spawn(async move {
+                        let _live = live;
                         handle_with_udp(client, connector.as_ref(), &credentials, scope).await;
                     });
                 }
@@ -1068,6 +1189,7 @@ pub struct HttpConnectProxy<C> {
     connector: Arc<C>,
     credentials: Arc<ProxyCredentials>,
     handover: Option<Handover>,
+    lifetime: ServeLifetime,
 }
 
 impl<C: Connector> HttpConnectProxy<C> {
@@ -1078,6 +1200,7 @@ impl<C: Connector> HttpConnectProxy<C> {
             connector: Arc::new(connector),
             credentials: Arc::new(credentials),
             handover: None,
+            lifetime: ServeLifetime::default(),
         }
     }
 
@@ -1086,6 +1209,22 @@ impl<C: Connector> HttpConnectProxy<C> {
     #[must_use]
     pub fn with_handover(mut self, handover: Handover) -> Self {
         self.handover = Some(handover);
+        self
+    }
+
+    /// Ends the connections this server starts when `path` goes `false`,
+    /// instead of when its accept signal does: a server that stops accepting
+    /// keeps relaying on a path that lives on.
+    #[must_use]
+    pub fn with_path(mut self, path: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.lifetime.path = Some(path);
+        self
+    }
+
+    /// Counts the connections this server handles in `live`.
+    #[must_use]
+    pub fn counting(mut self, live: LiveConnections) -> Self {
+        self.lifetime.live = Some(live);
         self
     }
 
@@ -1136,15 +1275,19 @@ impl<C: Connector> HttpConnectProxy<C> {
                 }
                 pending = handed_over(self.handover.as_ref()) => {
                     let connector = Arc::clone(&self.connector);
-                    let scope = PathScope::new(run.clone(), self.handover.clone());
-                    tokio::spawn(async move { answer(pending, connector.as_ref(), scope).await });
+                    let (scope, live) = self.lifetime.scope(&run, self.handover.as_ref());
+                    tokio::spawn(async move {
+                        let _live = live;
+                        answer(pending, connector.as_ref(), scope).await;
+                    });
                 }
                 accepted = accept(listener) => {
                     let client = accepted?;
                     let connector = Arc::clone(&self.connector);
                     let credentials = Arc::clone(&self.credentials);
-                    let scope = PathScope::new(run.clone(), self.handover.clone());
+                    let (scope, live) = self.lifetime.scope(&run, self.handover.as_ref());
                     tokio::spawn(async move {
+                        let _live = live;
                         handle_connect(client, connector.as_ref(), &credentials, scope).await;
                     });
                 }
@@ -1907,6 +2050,94 @@ mod tests {
         .expect("the early bytes reach the target with no further write")
         .expect("read");
         assert_eq!(&echoed, b"early");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_stops_accepting_keeps_its_relays_until_its_path_goes() {
+        // The helper stops taking new requests on its own tunnel the moment the
+        // Warren app's tunnel carries the host, but a download or a socket it
+        // already relays must go on over that tunnel until it ends: cutting it
+        // was a page, a video or a call dropping the second the app connected.
+        let echo = echo_server().await;
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind"));
+        let addr = listener.local_addr().expect("addr");
+        let credentials = ProxyCredentials::generate();
+        let live = LiveConnections::new();
+        let (accept_tx, accept_rx) = tokio::sync::watch::channel(true);
+        let (path_tx, path_rx) = tokio::sync::watch::channel(true);
+        let proxy = HttpConnectProxy::new(DirectConnector, credentials.clone())
+            .with_path(path_rx)
+            .counting(live.clone());
+        let server = {
+            let listener = Arc::clone(&listener);
+            tokio::spawn(async move { proxy.serve_until(&listener, accept_rx).await })
+        };
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(connect_request(&credentials, echo).as_bytes())
+            .await
+            .expect("write");
+        assert!(read_head(&mut client).await.starts_with("HTTP/1.1 200 "));
+        assert_eq!(live.count(), 1);
+
+        let _ = accept_tx.send(false);
+        server.await.expect("join").expect("served");
+        client.write_all(b"still").await.expect("write through");
+        let mut echoed = [0u8; 5];
+        client
+            .read_exact(&mut echoed)
+            .await
+            .expect("the relay outlives the accept loop");
+        assert_eq!(&echoed, b"still");
+
+        let _ = path_tx.send(false);
+        let mut rest = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_to_end(&mut rest),
+        )
+        .await
+        .expect("the relay closes with its path")
+        .expect("read");
+        tokio::time::timeout(std::time::Duration::from_secs(2), live.drained())
+            .await
+            .expect("drained once its last relay is gone");
+    }
+
+    #[tokio::test]
+    async fn live_connections_report_the_drain_when_the_last_client_leaves() {
+        let echo = echo_server().await;
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind"));
+        let addr = listener.local_addr().expect("addr");
+        let credentials = ProxyCredentials::generate();
+        let live = LiveConnections::new();
+        let (_accept_tx, accept_rx) = tokio::sync::watch::channel(true);
+        let proxy =
+            HttpConnectProxy::new(DirectConnector, credentials.clone()).counting(live.clone());
+        let _server = {
+            let listener = Arc::clone(&listener);
+            tokio::spawn(async move { proxy.serve_until(&listener, accept_rx).await })
+        };
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(connect_request(&credentials, echo).as_bytes())
+            .await
+            .expect("write");
+        assert!(read_head(&mut client).await.starts_with("HTTP/1.1 200 "));
+
+        let drained = tokio::spawn({
+            let live = live.clone();
+            async move { live.drained().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!drained.is_finished(), "a live relay is not a drain");
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(2), drained)
+            .await
+            .expect("drained")
+            .expect("join");
+        assert_eq!(live.count(), 0);
     }
 
     #[tokio::test]
