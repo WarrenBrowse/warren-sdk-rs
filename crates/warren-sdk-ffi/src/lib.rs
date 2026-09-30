@@ -157,6 +157,11 @@ pub enum FfiFatalCause {
     /// The exit closed with the opaque policy-rejection code and no sealed cause
     /// arrived: definitive, but the specific reason is unknown to the client.
     PolicyRefused,
+    /// No entry relay is reachable on this network's address families (an
+    /// IPv6-only network against IPv4-only entries). Neither the account nor
+    /// the fleet is at fault: the user changes network, or unpins an entry
+    /// country the network cannot reach.
+    NoReachableEntry,
 }
 
 /// Receives connection-state transitions during [`WarrenFfiClient::start_proxy`].
@@ -1325,6 +1330,7 @@ fn map_fatal_cause(cause: FatalCause) -> FfiFatalCause {
         FatalCause::NotAuthorized => FfiFatalCause::NotAuthorized,
         FatalCause::DeviceLimit => FfiFatalCause::DeviceLimit,
         FatalCause::PolicyRefused => FfiFatalCause::PolicyRefused,
+        FatalCause::NoReachableEntry => FfiFatalCause::NoReachableEntry,
         _ => FfiFatalCause::PolicyRefused,
     }
 }
@@ -2181,7 +2187,15 @@ mod tests {
             map_fatal_cause(FatalCause::PolicyRefused),
             FfiFatalCause::PolicyRefused
         );
+        assert_eq!(
+            map_fatal_cause(FatalCause::NoReachableEntry),
+            FfiFatalCause::NoReachableEntry
+        );
         // No two engine causes may collapse to the same FFI kind.
+        assert_ne!(
+            FfiFatalCause::NoReachableEntry,
+            FfiFatalCause::PolicyRefused
+        );
         assert_ne!(FfiFatalCause::NotAuthorized, FfiFatalCause::DeviceLimit);
         assert_ne!(FfiFatalCause::DeviceLimit, FfiFatalCause::PolicyRefused);
         assert_ne!(FfiFatalCause::NotAuthorized, FfiFatalCause::PolicyRefused);

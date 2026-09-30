@@ -353,6 +353,12 @@ pub async fn log_refusals(
 /// identity material: the account is named nowhere, on any branch.
 #[must_use]
 pub fn fatal_line(cause: Option<FatalCause>) -> String {
+    if cause == Some(FatalCause::NoReachableEntry) {
+        return "no entry relay is reachable on this network's address families (for example an \
+                IPv6-only network against IPv4-only entries). Not retrying: change network, or \
+                unpin an entry country this network cannot reach"
+            .to_owned();
+    }
     let detail = match cause {
         Some(FatalCause::NotAuthorized) => {
             "the account is not authorized (no active subscription, or not enrolled at this exit)"
@@ -780,6 +786,26 @@ mod tests {
         assert!(
             fatal_line(None).contains("refused"),
             "without a published cause the refusal is still terminal"
+        );
+    }
+
+    /// A network that routes no entry is not a refusal: the account and the
+    /// fleet are fine, and the operator's fix is a network change, so the
+    /// line must not send them after their subscription.
+    #[test]
+    fn an_unroutable_entry_is_named_as_a_network_problem_not_a_refusal() {
+        let line = fatal_line(Some(FatalCause::NoReachableEntry));
+        assert!(
+            line.contains("no entry relay is reachable"),
+            "the cause must be readable, got: {line}"
+        );
+        assert!(
+            line.contains("address families"),
+            "the line must say why no entry is reachable, got: {line}"
+        );
+        assert!(
+            !line.contains("refused"),
+            "no server refused anything, got: {line}"
         );
     }
 
