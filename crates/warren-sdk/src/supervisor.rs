@@ -908,7 +908,41 @@ pub(crate) async fn serve_epoch<C>(
     handover: &warren_net::Handover,
     connector: C,
     alive_rx: tokio::sync::watch::Receiver<bool>,
+    accepting: tokio::sync::watch::Receiver<bool>,
+) where
+    C: warren_net::UdpConnector + Clone,
+{
+    serve_epoch_draining_within(
+        socks_listener,
+        http_listener,
+        credentials,
+        handover,
+        connector,
+        alive_rx,
+        accepting,
+        DRAIN_LIMIT,
+    )
+    .await;
+}
+
+/// The longest an epoch of the proxy's own tunnel keeps relaying once the proxy
+/// stands aside. Long enough for the page loads and downloads in flight at the
+/// switch to finish; bounded so that one long-lived connection (a socket, a
+/// stream) cannot keep the own tunnel, its exit and its forwards alive under an
+/// exit the host no longer names for as long as the system tunnel stays up.
+pub(crate) const DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// [`serve_epoch`] with the drain bounded by `drain_limit`.
+#[allow(clippy::too_many_arguments)]
+async fn serve_epoch_draining_within<C>(
+    socks_listener: &tokio::net::TcpListener,
+    http_listener: Option<&tokio::net::TcpListener>,
+    credentials: &warren_net::ProxyCredentials,
+    handover: &warren_net::Handover,
+    connector: C,
+    alive_rx: tokio::sync::watch::Receiver<bool>,
     mut accepting: tokio::sync::watch::Receiver<bool>,
+    drain_limit: std::time::Duration,
 ) where
     C: warren_net::UdpConnector + Clone,
 {
@@ -973,15 +1007,21 @@ pub(crate) async fn serve_epoch<C>(
             }
         }
         let mut path = path_rx.clone();
+        let limit = tokio::time::sleep(drain_limit);
+        tokio::pin!(limit);
         tokio::select! {
             () = live.drained() => return,
             () = stopped(&mut path) => return,
+            // Returning drops `path_tx` with the bridge, which closes every
+            // relay still open.
+            () = &mut limit => return,
             changed = accepting.changed() => {
                 if changed.is_err() {
                     // Drain to the end: nothing will ask this epoch back.
                     tokio::select! {
                         () = live.drained() => return,
                         () = stopped(&mut path) => return,
+                        () = &mut limit => return,
                     }
                 }
             }
@@ -1015,6 +1055,9 @@ pub(crate) async fn serve_through_host_route(
     let http_listener = listeners.http_listener();
     let credentials = listeners.credentials().clone();
     let handover = listeners.handover();
+    // However this server ends (cancelled with its supervisor too), the
+    // listeners go back to the own tunnel: a later proxy on them must accept.
+    let _give_back = GiveBackListeners(&listeners);
     loop {
         let route = loop {
             if let Some(route) = verdict.borrow_and_update().clone() {
@@ -1072,6 +1115,15 @@ pub(crate) async fn serve_through_host_route(
                 return;
             }
         }
+    }
+}
+
+/// Hands the listeners back to the proxy's own tunnel when dropped.
+struct GiveBackListeners<'a>(&'a crate::proxy::ProxyListeners);
+
+impl Drop for GiveBackListeners<'_> {
+    fn drop(&mut self) {
+        self.0.set_own_accepting(true);
     }
 }
 
@@ -3157,6 +3209,78 @@ mod host_route_tests {
             .expect("the epoch accepts again");
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         assert!(!served.is_finished());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drain_that_outlasts_its_limit_lets_the_tunnel_go() {
+        // One long-lived connection (a socket, a stream) must not keep the own
+        // tunnel, its exit and its forwards alive for as long as the app stays
+        // connected, under an exit the popup no longer names.
+        let target = echo().await;
+        let listeners = listeners().await;
+        let http = listeners.http_addr().expect("http listener");
+        let (_alive_tx, alive_rx) = tokio::sync::watch::channel(true);
+        let served = {
+            let listeners = listeners.clone();
+            tokio::spawn(async move {
+                let socks = listeners.socks_listener();
+                let http = listeners.http_listener();
+                serve_epoch_draining_within(
+                    &socks,
+                    http.as_deref(),
+                    listeners.credentials(),
+                    &listeners.handover(),
+                    LocalUdpless,
+                    alive_rx,
+                    listeners.own_accepting(),
+                    Duration::from_millis(300),
+                )
+                .await;
+            })
+        };
+        let (_head, mut stream) = http_connect(http, target, Duration::from_secs(3))
+            .await
+            .expect("served");
+        listeners.set_own_accepting(false);
+
+        tokio::time::timeout(Duration::from_secs(3), served)
+            .await
+            .expect("the epoch ends at its drain limit")
+            .expect("join");
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut rest))
+            .await
+            .expect("its last relay closes with it")
+            .expect("read");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_route_server_stopped_mid_stand_aside_gives_the_listeners_back() {
+        let listeners = listeners().await;
+        let (_verdict_tx, verdict_rx) = tokio::sync::watch::channel(Some(loopback_route()));
+        let mut own_accepting = listeners.own_accepting();
+        let served = tokio::spawn(serve_through_host_route(
+            listeners.clone(),
+            verdict_rx,
+            "127.0.0.1:53".parse().expect("literal"),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            own_accepting.wait_for(|accepting| !accepting),
+        )
+        .await
+        .expect("standing aside")
+        .expect("sender alive");
+
+        served.abort();
+        let _ = served.await;
+        assert!(
+            *own_accepting.borrow_and_update(),
+            "a later proxy on the same listeners must be able to accept"
+        );
     }
 
     #[cfg(unix)]
