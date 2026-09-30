@@ -43,6 +43,9 @@ crypto-bigint = { version = "0.7", default-features = false, features = ["alloc"
 der = { version = "0.8", default-features = false }
 data-encoding = { workspace = true }
 thiserror = { workspace = true }
+# Parses the `Date` header of the API's answers, the server clock a device
+# whose own clock drifted stamps its signed requests with (`clock`).
+httpdate = "1"
 
 # Optional batteries-included transport. Off by default so the pure request
 # builder stays cheap to compile and test; the SDK facade enables it.

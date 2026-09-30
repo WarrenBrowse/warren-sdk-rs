@@ -10,6 +10,7 @@
 //! behind the `reqwest-transport` feature.
 
 pub mod client;
+pub mod clock;
 pub mod dto;
 pub mod route_admission;
 pub mod token_blinding;
@@ -23,6 +24,7 @@ pub mod reqwest_transport;
 pub mod marked_transport;
 
 pub use client::{ClientError, WarrenApiClient};
+pub use clock::ServerClock;
 pub use dto::{
     AbuseCategory, AccountBan, AccountStandingResponse, AccountStrike, BanReasonCode,
     CampaignVoucherResponse, CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,

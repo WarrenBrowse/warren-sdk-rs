@@ -553,14 +553,19 @@ fn route_admission_of(
 
 /// Whether a mint failure gives every remaining epoch the same answer, so a
 /// refresh must stop and return it: swallowed, it would read as a refresh that
-/// went fine and stocked nothing. A ban; an issuer whose attribution tags
-/// cannot pass the exit's checks; a token crate that no longer blinds in the
-/// derived order, which would leave every tick with no batch at all.
+/// went fine and stocked nothing. A ban; a signature the server refuses (a
+/// clock outside its window, a key it does not accept); an issuer whose
+/// attribution tags cannot pass the exit's checks; a token crate that no
+/// longer blinds in the derived order, which would leave every tick with no
+/// batch at all.
 fn answers_every_epoch_alike(err: &TokenClientError) -> bool {
     matches!(
         err,
-        TokenClientError::Api(ClientError::Banned { .. })
-            | TokenClientError::BadAttributionKey
+        TokenClientError::Api(
+            ClientError::Banned { .. }
+                | ClientError::ClockSkew { .. }
+                | ClientError::ServerStatus { status: 401, .. }
+        ) | TokenClientError::BadAttributionKey
             | TokenClientError::AttributionTagCount { .. }
             | TokenClientError::AttributionTagEpoch { .. }
             | TokenClientError::AttributionTagInvalid { .. }
@@ -754,7 +759,9 @@ impl<T: HttpTransport> TokenManager<T> {
     /// # Errors
     /// [`TokenClientError`] when the directory fetch itself fails; when the
     /// issuer refuses the wallet as banned
-    /// (`TokenClientError::Api(ClientError::Banned { .. })`); and, for port
+    /// (`TokenClientError::Api(ClientError::Banned { .. })`); when it refuses
+    /// the signature (`ClientError::ClockSkew` for a device clock outside its
+    /// window, `ClientError::ServerStatus` 401 otherwise); and, for port
     /// entitlements, when the directory carries no usable attribution key or
     /// a batch's tags fail the checks (`BadAttributionKey`,
     /// `AttributionTag*`). The pass stops there, leaving that epoch and the

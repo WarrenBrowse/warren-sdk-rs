@@ -527,6 +527,15 @@ fn connect_error() -> TransportError {
     TransportError::Connect("connection failed".to_owned())
 }
 
+/// The answer's `Date` header, the server clock the client stamps signed
+/// requests with (`crate::clock`).
+fn date_of(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get(http::header::DATE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
 impl HttpTransport for MarkedTransport {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
         let total = TOTAL_TIMEOUT;
@@ -614,6 +623,7 @@ impl MarkedTransport {
             .await
             .map_err(|_| TransportError::Io("request failed".to_owned()))?;
         let status = response.status().as_u16();
+        let date = date_of(response.headers());
         let body = response
             .into_body()
             .collect()
@@ -621,7 +631,11 @@ impl MarkedTransport {
             .map_err(|_| TransportError::Io("response read failed".to_owned()))?
             .to_bytes()
             .to_vec();
-        Ok(HttpResponse { status, body })
+        let response = HttpResponse::new(status, body);
+        Ok(match date {
+            Some(date) => response.with_date(date),
+            None => response,
+        })
     }
 }
 
@@ -645,6 +659,20 @@ mod tests {
         assert!(
             !unmarked.mark_sockets,
             "unmarked() must not tag its sockets"
+        );
+    }
+
+    #[test]
+    fn the_answers_date_header_is_kept_and_its_absence_is_none() {
+        let mut headers = http::HeaderMap::new();
+        assert_eq!(date_of(&headers), None);
+        headers.insert(
+            http::header::DATE,
+            http::HeaderValue::from_static("Tue, 14 Nov 2023 22:13:20 GMT"),
+        );
+        assert_eq!(
+            date_of(&headers).as_deref(),
+            Some("Tue, 14 Nov 2023 22:13:20 GMT")
         );
     }
 

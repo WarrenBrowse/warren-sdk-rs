@@ -22,15 +22,15 @@ struct SplitTransport {
 impl HttpTransport for SplitTransport {
     async fn execute(&self, req: HttpRequest) -> Result<HttpResponse, TransportError> {
         if req.url.ends_with("/v1/multihop/path-quality") {
-            return Ok(HttpResponse {
-                status: self.path_quality_status,
-                body: self.path_quality_body.clone().into_bytes(),
-            });
+            return Ok(HttpResponse::new(
+                self.path_quality_status,
+                self.path_quality_body.clone().into_bytes(),
+            ));
         }
-        Ok(HttpResponse {
-            status: 200,
-            body: self.directory_json.clone().into_bytes(),
-        })
+        Ok(HttpResponse::new(
+            200,
+            self.directory_json.clone().into_bytes(),
+        ))
     }
 }
 

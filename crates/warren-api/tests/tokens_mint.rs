@@ -123,7 +123,7 @@ impl FakeIssuer {
 
 impl HttpTransport for FakeIssuer {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
-        let ok = |body: Vec<u8>| Ok(HttpResponse { status: 200, body });
+        let ok = |body: Vec<u8>| Ok(HttpResponse::new(200, body));
         if request.url.ends_with("/v1/tokens/keys")
             || request.url.ends_with("/v1/browser-proxy/keys")
         {
@@ -143,18 +143,12 @@ impl HttpTransport for FakeIssuer {
         );
         self.issue_calls.fetch_add(1, Ordering::SeqCst);
         if let Some((status, body)) = *self.issue_refusal.lock().unwrap() {
-            return Ok(HttpResponse {
-                status,
-                body: body.as_bytes().to_vec(),
-            });
+            return Ok(HttpResponse::new(status, body.as_bytes().to_vec()));
         }
         if self.fail_issue_once.swap(false, Ordering::SeqCst) {
             // A connected-but-unavailable answer: a transient transport-class
             // failure the client must retry, not a definitive ledger refusal.
-            return Ok(HttpResponse {
-                status: 503,
-                body: Vec::new(),
-            });
+            return Ok(HttpResponse::new(503, Vec::new()));
         }
         let req: TokenIssueRequest = serde_json::from_slice(&request.body).unwrap();
         let mut epochs = Vec::new();
@@ -719,6 +713,53 @@ async fn a_refresh_surfaces_a_ban_and_mints_once_it_is_lifted() {
         .await
         .expect("the ban is lifted");
     assert_eq!(manager.available(100), QUOTA as usize);
+}
+
+/// Forum topic 219: a clock outside the window was refused 401 on every issue
+/// call, the refusal was swallowed as one epoch's transient failure, and the
+/// daemon logged a successful refresh round that stocked nothing. A clock
+/// refusal answers every epoch alike, so it ends the pass and names the clock.
+#[tokio::test]
+async fn a_refresh_refused_for_the_clock_ends_the_pass_and_names_the_clock() {
+    let fake = FakeIssuer::new(&[100, 101]);
+    *fake.issue_refusal.lock().unwrap() = Some((401, r#"{"error":"clock_skew"}"#));
+    let api = std::sync::Arc::new(client(fake));
+    let manager = TokenManager::new(api.clone(), session_key());
+
+    let err = manager
+        .refresh(100 * EPOCH_SECS)
+        .await
+        .expect_err("the clock refusal reaches the caller");
+
+    assert!(
+        matches!(err, TokenClientError::Api(ClientError::ClockSkew { .. })),
+        "{err:?}"
+    );
+    assert_eq!(api.transport().issue_calls.load(Ordering::SeqCst), 1);
+}
+
+/// A 401 that does not name the clock is a key the server does not accept:
+/// no later epoch will be answered otherwise, so it ends the pass as well.
+#[tokio::test]
+async fn a_refresh_refused_401_ends_the_pass() {
+    let fake = FakeIssuer::new(&[100, 101]);
+    *fake.issue_refusal.lock().unwrap() = Some((401, ""));
+    let api = std::sync::Arc::new(client(fake));
+    let manager = TokenManager::new(api.clone(), session_key());
+
+    let err = manager
+        .refresh(100 * EPOCH_SECS)
+        .await
+        .expect_err("the refusal reaches the caller");
+
+    assert!(
+        matches!(
+            err,
+            TokenClientError::Api(ClientError::ServerStatus { status: 401, .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(api.transport().issue_calls.load(Ordering::SeqCst), 1);
 }
 
 fn drain(manager: &TokenManager<FakeIssuer>, now: u64) -> Vec<[u8; warrenguard_token::TOKEN_LEN]> {

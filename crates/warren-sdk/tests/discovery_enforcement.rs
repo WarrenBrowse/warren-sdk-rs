@@ -25,10 +25,7 @@ struct QueueTransport {
 impl HttpTransport for QueueTransport {
     async fn execute(&self, _req: HttpRequest) -> Result<HttpResponse, TransportError> {
         let body = self.bodies.lock().unwrap().pop_front().unwrap_or_default();
-        Ok(HttpResponse {
-            status: 200,
-            body: body.into_bytes(),
-        })
+        Ok(HttpResponse::new(200, body.into_bytes()))
     }
 }
 

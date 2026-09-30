@@ -97,6 +97,15 @@ pub enum FfiError {
         /// redemption may omit it).
         lapses_at_unix_secs: Option<u64>,
     },
+    /// The server refused a signed request's timestamp: this device's clock
+    /// is further off than the SDK's correction may follow. What the user
+    /// can do is set the clock right; the wallet key is not in question.
+    #[error("the server refused the request's timestamp: this device's clock is off")]
+    ClockSkew {
+        /// The server's clock minus this device's, in seconds (positive when
+        /// the device is behind); `None` when the refusal carried no `Date`.
+        offset_secs: Option<i64>,
+    },
 }
 
 /// Why an account is banned. Mirrors the contract's `BanReasonCode` across
@@ -1337,6 +1346,7 @@ fn map_client_error(e: ClientError) -> FfiError {
             },
             lapses_at_unix_secs,
         },
+        ClientError::ClockSkew { offset_secs } => FfiError::ClockSkew { offset_secs },
         other => FfiError::Client {
             message: other.to_string(),
         },
@@ -1438,6 +1448,23 @@ mod tests {
                 FfiError::Banned {
                     reason: FfiBanReason::PortForwardingAbuse,
                     lapses_at_unix_secs: Some(1_790_000_000),
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_clock_refusal_crosses_the_ffi_typed_with_the_measured_offset() {
+        let err = map_sdk_error(SdkError::Api(ClientError::ClockSkew {
+            offset_secs: Some(-91),
+        }));
+
+        assert!(
+            matches!(
+                err,
+                FfiError::ClockSkew {
+                    offset_secs: Some(-91)
                 }
             ),
             "{err:?}"

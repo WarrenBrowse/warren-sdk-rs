@@ -135,12 +135,21 @@ impl HttpTransport for ReqwestTransport {
         }
         let resp = builder.send().await.map_err(|e| to_transport_error(&e))?;
         let status = resp.status().as_u16();
+        let date = resp
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let body = resp
             .bytes()
             .await
             .map_err(|e| to_transport_error(&e))?
             .to_vec();
-        Ok(HttpResponse { status, body })
+        let response = HttpResponse::new(status, body);
+        Ok(match date {
+            Some(date) => response.with_date(date),
+            None => response,
+        })
     }
 }
 
@@ -197,7 +206,10 @@ mod tests {
                 let mut request = [0u8; 1024];
                 let _ = tls.read(&mut request).await;
                 let _ = tls
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nDate: Tue, 14 Nov 2023 22:13:20 GMT\r\n\
+                          Content-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
                     .await;
                 let _ = tls.shutdown().await;
             }
@@ -227,6 +239,34 @@ mod tests {
             handshakes.push(seen.recv().await.unwrap());
         }
         handshakes
+    }
+
+    /// The client reads the server's clock off this header; a transport that
+    /// dropped it would leave a drifted device refused on every signed call.
+    #[tokio::test]
+    async fn the_answers_date_header_reaches_the_client() {
+        let (port, _seen) = server().await;
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(CA).unwrap())
+            .unwrap();
+        let transport = ReqwestTransport::with_roots(&roots).unwrap();
+
+        let response = transport
+            .execute(HttpRequest {
+                method: Method::Get,
+                url: format!("https://localhost:{port}/"),
+                headers: Vec::new(),
+                body: Vec::new(),
+                use_sni: true,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.date.as_deref(),
+            Some("Tue, 14 Nov 2023 22:13:20 GMT")
+        );
     }
 
     #[tokio::test]

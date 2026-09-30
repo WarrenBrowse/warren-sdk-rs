@@ -26,6 +26,22 @@ the pre-release `0.0.x` line.
 
 ### Added
 
+- Signed requests are stamped with the server's clock when the device's is
+  off (forum topic 219: a Windows clock 91 s fast was refused `401` on every
+  signed call, and lost its port forwarding, its session tokens and its
+  account data). `warren_api::clock::ServerClock` learns the offset from the
+  `Date` header of a `401` refusal (never from another answer, which a cache
+  can serve with a stale `Date`), and moves the stamp only when the device is
+  outside half the contract's `SIGNATURE_WINDOW_SECS`, and forward by at most
+  `MAX_FORWARD_CORRECTION_SECS` (15 min); a request refused for its
+  timestamp is signed again once when the refusal's `Date` leads to a stamp
+  inside the window. `WarrenApiClient::with_server_clock`
+  shares one clock between the clients (and other signers) of a wallet, and
+  `server_clock()` exposes it. A refusal the correction could not fix is
+  `ClientError::ClockSkew { offset_secs }` (FFI: `FfiError::ClockSkew`),
+  raised on the contract's `401 {"error":"clock_skew"}` body or on a bare
+  `401` whose `Date` shows the stamp outside the window.
+
 - Port-entitlement batches are derived from the wallet like the session
   batches, under their own purpose (`BlindingKey::port_entitlement(seed)`,
   `BLINDING_PURPOSE_PORT_ENTITLEMENT` = `port-entitlement/v1`, frozen by
@@ -256,6 +272,16 @@ the pre-release `0.0.x` line.
   `IdleCoverDriverHandle`, `CoverSink`.
 
 ### Changed
+
+- `HttpResponse` carries the answer's `Date` header (`date`) and is
+  `#[non_exhaustive]`: a transport builds it with `HttpResponse::new(status,
+  body)` and `.with_date(..)`. A transport that does not pass the `Date` on
+  leaves a device with a drifted clock refused on every signed call. The
+  bundled reqwest and marked transports pass it on.
+- `TokenManager::refresh` ends the pass on a `401` from the issuer
+  (`ClientError::ClockSkew`, or `ServerStatus` 401) and returns it, instead
+  of swallowing it as one epoch's transient failure and reporting a refresh
+  that stocked nothing as a success.
 
 - A port-forwarding slot now presents the entitlement ENVELOPE, not a bare
   token (warren-core doc 105): `PortEntitlementManager::credential_for_slot`

@@ -1,11 +1,17 @@
 //! The signed Warren account API client.
 
+use std::sync::Arc;
+
 use rand::RngCore;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use warren_discovery_core::{MULTIHOP_DIRECTORY_PATH_V1, MULTIHOP_DIRECTORY_PATH_V2};
 use warren_identity::WarrenIdentity;
 
+use warren_contract::auth::SIGNATURE_WINDOW_SECS;
+use warren_contract::dto::AuthRefusal;
+
+use crate::clock::ServerClock;
 use crate::dto::{
     AccountStandingResponse, BanReasonCode, CampaignVoucherResponse, CheckApplePaymentRequest,
     CheckResponse, IncidentExitDownRequest, IncidentPubkeyMismatchRequest,
@@ -58,6 +64,21 @@ pub enum ClientError {
     /// The system clock is before the Unix epoch.
     #[error("system clock is before the Unix epoch")]
     BadClock,
+    /// The server refused a signed request because its timestamp is outside
+    /// the server's window: this device's clock is off, and the wallet key
+    /// may well be fine. Raised on a `401` whose body is the contract's
+    /// `{"error":"clock_skew"}`, or whose `Date` shows the stamp outside the
+    /// window, once the correction learned from that `Date` (see
+    /// [`crate::clock`]) could not bring the stamp back inside it: the clock
+    /// is further ahead than the correction may follow, or the answer
+    /// carried no usable `Date`. What a user can do is set the clock right.
+    #[error("the server refused the request's timestamp: this device's clock is off")]
+    ClockSkew {
+        /// The server's clock minus this device's, in seconds (positive when
+        /// the device is behind), read off the refusal's `Date` header.
+        /// `None` when the refusal carried no usable one.
+        offset_secs: Option<i64>,
+    },
     /// The server refused the wallet because it is on the CRL (HTTP 403
     /// `{"error":"banned"}`, warren-core doc 105): session-token and
     /// port-entitlement issuance, and every call that credits time (a voucher
@@ -85,6 +106,9 @@ pub struct WarrenApiClient<T> {
     alternative_hosts: Vec<String>,
     identity: WarrenIdentity,
     transport: T,
+    /// The server's clock as the answers read so far tell it; every signed
+    /// request is stamped with it.
+    clock: Arc<ServerClock>,
 }
 
 impl<T: HttpTransport> WarrenApiClient<T> {
@@ -109,7 +133,25 @@ impl<T: HttpTransport> WarrenApiClient<T> {
             alternative_hosts,
             identity,
             transport,
+            clock: Arc::new(ServerClock::new()),
         }
+    }
+
+    /// The same client stamping with `clock`, shared with every other client
+    /// (or signer) of the wallet that holds it, so one answer read by any of
+    /// them corrects all their stamps.
+    #[must_use]
+    pub fn with_server_clock(mut self, clock: Arc<ServerClock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The server clock this client stamps its signed requests with: read
+    /// [`ServerClock::offset_secs`] to tell a user their clock is off, or
+    /// share it with another signer of the same wallet.
+    #[must_use]
+    pub fn server_clock(&self) -> &Arc<ServerClock> {
+        &self.clock
     }
 
     /// The Warren SS58 address of the client identity.
@@ -224,8 +266,8 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     ///
     /// See [`Self::register`].
     pub async fn subscription(&self) -> Result<SubscriptionResponse, ClientError> {
-        let http = self.signed_request(Method::Get, "/v1/subscription", Vec::new())?;
-        self.send_json(http).await
+        self.send_signed_json(Method::Get, "/v1/subscription", Vec::new())
+            .await
     }
 
     /// Signed `GET /v1/campaign/{campaign_id}/voucher`. Returns the code this
@@ -250,8 +292,7 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     /// backend failure never reads as "you were never eligible".
     pub async fn campaign_voucher(&self, campaign_id: &str) -> Result<Option<String>, ClientError> {
         let path = format!("/v1/campaign/{campaign_id}/voucher");
-        let http = self.signed_request(Method::Get, &path, Vec::new())?;
-        match self.send(http).await {
+        match self.send_signed(Method::Get, &path, Vec::new()).await {
             Ok(resp) => {
                 let parsed: CampaignVoucherResponse =
                     serde_json::from_slice(&resp.body).map_err(ClientError::ResponseJson)?;
@@ -274,8 +315,8 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     ///
     /// See [`Self::register`].
     pub async fn account_standing(&self) -> Result<AccountStandingResponse, ClientError> {
-        let http = self.signed_request(Method::Get, "/v1/account/standing", Vec::new())?;
-        self.send_json(http).await
+        self.send_signed_json(Method::Get, "/v1/account/standing", Vec::new())
+            .await
     }
 
     /// Signed `GET /v1/check`. Reports the client's egress IP and whether it is
@@ -285,8 +326,8 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     ///
     /// See [`Self::register`].
     pub async fn check(&self) -> Result<CheckResponse, ClientError> {
-        let http = self.signed_request(Method::Get, "/v1/check", Vec::new())?;
-        self.send_json(http).await
+        self.send_signed_json(Method::Get, "/v1/check", Vec::new())
+            .await
     }
 
     /// Signed `POST /v1/session/open`.
@@ -299,8 +340,8 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         req: &SessionOpenRequest,
     ) -> Result<SessionOpenResponse, ClientError> {
         let body = serialize(req)?;
-        let http = self.signed_request(Method::Post, "/v1/session/open", body)?;
-        self.send_json(http).await
+        self.send_signed_json(Method::Post, "/v1/session/open", body)
+            .await
     }
 
     /// Signed `POST /v1/session/close`.
@@ -310,8 +351,9 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     /// See [`Self::register`].
     pub async fn close_session(&self, req: &SessionCloseRequest) -> Result<(), ClientError> {
         let body = serialize(req)?;
-        let http = self.signed_request(Method::Post, "/v1/session/close", body)?;
-        self.send(http).await.map(|_| ())
+        self.send_signed(Method::Post, "/v1/session/close", body)
+            .await
+            .map(|_| ())
     }
 
     /// Unsigned `GET /v1/tokens/keys`. The public, self-describing issuer
@@ -374,8 +416,9 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         req: &TokenIssueRequest,
     ) -> Result<TokenIssueResponse, ClientError> {
         let body = serialize(req)?;
-        let http = self.signed_request(Method::Post, class.issue_path(), body)?;
-        self.send_json(http).await.map_err(ban_refusal)
+        self.send_signed_json(Method::Post, class.issue_path(), body)
+            .await
+            .map_err(ban_refusal)
     }
 
     /// Signed `DELETE /v1/account`. Deletes the account's subscription.
@@ -384,8 +427,9 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     ///
     /// See [`Self::register`].
     pub async fn delete_account(&self) -> Result<(), ClientError> {
-        let http = self.signed_request(Method::Delete, "/v1/account", Vec::new())?;
-        self.send(http).await.map(|_| ())
+        self.send_signed(Method::Delete, "/v1/account", Vec::new())
+            .await
+            .map(|_| ())
     }
 
     /// Signed `POST /v1/payments/apple/init`. Opens an Apple IAP session bound
@@ -399,8 +443,9 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     /// wallet on the revocation list is refused with [`ClientError::Banned`]
     /// and no payment session is opened: do not start the StoreKit purchase.
     pub async fn init_apple_payment(&self) -> Result<InitApplePaymentResponse, ClientError> {
-        let http = self.signed_request(Method::Post, "/v1/payments/apple/init", Vec::new())?;
-        self.send_json(http).await.map_err(ban_refusal)
+        self.send_signed_json(Method::Post, "/v1/payments/apple/init", Vec::new())
+            .await
+            .map_err(ban_refusal)
     }
 
     /// Signed `POST /v1/payments/apple/check`. Uploads the StoreKit 2 signed
@@ -423,8 +468,9 @@ impl<T: HttpTransport> WarrenApiClient<T> {
             jws_transaction: jws_transaction.to_owned(),
         };
         let body = serialize(&req)?;
-        let http = self.signed_request(Method::Post, "/v1/payments/apple/check", body)?;
-        self.send_json(http).await.map_err(ban_refusal)
+        self.send_signed_json(Method::Post, "/v1/payments/apple/check", body)
+            .await
+            .map_err(ban_refusal)
     }
 
     /// Unsigned `POST /v1/checkout/{wpid}/voucher`. Polls for the voucher a
@@ -471,8 +517,9 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     /// `reason_code` surface as [`ClientError::ServerStatus`].
     pub async fn report_exit_down(&self, req: &IncidentExitDownRequest) -> Result<(), ClientError> {
         let body = serialize(req)?;
-        let http = self.signed_request(Method::Post, "/v1/incidents/exit-down", body)?;
-        self.send(http).await.map(|_| ())
+        self.send_signed(Method::Post, "/v1/incidents/exit-down", body)
+            .await
+            .map(|_| ())
     }
 
     /// Signed `POST /v1/incidents/pubkey-mismatch`. Reports a pinned-pubkey
@@ -487,8 +534,9 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         req: &IncidentPubkeyMismatchRequest,
     ) -> Result<(), ClientError> {
         let body = serialize(req)?;
-        let http = self.signed_request(Method::Post, "/v1/incidents/pubkey-mismatch", body)?;
-        self.send(http).await.map(|_| ())
+        self.send_signed(Method::Post, "/v1/incidents/pubkey-mismatch", body)
+            .await
+            .map(|_| ())
     }
 
     /// Builds an unsigned request (carries only `accept`/`content-type` plus
@@ -524,8 +572,8 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         method: Method,
         path: &str,
         body: Vec<u8>,
-    ) -> Result<HttpRequest, ClientError> {
-        let timestamp = now_secs()?;
+    ) -> Result<(HttpRequest, u64), ClientError> {
+        let timestamp = self.clock.stamp(now_secs()?);
         let mut nonce = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut nonce);
         let sig = self
@@ -545,13 +593,14 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         if !body.is_empty() {
             headers.push(("content-type".to_owned(), "application/json".to_owned()));
         }
-        Ok(HttpRequest {
+        let request = HttpRequest {
             method,
             url: format!("{}{path}", self.api_base),
             headers,
             body,
             use_sni: true,
-        })
+        };
+        Ok((request, timestamp))
     }
 
     /// Sends a request through the anti-censorship fallback sequence: the
@@ -566,6 +615,75 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     /// SDK and warren-core cannot drift (an alt host is only ever tried with
     /// SNI; only the primary is retried without it).
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, ClientError> {
+        let resp = self.send_through_fallback(request).await?;
+        self.finish(resp)
+    }
+
+    /// Sends a wallet-signed request, stamped with the server clock.
+    ///
+    /// The clock is learned from the `Date` of a `401` only. A refusal is the
+    /// one answer that is never served from a cache (it has no freshness, and
+    /// it answers this request's own signature), and it is the one that says
+    /// the stamp needs moving. Any other answer can be a cached copy: the
+    /// relay list is `public, max-age=60`, and a browser or an intermediary
+    /// cache hands it back with the `Date` it was first served under, which
+    /// would move a right clock's stamp out of the window.
+    ///
+    /// A `401` that refuses the timestamp is signed again, once, when the
+    /// stamp the refusal's own `Date` leads to fits the window: a device
+    /// whose clock drifted then costs one refusal per [`ServerClock`], not
+    /// every call. A stamp the correction may not follow (a server further
+    /// ahead than [`crate::clock::MAX_FORWARD_CORRECTION_SECS`], or a refusal
+    /// with no `Date`) is [`ClientError::ClockSkew`] at once, and any other
+    /// `401` is final, so a bad key costs one request, not two.
+    async fn send_signed(
+        &self,
+        method: Method,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<HttpResponse, ClientError> {
+        let (request, stamp) = self.signed_request(method, path, body.clone())?;
+        let resp = self.send_through_fallback(request).await?;
+        if !self.refused_for_the_clock(&resp, stamp) {
+            return self.finish(resp);
+        }
+        let (retry, retry_stamp) = self.signed_request(method, path, body)?;
+        if !stamp_fits_the_window(&resp, retry_stamp) {
+            return Err(clock_skew(&resp));
+        }
+        let resp = self.send_through_fallback(retry).await?;
+        if self.refused_for_the_clock(&resp, retry_stamp) {
+            return Err(clock_skew(&resp));
+        }
+        self.finish(resp)
+    }
+
+    /// Whether `resp` is a `401` refusing `stamp` for the clock, after
+    /// learning the server clock from any `401`'s `Date`.
+    fn refused_for_the_clock(&self, resp: &HttpResponse, stamp: u64) -> bool {
+        if resp.status != 401 {
+            return false;
+        }
+        if let (Some(date), Ok(device_now)) = (resp.date.as_deref(), now_secs()) {
+            self.clock.observe_date(date, device_now);
+        }
+        refuses_the_clock(resp, stamp)
+    }
+
+    async fn send_signed_json<R: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<R, ClientError> {
+        let resp = self.send_signed(method, path, body).await?;
+        serde_json::from_slice(&resp.body).map_err(ClientError::ResponseJson)
+    }
+
+    async fn send_through_fallback(
+        &self,
+        request: HttpRequest,
+    ) -> Result<HttpResponse, ClientError> {
         let primary_url = request.url.clone();
         let primary_host = host_of(&primary_url);
 
@@ -578,7 +696,7 @@ impl<T: HttpTransport> WarrenApiClient<T> {
                 ..request.clone()
             };
             match self.attempt(&attempt).await? {
-                AttemptOutcome::Response(resp) => return self.finish(resp),
+                AttemptOutcome::Response(resp) => return Ok(resp),
                 AttemptOutcome::Blocked => {}
             }
         }
@@ -630,6 +748,43 @@ fn ban_refusal(err: ClientError) -> ClientError {
         },
         _ => err,
     }
+}
+
+/// Whether a `401` refuses the request's timestamp rather than its key: the
+/// body says so (the contract's clock refusal), or the answer's own `Date`
+/// puts the stamp that was sent outside the window. The second reading covers
+/// a server that answers a bare `401`, as warren-api did before it named the
+/// cause; the server checks the window before the signature, so a stamp
+/// outside it can have been refused for nothing else.
+fn refuses_the_clock(resp: &HttpResponse, stamp: u64) -> bool {
+    if matches!(
+        serde_json::from_slice::<AuthRefusal>(&resp.body),
+        Ok(AuthRefusal::ClockSkew)
+    ) {
+        return true;
+    }
+    stamp_offset(resp, stamp).is_some_and(|offset| offset.unsigned_abs() > SIGNATURE_WINDOW_SECS)
+}
+
+/// Whether the server whose clock `resp`'s `Date` shows would take `stamp`.
+/// False without a `Date`: nothing then says a new stamp would fare better.
+fn stamp_fits_the_window(resp: &HttpResponse, stamp: u64) -> bool {
+    stamp_offset(resp, stamp).is_some_and(|offset| offset.unsigned_abs() <= SIGNATURE_WINDOW_SECS)
+}
+
+/// The answer's `Date` minus `stamp`, in seconds.
+fn stamp_offset(resp: &HttpResponse, stamp: u64) -> Option<i64> {
+    crate::clock::clock_offset_secs(resp.date.as_deref()?, stamp)
+}
+
+/// The clock refusal `resp` stands for, with how far this device's clock is
+/// from the server's when the refusal says.
+fn clock_skew(resp: &HttpResponse) -> ClientError {
+    let offset_secs = resp
+        .date
+        .as_deref()
+        .and_then(|date| crate::clock::clock_offset_secs(date, now_secs().ok()?));
+    ClientError::ClockSkew { offset_secs }
 }
 
 /// Outcome of a single host attempt in the fallback sequence.
@@ -737,10 +892,7 @@ mod tests {
     impl HttpTransport for MockTransport {
         async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
             *self.last.lock().unwrap() = Some(request);
-            Ok(HttpResponse {
-                status: self.status,
-                body: self.body.clone(),
-            })
+            Ok(HttpResponse::new(self.status, self.body.clone()))
         }
     }
 
@@ -1046,10 +1198,7 @@ mod tests {
     }
 
     fn ok_200(body: &str) -> Result<HttpResponse, TransportError> {
-        Ok(HttpResponse {
-            status: 200,
-            body: body.as_bytes().to_vec(),
-        })
+        Ok(HttpResponse::new(200, body.as_bytes().to_vec()))
     }
 
     fn connect_fail() -> Result<HttpResponse, TransportError> {
@@ -1090,10 +1239,7 @@ mod tests {
     async fn a_backend_without_the_dual_stack_route_falls_back_to_the_frozen_one() {
         let t = ScriptedTransport::new(|req| {
             if req.url.ends_with(MULTIHOP_DIRECTORY_PATH_V2) {
-                Ok(HttpResponse {
-                    status: 404,
-                    body: b"no such route".to_vec(),
-                })
+                Ok(HttpResponse::new(404, b"no such route".to_vec()))
             } else {
                 ok_200(r#"{"from":"v1"}"#)
             }
@@ -1119,12 +1265,7 @@ mod tests {
     /// read as a transport failure.
     #[tokio::test]
     async fn no_directory_on_either_route_is_none() {
-        let t = ScriptedTransport::new(|_| {
-            Ok(HttpResponse {
-                status: 404,
-                body: b"none published".to_vec(),
-            })
-        });
+        let t = ScriptedTransport::new(|_| Ok(HttpResponse::new(404, b"none published".to_vec())));
         let c = WarrenApiClient::new(
             "https://api.example.test",
             WarrenIdentity::from_seed(&[0x11; 32]),
@@ -1605,6 +1746,284 @@ mod tests {
             .await
             .expect_err("400 must surface");
         assert!(matches!(err, ClientError::ServerStatus { status: 400, .. }));
+    }
+
+    /// A fake API whose clock is `server_offset` seconds from the device's.
+    /// Every answer carries its `Date`; a signed stamp further than the
+    /// window from its clock is refused 401, with the contract's clock body
+    /// when `names_the_clock` (warren-api once deployed) and bare otherwise
+    /// (warren-api as deployed when forum topic 219 was reported).
+    struct SkewedServer {
+        server_offset: i64,
+        names_the_clock: bool,
+        sends_date: bool,
+        /// How far in the past the `Date` of an unsigned answer is, as a
+        /// cache that kept it would serve it.
+        unsigned_date_lag: u64,
+        stamps: Mutex<Vec<u64>>,
+    }
+
+    impl SkewedServer {
+        fn new(server_offset: i64, names_the_clock: bool) -> Self {
+            Self {
+                server_offset,
+                names_the_clock,
+                sends_date: true,
+                unsigned_date_lag: 0,
+                stamps: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn server_now(&self) -> u64 {
+            device_now().saturating_add_signed(self.server_offset)
+        }
+
+        fn stamps(&self) -> Vec<u64> {
+            self.stamps.lock().unwrap().clone()
+        }
+    }
+
+    impl HttpTransport for SkewedServer {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+            let server_now = self.server_now();
+            let signed = header(&request, HEADER_TIMESTAMP).is_some();
+            let refused = header(&request, HEADER_TIMESTAMP).is_some_and(|ts| {
+                let ts: u64 = ts.parse().unwrap();
+                self.stamps.lock().unwrap().push(ts);
+                ts.abs_diff(server_now) > 60
+            });
+            let response = if refused {
+                let body = if self.names_the_clock {
+                    r#"{"error":"clock_skew"}"#
+                } else {
+                    ""
+                };
+                HttpResponse::new(401, body.as_bytes().to_vec())
+            } else {
+                HttpResponse::new(200, br#"{"expires_at":1700000000}"#.to_vec())
+            };
+            let date_secs = if signed {
+                server_now
+            } else {
+                server_now - self.unsigned_date_lag
+            };
+            Ok(if self.sends_date {
+                response.with_date(httpdate::fmt_http_date(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(date_secs),
+                ))
+            } else {
+                response
+            })
+        }
+    }
+
+    fn device_now() -> u64 {
+        now_secs().unwrap()
+    }
+
+    fn skewed_client(server: SkewedServer) -> WarrenApiClient<SkewedServer> {
+        WarrenApiClient::new(
+            "https://api.example.test",
+            WarrenIdentity::from_seed(&[0x11; 32]),
+            server,
+        )
+    }
+
+    fn assert_near(actual: u64, expected: u64, why: &str) {
+        assert!(
+            actual.abs_diff(expected) <= 2,
+            "{why}: stamped {actual}, expected about {expected}"
+        );
+    }
+
+    /// Forum topic 219: a Windows clock 91 s fast was refused on every signed
+    /// call by a server that answered a bare 401. The refusal's own `Date`
+    /// says why, so the client re-signs once at the server's clock.
+    #[tokio::test]
+    async fn a_device_91_s_fast_is_refused_once_then_signs_at_the_servers_clock() {
+        let c = skewed_client(SkewedServer::new(-91, false));
+
+        let sub = c
+            .subscription()
+            .await
+            .expect("the corrected stamp is accepted");
+
+        assert_eq!(sub.expires_at, 1_700_000_000);
+        let stamps = c.transport().stamps();
+        assert_eq!(stamps.len(), 2, "one refusal, one corrected retry");
+        assert_near(
+            stamps[0],
+            device_now(),
+            "the first stamp is the device clock",
+        );
+        assert_near(
+            stamps[1],
+            c.transport().server_now(),
+            "the retry is the server's clock",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_91_s_slow_is_refused_once_then_signs_at_the_servers_clock() {
+        let c = skewed_client(SkewedServer::new(91, true));
+
+        c.subscription()
+            .await
+            .expect("the corrected stamp is accepted");
+
+        let stamps = c.transport().stamps();
+        assert_eq!(stamps.len(), 2);
+        assert_near(
+            stamps[1],
+            c.transport().server_now(),
+            "the retry is the server's clock",
+        );
+    }
+
+    /// The relay list is `public, max-age=60`: a cache can hand it back with
+    /// the `Date` it was first served under. Such a `Date` must never move a
+    /// right clock's stamp out of the window, so only a refusal teaches.
+    #[tokio::test]
+    async fn a_stale_date_on_an_unsigned_answer_does_not_move_the_stamp() {
+        let mut server = SkewedServer::new(0, true);
+        server.unsigned_date_lag = 90;
+        let c = skewed_client(server);
+        c.list_exits().await.expect("unsigned read");
+
+        c.subscription().await.expect("accepted first time");
+
+        let stamps = c.transport().stamps();
+        assert_eq!(stamps.len(), 1, "no refusal");
+        assert_near(stamps[0], device_now(), "still the device clock");
+    }
+
+    /// The refusal teaches the clock once: every later call of the client is
+    /// stamped right the first time.
+    #[tokio::test]
+    async fn a_learned_correction_is_kept_for_the_next_calls() {
+        let c = skewed_client(SkewedServer::new(-91, false));
+        c.subscription().await.expect("corrected");
+
+        c.subscription().await.expect("accepted first time");
+
+        let stamps = c.transport().stamps();
+        assert_eq!(stamps.len(), 3, "one refusal, then two accepted stamps");
+        assert_near(
+            stamps[2],
+            c.transport().server_now(),
+            "stamped at the server's clock",
+        );
+    }
+
+    /// The retry is spent once: a corrected stamp refused for another reason
+    /// (the key) is that refusal, after exactly two calls.
+    #[tokio::test]
+    async fn a_corrected_stamp_refused_for_another_reason_is_a_server_status() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let c = fallback_client(ScriptedTransport::new(move |_| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let server_now = device_now() - 91;
+            let date = httpdate::fmt_http_date(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(server_now),
+            );
+            let body = if call == 0 {
+                r#"{"error":"clock_skew"}"#
+            } else {
+                ""
+            };
+            Ok(HttpResponse::new(401, body.as_bytes().to_vec()).with_date(date))
+        }));
+
+        let err = c.subscription().await.expect_err("refused");
+
+        assert!(
+            matches!(err, ClientError::ServerStatus { status: 401, .. }),
+            "got {err:?}"
+        );
+        assert_eq!(c.transport().attempts.lock().unwrap().len(), 2);
+    }
+
+    /// A device whose clock is right must come out exactly as it went in: one
+    /// request, stamped with the device clock.
+    #[tokio::test]
+    async fn a_right_clock_is_signed_once_on_the_device_clock() {
+        let c = skewed_client(SkewedServer::new(0, true));
+
+        c.subscription().await.expect("ok");
+        c.subscription().await.expect("ok");
+
+        let stamps = c.transport().stamps();
+        assert_eq!(stamps.len(), 2, "no retry for either call");
+        assert_near(stamps[1], device_now(), "still the device clock");
+        assert_eq!(c.server_clock().applied_offset_secs(), 0);
+    }
+
+    /// Past the forward bound the answer does not get to choose the instant
+    /// the wallet signs at: no retry, and the refusal is named for what it is.
+    #[tokio::test]
+    async fn a_server_further_ahead_than_the_bound_is_not_followed_and_names_the_clock() {
+        let c = skewed_client(SkewedServer::new(3_600, false));
+
+        let err = c.subscription().await.expect_err("refused");
+
+        assert_eq!(
+            c.transport().stamps().len(),
+            1,
+            "the stamp was not moved, so no retry"
+        );
+        let ClientError::ClockSkew { offset_secs } = err else {
+            panic!(
+                "a bare 401 whose Date shows the stamp outside the window is a clock refusal, got {err:?}"
+            );
+        };
+        let offset = offset_secs.expect("the answer carried a Date");
+        assert!((3_598..=3_602).contains(&offset), "offset {offset}");
+    }
+
+    #[tokio::test]
+    async fn the_clock_body_names_the_clock_even_without_a_date() {
+        let mut server = SkewedServer::new(3_600, true);
+        server.sends_date = false;
+        let c = skewed_client(server);
+
+        let err = c.subscription().await.expect_err("refused");
+
+        assert!(
+            matches!(err, ClientError::ClockSkew { offset_secs: None }),
+            "got {err:?}"
+        );
+    }
+
+    /// A 401 on a right clock is a key problem, not a clock one: it must not
+    /// be retried nor named for the clock.
+    #[tokio::test]
+    async fn a_bare_401_on_a_right_clock_stays_a_server_status() {
+        let date = httpdate::fmt_http_date(std::time::SystemTime::now());
+        let c = fallback_client(ScriptedTransport::new(move |_| {
+            Ok(HttpResponse::new(401, Vec::new()).with_date(date.clone()))
+        }));
+
+        let err = c.subscription().await.expect_err("refused");
+
+        assert!(
+            matches!(err, ClientError::ServerStatus { status: 401, .. }),
+            "got {err:?}"
+        );
+        assert_eq!(c.transport().attempts.lock().unwrap().len(), 1, "no retry");
+    }
+
+    /// One wallet, one clock: a client built on a shared [`ServerClock`]
+    /// stamps with what any other client of it learned.
+    #[tokio::test]
+    async fn clients_sharing_a_server_clock_share_what_it_learned() {
+        let clock = std::sync::Arc::new(ServerClock::new());
+        let first = skewed_client(SkewedServer::new(-91, false)).with_server_clock(clock.clone());
+        first.subscription().await.expect("corrected");
+
+        let second = skewed_client(SkewedServer::new(-91, false)).with_server_clock(clock);
+        second.subscription().await.expect("accepted first time");
+
+        assert_eq!(second.transport().stamps().len(), 1);
     }
 
     #[test]

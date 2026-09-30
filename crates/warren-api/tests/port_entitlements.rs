@@ -180,10 +180,10 @@ impl HttpTransport for FakeIssuer {
         tokio::task::yield_now().await;
         self.last_paths.lock().unwrap().push(request.url.clone());
         if request.url.ends_with("/v1/port-entitlements/keys") {
-            return Ok(HttpResponse {
-                status: 200,
-                body: serde_json::to_vec(&self.directory()).unwrap(),
-            });
+            return Ok(HttpResponse::new(
+                200,
+                serde_json::to_vec(&self.directory()).unwrap(),
+            ));
         }
         assert!(
             request.url.ends_with("/v1/port-entitlements/issue"),
@@ -192,10 +192,7 @@ impl HttpTransport for FakeIssuer {
         );
         let call = self.issue_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(body) = self.banned_body {
-            return Ok(HttpResponse {
-                status: 403,
-                body: body.as_bytes().to_vec(),
-            });
+            return Ok(HttpResponse::new(403, body.as_bytes().to_vec()));
         }
         let req: TokenIssueRequest = serde_json::from_slice(&request.body).unwrap();
         let epochs = req
@@ -237,10 +234,10 @@ impl HttpTransport for FakeIssuer {
                 }
             })
             .collect();
-        Ok(HttpResponse {
-            status: 200,
-            body: serde_json::to_vec(&TokenIssueResponse { epochs }).unwrap(),
-        })
+        Ok(HttpResponse::new(
+            200,
+            serde_json::to_vec(&TokenIssueResponse { epochs }).unwrap(),
+        ))
     }
 }
 

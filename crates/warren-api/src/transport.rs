@@ -45,12 +45,40 @@ pub struct HttpRequest {
 }
 
 /// An HTTP response.
+///
+/// Built with [`HttpResponse::new`] outside this crate, so a field added
+/// later does not break every transport.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HttpResponse {
     /// HTTP status code.
     pub status: u16,
     /// Response body bytes.
     pub body: Vec<u8>,
+    /// The `Date` header of the answer, verbatim, when it carried one. The
+    /// client reads the server's clock off it (`crate::clock`), so a
+    /// transport that drops it leaves a device with a drifted clock refused
+    /// on every signed call.
+    pub date: Option<String>,
+}
+
+impl HttpResponse {
+    /// A response with no `Date` header.
+    #[must_use]
+    pub fn new(status: u16, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            body,
+            date: None,
+        }
+    }
+
+    /// The same response carrying the answer's `Date` header.
+    #[must_use]
+    pub fn with_date(mut self, date: impl Into<String>) -> Self {
+        self.date = Some(date.into());
+        self
+    }
 }
 
 /// Error raised by a transport while executing a request (connect failure,
@@ -105,6 +133,18 @@ mod tests {
         assert_eq!(Method::Get.as_str(), "GET");
         assert_eq!(Method::Post.as_str(), "POST");
         assert_eq!(Method::Delete.as_str(), "DELETE");
+    }
+
+    #[test]
+    fn a_response_carries_the_date_it_was_given_and_none_otherwise() {
+        let plain = HttpResponse::new(204, b"x".to_vec());
+        assert_eq!(
+            (plain.status, plain.body.as_slice()),
+            (204, b"x".as_slice())
+        );
+        assert_eq!(plain.date, None);
+        let dated = plain.with_date("Tue, 14 Nov 2023 22:13:20 GMT");
+        assert_eq!(dated.date.as_deref(), Some("Tue, 14 Nov 2023 22:13:20 GMT"));
     }
 
     #[test]

@@ -160,10 +160,10 @@ impl FakeEntitlementIssuer {
                 }
             })
             .collect();
-        HttpResponse {
-            status: 200,
-            body: serde_json::to_vec(&TokenIssueResponse { epochs }).expect("serializes"),
-        }
+        HttpResponse::new(
+            200,
+            serde_json::to_vec(&TokenIssueResponse { epochs }).expect("serializes"),
+        )
     }
 }
 
@@ -173,10 +173,10 @@ impl HttpTransport for FakeEntitlementIssuer {
             || request.url.ends_with("/v1/tokens/keys")
         {
             self.directory_fetches.fetch_add(1, Ordering::SeqCst);
-            return Ok(HttpResponse {
-                status: 200,
-                body: serde_json::to_vec(&self.directory()).expect("serializes"),
-            });
+            return Ok(HttpResponse::new(
+                200,
+                serde_json::to_vec(&self.directory()).expect("serializes"),
+            ));
         }
         assert!(
             request.url.ends_with("/v1/port-entitlements/issue")
@@ -185,10 +185,7 @@ impl HttpTransport for FakeEntitlementIssuer {
             request.url
         );
         if self.banned.load(Ordering::SeqCst) {
-            return Ok(HttpResponse {
-                status: 403,
-                body: BANNED_BODY.as_bytes().to_vec(),
-            });
+            return Ok(HttpResponse::new(403, BANNED_BODY.as_bytes().to_vec()));
         }
         Ok(self.issue(&request.body))
     }

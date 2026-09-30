@@ -28,10 +28,7 @@ struct NotFoundTransport;
 
 impl HttpTransport for NotFoundTransport {
     async fn execute(&self, _req: HttpRequest) -> Result<HttpResponse, TransportError> {
-        Ok(HttpResponse {
-            status: 404,
-            body: b"not found".to_vec(),
-        })
+        Ok(HttpResponse::new(404, b"not found".to_vec()))
     }
 }
 
@@ -40,10 +37,7 @@ struct DirectoryTransport(String);
 
 impl HttpTransport for DirectoryTransport {
     async fn execute(&self, _req: HttpRequest) -> Result<HttpResponse, TransportError> {
-        Ok(HttpResponse {
-            status: 200,
-            body: self.0.clone().into_bytes(),
-        })
+        Ok(HttpResponse::new(200, self.0.clone().into_bytes()))
     }
 }
 
