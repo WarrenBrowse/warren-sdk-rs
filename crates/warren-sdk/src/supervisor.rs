@@ -2461,7 +2461,9 @@ pub(crate) async fn establish_multihop_with_bypass(
         transport_config,
         socket_bypass,
     );
-    connect_established(tunnel, exit, rtt_cache).await
+    connect_established(tunnel, exit, rtt_cache)
+        .await
+        .map_err(|e| auth.explain(e))
 }
 
 /// Builds the multihop dial for `exit` with the supervised path's options.

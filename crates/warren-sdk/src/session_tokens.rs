@@ -87,6 +87,10 @@ impl<T: HttpTransport + 'static> TokenBatch for TokenManager<T> {
 struct Inner {
     batch: Arc<dyn TokenBatch>,
     clock: Clock,
+    /// The issuer's last word on this device's clock: `Some` when the last
+    /// refresh was refused because the request stamp fell outside the
+    /// issuer's window (the server's clock minus this device's, when known).
+    clock_refused: Mutex<Option<Option<i64>>>,
     /// `true` once the first refresh has come back, whatever it answered.
     answered: tokio::sync::watch::Sender<bool>,
     refresh: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -97,6 +101,7 @@ impl Inner {
         Arc::new(Self {
             batch,
             clock,
+            clock_refused: Mutex::new(None),
             answered: tokio::sync::watch::channel(false).0,
             refresh: Mutex::new(None),
         })
@@ -116,7 +121,17 @@ impl Inner {
                 let Some(inner) = batch.upgrade() else {
                     return;
                 };
-                if let Err(error) = inner.batch.refresh((inner.clock)()).await {
+                let answer = inner.batch.refresh((inner.clock)()).await;
+                *inner
+                    .clock_refused
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = match &answer {
+                    Err(TokenClientError::Api(warren_api::ClientError::ClockSkew {
+                        offset_secs,
+                    })) => Some(*offset_secs),
+                    _ => None,
+                };
+                if let Err(error) = answer {
                     // The tokens already held stay usable; the next tick asks
                     // again. The error names epochs and API verdicts, never a
                     // token or the wallet.
@@ -220,6 +235,37 @@ impl SessionTokens {
     }
 }
 
+impl SessionTokens {
+    /// Names the device clock as the cause of a dial that found no token,
+    /// when the issuer refused this wallet's last refresh for it: the user
+    /// can fix a clock, and an app that only sees "no token" retries for
+    /// ever. Every other error, and a stack the wallet's other devices hold,
+    /// passes through unchanged.
+    pub(crate) fn explain(&self, error: crate::SdkError) -> crate::SdkError {
+        use warren_transport::{MultihopError, NoSessionTokenCause};
+        let tokenless = matches!(
+            error,
+            crate::SdkError::Multihop(MultihopError::NoSessionToken(
+                NoSessionTokenCause::Empty | NoSessionTokenCause::AllRefused
+            ))
+        );
+        if !tokenless {
+            return error;
+        }
+        match *self
+            .inner
+            .clock_refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            Some(offset_secs) => {
+                crate::SdkError::Api(warren_api::ClientError::ClockSkew { offset_secs })
+            }
+            None => error,
+        }
+    }
+}
+
 /// What a dial draws from: the batch at the moment of dialing.
 struct DialSource(Arc<Inner>);
 
@@ -259,6 +305,14 @@ impl DialAuth {
             signing,
             tokens: None,
             admission: SessionAdmission::default(),
+        }
+    }
+
+    /// [`SessionTokens::explain`] for this admission's tokens, if any.
+    pub(crate) fn explain(&self, error: crate::SdkError) -> crate::SdkError {
+        match &self.tokens {
+            Some(tokens) => tokens.explain(error),
+            None => error,
         }
     }
 
@@ -332,6 +386,90 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    /// A batch the issuer refuses for this device's clock, every time.
+    struct SkewedBatch(Option<i64>);
+
+    impl TokenBatch for SkewedBatch {
+        fn stack(&self, _now: u64) -> Vec<[u8; SESSION_TOKEN_LEN]> {
+            Vec::new()
+        }
+
+        fn claim(&self, _token: &[u8; SESSION_TOKEN_LEN]) -> Option<SerialLease> {
+            None
+        }
+
+        fn holds_current(&self, _now: u64) -> bool {
+            false
+        }
+
+        fn refresh(&self, _now: u64) -> RefreshFuture<'_> {
+            let offset_secs = self.0;
+            Box::pin(async move {
+                Err(TokenClientError::Api(warren_api::ClientError::ClockSkew {
+                    offset_secs,
+                }))
+            })
+        }
+    }
+
+    fn no_token(cause: warren_transport::NoSessionTokenCause) -> crate::SdkError {
+        crate::SdkError::Multihop(warren_transport::MultihopError::NoSessionToken(cause))
+    }
+
+    #[tokio::test]
+    async fn a_dial_left_without_a_token_by_a_wrong_clock_says_so() {
+        let tokens = SessionTokens::unregistered(
+            Arc::new(SkewedBatch(Some(-7200))) as Arc<dyn TokenBatch>,
+            Arc::new(|| 0),
+        );
+        let _ = tokens.source().await;
+        let err = tokens.explain(no_token(warren_transport::NoSessionTokenCause::Empty));
+        assert!(
+            matches!(
+                err,
+                crate::SdkError::Api(warren_api::ClientError::ClockSkew {
+                    offset_secs: Some(-7200)
+                })
+            ),
+            "an app must be able to tell the user to set the clock right instead of \
+             retrying for ever: got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dial_left_without_a_token_on_a_right_clock_keeps_its_error() {
+        let batch = ScriptedBatch::answering_after(Some(Duration::from_millis(1)), &[]);
+        let tokens = tokens(&batch);
+        let _ = tokens.source().await;
+        let err = tokens.explain(no_token(warren_transport::NoSessionTokenCause::Empty));
+        assert!(
+            matches!(
+                err,
+                crate::SdkError::Multihop(warren_transport::MultihopError::NoSessionToken(_))
+            ),
+            "nothing says the clock is wrong: got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tokens_held_by_other_devices_are_not_blamed_on_the_clock() {
+        let tokens = SessionTokens::unregistered(
+            Arc::new(SkewedBatch(Some(-7200))) as Arc<dyn TokenBatch>,
+            Arc::new(|| 0),
+        );
+        let _ = tokens.source().await;
+        let err = tokens.explain(no_token(warren_transport::NoSessionTokenCause::AllInUse));
+        assert!(
+            matches!(
+                err,
+                crate::SdkError::Multihop(warren_transport::MultihopError::NoSessionToken(
+                    warren_transport::NoSessionTokenCause::AllInUse
+                ))
+            ),
+            "every slot held by the wallet's other devices is not a clock problem"
+        );
     }
 
     fn tokens(batch: &Arc<ScriptedBatch>) -> SessionTokens {
