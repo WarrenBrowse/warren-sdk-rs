@@ -17,7 +17,8 @@ use crate::dto::{
     CheckResponse, IncidentExitDownRequest, IncidentPubkeyMismatchRequest,
     InitApplePaymentResponse, IssuanceRefusal, MobilePaymentResponse, RegisterAccountRequest,
     RegisterAccountResponse, SessionCloseRequest, SessionOpenRequest, SessionOpenResponse,
-    SubscriptionResponse, TokenIssueRequest, TokenIssueResponse, TokenIssuerDirectory,
+    SignedCryptoRefundRequest, SubscriptionResponse, TokenIssueRequest, TokenIssueResponse,
+    TokenIssuerDirectory, WithdrawalAck,
 };
 use crate::transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 
@@ -430,6 +431,37 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         self.send_signed(Method::Delete, "/v1/account", Vec::new())
             .await
             .map(|_| ())
+    }
+
+    /// Signed `POST /v1/account/refund/by-wpid`. Declares the 14-day
+    /// withdrawal of a crypto purchase whose voucher this account redeemed:
+    /// the wallet signature is the proof of purchase, so no voucher code is
+    /// sent. `wpid` names the purchase (32 hex chars); `refund_address` is
+    /// where the operator sends the crypto back, supplied by the buyer.
+    ///
+    /// The returned [`WithdrawalAck`] is the buyer's proof of declaration:
+    /// keep its `reference`, and show `submitted_at` and the refund owed when
+    /// the server provides them (an older server omits them).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`]. Notable statuses surface as
+    /// [`ClientError::ServerStatus`]: `403` this wallet did not redeem the
+    /// purchase (also the answer for an unknown wpid), `409` a request is
+    /// already on file with another address, `422` a malformed wpid or
+    /// address.
+    pub async fn declare_crypto_withdrawal(
+        &self,
+        wpid: &str,
+        refund_address: Option<&str>,
+    ) -> Result<WithdrawalAck, ClientError> {
+        let req = SignedCryptoRefundRequest {
+            wpid: wpid.to_owned(),
+            refund_address: refund_address.map(str::to_owned),
+        };
+        let body = serialize(&req)?;
+        self.send_signed_json(Method::Post, "/v1/account/refund/by-wpid", body)
+            .await
     }
 
     /// Signed `POST /v1/payments/apple/init`. Opens an Apple IAP session bound
@@ -1495,6 +1527,70 @@ mod tests {
         assert!(header(r, HEADER_PUBKEY).is_some(), "check is signed");
         let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(body["jws_transaction"], "header.payload.sig");
+    }
+
+    #[tokio::test]
+    async fn declare_crypto_withdrawal_signs_the_wpid_and_address_and_parses_the_ack() {
+        let c = client(MockTransport::new(
+            200,
+            r#"{"reference":"0123456789abcdef0123456789abcdef","submitted_at":"2026-10-14T09:30:00Z","refund_amount_minor":467,"currency":"EUR"}"#,
+        ));
+        let ack = c
+            .declare_crypto_withdrawal("00112233445566778899aabbccddeeff", Some("8xmrRefundAddr"))
+            .await
+            .expect("ok");
+        assert_eq!(ack.reference, "0123456789abcdef0123456789abcdef");
+        assert_eq!(ack.submitted_at.as_deref(), Some("2026-10-14T09:30:00Z"));
+        assert_eq!(ack.refund_amount_minor, Some(467));
+        assert_eq!(ack.currency.as_deref(), Some("EUR"));
+        let g = c.transport.last.lock().unwrap();
+        let r = g.as_ref().unwrap();
+        assert_eq!(r.method, Method::Post);
+        assert_eq!(r.url, "https://api.example.test/v1/account/refund/by-wpid");
+        assert!(
+            header(r, HEADER_SIGNATURE).is_some(),
+            "the wallet signature is the proof of purchase"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "wpid": "00112233445566778899aabbccddeeff",
+                "refund_address": "8xmrRefundAddr"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn declare_crypto_withdrawal_tolerates_a_server_without_the_proof_fields() {
+        let c = client(MockTransport::new(200, r#"{"reference":"abc"}"#));
+        let ack = c
+            .declare_crypto_withdrawal("00112233445566778899aabbccddeeff", None)
+            .await
+            .expect("ok");
+        assert_eq!(ack.reference, "abc");
+        assert_eq!(ack.submitted_at, None);
+        assert_eq!(ack.refund_amount_minor, None);
+        let g = c.transport.last.lock().unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&g.as_ref().unwrap().body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "wpid": "00112233445566778899aabbccddeeff" }),
+            "no address is sent when none is given"
+        );
+    }
+
+    #[tokio::test]
+    async fn declare_crypto_withdrawal_of_an_unproven_purchase_is_a_server_status() {
+        let c = client(MockTransport::new(
+            403,
+            r#"{"error":"the proof does not match this purchase"}"#,
+        ));
+        let err = c
+            .declare_crypto_withdrawal("00112233445566778899aabbccddeeff", None)
+            .await
+            .expect_err("a wallet that did not redeem the sale is refused");
+        assert!(matches!(err, ClientError::ServerStatus { status: 403, .. }));
     }
 
     #[tokio::test]

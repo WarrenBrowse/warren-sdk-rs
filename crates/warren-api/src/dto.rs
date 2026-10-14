@@ -7,6 +7,6 @@ pub use warren_contract::dto::{
     IncidentPubkeyMismatchRequest, IncidentReason, InitApplePaymentResponse, IssuanceRefusal,
     MobilePaymentResponse, PubkeyHex, PubkeySs58, RegisterAccountRequest, RegisterAccountResponse,
     SessionCloseRequest, SessionOpenRequest, SessionOpenResponse, SessionRejectReason,
-    SubscriptionResponse, TokenEpochRequest, TokenEpochResponse, TokenIssueRequest,
-    TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey,
+    SignedCryptoRefundRequest, SubscriptionResponse, TokenEpochRequest, TokenEpochResponse,
+    TokenIssueRequest, TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey, WithdrawalAck,
 };
