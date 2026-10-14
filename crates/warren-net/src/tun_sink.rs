@@ -294,6 +294,11 @@ where
                 self.0
             }
         }
+        // tokio 1.53 deprecated the safe constructors in favour of `unsafe`
+        // ones (tokio#8587), and this workspace forbids `unsafe`. The I/O
+        // safety it asks for holds here: `device` owns the fd and outlives
+        // `afd`, which is declared after it and so dropped first.
+        #[allow(deprecated)]
         let afd = AsyncFd::with_interest(FdRef(raw), Interest::READABLE | Interest::WRITABLE)?;
 
         loop {
