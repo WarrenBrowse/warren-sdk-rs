@@ -621,9 +621,10 @@ pub struct TokenManager<T> {
     /// ([`Self::claim`]), left out of every [`Self::session_stack`].
     live: Arc<LiveSerials>,
     /// Where [`Self::session_stack`] starts in the epoch's batch, drawn once
-    /// per manager. Every client of a wallet holds the same batch in the same
-    /// order, so a fixed start would send all of them to the first serial.
-    rotation: usize,
+    /// per manager unless [`Self::with_rotation`] gives it. Every client of a
+    /// wallet holds the same batch in the same order, so a fixed start would
+    /// send all of them to the first serial.
+    rotation: u64,
     /// The API server keys trusted to sign the route KEM key
     /// ([`Self::with_server_pubkey_pins`]). Empty: no route admission.
     server_pubkey_pins: Vec<String>,
@@ -713,8 +714,19 @@ impl<T: HttpTransport> TokenManager<T> {
         self
     }
 
-    #[cfg(test)]
-    fn with_rotation(mut self, rotation: usize) -> Self {
+    /// Starts every [`Self::session_stack`] at `rotation` rather than at a
+    /// start drawn for this manager.
+    ///
+    /// An exit keys a session's inner address, and the forwarded ports bound
+    /// to it, on the serial the session was admitted on. A process that
+    /// draws a new start leads with another serial of the same batch after a
+    /// restart, so the exit takes it for a stranger: a new address, and its
+    /// pinned ports refused until the predecessor's are released and cooled
+    /// down. A client that draws `rotation` once per install, keeps it, and
+    /// gives it back here leads with its predecessor's serial instead. Two
+    /// installs of one wallet must not share a value.
+    #[must_use]
+    pub fn with_rotation(mut self, rotation: u64) -> Self {
         self.rotation = rotation;
         self
     }
@@ -930,7 +942,7 @@ impl<T: HttpTransport> TokenManager<T> {
         };
         let mut tokens: Vec<&Token> = st.store.tokens(epoch).collect();
         if !tokens.is_empty() {
-            let start = self.rotation % tokens.len();
+            let start = (self.rotation % tokens.len() as u64) as usize;
             tokens.rotate_left(start);
         }
         let held = self.live.lock();

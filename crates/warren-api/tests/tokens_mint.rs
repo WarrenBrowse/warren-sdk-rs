@@ -636,6 +636,28 @@ async fn a_refresh_after_restore_keeps_the_restored_stock_on_already_issued() {
     assert_eq!(manager.take_current_stack(100 * EPOCH_SECS + 6).len(), 1);
 }
 
+#[tokio::test]
+async fn a_restarted_process_given_its_rotation_back_leads_with_its_predecessors_token() {
+    use std::sync::Arc;
+    use warren_api::{PersistedTokens, TokenManager};
+
+    // The exit keys a session's inner address and forwarded ports on the
+    // serial it was admitted on: a restarted client that leads with another
+    // serial of the same batch is a stranger and loses both.
+    let batch: Vec<_> = (1..=8).map(fake_token_bytes).collect();
+    let bundle = PersistedTokens::from_json(&bundle_json(100, &batch)).expect("parse");
+    let now = 100 * EPOCH_SECS + 5;
+    let lead_of = |rotation: u64| {
+        let manager = TokenManager::new(Arc::new(client(FakeIssuer::new(&[]))), session_key())
+            .with_rotation(rotation);
+        manager.restore_persisted(&bundle);
+        manager.session_stack(now)[0]
+    };
+
+    assert_eq!(lead_of(u64::MAX - 2), lead_of(u64::MAX - 2));
+    assert_ne!(lead_of(u64::MAX - 2), lead_of(u64::MAX - 1));
+}
+
 const BANNED_BODY: &str =
     r#"{"error":"banned","reason_code":"port_forwarding_abuse","lapses_at_unix_secs":1790336000}"#;
 
