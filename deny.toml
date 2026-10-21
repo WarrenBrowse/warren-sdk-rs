@@ -28,6 +28,11 @@ ignore = [
     # Compile-time code generation only, no runtime surface. warren-core and
     # warren-app ignore the same.
     "RUSTSEC-2024-0436",
+    # basic-toml: unmaintained, no successor release. Reached only through
+    # askama_derive, the proc-macro uniffi_bindgen uses to render binding
+    # templates, so it parses askama's own build-time config and never ships in
+    # a binary. Goes when uniffi moves off askama 0.14.
+    "RUSTSEC-2026-0374",
     # rsa 0.10-rc: the Marvin timing sidechannel is exploitable only against
     # variable-time RSA PRIVATE-KEY PKCS#1 v1.5 DECRYPTION of attacker-controlled
     # ciphertext (a padding oracle). Warren pulls rsa transitively via
