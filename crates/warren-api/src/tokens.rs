@@ -723,8 +723,10 @@ impl<T: HttpTransport> TokenManager<T> {
     /// restart, so the exit takes it for a stranger: a new address, and its
     /// pinned ports refused until the predecessor's are released and cooled
     /// down. A client that draws `rotation` once per install, keeps it, and
-    /// gives it back here leads with its predecessor's serial instead. Two
-    /// installs of one wallet must not share a value.
+    /// gives it back here leads with its predecessor's serial instead. Only
+    /// `rotation` modulo the batch length matters, so two installs of one
+    /// wallet that drew independently still share a lead with probability one
+    /// in the batch length, and now share it for good.
     #[must_use]
     pub fn with_rotation(mut self, rotation: u64) -> Self {
         self.rotation = rotation;
