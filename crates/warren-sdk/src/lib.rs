@@ -113,7 +113,7 @@ pub use portfollow::{
     MigrationOutcome, PortFollowConfig, PortFollowOutcome, PortFollowPolicy, plan_migration,
 };
 pub use proxy::{ProxyForwarder, ProxyHandle, ProxyListeners, TunnelState};
-pub use store::{FileGenerationStore, FileServerKeyStore};
+pub use store::{FileGenerationStore, FileServerKeyStore, kept_token_rotation};
 pub use supervisor::{
     EpochEnd, EpochEndCause, MetricsReader, PacketForwarder, PortRelease, SupervisedForwardedPort,
     SupervisedPacketHandle, SupervisedProxyHandle,

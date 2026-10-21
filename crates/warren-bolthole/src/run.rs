@@ -121,7 +121,12 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
             env.server_pubkey_hex
                 .as_deref()
                 .unwrap_or(warren_sdk::product::SERVER_PUBKEY_HEX),
-        );
+        )
+        // A restarted gateway leads with its predecessor's serial, so the
+        // exit hands it back its inner address.
+        .token_rotation(warren_sdk::kept_token_rotation(
+            &env.state_dir.join("token_rotation"),
+        ));
     if env.ipv6 {
         builder = builder.request_ipv6();
     }

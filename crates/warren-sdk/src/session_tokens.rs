@@ -168,6 +168,20 @@ impl Drop for Inner {
 /// (and re-served by the issuer) after that.
 static REGISTRY: OnceLock<Mutex<HashMap<String, Weak<Inner>>>> = OnceLock::new();
 
+/// The manager of a wallet's batch, starting each session stack at
+/// `rotation` when the client keeps one across restarts.
+fn wallet_manager<T: HttpTransport>(
+    api: &Arc<WarrenApiClient<T>>,
+    key: BlindingKey,
+    rotation: Option<u64>,
+) -> TokenManager<T> {
+    let manager = TokenManager::new(Arc::clone(api), key).with_mint_horizon(MINT_HORIZON);
+    match rotation {
+        Some(rotation) => manager.with_rotation(rotation),
+        None => manager,
+    }
+}
+
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -190,6 +204,7 @@ impl SessionTokens {
         registry_key: String,
         api: &Arc<WarrenApiClient<T>>,
         key: BlindingKey,
+        rotation: Option<u64>,
     ) -> Self {
         let mut registry = REGISTRY
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -199,8 +214,7 @@ impl SessionTokens {
             Some(inner) => inner,
             None => {
                 registry.retain(|_, batch| batch.strong_count() > 0);
-                let manager =
-                    TokenManager::new(Arc::clone(api), key).with_mint_horizon(MINT_HORIZON);
+                let manager = wallet_manager(api, key, rotation);
                 let inner = Inner::new(Arc::new(manager), Arc::new(now_unix_secs));
                 registry.insert(registry_key, Arc::downgrade(&inner));
                 inner
@@ -511,6 +525,33 @@ mod tests {
         assert_eq!(tokens.source().await.stack().len(), 1);
     }
 
+    #[test]
+    fn a_wallet_batch_given_its_rotation_back_leads_where_its_predecessor_led() {
+        let api = Arc::new(WarrenApiClient::new(
+            "https://api.example.test",
+            warren_identity::WarrenIdentity::from_seed(&[0x7c; 32]),
+            Unreachable,
+        ));
+        let batch: Vec<String> = (1..=200u8)
+            .map(|fill| {
+                let mut token = [fill; SESSION_TOKEN_LEN];
+                token[..2].copy_from_slice(&2u16.to_be_bytes());
+                data_encoding::BASE64URL_NOPAD.encode(&token)
+            })
+            .collect();
+        let bundle = warren_api::PersistedTokens::from_json(
+            &serde_json::json!({ "epoch_secs": 3600, "epochs": { "100": batch } }).to_string(),
+        )
+        .expect("a bundle");
+        let lead = || {
+            let manager = super::wallet_manager(&api, BlindingKey::session(&[0x7c; 32]), Some(41));
+            manager.restore_persisted(&bundle);
+            manager.session_stack(100 * 3600 + 5)[0]
+        };
+
+        assert_eq!(lead(), lead());
+    }
+
     #[tokio::test]
     async fn clients_of_one_wallet_share_its_batch_until_the_last_one_is_gone() {
         let api = Arc::new(WarrenApiClient::new(
@@ -523,6 +564,7 @@ mod tests {
                 "registry-test\nwallet".to_owned(),
                 &api,
                 BlindingKey::session(&[0x7c; 32]),
+                None,
             )
         };
         let first = open();

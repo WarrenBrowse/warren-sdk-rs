@@ -136,9 +136,21 @@ pub struct WarrenClientBuilder {
     pub(crate) session_blinding_key: Option<warren_api::BlindingKey>,
     pub(crate) port_entitlement_blinding_key: Option<warren_api::BlindingKey>,
     pub(crate) stand_aside: bool,
+    pub(crate) token_rotation: Option<u64>,
 }
 
 impl WarrenClientBuilder {
+    /// Starts every session token stack of the wallet at `rotation`, a value
+    /// the client keeps across restarts ([`crate::kept_token_rotation`]).
+    /// Without it each process draws its own start, so a restarted client
+    /// leads with another serial and the exit gives it a new inner address,
+    /// and with it none of the ports its predecessor had forwarded.
+    #[must_use]
+    pub fn token_rotation(mut self, rotation: u64) -> Self {
+        self.token_rotation = Some(rotation);
+        self
+    }
+
     /// Sets the wallet identity (required).
     #[must_use]
     pub fn identity(mut self, identity: WarrenIdentity) -> Self {
@@ -430,7 +442,12 @@ impl WarrenClientBuilder {
             transport,
         ));
         let session_tokens = session_blinding.map(|key| {
-            crate::session_tokens::SessionTokens::for_wallet(entitlements_key.clone(), &api, key)
+            crate::session_tokens::SessionTokens::for_wallet(
+                entitlements_key.clone(),
+                &api,
+                key,
+                self.token_rotation,
+            )
         });
         let port_entitlements = entitlement_blinding.map(|key| {
             crate::entitlements::PortEntitlements::for_wallet(entitlements_key, &api, key)
@@ -528,6 +545,7 @@ impl WarrenClient<()> {
             server_key_store: None,
             session_admission: SessionAdmission::default(),
             stand_aside: false,
+            token_rotation: None,
             session_blinding_key: None,
             port_entitlement_blinding_key: None,
         }

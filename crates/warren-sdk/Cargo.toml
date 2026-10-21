@@ -50,6 +50,9 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 # Frame the in-tunnel egress-probe DNS query into the netstack UDP send path.
 bytes = { workspace = true }
 
+# Draws the token rotation a client keeps across restarts.
+rand = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 # The adapters and their GUIDs, read without unsafe code (the workspace forbids it).
 if-addrs = "0.15"
@@ -95,6 +98,8 @@ name = "live_tun"
 required-features = ["experimental-tun"]
 
 [dev-dependencies]
+# Encodes the token bundle the rotation test restores.
+data-encoding = { workspace = true }
 # The route admission probe (example `live_route_admission`) drives the engine
 # supervisors directly and runs its own HTTPS echo over the SDK netstack.
 warrenguard-transport = { workspace = true }

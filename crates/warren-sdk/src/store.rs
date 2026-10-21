@@ -102,6 +102,31 @@ fn read_u64(path: &Path) -> std::io::Result<u64> {
     }
 }
 
+/// The token rotation kept at `path` for [`crate::WarrenClientBuilder::token_rotation`]:
+/// read back, or drawn and kept there on first use.
+///
+/// An exit gives a client back its inner address and forwarded ports only
+/// when it leads with the serial its previous session was admitted on, so a
+/// client that draws a new rotation at every start loses both at every
+/// restart. Written to a side file then renamed, because a torn write would
+/// still parse as another number. A path it cannot write to leaves this
+/// process its own draw.
+#[must_use]
+pub fn kept_token_rotation(path: &Path) -> u64 {
+    if let Some(kept) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+    {
+        return kept;
+    }
+    let drawn: u64 = rand::random();
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    let _ =
+        std::fs::write(&partial, drawn.to_string()).and_then(|()| std::fs::rename(&partial, path));
+    drawn
+}
+
 /// Reads a persisted pin, treating a missing file as "no pin yet".
 fn read_pin(path: &Path) -> std::io::Result<Option<String>> {
     match std::fs::read_to_string(path) {
@@ -117,6 +142,27 @@ fn read_pin(path: &Path) -> std::io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kept_token_rotation_is_read_back_by_the_next_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token_rotation");
+
+        let drawn = kept_token_rotation(&path);
+
+        assert_eq!(kept_token_rotation(&path), drawn);
+    }
+
+    #[test]
+    fn an_unreadable_token_rotation_is_drawn_again_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token_rotation");
+        std::fs::write(&path, b"not a number").unwrap();
+
+        let drawn = kept_token_rotation(&path);
+
+        assert_eq!(kept_token_rotation(&path), drawn);
+    }
 
     #[test]
     fn generation_floor_persists_across_reopen() {

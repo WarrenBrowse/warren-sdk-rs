@@ -610,7 +610,8 @@ fn build_client_with_identity(
         builder = builder
             .generation_store(Arc::new(relay_gen))
             .multihop_generation_store(Arc::new(mh_gen))
-            .server_key_store(Arc::new(key_store));
+            .server_key_store(Arc::new(key_store))
+            .token_rotation(warren_sdk::kept_token_rotation(&dir.join("token_rotation")));
     }
     if let Some(machine) = options.daita_machine {
         builder = builder.daita_machine(machine);
