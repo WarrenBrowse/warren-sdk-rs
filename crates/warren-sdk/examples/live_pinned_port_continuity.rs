@@ -9,6 +9,8 @@
 //! 2. A closes its tunnel and its process dies without releasing the
 //!    mapping, as a daemon stopped for an update does (A runs as a child
 //!    process: a mapping kept alive in-process keeps its tunnel alive too).
+//!    With `PIN_CRASH=1`, A is killed with SIGKILL instead, so its tunnel is
+//!    never closed and the exit learns of it only from its idle timeout.
 //! 3. Client B of the same wallet (token rotation 1, so another serial of the
 //!    same batch and a stranger to the exit's session placement) opens a new
 //!    tunnel to the same exit and asks for the same port every
@@ -80,6 +82,11 @@ async fn hold(phrase: &str, country: &str, port: u16) -> Result<(), Box<dyn std:
         "[A] pinned port granted: {} (asked {port})",
         granted.external_port()
     );
+    if std::env::var("PIN_CRASH").is_ok() {
+        // Wait to be killed: a crash closes nothing, and the exit learns of
+        // it only from its own idle timeout.
+        std::future::pending::<()>().await;
+    }
     handle.shutdown();
     tokio::time::sleep(Duration::from_millis(500)).await;
     println!("[A] tunnel closed, mapping left behind");
@@ -106,10 +113,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let budget = Duration::from_secs(env_u64("PIN_MAX_SECS", 420));
     let port: u16 = 50_000 + (rand::random::<u16>() % 15_000);
 
-    let status = std::process::Command::new(std::env::current_exe()?)
+    let mut holder = std::process::Command::new(std::env::current_exe()?)
         .env("PIN_HOLD_PORT", port.to_string())
-        .status()?;
-    if !status.success() {
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let stdout = holder.stdout.take().ok_or("client A has no stdout")?;
+    for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
+        let line = line?;
+        println!("{line}");
+        if line.starts_with("[A] pinned port granted") && std::env::var("PIN_CRASH").is_ok() {
+            holder.kill()?;
+            println!("[A] killed (SIGKILL), mapping and tunnel left behind");
+            break;
+        }
+    }
+    if !holder.wait()?.success() && std::env::var("PIN_CRASH").is_err() {
         return Err("client A failed".into());
     }
     let left = Instant::now();
