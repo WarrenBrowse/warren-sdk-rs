@@ -33,7 +33,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use warren_sdk::api::{
-    BanReasonCode, BlindingKey, ClientError, PubkeySs58, RegisterAccountRequest,
+    BanReasonCode, BlindingKey, ClientError, DeviceId, DeviceListResponse, DevicePlatform,
+    PubkeySs58, RegisterAccountRequest,
 };
 use warren_sdk::identity::{WarrenIdentity, ss58};
 use warren_sdk::net::{ForwardedPort, MapProto, ProxyConfig, ProxyCredentials};
@@ -106,6 +107,17 @@ pub enum FfiError {
         /// the device is behind); `None` when the refusal carried no `Date`.
         offset_secs: Option<i64>,
     },
+    /// This install's device was revoked from another device of the account
+    /// (warren-core doc 115): disconnect, show "This device was disconnected
+    /// from another device of your account", and call
+    /// [`WarrenFfiClient::forget_device`]. Coming back takes the recovery
+    /// phrase.
+    #[error("this device was disconnected from another device of the account")]
+    DeviceRevoked,
+    /// A device identifier argument is not 16 bytes of base64url without
+    /// padding.
+    #[error("invalid device id")]
+    InvalidDeviceId,
 }
 
 /// Why an account is banned. Mirrors the contract's `BanReasonCode` across
@@ -512,6 +524,107 @@ pub struct FfiClientOptions {
     /// determinism). Off by default (the OS chooses the source).
     #[uniffi(default = false)]
     pub auto_local_ip: bool,
+    /// Registers this install as a device of the account (warren-core doc
+    /// 115) on this platform: `android`, `ios`, `macos`, `windows`, `linux`,
+    /// `cli` or `browser`. Needs `state_dir`, where the device identity is
+    /// kept (`device`), and `app_version`. `None` registers no device.
+    #[uniffi(default = None)]
+    pub device_platform: Option<String>,
+    /// The app version the device registers with (semver), with
+    /// `device_platform`.
+    #[uniffi(default = None)]
+    pub app_version: Option<String>,
+}
+
+/// One device of the account, as [`WarrenFfiClient::list_devices`] lists it.
+/// The name and identifier belong in the account's own UI, never in a log.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiDevice {
+    /// The install's identifier, base64url: what
+    /// [`WarrenFfiClient::rename_device`] and
+    /// [`WarrenFfiClient::revoke_device`] take.
+    pub device_id: String,
+    /// Its name.
+    pub name: String,
+    /// Its platform (`android`, `ios`, `macos`, `windows`, `linux`, `cli`,
+    /// `browser`, or `other` for one this build does not know).
+    pub platform: String,
+    /// The app version it last registered with.
+    pub app_version: String,
+    /// The day it registered, `YYYY-MM-DD`.
+    pub registered_on: String,
+    /// The last day it was seen, `YYYY-MM-DD`.
+    pub last_seen_on: String,
+    /// Whether it is this install.
+    pub this_device: bool,
+}
+
+/// The account's devices ([`WarrenFfiClient::list_devices`]).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiDeviceList {
+    /// The active devices.
+    pub devices: Vec<FfiDevice>,
+    /// The last day an older client of the account (one that does not
+    /// register) was superseded by a registered device, `YYYY-MM-DD`: the
+    /// list shows it as an older version of Warren to update.
+    pub older_client_seen_on: Option<String>,
+}
+
+impl From<DeviceListResponse> for FfiDeviceList {
+    fn from(list: DeviceListResponse) -> Self {
+        Self {
+            devices: list
+                .devices
+                .into_iter()
+                .map(|d| FfiDevice {
+                    device_id: String::from(d.device_id),
+                    name: d.name,
+                    platform: platform_name(d.platform),
+                    app_version: d.app_version,
+                    registered_on: d.registered_on,
+                    last_seen_on: d.last_seen_on,
+                    this_device: d.this_device,
+                })
+                .collect(),
+            older_client_seen_on: list.older_client_seen_on,
+        }
+    }
+}
+
+/// The platforms a binding names, by their wire name.
+const PLATFORMS: [(DevicePlatform, &str); 7] = [
+    (DevicePlatform::Android, "android"),
+    (DevicePlatform::Ios, "ios"),
+    (DevicePlatform::Macos, "macos"),
+    (DevicePlatform::Windows, "windows"),
+    (DevicePlatform::Linux, "linux"),
+    (DevicePlatform::Cli, "cli"),
+    (DevicePlatform::Browser, "browser"),
+];
+
+/// The wire name of `platform`, the one the bindings read and pass.
+fn platform_name(platform: DevicePlatform) -> String {
+    PLATFORMS
+        .iter()
+        .find(|(p, _)| *p == platform)
+        .map_or("other", |(_, name)| name)
+        .to_owned()
+}
+
+/// The platform `name` names, refusing one this build does not know: a
+/// binding passing a typo would register its devices as `other`.
+fn parse_platform(name: &str) -> Result<DevicePlatform, FfiError> {
+    PLATFORMS
+        .iter()
+        .find(|(_, n)| *n == name)
+        .map(|(p, _)| *p)
+        .ok_or_else(|| FfiError::Client {
+            message: "unknown device platform".to_owned(),
+        })
+}
+
+fn parse_device_id(id: String) -> Result<DeviceId, FfiError> {
+    DeviceId::try_from(id).map_err(|_| FfiError::InvalidDeviceId)
 }
 
 /// Optional per-proxy knobs for the `start_proxy*` methods.
@@ -612,6 +725,24 @@ fn build_client_with_identity(
             .multihop_generation_store(Arc::new(mh_gen))
             .server_key_store(Arc::new(key_store))
             .token_rotation(warren_sdk::kept_token_rotation(&dir.join("token_rotation")));
+    }
+    if let Some(platform) = options.device_platform.as_deref() {
+        let platform = parse_platform(platform)?;
+        let refused = |message: &str| FfiError::Client {
+            message: message.to_owned(),
+        };
+        let dir = options
+            .state_dir
+            .as_deref()
+            .ok_or_else(|| refused("a device needs a state directory to keep its identity"))?;
+        let app_version = options
+            .app_version
+            .ok_or_else(|| refused("a device needs an app version"))?;
+        builder = builder.device(
+            std::path::Path::new(dir).join("device"),
+            platform,
+            app_version,
+        );
     }
     if let Some(machine) = options.daita_machine {
         builder = builder.daita_machine(machine);
@@ -778,6 +909,79 @@ impl WarrenFfiClient {
     #[must_use]
     pub fn address(&self) -> String {
         self.inner.api().address()
+    }
+
+    /// This install's device identifier (base64url), when the client was
+    /// built with a `device_platform`. Keep it out of every log.
+    #[must_use]
+    pub fn device_id(&self) -> Option<String> {
+        self.inner.device_id().map(String::from)
+    }
+
+    /// Whether this install's device was revoked from another device of the
+    /// account, as the last credential refresh learned (every 10 minutes and
+    /// at start). Sticky. When it reads `true`: disconnect, say "This device
+    /// was disconnected from another device of your account", call
+    /// [`Self::forget_device`], and ask for the recovery phrase again.
+    #[must_use]
+    pub fn device_revoked(&self) -> bool {
+        self.inner.device_revoked()
+    }
+
+    /// The account's devices, this install's marked `this_device`.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::ServerStatus`] on a non-2xx reply, [`FfiError::Client`] on a
+    /// transport or other client-side failure.
+    pub async fn list_devices(&self) -> Result<FfiDeviceList, FfiError> {
+        self.inner
+            .list_devices()
+            .await
+            .map(FfiDeviceList::from)
+            .map_err(map_sdk_error)
+    }
+
+    /// Renames a device of the account; this install's own name is kept for
+    /// its later registrations.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InvalidDeviceId`] for a malformed identifier,
+    /// [`FfiError::ServerStatus`] on a non-2xx reply (a name the registry
+    /// refuses), [`FfiError::Client`] on a transport failure or when the
+    /// state directory could not keep the name.
+    pub async fn rename_device(&self, device_id: String, name: String) -> Result<(), FfiError> {
+        let id = parse_device_id(device_id)?;
+        self.inner
+            .rename_device(id, &name)
+            .await
+            .map_err(map_sdk_error)
+    }
+
+    /// Revokes a device of the account. Revoking this install's own device is
+    /// a logout.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::InvalidDeviceId`] for a malformed identifier,
+    /// [`FfiError::ServerStatus`] on a non-2xx reply, [`FfiError::Client`] on a
+    /// transport or other client-side failure.
+    pub async fn revoke_device(&self, device_id: String) -> Result<(), FfiError> {
+        let id = parse_device_id(device_id)?;
+        self.inner.revoke_device(id).await.map_err(map_sdk_error)
+    }
+
+    /// Erases this install's kept device identity from the state directory,
+    /// once it was revoked or logged out: the next client draws a new one.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::Client`] when the identity file cannot be removed.
+    pub fn forget_device(&self) -> Result<(), FfiError> {
+        self.inner.forget_device().map_err(|_| FfiError::Client {
+            message: "the device identity could not be erased".to_owned(),
+        })
     }
 
     /// Fetches the subscription expiry (unix epoch seconds) for this account.
@@ -1354,6 +1558,7 @@ fn map_client_error(e: ClientError) -> FfiError {
             lapses_at_unix_secs,
         },
         ClientError::ClockSkew { offset_secs } => FfiError::ClockSkew { offset_secs },
+        ClientError::DeviceRevoked => FfiError::DeviceRevoked,
         other => FfiError::Client {
             message: other.to_string(),
         },
@@ -1653,6 +1858,170 @@ mod tests {
         assert_eq!(client.address(), id.address);
     }
 
+    fn device_client(
+        state: &std::path::Path,
+        platform: &str,
+    ) -> Result<Arc<WarrenFfiClient>, FfiError> {
+        WarrenFfiClient::with_options(
+            generate_identity().mnemonic,
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+            FfiClientOptions {
+                state_dir: Some(state.to_string_lossy().into_owned()),
+                device_platform: Some(platform.to_owned()),
+                app_version: Some("1.2.0".to_owned()),
+                ..FfiClientOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_client_given_a_device_platform_keeps_its_identity_in_the_state_dir() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let client = device_client(dir.path(), "android").expect("valid build");
+
+        let kept = warren_sdk::kept_device_identity(&dir.path().join("device"));
+        assert_eq!(client.device_id(), Some(String::from(kept.device_id)));
+        assert!(!client.device_revoked());
+    }
+
+    #[test]
+    fn a_client_without_a_device_platform_has_no_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = WarrenFfiClient::with_persistence(
+            generate_identity().mnemonic,
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+            vec![],
+            dir.path().to_string_lossy().into_owned(),
+        )
+        .expect("valid build");
+
+        assert_eq!(client.device_id(), None);
+        assert!(!dir.path().join("device").exists());
+    }
+
+    #[test]
+    fn an_unknown_device_platform_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = device_client(dir.path(), "amiga").map(|_| ()).unwrap_err();
+
+        assert!(matches!(err, FfiError::Client { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_device_without_a_state_dir_is_refused() {
+        // A device drawn anew at every launch would add a line to the
+        // account's device list at every launch.
+        let err = WarrenFfiClient::with_options(
+            generate_identity().mnemonic,
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+            FfiClientOptions {
+                device_platform: Some("linux".to_owned()),
+                app_version: Some("1.2.0".to_owned()),
+                ..FfiClientOptions::default()
+            },
+        )
+        .map(|_| ())
+        .unwrap_err();
+
+        assert!(matches!(err, FfiError::Client { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_device_without_an_app_version_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = WarrenFfiClient::with_options(
+            generate_identity().mnemonic,
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+            FfiClientOptions {
+                state_dir: Some(dir.path().to_string_lossy().into_owned()),
+                device_platform: Some("linux".to_owned()),
+                ..FfiClientOptions::default()
+            },
+        )
+        .map(|_| ())
+        .unwrap_err();
+
+        assert!(matches!(err, FfiError::Client { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn forgetting_the_device_erases_its_identity_from_the_state_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = device_client(dir.path(), "ios").expect("valid build");
+
+        client.forget_device().expect("forgotten");
+
+        assert!(!dir.path().join("device").exists());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_device_id_is_refused_before_any_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = device_client(dir.path(), "macos").expect("valid build");
+
+        let renamed = client
+            .rename_device("not-a-device".to_owned(), "calm heron".to_owned())
+            .await;
+        let revoked = client.revoke_device("not-a-device".to_owned()).await;
+
+        assert!(
+            matches!(renamed, Err(FfiError::InvalidDeviceId)),
+            "{renamed:?}"
+        );
+        assert!(
+            matches!(revoked, Err(FfiError::InvalidDeviceId)),
+            "{revoked:?}"
+        );
+    }
+
+    #[test]
+    fn a_device_revocation_crosses_the_ffi_typed() {
+        let err = map_sdk_error(SdkError::Api(ClientError::DeviceRevoked));
+
+        assert!(matches!(err, FfiError::DeviceRevoked), "{err:?}");
+    }
+
+    #[test]
+    fn a_device_list_crosses_the_ffi_with_every_field() {
+        let id = warren_sdk::api::DeviceId::from_bytes([7; 16]);
+        let list = warren_sdk::api::DeviceListResponse {
+            devices: vec![warren_sdk::api::DeviceView {
+                device_id: id,
+                name: "calm heron".to_owned(),
+                platform: warren_sdk::api::DevicePlatform::Windows,
+                app_version: "1.2.0".to_owned(),
+                registered_on: "2026-10-01".to_owned(),
+                last_seen_on: "2026-10-28".to_owned(),
+                this_device: true,
+            }],
+            older_client_seen_on: Some("2026-10-27".to_owned()),
+        };
+
+        let crossed = FfiDeviceList::from(list);
+
+        assert_eq!(
+            crossed,
+            FfiDeviceList {
+                devices: vec![FfiDevice {
+                    device_id: String::from(id),
+                    name: "calm heron".to_owned(),
+                    platform: "windows".to_owned(),
+                    app_version: "1.2.0".to_owned(),
+                    registered_on: "2026-10-01".to_owned(),
+                    last_seen_on: "2026-10-28".to_owned(),
+                    this_device: true,
+                }],
+                older_client_seen_on: Some("2026-10-27".to_owned()),
+            }
+        );
+    }
+
     #[test]
     fn client_with_persistence_builds_and_creates_state_dir() {
         let id = generate_identity();
@@ -1687,6 +2056,8 @@ mod tests {
                 api_alternative_hosts: vec!["mirror.example.test".to_owned()],
                 request_ipv6: true,
                 auto_local_ip: true,
+                device_platform: Some("linux".to_owned()),
+                app_version: Some("1.2.0".to_owned()),
             },
         )
         .expect("valid build with full options");

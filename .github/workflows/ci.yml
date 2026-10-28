@@ -267,6 +267,12 @@ jobs:
           grep -q "class WarrenFfiSupervisedProxy" target/bindings/warren_sdk_ffi.py
           grep -q "async def forward_port" target/bindings/warren_sdk_ffi.py
           grep -q "async def delete_account" target/bindings/warren_sdk_ffi.py
+          grep -q "async def list_devices" target/bindings/warren_sdk_ffi.py
+          grep -q "async def rename_device" target/bindings/warren_sdk_ffi.py
+          grep -q "async def revoke_device" target/bindings/warren_sdk_ffi.py
+          grep -q "def device_revoked" target/bindings/warren_sdk_ffi.py
+          grep -q "def forget_device" target/bindings/warren_sdk_ffi.py
+          grep -q "class FfiDeviceList" target/bindings/warren_sdk_ffi.py
 
   deny:
     # Only same-repo events reach this job: a fork's run gets none of the
