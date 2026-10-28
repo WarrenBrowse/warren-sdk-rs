@@ -308,6 +308,7 @@ async fn mint_batches<T: HttpTransport>(
             class,
             &TokenIssueRequest {
                 epochs: request_epochs,
+                device_id: None,
             },
         )
         .await?;
