@@ -20,9 +20,10 @@ use rand010::SeedableRng;
 use rand010::rngs::StdRng;
 use warren_api::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_api::{
-    AttributionTag, BanReasonCode, BlindingKey, ClientError, CredentialClass, EntitlementEnvelope,
-    PortEntitlementManager, PubkeyHex, TokenClientError, TokenEpochResponse, TokenIssueRequest,
-    TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey, WarrenApiClient, mint_tokens,
+    AttributionTag, BanReasonCode, BlindingKey, ClientError, CredentialClass, DeviceId,
+    DevicePlatform, DeviceRegistration, EntitlementEnvelope, PortEntitlementManager, PubkeyHex,
+    TokenClientError, TokenEpochResponse, TokenIssueRequest, TokenIssueResponse,
+    TokenIssuerDirectory, TokenIssuerKey, WarrenApiClient, mint_tokens,
 };
 use warren_contract::pf_attribution::{
     CIPHERTEXT_LEN, ENVELOPE_LEN, NONCE_LEN, TAG_VERSION, signing_preimage,
@@ -79,6 +80,10 @@ struct FakeIssuer {
     fault: TagFault,
     /// When set, every issue call is answered 403 with this body.
     banned_body: Option<&'static str>,
+    /// When set, `POST /v1/devices` answers `device_revoked`.
+    device_revoked: bool,
+    /// The `device_id` each issue request carried.
+    issued_device_ids: Mutex<Vec<Option<DeviceId>>>,
     issue_calls: AtomicUsize,
     last_paths: Mutex<Vec<String>>,
     /// The batch that took each epoch.
@@ -100,6 +105,8 @@ impl FakeIssuer {
             attribution_key: SigningKey::from_bytes(&[0x42; 32]),
             fault,
             banned_body: None,
+            device_revoked: false,
+            issued_device_ids: Mutex::new(Vec::new()),
             issue_calls: AtomicUsize::new(0),
             last_paths: Mutex::new(Vec::new()),
             ledger: Mutex::new(HashMap::new()),
@@ -185,6 +192,13 @@ impl HttpTransport for FakeIssuer {
                 serde_json::to_vec(&self.directory()).unwrap(),
             ));
         }
+        if request.url.ends_with("/v1/devices") {
+            return Ok(if self.device_revoked {
+                HttpResponse::new(403, br#"{"error":"device_revoked"}"#.to_vec())
+            } else {
+                HttpResponse::new(404, Vec::new())
+            });
+        }
         assert!(
             request.url.ends_with("/v1/port-entitlements/issue"),
             "the client must never reach {} for an entitlement",
@@ -195,6 +209,7 @@ impl HttpTransport for FakeIssuer {
             return Ok(HttpResponse::new(403, body.as_bytes().to_vec()));
         }
         let req: TokenIssueRequest = serde_json::from_slice(&request.body).unwrap();
+        self.issued_device_ids.lock().unwrap().push(req.device_id);
         let epochs = req
             .epochs
             .iter()
@@ -737,4 +752,45 @@ async fn two_overlapping_refreshes_stock_the_batch_once() {
         .collect();
     assert_eq!(presented.len(), QUOTA as usize);
     assert_eq!(m.credential_for_slot(QUOTA as usize, NOW), None);
+}
+
+fn this_device() -> DeviceRegistration {
+    DeviceRegistration {
+        device_id: DeviceId::from_bytes([0x5A; 16]),
+        name: "brave otter".to_owned(),
+        platform: DevicePlatform::Android,
+        app_version: "1.2.0".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn a_manager_given_a_device_names_it_on_its_issue_requests() {
+    let api = Arc::new(client(FakeIssuer::new(&[100])));
+    let m = manager_over(&api).with_device(this_device());
+
+    m.refresh_auto(100 * EPOCH_SECS).await.unwrap();
+
+    assert_eq!(
+        *api.transport().issued_device_ids.lock().unwrap(),
+        vec![Some(this_device().device_id)]
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_device_is_told_and_presents_no_entitlement() {
+    let mut issuer = FakeIssuer::new(&[100]);
+    issuer.device_revoked = true;
+    let m = manager_over(&Arc::new(client(issuer))).with_device(this_device());
+
+    let err = m
+        .refresh_auto(100 * EPOCH_SECS)
+        .await
+        .expect_err("the revocation reaches the caller");
+
+    assert!(
+        matches!(err, TokenClientError::Api(ClientError::DeviceRevoked)),
+        "{err:?}"
+    );
+    assert!(m.device_revoked());
+    assert_eq!(m.credential_for_slot(0, 100 * EPOCH_SECS), None);
 }

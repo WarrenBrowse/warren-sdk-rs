@@ -7,7 +7,7 @@
 //! same engine crypto warren-api uses server-side, so a passing test means
 //! the client's bytes would satisfy a real issuer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -16,9 +16,10 @@ use rand010::SeedableRng;
 use rand010::rngs::StdRng;
 use warren_api::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_api::{
-    BanReasonCode, BlindingKey, ClientError, TokenClientError, TokenEpochResponse,
-    TokenIssueRequest, TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey, TokenManager,
-    TokenStore, WarrenApiClient, current_epoch, mint_tokens,
+    BanReasonCode, BlindingKey, ClientError, DeviceId, DevicePlatform, DeviceRegistration,
+    DeviceView, TokenClientError, TokenEpochResponse, TokenIssueRequest, TokenIssueResponse,
+    TokenIssuerDirectory, TokenIssuerKey, TokenManager, TokenStore, WarrenApiClient, current_epoch,
+    mint_tokens,
 };
 use warren_identity::WarrenIdentity;
 use warrenguard_token::{IssuerSecretKey, TokenChallenge};
@@ -62,6 +63,26 @@ struct FakeIssuer {
     /// The raw `route_admission` block the directory serves, when set, so a
     /// test can serve one the contract cannot read.
     route_admission: Mutex<Option<serde_json::Value>>,
+    /// When set, the fake keeps warren-api's device registry (warren-core doc
+    /// 115): an issue request naming a device it does not know is refused
+    /// `device_unregistered`, and one naming a revoked device
+    /// `device_revoked`, as is that device's registration.
+    enforce_devices: bool,
+    /// The devices registered through `POST /v1/devices`.
+    devices: Mutex<HashMap<DeviceId, DeviceRegistration>>,
+    /// The devices revoked from another device of the account.
+    revoked_devices: Mutex<HashSet<DeviceId>>,
+    /// Count of `POST /v1/devices` calls.
+    register_calls: AtomicUsize,
+    /// When set, the next `POST /v1/devices` answers 503 and records nothing.
+    fail_register_once: AtomicBool,
+    /// When set, `POST /v1/devices` answers 404, as a backend that predates
+    /// the registry does.
+    registry_absent: bool,
+    /// Count of directory fetches.
+    keys_calls: AtomicUsize,
+    /// Every issue request body, as JSON, in order.
+    issue_bodies: Mutex<Vec<serde_json::Value>>,
 }
 
 impl FakeIssuer {
@@ -84,7 +105,57 @@ impl FakeIssuer {
             replay_ledger: false,
             ledger: Mutex::new(HashMap::new()),
             route_admission: Mutex::new(None),
+            enforce_devices: false,
+            devices: Mutex::new(HashMap::new()),
+            revoked_devices: Mutex::new(HashSet::new()),
+            register_calls: AtomicUsize::new(0),
+            fail_register_once: AtomicBool::new(false),
+            registry_absent: false,
+            keys_calls: AtomicUsize::new(0),
+            issue_bodies: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The device refusal an issue request naming `device` earns, if any.
+    fn device_refusal(&self, device: Option<DeviceId>) -> Option<&'static str> {
+        let device = device.filter(|_| self.enforce_devices)?;
+        if self.revoked_devices.lock().unwrap().contains(&device) {
+            return Some(r#"{"error":"device_revoked"}"#);
+        }
+        (!self.devices.lock().unwrap().contains_key(&device))
+            .then_some(r#"{"error":"device_unregistered"}"#)
+    }
+
+    fn register(&self, registration: DeviceRegistration) -> HttpResponse {
+        self.register_calls.fetch_add(1, Ordering::SeqCst);
+        if self.registry_absent {
+            return HttpResponse::new(404, Vec::new());
+        }
+        if self.fail_register_once.swap(false, Ordering::SeqCst) {
+            return HttpResponse::new(503, Vec::new());
+        }
+        if self
+            .revoked_devices
+            .lock()
+            .unwrap()
+            .contains(&registration.device_id)
+        {
+            return HttpResponse::new(403, br#"{"error":"device_revoked"}"#.to_vec());
+        }
+        let view = DeviceView {
+            device_id: registration.device_id,
+            name: registration.name.clone(),
+            platform: registration.platform,
+            app_version: registration.app_version.clone(),
+            registered_on: "2026-10-28".to_owned(),
+            last_seen_on: "2026-10-28".to_owned(),
+            this_device: true,
+        };
+        self.devices
+            .lock()
+            .unwrap()
+            .insert(registration.device_id, registration);
+        HttpResponse::new(200, serde_json::to_vec(&view).unwrap())
     }
 
     fn serve_route_admission(&self, block: Option<serde_json::Value>) {
@@ -127,6 +198,7 @@ impl HttpTransport for FakeIssuer {
         if request.url.ends_with("/v1/tokens/keys")
             || request.url.ends_with("/v1/browser-proxy/keys")
         {
+            self.keys_calls.fetch_add(1, Ordering::SeqCst);
             *self.last_keys_headers.lock().unwrap() = Some(request.headers.clone());
             *self.last_keys_url.lock().unwrap() = Some(request.url.clone());
             let mut directory = serde_json::to_value(self.directory()).unwrap();
@@ -135,6 +207,9 @@ impl HttpTransport for FakeIssuer {
             }
             return ok(serde_json::to_vec(&directory).unwrap());
         }
+        if request.url.ends_with("/v1/devices") {
+            return Ok(self.register(serde_json::from_slice(&request.body).unwrap()));
+        }
         assert!(
             request.url.ends_with("/v1/tokens/issue")
                 || request.url.ends_with("/v1/browser-proxy/issue"),
@@ -142,6 +217,10 @@ impl HttpTransport for FakeIssuer {
             request.url
         );
         self.issue_calls.fetch_add(1, Ordering::SeqCst);
+        self.issue_bodies
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&request.body).unwrap());
         if let Some((status, body)) = *self.issue_refusal.lock().unwrap() {
             return Ok(HttpResponse::new(status, body.as_bytes().to_vec()));
         }
@@ -151,6 +230,9 @@ impl HttpTransport for FakeIssuer {
             return Ok(HttpResponse::new(503, Vec::new()));
         }
         let req: TokenIssueRequest = serde_json::from_slice(&request.body).unwrap();
+        if let Some(body) = self.device_refusal(req.device_id) {
+            return Ok(HttpResponse::new(403, body.as_bytes().to_vec()));
+        }
         let mut epochs = Vec::new();
         for e in &req.epochs {
             let taken_by_another_batch = self.replay_ledger
@@ -1104,4 +1186,186 @@ async fn a_browser_proxy_manager_never_offers_route_admission() {
     manager.refresh(REFRESH_AT).await.expect("refresh");
 
     assert!(manager.route_admission().is_none());
+}
+
+// ---- Device registry (warren-core doc 115) ----
+
+fn this_device() -> DeviceRegistration {
+    DeviceRegistration {
+        device_id: DeviceId::from_bytes([0x5A; 16]),
+        name: "brave otter".to_owned(),
+        platform: DevicePlatform::Linux,
+        app_version: "1.2.0".to_owned(),
+    }
+}
+
+/// The `device_id` member of each issue request the fake saw, verbatim.
+fn issued_device_ids(fake: &FakeIssuer) -> Vec<Option<serde_json::Value>> {
+    fake.issue_bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| body.get("device_id").cloned())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_manager_given_a_device_names_it_on_every_issue_request() {
+    let api = std::sync::Arc::new(client(FakeIssuer::new(&[100, 101])));
+    let manager = TokenManager::new(api.clone(), session_key()).with_device(this_device());
+
+    manager.refresh(100 * EPOCH_SECS).await.expect("refresh");
+
+    let named = serde_json::Value::String(this_device().device_id.into());
+    assert_eq!(
+        issued_device_ids(api.transport()),
+        vec![Some(named.clone()), Some(named)],
+        "one issue request per epoch, each naming the device"
+    );
+}
+
+#[tokio::test]
+async fn a_manager_without_a_device_sends_the_original_issue_body() {
+    let api = std::sync::Arc::new(client(FakeIssuer::new(&[100, 101])));
+    let manager = TokenManager::new(api.clone(), session_key());
+
+    manager.refresh(100 * EPOCH_SECS).await.expect("refresh");
+
+    assert_eq!(
+        issued_device_ids(api.transport()),
+        vec![None, None],
+        "an older server must see the body it always parsed"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_registers_the_device_before_it_mints() {
+    let mut fake = FakeIssuer::new(&[100]);
+    fake.enforce_devices = true;
+    let api = std::sync::Arc::new(client(fake));
+    let manager = TokenManager::new(api.clone(), session_key()).with_device(this_device());
+
+    manager.refresh(100 * EPOCH_SECS).await.expect("refresh");
+
+    assert_eq!(
+        api.transport()
+            .devices
+            .lock()
+            .unwrap()
+            .get(&this_device().device_id),
+        Some(&this_device()),
+        "the registration the manager holds is the one sent"
+    );
+    assert_eq!(
+        api.transport().issue_calls.load(Ordering::SeqCst),
+        1,
+        "registered first, the device is served at once"
+    );
+    assert_eq!(manager.available(100), QUOTA as usize);
+}
+
+#[tokio::test]
+async fn an_unregistered_device_registers_then_asks_again() {
+    let mut fake = FakeIssuer::new(&[100]);
+    fake.enforce_devices = true;
+    fake.fail_register_once.store(true, Ordering::SeqCst);
+    let api = std::sync::Arc::new(client(fake));
+    let manager = TokenManager::new(api.clone(), session_key()).with_device(this_device());
+
+    manager.refresh(100 * EPOCH_SECS).await.expect("refresh");
+
+    assert_eq!(
+        api.transport().register_calls.load(Ordering::SeqCst),
+        2,
+        "the pass's registration failed, the refusal registered again"
+    );
+    assert_eq!(
+        api.transport().issue_calls.load(Ordering::SeqCst),
+        2,
+        "refused once as unregistered, then served"
+    );
+    assert_eq!(manager.available(100), QUOTA as usize);
+    assert!(!manager.device_revoked());
+}
+
+#[tokio::test]
+async fn a_backend_without_the_registry_still_issues_to_a_device() {
+    let mut fake = FakeIssuer::new(&[100]);
+    fake.registry_absent = true;
+    let api = std::sync::Arc::new(client(fake));
+    let manager = TokenManager::new(api.clone(), session_key()).with_device(this_device());
+
+    manager.refresh(100 * EPOCH_SECS).await.expect("refresh");
+
+    assert_eq!(manager.available(100), QUOTA as usize);
+}
+
+#[tokio::test]
+async fn an_issuance_answering_device_revoked_revokes_the_device() {
+    let fake = FakeIssuer::new(&[100]);
+    *fake.issue_refusal.lock().unwrap() = Some((403, r#"{"error":"device_revoked"}"#));
+    let api = std::sync::Arc::new(client(fake));
+    let manager = TokenManager::new(api.clone(), session_key()).with_device(this_device());
+
+    let err = manager
+        .refresh(100 * EPOCH_SECS)
+        .await
+        .expect_err("the revocation reaches the caller");
+
+    assert!(
+        matches!(err, TokenClientError::Api(ClientError::DeviceRevoked)),
+        "{err:?}"
+    );
+    assert!(manager.device_revoked());
+}
+
+#[tokio::test]
+async fn a_revoked_device_stops_refreshing_and_holds_nothing_for_good() {
+    let mut fake = FakeIssuer::new(&[100, 101]);
+    fake.enforce_devices = true;
+    let api = std::sync::Arc::new(client(fake));
+    let manager = TokenManager::new(api.clone(), session_key()).with_device(this_device());
+    manager
+        .refresh(100 * EPOCH_SECS)
+        .await
+        .expect("first refresh");
+    assert!(!manager.session_stack(100 * EPOCH_SECS).is_empty());
+    api.transport()
+        .revoked_devices
+        .lock()
+        .unwrap()
+        .insert(this_device().device_id);
+
+    let err = manager
+        .refresh(101 * EPOCH_SECS + 5)
+        .await
+        .expect_err("the revocation reaches the caller");
+
+    assert!(
+        matches!(err, TokenClientError::Api(ClientError::DeviceRevoked)),
+        "{err:?}"
+    );
+    assert!(manager.device_revoked());
+    assert!(
+        manager.session_stack(101 * EPOCH_SECS + 5).is_empty(),
+        "a revoked device presents nothing"
+    );
+    let calls = |fake: &FakeIssuer| {
+        [&fake.register_calls, &fake.keys_calls, &fake.issue_calls]
+            .map(|count| count.load(Ordering::SeqCst))
+    };
+    let before = calls(api.transport());
+    let again = manager.refresh(102 * EPOCH_SECS).await;
+    assert!(
+        matches!(
+            again,
+            Err(TokenClientError::Api(ClientError::DeviceRevoked))
+        ),
+        "the revocation is sticky: {again:?}"
+    );
+    assert_eq!(
+        calls(api.transport()),
+        before,
+        "a revoked device asks the API nothing more"
+    );
 }

@@ -31,7 +31,9 @@ use warrenguard_token::{
 use zeroize::Zeroizing;
 
 use crate::client::{ClientError, WarrenApiClient};
-use crate::dto::{TokenEpochRequest, TokenIssueRequest, TokenIssuerDirectory};
+use crate::dto::{
+    DeviceId, DeviceRegistration, TokenEpochRequest, TokenIssueRequest, TokenIssuerDirectory,
+};
 use crate::route_admission::RouteAdmission;
 use crate::token_blinding::BlindingKey;
 use crate::transport::HttpTransport;
@@ -254,11 +256,23 @@ pub async fn mint_tokens<T: HttpTransport>(
     epochs: &[u64],
     key: &BlindingKey,
 ) -> Result<Vec<MintedEpoch>, TokenClientError> {
+    mint_as_device(client, directory, epochs, key, None).await
+}
+
+/// [`mint_tokens`], the issue request naming `device_id` when given.
+async fn mint_as_device<T: HttpTransport>(
+    client: &WarrenApiClient<T>,
+    directory: &TokenIssuerDirectory,
+    epochs: &[u64],
+    key: &BlindingKey,
+    device_id: Option<DeviceId>,
+) -> Result<Vec<MintedEpoch>, TokenClientError> {
     mint_batches(
         key.class(),
         client,
         directory,
         epochs,
+        device_id,
         |pk, challenge, epoch, index| key.blind_slot(pk, challenge, epoch, index),
     )
     .await
@@ -269,6 +283,7 @@ async fn mint_batches<T: HttpTransport>(
     client: &WarrenApiClient<T>,
     directory: &TokenIssuerDirectory,
     epochs: &[u64],
+    device_id: Option<DeviceId>,
     blind: impl Fn(
         &IssuerPublicKey,
         &TokenChallenge,
@@ -308,7 +323,7 @@ async fn mint_batches<T: HttpTransport>(
             class,
             &TokenIssueRequest {
                 epochs: request_epochs,
-                device_id: None,
+                device_id,
             },
         )
         .await?;
@@ -558,7 +573,8 @@ fn route_admission_of(
 /// clock outside its window, a key it does not accept); an issuer whose
 /// attribution tags cannot pass the exit's checks; a token crate that no
 /// longer blinds in the derived order, which would leave every tick with no
-/// batch at all.
+/// batch at all. A revoked device, and a device the issuer still does not
+/// know once it registered.
 fn answers_every_epoch_alike(err: &TokenClientError) -> bool {
     matches!(
         err,
@@ -566,6 +582,8 @@ fn answers_every_epoch_alike(err: &TokenClientError) -> bool {
             ClientError::Banned { .. }
                 | ClientError::ClockSkew { .. }
                 | ClientError::ServerStatus { status: 401, .. }
+                | ClientError::DeviceRevoked
+                | ClientError::DeviceUnregistered
         ) | TokenClientError::BadAttributionKey
             | TokenClientError::AttributionTagCount { .. }
             | TokenClientError::AttributionTagEpoch { .. }
@@ -598,6 +616,10 @@ struct ManagerState {
     /// `None` until then, and whenever the directory carries none or one this
     /// build cannot use.
     route_admission: Option<RouteAdmission>,
+    /// Set once the issuer or the registry answered `device_revoked`, and
+    /// never cleared: the device was disconnected from another device of the
+    /// account.
+    device_revoked: bool,
 }
 
 /// Keeps a [`TokenStore`] topped up and vends the per-session token stack the
@@ -629,6 +651,9 @@ pub struct TokenManager<T> {
     /// The API server keys trusted to sign the route KEM key
     /// ([`Self::with_server_pubkey_pins`]). Empty: no route admission.
     server_pubkey_pins: Vec<String>,
+    /// The registered device this manager asks as ([`Self::with_device`]),
+    /// kept whole so an issuer that does not know it yet can be told.
+    device: Option<DeviceRegistration>,
 }
 
 /// The serials held by the live sessions of one [`TokenManager`].
@@ -692,12 +717,94 @@ impl<T: HttpTransport> TokenManager<T> {
                 minted: BTreeSet::new(),
                 issued_elsewhere: BTreeSet::new(),
                 route_admission: None,
+                device_revoked: false,
             })),
             mint_horizon: None,
             live: Arc::default(),
             rotation: rand::random(),
             server_pubkey_pins: Vec::new(),
+            device: None,
         }
+    }
+
+    /// Names `device` on every issue request (warren-core doc 115), so the
+    /// issuer can tell this install from an older client of the wallet.
+    ///
+    /// Every [`Self::refresh`] registers `device` first (`POST /v1/devices`,
+    /// idempotent). An issuer that still does not know it refuses it
+    /// `device_unregistered`: the manager then registers it again and asks
+    /// once more. An issuer or a registry that answers `device_revoked`
+    /// ends it for good: every later [`Self::refresh`] returns
+    /// [`ClientError::DeviceRevoked`] without a request, the stock is
+    /// dropped, and [`Self::device_revoked`] reads `true`.
+    #[must_use]
+    pub fn with_device(mut self, device: DeviceRegistration) -> Self {
+        self.device = Some(device);
+        self
+    }
+
+    /// Whether the device this manager asks as was revoked from another
+    /// device of the account ([`Self::with_device`]). Sticky: the app
+    /// disconnects and forgets the device's identity.
+    #[must_use]
+    pub fn device_revoked(&self) -> bool {
+        self.state
+            .lock()
+            .expect("token manager mutex poisoned")
+            .device_revoked
+    }
+
+    /// Mints `epoch` as this manager's device, registering it and asking
+    /// once more when the issuer does not know it yet (the registration that
+    /// opened the pass failed, or lost a race). `registered` keeps a refresh
+    /// pass to one such retry.
+    async fn mint_epoch(
+        &self,
+        directory: &TokenIssuerDirectory,
+        epoch: u64,
+        registered: &mut bool,
+    ) -> Result<Vec<MintedEpoch>, TokenClientError> {
+        let device_id = self.device.as_ref().map(|d| d.device_id);
+        let minted =
+            mint_as_device(&self.client, directory, &[epoch], &self.blinding, device_id).await;
+        let Some(device) = &self.device else {
+            return minted;
+        };
+        match minted {
+            Err(TokenClientError::Api(ClientError::DeviceUnregistered)) if !*registered => {
+                *registered = true;
+                self.client.register_device(device).await?;
+                mint_as_device(&self.client, directory, &[epoch], &self.blinding, device_id).await
+            }
+            other => other,
+        }
+    }
+
+    /// Registers this manager's device at the start of a refresh pass. That is
+    /// how a revocation reaches a device whose epochs are all stocked, within
+    /// one refresh period rather than at the next epoch it mints, and it
+    /// keeps the registry's version and last-seen day current. Any answer but
+    /// the revocation is left to the issue requests: a backend without the
+    /// registry answers 404 here and still issues.
+    async fn register_device(&self) -> Result<(), TokenClientError> {
+        let Some(device) = &self.device else {
+            return Ok(());
+        };
+        match self.client.register_device(device).await {
+            Err(ClientError::DeviceRevoked) => {
+                self.revoke();
+                Err(ClientError::DeviceRevoked.into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Records a revocation: the stock goes with it, since a revoked device
+    /// presents nothing.
+    fn revoke(&self) {
+        let mut st = self.state.lock().expect("token manager mutex poisoned");
+        st.device_revoked = true;
+        st.store = TokenStore::new();
     }
 
     /// Trusts `pins` (64-char hex Ed25519 keys, the API server keys the
@@ -779,10 +886,17 @@ impl<T: HttpTransport> TokenManager<T> {
     /// window, `ClientError::ServerStatus` 401 otherwise); and, for port
     /// entitlements, when the directory carries no usable attribution key or
     /// a batch's tags fail the checks (`BadAttributionKey`,
-    /// `AttributionTag*`). The pass stops there, leaving that epoch and the
-    /// later ones unsettled, so the next tick asks again. Any other per-epoch
-    /// mint refusal or transport error is swallowed.
+    /// `AttributionTag*`). For a manager given a device, also when the device
+    /// was revoked (`ClientError::DeviceRevoked`, sticky, see
+    /// [`Self::with_device`]) or is still unknown once registered
+    /// (`ClientError::DeviceUnregistered`). The pass stops there, leaving
+    /// that epoch and the later ones unsettled, so the next tick asks again.
+    /// Any other per-epoch mint refusal or transport error is swallowed.
     pub async fn refresh(&self, now_unix_secs: u64) -> Result<(), TokenClientError> {
+        if self.device_revoked() {
+            return Err(ClientError::DeviceRevoked.into());
+        }
+        self.register_device().await?;
         let directory = self.client.token_keys_for(self.class()).await?;
         let Some(current) = current_epoch(&directory, now_unix_secs) else {
             return Err(TokenClientError::BadDirectoryPolicy);
@@ -813,8 +927,9 @@ impl<T: HttpTransport> TokenManager<T> {
                 .collect()
         };
 
+        let mut registered = false;
         for epoch in targets {
-            match mint_tokens(&self.client, &directory, &[epoch], &self.blinding).await {
+            match self.mint_epoch(&directory, epoch, &mut registered).await {
                 Ok(mut batches) => {
                     let mut st = self.state.lock().expect("token manager mutex poisoned");
                     // Two overlapping refreshes are both served the batch the
@@ -840,6 +955,10 @@ impl<T: HttpTransport> TokenManager<T> {
                 // The failed epoch stays unsettled: a lifted ban mints at the
                 // next tick, and an epoch the issuer did record is settled
                 // then by its already_issued answer.
+                Err(e @ TokenClientError::Api(ClientError::DeviceRevoked)) => {
+                    self.revoke();
+                    return Err(e);
+                }
                 Err(e) if answers_every_epoch_alike(&e) => return Err(e),
                 Err(_) => {
                     // Anything else (transport error, 5xx, a refusal that can
@@ -1612,6 +1731,22 @@ impl<T: HttpTransport> PortEntitlementManager<T> {
             inner: TokenManager::new(client, key),
             assigned: Mutex::new(Assigned::default()),
         }
+    }
+
+    /// Names `device` on every issue request and registers it at each
+    /// refresh, as [`TokenManager::with_device`] does.
+    #[must_use]
+    pub fn with_device(mut self, device: DeviceRegistration) -> Self {
+        self.inner = self.inner.with_device(device);
+        self
+    }
+
+    /// Whether the device was revoked from another device of the account
+    /// ([`TokenManager::device_revoked`]). Sticky; every slot then presents
+    /// nothing.
+    #[must_use]
+    pub fn device_revoked(&self) -> bool {
+        self.inner.device_revoked()
     }
 
     /// Tops the batch up, on the same coarse timer as session tokens.
