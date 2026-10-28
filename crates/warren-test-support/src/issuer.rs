@@ -7,18 +7,24 @@
 //! attribution verifying key, and an issue call answering one blind signature
 //! and one signed attribution tag per blinded message. The tag's ciphertext is
 //! filler: only warren-api can open a tag, and no client ever tries.
+//!
+//! It also keeps the account's device registry (warren-core doc 115):
+//! `/v1/devices` registers, lists, renames and revokes, and a revoked device
+//! is refused its registration.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand010::SeedableRng;
 use rand010::rngs::StdRng;
-use warren_api::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
+use warren_api::transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 use warren_api::{
-    AttributionTag, PubkeyHex, TokenEpochResponse, TokenIssueRequest, TokenIssueResponse,
-    TokenIssuerDirectory, TokenIssuerKey,
+    AttributionTag, DeviceId, DeviceListResponse, DeviceRegistration, DeviceRename, DeviceView,
+    PubkeyHex, TokenEpochResponse, TokenIssueRequest, TokenIssueResponse, TokenIssuerDirectory,
+    TokenIssuerKey,
 };
 use warren_contract::pf_attribution::{CIPHERTEXT_LEN, NONCE_LEN, TAG_VERSION, signing_preimage};
 use warrenguard_token::IssuerSecretKey;
@@ -39,6 +45,9 @@ pub struct FakeEntitlementIssuer {
     quota: u32,
     banned: AtomicBool,
     directory_fetches: AtomicUsize,
+    devices: Mutex<BTreeMap<String, DeviceRegistration>>,
+    revoked_devices: Mutex<HashSet<DeviceId>>,
+    registered_names: Mutex<Vec<String>>,
 }
 
 impl FakeEntitlementIssuer {
@@ -64,6 +73,112 @@ impl FakeEntitlementIssuer {
             quota,
             banned: AtomicBool::new(false),
             directory_fetches: AtomicUsize::new(0),
+            devices: Mutex::new(BTreeMap::new()),
+            revoked_devices: Mutex::new(HashSet::new()),
+            registered_names: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The registration the registry holds for `id`, as last registered or
+    /// renamed.
+    ///
+    /// # Panics
+    ///
+    /// When a test panicked while holding the registry.
+    #[must_use]
+    pub fn device(&self, id: DeviceId) -> Option<DeviceRegistration> {
+        self.devices
+            .lock()
+            .expect("registry")
+            .get(&String::from(id))
+            .cloned()
+    }
+
+    /// The name every registration carried, in order.
+    ///
+    /// # Panics
+    ///
+    /// When a test panicked while holding the registry.
+    #[must_use]
+    pub fn registered_names(&self) -> Vec<String> {
+        self.registered_names.lock().expect("registry").clone()
+    }
+
+    /// Revokes `id`, as another device of the account does.
+    ///
+    /// # Panics
+    ///
+    /// When a test panicked while holding the registry.
+    pub fn revoke_device(&self, id: DeviceId) {
+        self.revoked_devices.lock().expect("registry").insert(id);
+    }
+
+    /// Whether `id` was revoked.
+    ///
+    /// # Panics
+    ///
+    /// When a test panicked while holding the registry.
+    #[must_use]
+    pub fn is_revoked(&self, id: DeviceId) -> bool {
+        self.revoked_devices.lock().expect("registry").contains(&id)
+    }
+
+    fn devices_route(&self, request: &HttpRequest) -> HttpResponse {
+        let path = request
+            .url
+            .split_once("/v1/devices")
+            .map_or("", |(_, rest)| rest);
+        match (request.method, path.strip_prefix('/')) {
+            (Method::Post, None) => {
+                let registration: DeviceRegistration =
+                    serde_json::from_slice(&request.body).expect("a registration");
+                self.registered_names
+                    .lock()
+                    .expect("registry")
+                    .push(registration.name.clone());
+                if self.is_revoked(registration.device_id) {
+                    return HttpResponse::new(403, br#"{"error":"device_revoked"}"#.to_vec());
+                }
+                let view = view_of(&registration, true);
+                self.devices
+                    .lock()
+                    .expect("registry")
+                    .insert(String::from(registration.device_id), registration);
+                HttpResponse::new(200, serde_json::to_vec(&view).expect("serializes"))
+            }
+            (Method::Get, None) => {
+                let this = path.strip_prefix("?device_id=").unwrap_or_default();
+                let revoked = self.revoked_devices.lock().expect("registry").clone();
+                let devices = self
+                    .devices
+                    .lock()
+                    .expect("registry")
+                    .iter()
+                    .filter(|(_, d)| !revoked.contains(&d.device_id))
+                    .map(|(id, d)| view_of(d, id == this))
+                    .collect();
+                let list = DeviceListResponse {
+                    devices,
+                    older_client_seen_on: None,
+                };
+                HttpResponse::new(200, serde_json::to_vec(&list).expect("serializes"))
+            }
+            (Method::Patch, Some(id)) => {
+                let rename: DeviceRename = serde_json::from_slice(&request.body).expect("a rename");
+                match self.devices.lock().expect("registry").get_mut(id) {
+                    Some(device) => {
+                        device.name = rename.name;
+                        HttpResponse::new(204, Vec::new())
+                    }
+                    None => HttpResponse::new(404, Vec::new()),
+                }
+            }
+            (Method::Delete, Some(id)) => {
+                let id = DeviceId::try_from(id.to_owned()).expect("a device id");
+                self.revoke_device(id);
+                HttpResponse::new(204, Vec::new())
+            }
+            _ => HttpResponse::new(405, Vec::new()),
         }
     }
 
@@ -167,8 +282,23 @@ impl FakeEntitlementIssuer {
     }
 }
 
+fn view_of(registration: &DeviceRegistration, this_device: bool) -> DeviceView {
+    DeviceView {
+        device_id: registration.device_id,
+        name: registration.name.clone(),
+        platform: registration.platform,
+        app_version: registration.app_version.clone(),
+        registered_on: "2026-10-28".to_owned(),
+        last_seen_on: "2026-10-28".to_owned(),
+        this_device,
+    }
+}
+
 impl HttpTransport for FakeEntitlementIssuer {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+        if request.url.contains("/v1/devices") {
+            return Ok(self.devices_route(&request));
+        }
         if request.url.ends_with("/v1/port-entitlements/keys")
             || request.url.ends_with("/v1/tokens/keys")
         {

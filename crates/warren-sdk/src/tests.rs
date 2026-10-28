@@ -4357,3 +4357,201 @@ fn only_a_client_built_to_stand_aside_checks_the_host_route() {
     );
     assert_eq!(test_client().stand_aside_api_base, None);
 }
+
+mod device_registry {
+    //! The client registers its kept install identity with the account's
+    //! device registry (warren-core doc 115) through the wallet's real token
+    //! manager, against the fake registry of the test issuer.
+
+    use std::path::Path;
+
+    use warren_api::{DeviceId, DevicePlatform};
+    use warren_test_support::issuer::{EPOCH_SECS, FakeEntitlementIssuer};
+
+    use super::*;
+    use crate::store::kept_device_identity;
+
+    fn minting() -> FakeEntitlementIssuer {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after 1970")
+            .as_secs();
+        FakeEntitlementIssuer::new(&[now / EPOCH_SECS, now / EPOCH_SECS + 1], 3)
+    }
+
+    /// A client of the wallet `seed` keeping its device identity at `path`.
+    /// Each test uses its own seed: clients of one wallet share its batch.
+    fn client(
+        seed: u8,
+        issuer: FakeEntitlementIssuer,
+        path: &Path,
+    ) -> WarrenClient<FakeEntitlementIssuer> {
+        WarrenClient::builder()
+            .identity(WarrenIdentity::from_seed(&[seed; 32]))
+            .api_base("https://api.example.test")
+            .allow_any_server_key()
+            .device(path, DevicePlatform::Linux, "1.2.0")
+            .build_with_transport(issuer)
+            .expect("build")
+    }
+
+    fn issuer(client: &WarrenClient<FakeEntitlementIssuer>) -> &FakeEntitlementIssuer {
+        client.api().transport()
+    }
+
+    async fn wait_until(what: &str, done: impl Fn() -> bool) {
+        wait_within(Duration::from_secs(20), what, done).await;
+    }
+
+    async fn wait_within(within: Duration, what: &str, done: impl Fn() -> bool) {
+        tokio::time::timeout(within, async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    #[tokio::test]
+    async fn a_client_registers_the_identity_kept_for_its_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        let kept = kept_device_identity(&path);
+
+        let client = client(0x81, minting(), &path);
+        wait_until("the registration", || {
+            issuer(&client).device(kept.device_id).is_some()
+        })
+        .await;
+
+        assert_eq!(client.device_id(), Some(kept.device_id));
+        let registered = issuer(&client).device(kept.device_id).unwrap();
+        assert_eq!(registered.name, kept.name);
+        assert_eq!(registered.platform, DevicePlatform::Linux);
+        assert_eq!(registered.app_version, "1.2.0");
+    }
+
+    #[tokio::test]
+    async fn the_device_list_marks_this_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = client(0x82, minting(), &dir.path().join("device"));
+        let id = client.device_id().expect("a device");
+        wait_until("the registration", || issuer(&client).device(id).is_some()).await;
+
+        let list = client.list_devices().await.expect("listed");
+
+        assert_eq!(list.devices.len(), 1);
+        assert_eq!(list.devices[0].device_id, id);
+        assert!(list.devices[0].this_device);
+    }
+
+    #[tokio::test]
+    async fn a_client_without_a_device_lists_without_naming_one() {
+        let client = WarrenClient::builder()
+            .identity(WarrenIdentity::from_seed(&[0x83; 32]))
+            .api_base("https://api.example.test")
+            .allow_any_server_key()
+            .build_with_transport(minting())
+            .expect("build");
+
+        let list = client.list_devices().await.expect("listed");
+
+        assert_eq!(client.device_id(), None);
+        assert!(list.devices.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renaming_this_device_keeps_the_name_and_registers_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        let client = client(0x84, minting(), &path);
+        let id = client.device_id().expect("a device");
+        wait_until("the registration", || issuer(&client).device(id).is_some()).await;
+
+        client
+            .rename_device(id, "calm heron")
+            .await
+            .expect("renamed");
+        let before = issuer(&client).registered_names().len();
+        // Paused time: the refresh period passes as soon as the test waits.
+        wait_within(Duration::from_secs(1300), "the next refresh", || {
+            issuer(&client).registered_names().len() > before
+        })
+        .await;
+
+        assert_eq!(kept_device_identity(&path).name, "calm heron");
+        assert_eq!(
+            issuer(&client)
+                .registered_names()
+                .last()
+                .map(String::as_str),
+            Some("calm heron"),
+            "a refresh registering the old name would undo the rename"
+        );
+    }
+
+    #[tokio::test]
+    async fn renaming_another_device_leaves_this_one_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        let client = client(0x85, minting(), &path);
+        let kept = kept_device_identity(&path);
+        let other = warren_api::DeviceIdentity {
+            device_id: DeviceId::from_bytes([0x0F; 16]),
+            name: "bold lynx".to_owned(),
+        };
+        client
+            .api()
+            .register_device(&other.registration(DevicePlatform::Android, "1.2.0"))
+            .await
+            .expect("the other device registers");
+
+        client
+            .rename_device(other.device_id, "calm heron")
+            .await
+            .expect("renamed");
+
+        assert_eq!(
+            issuer(&client).device(other.device_id).map(|d| d.name),
+            Some("calm heron".to_owned())
+        );
+        assert_eq!(kept_device_identity(&path), kept);
+    }
+
+    #[tokio::test]
+    async fn a_device_revoked_from_another_device_reads_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        let issuer_side = minting();
+        issuer_side.revoke_device(kept_device_identity(&path).device_id);
+
+        let client = client(0x86, issuer_side, &path);
+
+        wait_until("the revocation", || client.device_revoked()).await;
+    }
+
+    #[tokio::test]
+    async fn revoking_a_device_reaches_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = client(0x87, minting(), &dir.path().join("device"));
+        let other = DeviceId::from_bytes([0x0E; 16]);
+
+        client.revoke_device(other).await.expect("revoked");
+
+        assert!(issuer(&client).is_revoked(other));
+        assert!(!client.device_revoked(), "another device was revoked");
+    }
+
+    #[tokio::test]
+    async fn forgetting_the_device_erases_its_kept_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        let client = client(0x88, minting(), &path);
+        assert!(path.exists());
+
+        client.forget_device().expect("forgotten");
+
+        assert!(!path.exists());
+    }
+}

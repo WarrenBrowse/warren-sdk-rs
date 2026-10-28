@@ -23,7 +23,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use warren_api::{
-    BlindingKey, HttpTransport, SerialLease, TokenClientError, TokenManager, WarrenApiClient,
+    BlindingKey, DeviceRegistration, HttpTransport, SerialLease, TokenClientError, TokenManager,
+    WarrenApiClient,
 };
 use warren_transport::{
     MultihopClientTunnel, SESSION_TOKEN_LEN, SessionAdmission, SessionToken, SessionTokenSource,
@@ -62,6 +63,13 @@ trait TokenBatch: Send + Sync {
     /// a live session or not.
     fn holds_current(&self, now_unix_secs: u64) -> bool;
     fn refresh(&self, now_unix_secs: u64) -> RefreshFuture<'_>;
+    /// Whether the batch's device was revoked; never, for a batch with no
+    /// device.
+    fn device_revoked(&self) -> bool {
+        false
+    }
+    /// Registers the batch's device under `name` from the next refresh on.
+    fn set_device_name(&self, _name: &str) {}
 }
 
 impl<T: HttpTransport + 'static> TokenBatch for TokenManager<T> {
@@ -80,6 +88,14 @@ impl<T: HttpTransport + 'static> TokenBatch for TokenManager<T> {
 
     fn refresh(&self, now_unix_secs: u64) -> RefreshFuture<'_> {
         Box::pin(TokenManager::refresh(self, now_unix_secs))
+    }
+
+    fn device_revoked(&self) -> bool {
+        TokenManager::device_revoked(self)
+    }
+
+    fn set_device_name(&self, name: &str) {
+        TokenManager::set_device_name(self, name);
     }
 }
 
@@ -169,17 +185,22 @@ impl Drop for Inner {
 static REGISTRY: OnceLock<Mutex<HashMap<String, Weak<Inner>>>> = OnceLock::new();
 
 /// The manager of a wallet's batch, starting each session stack at
-/// `rotation` when the client keeps one across restarts.
+/// `rotation` when the client keeps one across restarts, and issuing as
+/// `device` when the client registers one.
 fn wallet_manager<T: HttpTransport>(
     api: &Arc<WarrenApiClient<T>>,
     key: BlindingKey,
     rotation: Option<u64>,
+    device: Option<DeviceRegistration>,
 ) -> TokenManager<T> {
-    let manager = TokenManager::new(Arc::clone(api), key).with_mint_horizon(MINT_HORIZON);
-    match rotation {
-        Some(rotation) => manager.with_rotation(rotation),
-        None => manager,
+    let mut manager = TokenManager::new(Arc::clone(api), key).with_mint_horizon(MINT_HORIZON);
+    if let Some(rotation) = rotation {
+        manager = manager.with_rotation(rotation);
     }
+    if let Some(device) = device {
+        manager = manager.with_device(device);
+    }
+    manager
 }
 
 fn now_unix_secs() -> u64 {
@@ -205,6 +226,7 @@ impl SessionTokens {
         api: &Arc<WarrenApiClient<T>>,
         key: BlindingKey,
         rotation: Option<u64>,
+        device: Option<DeviceRegistration>,
     ) -> Self {
         let mut registry = REGISTRY
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -214,7 +236,7 @@ impl SessionTokens {
             Some(inner) => inner,
             None => {
                 registry.retain(|_, batch| batch.strong_count() > 0);
-                let manager = wallet_manager(api, key, rotation);
+                let manager = wallet_manager(api, key, rotation, device);
                 let inner = Inner::new(Arc::new(manager), Arc::new(now_unix_secs));
                 registry.insert(registry_key, Arc::downgrade(&inner));
                 inner
@@ -250,6 +272,17 @@ impl SessionTokens {
 }
 
 impl SessionTokens {
+    /// Whether the wallet's device was revoked from another device of the
+    /// account, as the last refresh learned.
+    pub(crate) fn device_revoked(&self) -> bool {
+        self.inner.batch.device_revoked()
+    }
+
+    /// Registers the wallet's device under `name` from the next refresh on.
+    pub(crate) fn set_device_name(&self, name: &str) {
+        self.inner.batch.set_device_name(name);
+    }
+
     /// Names the device clock as the cause of a dial that found no token,
     /// when the issuer refused this wallet's last refresh for it: the user
     /// can fix a clock, and an app that only sees "no token" retries for
@@ -544,7 +577,8 @@ mod tests {
         )
         .expect("a bundle");
         let lead = || {
-            let manager = super::wallet_manager(&api, BlindingKey::session(&[0x7c; 32]), Some(41));
+            let manager =
+                super::wallet_manager(&api, BlindingKey::session(&[0x7c; 32]), Some(41), None);
             manager.restore_persisted(&bundle);
             manager.session_stack(100 * 3600 + 5)[0]
         };
@@ -564,6 +598,7 @@ mod tests {
                 "registry-test\nwallet".to_owned(),
                 &api,
                 BlindingKey::session(&[0x7c; 32]),
+                None,
                 None,
             )
         };

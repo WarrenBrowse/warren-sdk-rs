@@ -79,6 +79,7 @@ pub use warren_transport::{Admission, NoSessionTokenCause, SessionAdmission};
 pub use warren_transport::egress_probe::{ExitEvidence, exit_evidence_from};
 
 mod client;
+mod device;
 pub mod egress;
 mod egress_probe;
 mod entitlements;
@@ -113,7 +114,10 @@ pub use portfollow::{
     MigrationOutcome, PortFollowConfig, PortFollowOutcome, PortFollowPolicy, plan_migration,
 };
 pub use proxy::{ProxyForwarder, ProxyHandle, ProxyListeners, TunnelState};
-pub use store::{FileGenerationStore, FileServerKeyStore, kept_token_rotation};
+pub use store::{
+    FileGenerationStore, FileServerKeyStore, forget_device_identity, keep_device_name,
+    kept_device_identity, kept_token_rotation,
+};
 pub use supervisor::{
     EpochEnd, EpochEndCause, MetricsReader, PacketForwarder, PortRelease, SupervisedForwardedPort,
     SupervisedPacketHandle, SupervisedProxyHandle,

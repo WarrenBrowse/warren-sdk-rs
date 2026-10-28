@@ -43,6 +43,13 @@ trait EntitlementSource: Send + Sync {
     fn mark_refused(&self, slot: usize, presented: &[u8], now_unix_secs: u64);
     fn release(&self, slot: usize);
     fn refresh(&self, now_unix_secs: u64) -> RefreshFuture<'_>;
+    /// Whether the batch's device was revoked; never, for a batch with no
+    /// device.
+    fn device_revoked(&self) -> bool {
+        false
+    }
+    /// Registers the batch's device under `name` from the next refresh on.
+    fn set_device_name(&self, _name: &str) {}
 }
 
 impl<T: HttpTransport + 'static> EntitlementSource for PortEntitlementManager<T> {
@@ -60,6 +67,14 @@ impl<T: HttpTransport + 'static> EntitlementSource for PortEntitlementManager<T>
 
     fn refresh(&self, now_unix_secs: u64) -> RefreshFuture<'_> {
         Box::pin(self.refresh_auto(now_unix_secs))
+    }
+
+    fn device_revoked(&self) -> bool {
+        PortEntitlementManager::device_revoked(self)
+    }
+
+    fn set_device_name(&self, name: &str) {
+        PortEntitlementManager::set_device_name(self, name);
     }
 }
 
@@ -194,11 +209,13 @@ impl PortEntitlements {
     /// port keeps its API client, and so its signing key, in memory until the
     /// process exits; its refresh stops once no rule holds a slot. A batch
     /// opened again after a restart is served again by the issuer, since the
-    /// wallet derives it.
+    /// wallet derives it. With a `device`, the batch issues as that device,
+    /// under the name it has when the batch opens.
     pub(crate) fn for_wallet<T: HttpTransport + 'static>(
         registry_key: String,
         api: &Arc<warren_api::WarrenApiClient<T>>,
         key: BlindingKey,
+        device: Option<Arc<crate::device::Device>>,
     ) -> Self {
         let api = Arc::clone(api);
         Self {
@@ -209,10 +226,12 @@ impl PortEntitlements {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     Arc::clone(registry.entry(registry_key.clone()).or_insert_with(|| {
-                        Inner::new(
-                            Arc::new(PortEntitlementManager::new(Arc::clone(&api), key.clone())),
-                            Arc::new(now_unix_secs),
-                        )
+                        let mut manager =
+                            PortEntitlementManager::new(Arc::clone(&api), key.clone());
+                        if let Some(device) = &device {
+                            manager = manager.with_device(device.registration());
+                        }
+                        Inner::new(Arc::new(manager), Arc::new(now_unix_secs))
                     }))
                 }),
                 batch: OnceLock::new(),
@@ -253,6 +272,23 @@ impl PortEntitlements {
             slot,
             owner,
             presented: Mutex::new(None),
+        }
+    }
+
+    /// Whether the wallet's device was revoked, as the batch's last refresh
+    /// learned. Never opens the batch.
+    pub(crate) fn device_revoked(&self) -> bool {
+        self.wallet
+            .batch
+            .get()
+            .is_some_and(|batch| batch.source.device_revoked())
+    }
+
+    /// Registers the wallet's device under `name` from the batch's next
+    /// refresh on. A batch not open yet takes the name when it opens.
+    pub(crate) fn set_device_name(&self, name: &str) {
+        if let Some(batch) = self.wallet.batch.get() {
+            batch.source.set_device_name(name);
         }
     }
 
@@ -882,7 +918,7 @@ mod tests {
         // no batch is taken from the wallet's other devices.
         let key = "never-forwards".to_owned();
         let api = api_for(FakeEntitlementIssuer::new(&[EPOCH], 5));
-        let entitlements = PortEntitlements::for_wallet(key.clone(), &api, wallet_key());
+        let entitlements = PortEntitlements::for_wallet(key.clone(), &api, wallet_key(), None);
 
         assert!(!registered(&key), "opened before any forward");
         let _lease = entitlements.claim();
@@ -898,11 +934,13 @@ mod tests {
             key.clone(),
             &api_for(FakeEntitlementIssuer::new(&[EPOCH], 5)),
             wallet_key(),
+            None,
         );
         let second = PortEntitlements::for_wallet(
             key,
             &api_for(FakeEntitlementIssuer::new(&[EPOCH], 5)),
             wallet_key(),
+            None,
         );
 
         let a = first.claim();
@@ -979,6 +1017,71 @@ mod tests {
             2,
             "the rule's next mapping restarted the refresh"
         );
+    }
+
+    /// The wallet's entitlements as the device kept at `path` (a fresh
+    /// identity), registered under `key`.
+    fn as_device(
+        key: &str,
+        api: &Api,
+        path: &std::path::Path,
+    ) -> (PortEntitlements, Arc<crate::device::Device>) {
+        let registration = crate::store::kept_device_identity(path)
+            .registration(warren_api::DevicePlatform::Linux, "1.2.0");
+        let device = Arc::new(crate::device::Device::new(path.to_owned(), registration));
+        let entitlements =
+            PortEntitlements::for_wallet(key.to_owned(), api, wallet_key(), Some(device.clone()));
+        (entitlements, device)
+    }
+
+    #[tokio::test]
+    async fn a_batch_opened_after_a_rename_registers_under_the_new_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api_for(FakeEntitlementIssuer::new(&[EPOCH], 5));
+        let (entitlements, device) =
+            as_device("renamed-before-open", &api, &dir.path().join("device"));
+
+        device.rename("calm heron").unwrap();
+        let _ = RuleSlot::default().provider(Some(&entitlements)).await;
+
+        assert_eq!(api.transport().registered_names(), ["calm heron"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_open_batch_registers_under_a_new_name_at_its_next_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api_for(FakeEntitlementIssuer::new(&[EPOCH], 5));
+        let (entitlements, _device) =
+            as_device("renamed-while-open", &api, &dir.path().join("device"));
+        let rule = RuleSlot::default();
+        let _held = rule.provider(Some(&entitlements)).await;
+
+        entitlements.set_device_name("calm heron");
+        tokio::time::sleep(REFRESH_PERIOD + Duration::from_secs(1)).await;
+
+        assert_eq!(
+            api.transport()
+                .registered_names()
+                .last()
+                .map(String::as_str),
+            Some("calm heron")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revoked_device_reads_revoked_once_the_batch_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api_for(FakeEntitlementIssuer::new(&[EPOCH], 5));
+        let (entitlements, device) = as_device("revoked-device", &api, &dir.path().join("device"));
+        api.transport().revoke_device(device.id());
+        assert!(
+            !entitlements.device_revoked(),
+            "a closed batch asked nothing"
+        );
+
+        let _ = RuleSlot::default().provider(Some(&entitlements)).await;
+
+        assert!(entitlements.device_revoked());
     }
 
     #[test]

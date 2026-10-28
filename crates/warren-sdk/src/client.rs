@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use warren_api::{HttpTransport, WarrenApiClient};
+use warren_api::{DeviceId, DeviceListResponse, HttpTransport, WarrenApiClient};
 use warren_discovery::{
     CircuitPolicy, DEFAULT_RTT_TTL_SECS, ExitQuery, ExitSelector, PATH_QUALITY_VERSION,
     PathAwareParams, PathQualityAdvisory, Relay, RttCache, SelectorError, VerifiedEntry,
@@ -137,9 +137,33 @@ pub struct WarrenClientBuilder {
     pub(crate) port_entitlement_blinding_key: Option<warren_api::BlindingKey>,
     pub(crate) stand_aside: bool,
     pub(crate) token_rotation: Option<u64>,
+    pub(crate) device: Option<(std::path::PathBuf, warren_api::DevicePlatform, String)>,
 }
 
 impl WarrenClientBuilder {
+    /// Registers this install as a device of the account (warren-core doc
+    /// 115), on `platform`, running `app_version`. Its identity, a random
+    /// identifier and a generated name, is kept at `path`
+    /// ([`crate::kept_device_identity`]), next to the token rotation in the
+    /// install's state directory, and read when the client is built.
+    ///
+    /// The wallet's credential managers then register the device at every
+    /// refresh and name it on every issue request, which is what lets the
+    /// account list it, revoke it, and supersede an older client of the
+    /// wallet that holds the tokens. Read [`WarrenClient::device_revoked`]
+    /// on the refresh timer: a revoked device disconnects and calls
+    /// [`WarrenClient::forget_device`].
+    #[must_use]
+    pub fn device(
+        mut self,
+        path: impl Into<std::path::PathBuf>,
+        platform: warren_api::DevicePlatform,
+        app_version: impl Into<String>,
+    ) -> Self {
+        self.device = Some((path.into(), platform, app_version.into()));
+        self
+    }
+
     /// Starts every session token stack of the wallet at `rotation`, a value
     /// the client keeps across restarts ([`crate::kept_token_rotation`]).
     /// Without it each process draws its own start, so a restarted client
@@ -433,6 +457,11 @@ impl WarrenClientBuilder {
         {
             return Err(BuildError::NotAPortEntitlementBlindingKey);
         }
+        let device = self.device.map(|(path, platform, app_version)| {
+            let registration =
+                crate::store::kept_device_identity(&path).registration(platform, app_version);
+            Arc::new(crate::device::Device::new(path, registration))
+        });
         let stand_aside_api_base = self.stand_aside.then(|| self.api_base.clone());
         let entitlements_key = format!("{}\n{}", self.api_base, identity.address());
         let api = Arc::new(WarrenApiClient::new_with_fallback(
@@ -447,13 +476,20 @@ impl WarrenClientBuilder {
                 &api,
                 key,
                 self.token_rotation,
+                device.as_ref().map(|d| d.registration()),
             )
         });
         let port_entitlements = entitlement_blinding.map(|key| {
-            crate::entitlements::PortEntitlements::for_wallet(entitlements_key, &api, key)
+            crate::entitlements::PortEntitlements::for_wallet(
+                entitlements_key,
+                &api,
+                key,
+                device.clone(),
+            )
         });
         Ok(WarrenClient {
             api,
+            device,
             port_entitlements,
             auth: crate::session_tokens::DialAuth {
                 signing,
@@ -484,6 +520,9 @@ pub type DefaultClient = WarrenClient<ReqwestTransport>;
 /// The high-level Warren client.
 pub struct WarrenClient<T> {
     pub(crate) api: Arc<WarrenApiClient<T>>,
+    /// The install's device in the account's registry, when the builder was
+    /// given one ([`WarrenClientBuilder::device`]).
+    pub(crate) device: Option<Arc<crate::device::Device>>,
     /// The wallet's port entitlements, shared with every client of the same
     /// wallet and API in the process: every forward of every datapath this
     /// client starts presents one (warren-core doc 105). `None` for an
@@ -546,6 +585,7 @@ impl WarrenClient<()> {
             session_admission: SessionAdmission::default(),
             stand_aside: false,
             token_rotation: None,
+            device: None,
             session_blinding_key: None,
             port_entitlement_blinding_key: None,
         }
@@ -557,6 +597,87 @@ impl<T: HttpTransport> WarrenClient<T> {
     #[must_use]
     pub fn api(&self) -> &WarrenApiClient<T> {
         &self.api
+    }
+
+    /// This install's device identifier, when the client registers one
+    /// ([`WarrenClientBuilder::device`]). It names the install to its own
+    /// account only: keep it out of every log.
+    #[must_use]
+    pub fn device_id(&self) -> Option<DeviceId> {
+        self.device.as_ref().map(|d| d.id())
+    }
+
+    /// Whether this install's device was revoked from another device of the
+    /// account, as the wallet's last credential refresh learned (warren-core
+    /// doc 115). Sticky: the credential managers ask nothing more. The app
+    /// disconnects, says "This device was disconnected from another device
+    /// of your account", and calls [`Self::forget_device`]; coming back
+    /// takes the recovery phrase.
+    #[must_use]
+    pub fn device_revoked(&self) -> bool {
+        self.auth
+            .tokens
+            .as_ref()
+            .is_some_and(crate::session_tokens::SessionTokens::device_revoked)
+            || self
+                .port_entitlements
+                .as_ref()
+                .is_some_and(crate::entitlements::PortEntitlements::device_revoked)
+    }
+
+    /// The account's devices, this install's marked `this_device`, and the
+    /// last day an older client of the account was superseded.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::Api`] when the call fails.
+    pub async fn list_devices(&self) -> Result<DeviceListResponse, SdkError> {
+        Ok(self.api.list_devices(self.device_id()).await?)
+    }
+
+    /// Renames a device of the account. Renaming this install's device also
+    /// keeps the name for its later registrations, this process's and the
+    /// next start's, which would otherwise register the old name again.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::Api`] when the account refuses the rename, and
+    /// [`SdkError::DeviceStore`] when the account took it but the identity
+    /// file could not keep it.
+    pub async fn rename_device(&self, id: DeviceId, name: &str) -> Result<(), SdkError> {
+        self.api.rename_device(id, name).await?;
+        let Some(device) = self.device.as_ref().filter(|d| d.id() == id) else {
+            return Ok(());
+        };
+        if let Some(tokens) = &self.auth.tokens {
+            tokens.set_device_name(name);
+        }
+        if let Some(entitlements) = &self.port_entitlements {
+            entitlements.set_device_name(name);
+        }
+        device.rename(name).map_err(SdkError::DeviceStore)
+    }
+
+    /// Revokes a device of the account. Revoking this install's own device is
+    /// a logout: the next refresh reads it revoked.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::Api`] when the call fails.
+    pub async fn revoke_device(&self, id: DeviceId) -> Result<(), SdkError> {
+        Ok(self.api.revoke_device(id).await?)
+    }
+
+    /// Erases this install's kept device identity, once it was revoked or
+    /// logged out: the next client built over the same path draws a new one,
+    /// which the account lists as a new device. Does nothing for a client
+    /// without a device.
+    ///
+    /// # Errors
+    ///
+    /// The error of the removal.
+    pub fn forget_device(&self) -> std::io::Result<()> {
+        self.device.as_ref().map_or(Ok(()), |d| d.forget())
     }
 
     /// Fetches the signed exit list, verifies it against the pinned server

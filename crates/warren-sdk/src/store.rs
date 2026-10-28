@@ -1,5 +1,6 @@
-//! File-backed persistence for the anti-rollback floor and the trust-on-first-use
-//! server pin, so both survive process restarts.
+//! File-backed persistence for the anti-rollback floor, the trust-on-first-use
+//! server pin, the token rotation and the device identity, so they survive
+//! process restarts.
 //!
 //! The in-memory defaults reset every run, which lets a network attacker replay an
 //! older-but-validly-signed list to a freshly launched client. These stores write
@@ -8,6 +9,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+use warren_api::DeviceIdentity;
 
 use crate::{GenerationStore, ServerKeyStore};
 
@@ -108,9 +111,7 @@ fn read_u64(path: &Path) -> std::io::Result<u64> {
 /// An exit gives a client back its inner address and forwarded ports only
 /// when it leads with the serial its previous session was admitted on, so a
 /// client that draws a new rotation at every start loses both at every
-/// restart. Written to a side file then renamed, because a torn write would
-/// still parse as another number. A path it cannot write to leaves this
-/// process its own draw.
+/// restart. A path it cannot write to leaves this process its own draw.
 #[must_use]
 pub fn kept_token_rotation(path: &Path) -> u64 {
     if let Some(kept) = std::fs::read_to_string(path)
@@ -120,11 +121,71 @@ pub fn kept_token_rotation(path: &Path) -> u64 {
         return kept;
     }
     let drawn: u64 = rand::random();
+    let _ = write_whole(path, drawn.to_string().as_bytes());
+    drawn
+}
+
+/// This install's device identity (warren-core doc 115), kept at `path` for
+/// [`crate::WarrenClientBuilder::device`]: read back, or drawn
+/// ([`DeviceIdentity::generate`]) and kept there on first use. Keep it next to
+/// the token rotation, in the install's own state directory.
+///
+/// The account's device list names an install by this identity, so one
+/// drawn anew at every start would add a device to the list at every start.
+/// A path it cannot write to leaves this process its own draw, and an
+/// unreadable file is replaced by a new draw.
+#[must_use]
+pub fn kept_device_identity(path: &Path) -> DeviceIdentity {
+    if let Some(kept) = read_device_identity(path) {
+        return kept;
+    }
+    let drawn = DeviceIdentity::generate();
+    if let Ok(json) = serde_json::to_vec(&drawn) {
+        let _ = write_whole(path, &json);
+    }
+    drawn
+}
+
+/// Keeps `name` as the name of the device identity kept at `path`, once the
+/// account renamed the device: the next start registers under it.
+///
+/// # Errors
+///
+/// [`std::io::ErrorKind::NotFound`] when no readable identity is kept at
+/// `path` (a name is never kept without the identifier it names), or the
+/// error of the write.
+pub fn keep_device_name(path: &Path, name: &str) -> std::io::Result<()> {
+    let mut kept = read_device_identity(path).ok_or(std::io::ErrorKind::NotFound)?;
+    name.clone_into(&mut kept.name);
+    let json = serde_json::to_vec(&kept).map_err(std::io::Error::other)?;
+    write_whole(path, &json)
+}
+
+/// Erases the device identity kept at `path`: the device was revoked, or
+/// logged out. The next [`kept_device_identity`] draws a new one, which the
+/// account lists as a new device.
+///
+/// # Errors
+///
+/// The error of the removal; an identity that is not there is already
+/// forgotten.
+pub fn forget_device_identity(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+fn read_device_identity(path: &Path) -> Option<DeviceIdentity> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// Writes `bytes` to a side file then renames it over `path`, because a torn
+/// write would still parse as another value.
+fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut partial = path.as_os_str().to_owned();
     partial.push(".partial");
-    let _ =
-        std::fs::write(&partial, drawn.to_string()).and_then(|()| std::fs::rename(&partial, path));
-    drawn
+    std::fs::write(&partial, bytes).and_then(|()| std::fs::rename(&partial, path))
 }
 
 /// Reads a persisted pin, treating a missing file as "no pin yet".
@@ -162,6 +223,65 @@ mod tests {
         let drawn = kept_token_rotation(&path);
 
         assert_eq!(kept_token_rotation(&path), drawn);
+    }
+
+    #[test]
+    fn a_kept_device_identity_is_read_back_by_the_next_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+
+        let drawn = kept_device_identity(&path);
+
+        assert_eq!(kept_device_identity(&path), drawn);
+    }
+
+    #[test]
+    fn an_unreadable_device_identity_is_drawn_again_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        std::fs::write(&path, b"{\"device_id\":\"short\"}").unwrap();
+
+        let drawn = kept_device_identity(&path);
+
+        assert_eq!(kept_device_identity(&path), drawn);
+    }
+
+    #[test]
+    fn a_kept_name_replaces_the_name_and_keeps_the_identifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        let drawn = kept_device_identity(&path);
+
+        keep_device_name(&path, "calm heron").unwrap();
+
+        let kept = kept_device_identity(&path);
+        assert_eq!(kept.device_id, drawn.device_id);
+        assert_eq!(kept.name, "calm heron");
+    }
+
+    #[test]
+    fn a_name_is_never_kept_for_an_identity_that_was_never_drawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+
+        let err = keep_device_name(&path, "calm heron").unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_forgotten_device_identity_is_drawn_anew() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        let drawn = kept_device_identity(&path);
+
+        forget_device_identity(&path).unwrap();
+
+        assert!(!path.exists());
+        assert_ne!(kept_device_identity(&path).device_id, drawn.device_id);
+        forget_device_identity(&dir.path().join("never-drawn"))
+            .expect("forgetting nothing is done already");
     }
 
     #[test]
