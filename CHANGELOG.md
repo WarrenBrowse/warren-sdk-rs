@@ -26,6 +26,41 @@ the pre-release `0.0.x` line.
 
 ### Added
 
+- Device registry (warren-core doc 115): an install registers as a device of
+  its account, the account lists its devices, renames them, and revokes one
+  from another. `WarrenApiClient::register_device`, `list_devices(this)`,
+  `rename_device(id, name)` and `revoke_device(id)` call `POST`, `GET`,
+  `PATCH` and `DELETE` on `/v1/devices`; a `403 {"error":"device_revoked"}`
+  or `{"error":"device_unregistered"}` answer to a registration, a device
+  route or an issuance is `ClientError::DeviceRevoked` or
+  `ClientError::DeviceUnregistered`. `TokenManager::with_device` and
+  `PortEntitlementManager::with_device` name the device on every issue
+  request (`TokenIssueRequest::device_id`) and register it at the start of
+  every refresh, which is how a revocation reaches a device whose epochs are
+  all stocked within one refresh period. An issuer that still answers
+  `device_unregistered` gets one more registration and one more request; a
+  `device_revoked` answer drops the stock and ends the manager for good:
+  `device_revoked()` reads `true` and every later `refresh` returns the
+  revocation without a request. A backend without the registry answers the
+  registration `404` and keeps issuing. `set_device_name` carries a rename
+  into the next registration. The identity is `warren_api::DeviceIdentity`,
+  16 bytes from the OS CSPRNG and a two-word name (adjective and animal,
+  `device::DEVICE_NAME_ADJECTIVES` and `DEVICE_NAME_ANIMALS`, 40 words each),
+  drawn in the SDK so every client names devices alike; its `Debug` renders
+  no name and a two-byte prefix of the identifier.
+  `warren_sdk::kept_device_identity(path)`, `keep_device_name` and
+  `forget_device_identity` keep it next to the token rotation;
+  `WarrenClientBuilder::device(path, platform, app_version)` registers the
+  client with it, and `WarrenClient::device_id`, `device_revoked`,
+  `list_devices`, `rename_device` (which keeps a rename of this install for
+  its later registrations, or fails with `SdkError::DeviceStore`),
+  `revoke_device` and `forget_device` expose it. The FFI takes
+  `FfiClientOptions::device_platform` and `app_version` (with `state_dir`,
+  where the identity is kept as `device`), and exports the same calls,
+  `FfiDeviceList`, `FfiDevice`, `FfiError::DeviceRevoked` and
+  `FfiError::InvalidDeviceId`. warren-bolthole registers its gateway as a
+  `linux` device kept in its state directory.
+
 - Signed requests are stamped with the server's clock when the device's is
   off (forum topic 219: a Windows clock 91 s fast was refused `401` on every
   signed call, and lost its port forwarding, its session tokens and its
@@ -273,6 +308,10 @@ the pre-release `0.0.x` line.
 
 ### Changed
 
+- `transport::Method` gains `Patch` (the device rename): a transport that
+  matches on the method must map it. warren-contract moves to `7ba209a`,
+  whose `TokenIssueRequest` gains `device_id: Option<DeviceId>`, absent from
+  the wire when `None`.
 - `HttpResponse` carries the answer's `Date` header (`date`) and is
   `#[non_exhaustive]`: a transport builds it with `HttpResponse::new(status,
   body)` and `.with_date(..)`. A transport that does not pass the `Date` on
