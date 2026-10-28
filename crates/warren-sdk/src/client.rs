@@ -476,7 +476,7 @@ impl WarrenClientBuilder {
                 &api,
                 key,
                 self.token_rotation,
-                device.as_ref().map(|d| d.registration()),
+                device.clone(),
             )
         });
         let port_entitlements = entitlement_blinding.map(|key| {
@@ -625,6 +625,18 @@ impl<T: HttpTransport> WarrenClient<T> {
                 .is_some_and(crate::entitlements::PortEntitlements::device_revoked)
     }
 
+    /// Whether the wallet's last credential refresh found the account's
+    /// device cap reached: this install is not registered and is issued no
+    /// session token until another device of the account is revoked. The app
+    /// opens the device list. Not sticky: the next refresh registers again.
+    #[must_use]
+    pub fn device_limit_reached(&self) -> bool {
+        self.auth
+            .tokens
+            .as_ref()
+            .is_some_and(crate::session_tokens::SessionTokens::device_limit_reached)
+    }
+
     /// The account's devices, this install's marked `this_device`, and the
     /// last day an older client of the account was superseded.
     ///
@@ -636,14 +648,15 @@ impl<T: HttpTransport> WarrenClient<T> {
     }
 
     /// Renames a device of the account. Renaming this install's device also
-    /// keeps the name for its later registrations, this process's and the
-    /// next start's, which would otherwise register the old name again.
+    /// keeps the name in its identity file and for its later registrations.
+    /// The registry keeps a known device's name, so these matter once it
+    /// deleted the row (a device unseen for 90 days) and the device
+    /// registers anew. A file that cannot keep the name is written again
+    /// from the next registration's answer, which carries it.
     ///
     /// # Errors
     ///
-    /// [`SdkError::Api`] when the account refuses the rename, and
-    /// [`SdkError::DeviceStore`] when the account took it but the identity
-    /// file could not keep it.
+    /// [`SdkError::Api`] when the account refuses the rename.
     pub async fn rename_device(&self, id: DeviceId, name: &str) -> Result<(), SdkError> {
         self.api.rename_device(id, name).await?;
         let Some(device) = self.device.as_ref().filter(|d| d.id() == id) else {
@@ -655,7 +668,8 @@ impl<T: HttpTransport> WarrenClient<T> {
         if let Some(entitlements) = &self.port_entitlements {
             entitlements.set_device_name(name);
         }
-        device.rename(name).map_err(SdkError::DeviceStore)
+        device.adopt(name);
+        Ok(())
     }
 
     /// Revokes a device of the account. Revoking this install's own device is

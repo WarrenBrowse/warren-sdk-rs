@@ -30,11 +30,21 @@ impl Device {
         self.lock().clone()
     }
 
-    /// Takes `name` for the registrations to come, and keeps it in the
-    /// identity file so the next start registers under it too.
-    pub(crate) fn rename(&self, name: &str) -> std::io::Result<()> {
-        name.clone_into(&mut self.lock().name);
-        crate::store::keep_device_name(&self.path, name)
+    /// Takes the name the registry answered a registration with, which
+    /// carries a rename made from another device of the account, and keeps
+    /// it for the next start. A file that cannot keep it is written again at
+    /// the next answer.
+    pub(crate) fn adopt(&self, name: &str) {
+        {
+            let mut registration = self.lock();
+            if registration.name == name {
+                return;
+            }
+            name.clone_into(&mut registration.name);
+        }
+        if crate::store::keep_device_name(&self.path, name).is_err() {
+            tracing::debug!("the device name could not be kept");
+        }
     }
 
     pub(crate) fn forget(&self) -> std::io::Result<()> {
@@ -45,5 +55,15 @@ impl Device {
         self.registration
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The key a wallet's credential batch is shared under in this process: one
+/// batch per wallet, API and device, since a batch issues as one device.
+/// Process memory only; it is never logged.
+pub(crate) fn registry_key(wallet_key: String, device: Option<&Device>) -> String {
+    match device {
+        Some(device) => format!("{wallet_key}\n{}", String::from(device.id())),
+        None => wallet_key,
     }
 }

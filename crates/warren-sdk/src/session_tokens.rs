@@ -70,6 +70,10 @@ trait TokenBatch: Send + Sync {
     }
     /// Registers the batch's device under `name` from the next refresh on.
     fn set_device_name(&self, _name: &str) {}
+    /// The batch's device name as the registry last answered it.
+    fn device_name(&self) -> Option<String> {
+        None
+    }
 }
 
 impl<T: HttpTransport + 'static> TokenBatch for TokenManager<T> {
@@ -97,12 +101,21 @@ impl<T: HttpTransport + 'static> TokenBatch for TokenManager<T> {
     fn set_device_name(&self, name: &str) {
         TokenManager::set_device_name(self, name);
     }
+
+    fn device_name(&self) -> Option<String> {
+        TokenManager::device_name(self)
+    }
 }
 
 /// One wallet's batch and its refresh.
 struct Inner {
     batch: Arc<dyn TokenBatch>,
     clock: Clock,
+    /// The install's device the batch issues as, which keeps the name the
+    /// registry answers with.
+    device: Option<Arc<crate::device::Device>>,
+    /// Whether the last refresh found the account's device cap reached.
+    device_limit: std::sync::atomic::AtomicBool,
     /// The issuer's last word on this device's clock: `Some` when the last
     /// refresh was refused because the request stamp fell outside the
     /// issuer's window (the server's clock minus this device's, when known).
@@ -113,10 +126,16 @@ struct Inner {
 }
 
 impl Inner {
-    fn new(batch: Arc<dyn TokenBatch>, clock: Clock) -> Arc<Self> {
+    fn new(
+        batch: Arc<dyn TokenBatch>,
+        clock: Clock,
+        device: Option<Arc<crate::device::Device>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             batch,
             clock,
+            device,
+            device_limit: std::sync::atomic::AtomicBool::new(false),
             clock_refused: Mutex::new(None),
             answered: tokio::sync::watch::channel(false).0,
             refresh: Mutex::new(None),
@@ -147,6 +166,18 @@ impl Inner {
                     })) => Some(*offset_secs),
                     _ => None,
                 };
+                inner.device_limit.store(
+                    matches!(
+                        answer,
+                        Err(TokenClientError::Api(
+                            warren_api::ClientError::DeviceLimitReached
+                        ))
+                    ),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let (Some(device), Some(name)) = (&inner.device, inner.batch.device_name()) {
+                    device.adopt(&name);
+                }
                 if let Err(error) = answer {
                     // The tokens already held stay usable; the next tick asks
                     // again. The error names epochs and API verdicts, never a
@@ -220,14 +251,17 @@ impl SessionTokens {
     /// other client of the same wallet and API in the process, so their
     /// sessions never lead with each other's serial. `key` must be that
     /// wallet's session blinding key; it is dropped when a batch is already
-    /// open.
+    /// open. A batch issues as one device: a client of the wallet with
+    /// another device (a new identity drawn after a revocation, while the
+    /// revoked client still lives) opens its own.
     pub(crate) fn for_wallet<T: HttpTransport + 'static>(
         registry_key: String,
         api: &Arc<WarrenApiClient<T>>,
         key: BlindingKey,
         rotation: Option<u64>,
-        device: Option<DeviceRegistration>,
+        device: Option<Arc<crate::device::Device>>,
     ) -> Self {
+        let registry_key = crate::device::registry_key(registry_key, device.as_deref());
         let mut registry = REGISTRY
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -236,8 +270,13 @@ impl SessionTokens {
             Some(inner) => inner,
             None => {
                 registry.retain(|_, batch| batch.strong_count() > 0);
-                let manager = wallet_manager(api, key, rotation, device);
-                let inner = Inner::new(Arc::new(manager), Arc::new(now_unix_secs));
+                let manager = wallet_manager(
+                    api,
+                    key,
+                    rotation,
+                    device.as_ref().map(|d| d.registration()),
+                );
+                let inner = Inner::new(Arc::new(manager), Arc::new(now_unix_secs), device);
                 registry.insert(registry_key, Arc::downgrade(&inner));
                 inner
             }
@@ -255,7 +294,7 @@ impl SessionTokens {
     #[cfg(test)]
     fn unregistered(batch: Arc<dyn TokenBatch>, clock: Clock) -> Self {
         Self {
-            inner: Inner::new(batch, clock),
+            inner: Inner::new(batch, clock, None),
         }
     }
 
@@ -278,6 +317,15 @@ impl SessionTokens {
         self.inner.batch.device_revoked()
     }
 
+    /// Whether the last refresh found the account's device cap reached: this
+    /// install is not registered and is issued nothing until another device
+    /// of the account is revoked.
+    pub(crate) fn device_limit_reached(&self) -> bool {
+        self.inner
+            .device_limit
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Registers the wallet's device under `name` from the next refresh on.
     pub(crate) fn set_device_name(&self, name: &str) {
         self.inner.batch.set_device_name(name);
@@ -286,8 +334,10 @@ impl SessionTokens {
     /// Names the device clock as the cause of a dial that found no token,
     /// when the issuer refused this wallet's last refresh for it: the user
     /// can fix a clock, and an app that only sees "no token" retries for
-    /// ever. Every other error, and a stack the wallet's other devices hold,
-    /// passes through unchanged.
+    /// ever. A revoked device's dial is named the revocation instead, which
+    /// no retry heals, and an unregistered one past the account's device cap
+    /// the cap, which the device list heals. Every other error, and a stack the wallet's other
+    /// devices hold, passes through unchanged.
     pub(crate) fn explain(&self, error: crate::SdkError) -> crate::SdkError {
         use warren_transport::{MultihopError, NoSessionTokenCause};
         let tokenless = matches!(
@@ -298,6 +348,12 @@ impl SessionTokens {
         );
         if !tokenless {
             return error;
+        }
+        if self.device_revoked() {
+            return crate::SdkError::Api(warren_api::ClientError::DeviceRevoked);
+        }
+        if self.device_limit_reached() {
+            return crate::SdkError::Api(warren_api::ClientError::DeviceLimitReached);
         }
         match *self
             .inner
@@ -497,6 +553,90 @@ mod tests {
                 crate::SdkError::Multihop(warren_transport::MultihopError::NoSessionToken(_))
             ),
             "nothing says the clock is wrong: got {err:?}"
+        );
+    }
+
+    /// A batch whose device was revoked from another device of the account.
+    struct RevokedBatch;
+
+    impl TokenBatch for RevokedBatch {
+        fn stack(&self, _now: u64) -> Vec<[u8; SESSION_TOKEN_LEN]> {
+            Vec::new()
+        }
+
+        fn claim(&self, _token: &[u8; SESSION_TOKEN_LEN]) -> Option<SerialLease> {
+            None
+        }
+
+        fn holds_current(&self, _now: u64) -> bool {
+            false
+        }
+
+        fn refresh(&self, _now: u64) -> RefreshFuture<'_> {
+            Box::pin(async { Err(warren_api::ClientError::DeviceRevoked.into()) })
+        }
+
+        fn device_revoked(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dial_left_without_a_token_by_a_revocation_says_so() {
+        let tokens = SessionTokens::unregistered(
+            Arc::new(RevokedBatch) as Arc<dyn TokenBatch>,
+            Arc::new(|| 0),
+        );
+        let _ = tokens.source().await;
+
+        let err = tokens.explain(no_token(warren_transport::NoSessionTokenCause::Empty));
+
+        assert!(
+            matches!(
+                err,
+                crate::SdkError::Api(warren_api::ClientError::DeviceRevoked)
+            ),
+            "an app must disconnect and forget a revoked device, not retry: got {err:?}"
+        );
+    }
+
+    /// A batch whose device the registry has no room for.
+    struct UnregisteredBatch;
+
+    impl TokenBatch for UnregisteredBatch {
+        fn stack(&self, _now: u64) -> Vec<[u8; SESSION_TOKEN_LEN]> {
+            Vec::new()
+        }
+
+        fn claim(&self, _token: &[u8; SESSION_TOKEN_LEN]) -> Option<SerialLease> {
+            None
+        }
+
+        fn holds_current(&self, _now: u64) -> bool {
+            false
+        }
+
+        fn refresh(&self, _now: u64) -> RefreshFuture<'_> {
+            Box::pin(async { Err(warren_api::ClientError::DeviceLimitReached.into()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dial_left_without_a_token_by_the_device_cap_says_so() {
+        let tokens = SessionTokens::unregistered(
+            Arc::new(UnregisteredBatch) as Arc<dyn TokenBatch>,
+            Arc::new(|| 0),
+        );
+        let _ = tokens.source().await;
+
+        let err = tokens.explain(no_token(warren_transport::NoSessionTokenCause::Empty));
+
+        assert!(
+            matches!(
+                err,
+                crate::SdkError::Api(warren_api::ClientError::DeviceLimitReached)
+            ),
+            "the app opens the device list on this: got {err:?}"
         );
     }
 

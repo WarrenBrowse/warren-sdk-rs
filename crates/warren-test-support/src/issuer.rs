@@ -48,6 +48,7 @@ pub struct FakeEntitlementIssuer {
     devices: Mutex<BTreeMap<String, DeviceRegistration>>,
     revoked_devices: Mutex<HashSet<DeviceId>>,
     registered_names: Mutex<Vec<String>>,
+    device_limit_reached: AtomicBool,
 }
 
 impl FakeEntitlementIssuer {
@@ -76,6 +77,7 @@ impl FakeEntitlementIssuer {
             devices: Mutex::new(BTreeMap::new()),
             revoked_devices: Mutex::new(HashSet::new()),
             registered_names: Mutex::new(Vec::new()),
+            device_limit_reached: AtomicBool::new(false),
         }
     }
 
@@ -102,6 +104,12 @@ impl FakeEntitlementIssuer {
     #[must_use]
     pub fn registered_names(&self) -> Vec<String> {
         self.registered_names.lock().expect("registry").clone()
+    }
+
+    /// Answers every later registration of a device the registry does not
+    /// know with 409, as warren-api does past the active-device cap.
+    pub fn reach_device_limit(&self) {
+        self.device_limit_reached.store(true, Ordering::SeqCst);
     }
 
     /// Revokes `id`, as another device of the account does.
@@ -139,11 +147,21 @@ impl FakeEntitlementIssuer {
                 if self.is_revoked(registration.device_id) {
                     return HttpResponse::new(403, br#"{"error":"device_revoked"}"#.to_vec());
                 }
-                let view = view_of(&registration, true);
-                self.devices
-                    .lock()
-                    .expect("registry")
-                    .insert(String::from(registration.device_id), registration);
+                let mut devices = self.devices.lock().expect("registry");
+                let key = String::from(registration.device_id);
+                if !devices.contains_key(&key) && self.device_limit_reached.load(Ordering::SeqCst) {
+                    return HttpResponse::new(409, Vec::new());
+                }
+                // warren-api keeps a known device's name: a rename goes
+                // through PATCH, from whichever device of the account.
+                let kept = devices
+                    .entry(key)
+                    .and_modify(|known| {
+                        known.platform = registration.platform;
+                        known.app_version.clone_from(&registration.app_version);
+                    })
+                    .or_insert(registration);
+                let view = view_of(kept, true);
                 HttpResponse::new(200, serde_json::to_vec(&view).expect("serializes"))
             }
             (Method::Get, None) => {

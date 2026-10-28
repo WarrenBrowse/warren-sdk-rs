@@ -106,10 +106,6 @@ pub enum SdkError {
     /// The client builder was misconfigured.
     #[error(transparent)]
     Build(#[from] BuildError),
-    /// The account renamed this install's device, but its identity file
-    /// could not keep the name: the next start would register the old one.
-    #[error("the device identity file could not be written")]
-    DeviceStore(#[source] std::io::Error),
 }
 
 impl SdkError {

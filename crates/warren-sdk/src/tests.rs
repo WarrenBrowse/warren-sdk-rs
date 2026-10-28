@@ -4473,6 +4473,11 @@ mod device_registry {
             .rename_device(id, "calm heron")
             .await
             .expect("renamed");
+        assert_eq!(
+            kept_device_identity(&path).name,
+            "calm heron",
+            "kept at once, not only once a registration answers it"
+        );
         let before = issuer(&client).registered_names().len();
         // Paused time: the refresh period passes as soon as the test waits.
         wait_within(Duration::from_secs(1300), "the next refresh", || {
@@ -4529,6 +4534,62 @@ mod device_registry {
         let client = client(0x86, issuer_side, &path);
 
         wait_until("the revocation", || client.device_revoked()).await;
+    }
+
+    #[tokio::test]
+    async fn a_new_identity_after_a_revocation_is_not_held_back_by_the_revoked_one() {
+        // The app forgets a revoked identity and logs back in, in the same
+        // process, while the revoked client may still be alive.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        let revoking = minting();
+        revoking.revoke_device(kept_device_identity(&path).device_id);
+        let revoked = client(0x89, revoking, &path);
+        wait_until("the revocation", || revoked.device_revoked()).await;
+        revoked.forget_device().expect("forgotten");
+
+        let again = client(0x89, minting(), &path);
+        let id = again.device_id().expect("a device");
+        wait_until("the new registration", || {
+            issuer(&again).device(id).is_some()
+        })
+        .await;
+
+        assert_ne!(Some(id), revoked.device_id());
+        assert!(!again.device_revoked());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rename_made_from_another_device_is_kept_for_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        let client = client(0x8A, minting(), &path);
+        let id = client.device_id().expect("a device");
+        wait_until("the registration", || issuer(&client).device(id).is_some()).await;
+
+        client
+            .api()
+            .rename_device(id, "calm heron")
+            .await
+            .expect("renamed from another device");
+
+        // Paused time: the refresh period passes as soon as the test waits.
+        wait_within(Duration::from_secs(1300), "the next registration", || {
+            kept_device_identity(&path).name == "calm heron"
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_device_past_the_account_cap_reads_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = minting();
+        full.reach_device_limit();
+
+        let client = client(0x8B, full, &dir.path().join("device"));
+
+        wait_until("the cap", || client.device_limit_reached()).await;
+        assert!(!client.device_revoked());
     }
 
     #[tokio::test]

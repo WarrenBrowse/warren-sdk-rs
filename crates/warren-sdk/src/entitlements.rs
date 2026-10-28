@@ -50,6 +50,10 @@ trait EntitlementSource: Send + Sync {
     }
     /// Registers the batch's device under `name` from the next refresh on.
     fn set_device_name(&self, _name: &str) {}
+    /// The batch's device name as the registry last answered it.
+    fn device_name(&self) -> Option<String> {
+        None
+    }
 }
 
 impl<T: HttpTransport + 'static> EntitlementSource for PortEntitlementManager<T> {
@@ -75,6 +79,10 @@ impl<T: HttpTransport + 'static> EntitlementSource for PortEntitlementManager<T>
 
     fn set_device_name(&self, name: &str) {
         PortEntitlementManager::set_device_name(self, name);
+    }
+
+    fn device_name(&self) -> Option<String> {
+        PortEntitlementManager::device_name(self)
     }
 }
 
@@ -117,16 +125,24 @@ struct Wallet {
 struct Inner {
     source: Arc<dyn EntitlementSource>,
     clock: Clock,
+    /// The install's device the batch issues as, which keeps the name the
+    /// registry answers with.
+    device: Option<Arc<crate::device::Device>>,
     slots: Mutex<BTreeSet<usize>>,
     issuance: tokio::sync::watch::Sender<Issuance>,
     refresh: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Inner {
-    fn new(source: Arc<dyn EntitlementSource>, clock: Clock) -> Arc<Self> {
+    fn new(
+        source: Arc<dyn EntitlementSource>,
+        clock: Clock,
+        device: Option<Arc<crate::device::Device>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             source,
             clock,
+            device,
             slots: Mutex::new(BTreeSet::new()),
             issuance: tokio::sync::watch::channel(Issuance::Pending).0,
             refresh: Mutex::new(None),
@@ -161,6 +177,9 @@ impl Inner {
                 inner
                     .issuance
                     .send_modify(|state| *state = next_issuance(*state, &answer));
+                if let (Some(device), Some(name)) = (&inner.device, inner.source.device_name()) {
+                    device.adopt(&name);
+                }
                 drop(inner);
                 tokio::time::sleep(REFRESH_PERIOD).await;
                 // Every refresh is a request signed by the wallet: once no
@@ -210,13 +229,15 @@ impl PortEntitlements {
     /// process exits; its refresh stops once no rule holds a slot. A batch
     /// opened again after a restart is served again by the issuer, since the
     /// wallet derives it. With a `device`, the batch issues as that device,
-    /// under the name it has when the batch opens.
+    /// under the name it has when the batch opens; a client of the wallet
+    /// with another device opens its own.
     pub(crate) fn for_wallet<T: HttpTransport + 'static>(
         registry_key: String,
         api: &Arc<warren_api::WarrenApiClient<T>>,
         key: BlindingKey,
         device: Option<Arc<crate::device::Device>>,
     ) -> Self {
+        let registry_key = crate::device::registry_key(registry_key, device.as_deref());
         let api = Arc::clone(api);
         Self {
             wallet: Arc::new(Wallet {
@@ -231,7 +252,7 @@ impl PortEntitlements {
                         if let Some(device) = &device {
                             manager = manager.with_device(device.registration());
                         }
-                        Inner::new(Arc::new(manager), Arc::new(now_unix_secs))
+                        Inner::new(Arc::new(manager), Arc::new(now_unix_secs), device.clone())
                     }))
                 }),
                 batch: OnceLock::new(),
@@ -242,7 +263,7 @@ impl PortEntitlements {
     /// A batch outside the registry, for tests that must not share one.
     #[cfg(test)]
     fn unregistered(source: Arc<dyn EntitlementSource>, clock: Clock) -> Self {
-        let batch = Inner::new(source, clock);
+        let batch = Inner::new(source, clock, None);
         Self {
             wallet: Arc::new(Wallet {
                 open: Box::new(move || Arc::clone(&batch)),
@@ -1041,7 +1062,7 @@ mod tests {
         let (entitlements, device) =
             as_device("renamed-before-open", &api, &dir.path().join("device"));
 
-        device.rename("calm heron").unwrap();
+        device.adopt("calm heron");
         let _ = RuleSlot::default().provider(Some(&entitlements)).await;
 
         assert_eq!(api.transport().registered_names(), ["calm heron"]);
@@ -1082,6 +1103,36 @@ mod tests {
         let _ = RuleSlot::default().provider(Some(&entitlements)).await;
 
         assert!(entitlements.device_revoked());
+    }
+
+    #[tokio::test]
+    async fn a_new_device_of_the_wallet_opens_its_own_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api_for(FakeEntitlementIssuer::new(&[EPOCH], 5));
+        let (revoked, device) = as_device("one-wallet", &api, &dir.path().join("first"));
+        api.transport().revoke_device(device.id());
+        let _held = RuleSlot::default().provider(Some(&revoked)).await;
+        assert!(revoked.device_revoked());
+
+        let (again, _) = as_device("one-wallet", &api, &dir.path().join("second"));
+        let _ = RuleSlot::default().provider(Some(&again)).await;
+
+        assert!(!again.device_revoked());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_name_the_registry_answers_is_kept_for_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        let api = api_for(FakeEntitlementIssuer::new(&[EPOCH], 5));
+        let (entitlements, device) = as_device("renamed-elsewhere", &api, &path);
+        let rule = RuleSlot::default();
+        let _held = rule.provider(Some(&entitlements)).await;
+
+        api.rename_device(device.id(), "calm heron").await.unwrap();
+        tokio::time::sleep(REFRESH_PERIOD + Duration::from_secs(1)).await;
+
+        assert_eq!(crate::store::kept_device_identity(&path).name, "calm heron");
     }
 
     #[test]
