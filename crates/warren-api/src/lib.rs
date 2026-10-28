@@ -27,12 +27,14 @@ pub use client::{ClientError, WarrenApiClient};
 pub use clock::ServerClock;
 pub use dto::{
     AbuseCategory, AccountBan, AccountStandingResponse, AccountStrike, BanReasonCode,
-    CampaignVoucherResponse, CheckApplePaymentRequest, CheckResponse, IncidentExitDownRequest,
-    IncidentPubkeyMismatchRequest, IncidentReason, InitApplePaymentResponse, IssuanceRefusal,
-    MobilePaymentResponse, PubkeyHex, PubkeySs58, RegisterAccountRequest, RegisterAccountResponse,
-    SessionCloseRequest, SessionOpenRequest, SessionOpenResponse, SessionRejectReason,
-    SubscriptionResponse, TokenEpochRequest, TokenEpochResponse, TokenIssueRequest,
-    TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey,
+    CampaignVoucherResponse, CheckApplePaymentRequest, CheckResponse, DEVICE_ID_LEN, DeviceId,
+    DeviceListResponse, DevicePlatform, DeviceRegistration, DeviceRename, DeviceView,
+    IncidentExitDownRequest, IncidentPubkeyMismatchRequest, IncidentReason,
+    InitApplePaymentResponse, IssuanceRefusal, MobilePaymentResponse, PubkeyHex, PubkeySs58,
+    RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest, SessionOpenRequest,
+    SessionOpenResponse, SessionRejectReason, SubscriptionResponse, TokenEpochRequest,
+    TokenEpochResponse, TokenIssueRequest, TokenIssueResponse, TokenIssuerDirectory,
+    TokenIssuerKey,
 };
 pub use route_admission::{RouteAdmission, RouteAdmissionError};
 pub use token_blinding::{

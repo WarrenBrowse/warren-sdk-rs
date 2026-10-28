@@ -14,11 +14,12 @@ use warren_contract::dto::AuthRefusal;
 use crate::clock::ServerClock;
 use crate::dto::{
     AccountStandingResponse, BanReasonCode, CampaignVoucherResponse, CheckApplePaymentRequest,
-    CheckResponse, IncidentExitDownRequest, IncidentPubkeyMismatchRequest,
-    InitApplePaymentResponse, IssuanceRefusal, MobilePaymentResponse, RegisterAccountRequest,
-    RegisterAccountResponse, SessionCloseRequest, SessionOpenRequest, SessionOpenResponse,
-    SignedCryptoRefundRequest, SubscriptionResponse, TokenIssueRequest, TokenIssueResponse,
-    TokenIssuerDirectory, WithdrawalAck,
+    CheckResponse, DeviceId, DeviceListResponse, DeviceRegistration, DeviceRename, DeviceView,
+    IncidentExitDownRequest, IncidentPubkeyMismatchRequest, InitApplePaymentResponse,
+    IssuanceRefusal, MobilePaymentResponse, RegisterAccountRequest, RegisterAccountResponse,
+    SessionCloseRequest, SessionOpenRequest, SessionOpenResponse, SignedCryptoRefundRequest,
+    SubscriptionResponse, TokenIssueRequest, TokenIssueResponse, TokenIssuerDirectory,
+    WithdrawalAck,
 };
 use crate::transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 
@@ -94,6 +95,18 @@ pub enum ClientError {
         /// that does not lapse, or when the refusing endpoint does not say.
         lapses_at_unix_secs: Option<u64>,
     },
+    /// The device the request named was revoked from another device of the
+    /// account (HTTP 403 `{"error":"device_revoked"}`, warren-core doc 115):
+    /// on device registration and on credential issuance. The client stops,
+    /// disconnects and forgets its device identity; coming back takes the
+    /// recovery phrase.
+    #[error("this device was disconnected from another device of the account")]
+    DeviceRevoked,
+    /// The device the issuance request named is not registered (HTTP 403
+    /// `{"error":"device_unregistered"}`): register it
+    /// ([`WarrenApiClient::register_device`]), then ask again.
+    #[error("this device is not registered with the account")]
+    DeviceUnregistered,
 }
 
 /// Signed HTTP client for the Warren account API.
@@ -419,7 +432,81 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         let body = serialize(req)?;
         self.send_signed_json(Method::Post, class.issue_path(), body)
             .await
-            .map_err(ban_refusal)
+            .map_err(issuance_refusal)
+    }
+
+    /// Signed `POST /v1/devices` (warren-core doc 115): registers this
+    /// install with the account, or refreshes its name, version and last-seen
+    /// day when the account already knows it. Idempotent; call it at login
+    /// and at each start.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`]. A device revoked from another device of the
+    /// account is refused with [`ClientError::DeviceRevoked`].
+    pub async fn register_device(
+        &self,
+        registration: &DeviceRegistration,
+    ) -> Result<DeviceView, ClientError> {
+        let body = serialize(registration)?;
+        self.send_signed_json(Method::Post, DEVICES_PATH, body)
+            .await
+            .map_err(issuance_refusal)
+    }
+
+    /// Signed `GET /v1/devices`: the account's active devices, and the last
+    /// day an older client of the account (one that does not register) was
+    /// superseded. `this` names the calling device, so the server marks its
+    /// line `this_device`.
+    ///
+    /// The list names the account's devices and the days they were used: it
+    /// belongs in the account's own UI, never in a log.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`].
+    pub async fn list_devices(
+        &self,
+        this: Option<DeviceId>,
+    ) -> Result<DeviceListResponse, ClientError> {
+        let path = match this {
+            Some(id) => format!("{DEVICES_PATH}?device_id={}", String::from(id)),
+            None => DEVICES_PATH.to_owned(),
+        };
+        self.send_signed_json(Method::Get, &path, Vec::new())
+            .await
+            .map_err(issuance_refusal)
+    }
+
+    /// Signed `PATCH /v1/devices/{device_id}`: renames a device of the
+    /// account.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`].
+    pub async fn rename_device(&self, id: DeviceId, name: &str) -> Result<(), ClientError> {
+        let body = serialize(&DeviceRename {
+            name: name.to_owned(),
+        })?;
+        self.send_signed(Method::Patch, &device_path(id), body)
+            .await
+            .map(|_| ())
+            .map_err(issuance_refusal)
+    }
+
+    /// Signed `DELETE /v1/devices/{device_id}`: revokes a device of the
+    /// account. A device may revoke itself, which is a logout. The revoked
+    /// device learns it at its next registration or issuance
+    /// ([`ClientError::DeviceRevoked`]).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::register`].
+    pub async fn revoke_device(&self, id: DeviceId) -> Result<(), ClientError> {
+        self.send_signed(Method::Delete, &device_path(id), Vec::new())
+            .await
+            .map(|_| ())
+            .map_err(issuance_refusal)
     }
 
     /// Signed `DELETE /v1/account`. Deletes the account's subscription.
@@ -782,6 +869,26 @@ fn ban_refusal(err: ClientError) -> ClientError {
     }
 }
 
+/// [`ban_refusal`], and the device registry's refusals (warren-core doc
+/// 115), typed: the 403 an issuance or a device route answers a revoked or
+/// an unregistered device.
+fn issuance_refusal(err: ClientError) -> ClientError {
+    let ClientError::ServerStatus { status: 403, body } = &err else {
+        return err;
+    };
+    match serde_json::from_str::<IssuanceRefusal>(body) {
+        Ok(IssuanceRefusal::DeviceRevoked) => ClientError::DeviceRevoked,
+        Ok(IssuanceRefusal::DeviceUnregistered) => ClientError::DeviceUnregistered,
+        _ => ban_refusal(err),
+    }
+}
+
+const DEVICES_PATH: &str = "/v1/devices";
+
+fn device_path(id: DeviceId) -> String {
+    format!("{DEVICES_PATH}/{}", String::from(id))
+}
+
 /// Whether a `401` refuses the request's timestamp rather than its key: the
 /// body says so (the contract's clock refusal), or the answer's own `Date`
 /// puts the stamp that was sent outside the window. The second reading covers
@@ -893,6 +1000,7 @@ fn unix_secs_from(t: std::time::SystemTime) -> Result<u64, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dto::DevicePlatform;
     use std::sync::Mutex;
     use warren_contract::dto::{PubkeyHex, PubkeySs58};
 
@@ -2142,5 +2250,180 @@ mod tests {
             replace_host("https://api.x.com", "alt.x.com"),
             "https://alt.x.com"
         );
+    }
+
+    // ---- Device registry (warren-core doc 115) ----
+
+    const A_DEVICE: [u8; 16] = [0x5A; 16];
+
+    fn a_device_id() -> DeviceId {
+        DeviceId::from_bytes(A_DEVICE)
+    }
+
+    fn a_device_view_json(this_device: bool) -> String {
+        format!(
+            r#"{{"device_id":"{}","name":"brave otter","platform":"macos","app_version":"1.2.0","registered_on":"2026-10-28","last_seen_on":"2026-10-28","this_device":{this_device}}}"#,
+            String::from(a_device_id())
+        )
+    }
+
+    fn assert_signed(req: &HttpRequest) {
+        assert_eq!(
+            header(req, HEADER_PUBKEY),
+            Some(WarrenIdentity::from_seed(&[0x11; 32]).address().as_str()),
+            "a device belongs to the wallet: the request must be wallet-signed"
+        );
+        assert!(header(req, HEADER_SIGNATURE).is_some());
+    }
+
+    #[tokio::test]
+    async fn register_device_is_a_signed_post_of_the_registration_and_parses_the_view() {
+        let c = client(MockTransport::new(200, &a_device_view_json(true)));
+        let registration = DeviceRegistration {
+            device_id: a_device_id(),
+            name: "brave otter".to_owned(),
+            platform: DevicePlatform::Macos,
+            app_version: "1.2.0".to_owned(),
+        };
+
+        let view = c.register_device(&registration).await.expect("ok");
+
+        assert_eq!(view.device_id, a_device_id());
+        assert!(view.this_device);
+        let guard = c.transport.last.lock().unwrap();
+        let req = guard.as_ref().expect("request captured");
+        assert_eq!(req.method, Method::Post);
+        assert_eq!(req.url, "https://api.example.test/v1/devices");
+        assert_signed(req);
+        let sent: DeviceRegistration = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(sent, registration);
+    }
+
+    #[tokio::test]
+    async fn list_devices_names_the_calling_device_in_the_signed_query() {
+        let body = format!(
+            r#"{{"devices":[{}],"older_client_seen_on":"2026-10-27"}}"#,
+            a_device_view_json(true)
+        );
+        let c = client(MockTransport::new(200, &body));
+
+        let list = c.list_devices(Some(a_device_id())).await.expect("ok");
+
+        assert_eq!(list.devices.len(), 1);
+        assert_eq!(list.older_client_seen_on.as_deref(), Some("2026-10-27"));
+        let guard = c.transport.last.lock().unwrap();
+        let req = guard.as_ref().expect("request captured");
+        assert_eq!(req.method, Method::Get);
+        assert_eq!(
+            req.url,
+            format!(
+                "https://api.example.test/v1/devices?device_id={}",
+                String::from(a_device_id())
+            )
+        );
+        assert_signed(req);
+    }
+
+    #[tokio::test]
+    async fn list_devices_without_a_device_sends_no_query() {
+        let c = client(MockTransport::new(200, r#"{"devices":[]}"#));
+
+        let list = c.list_devices(None).await.expect("ok");
+
+        assert!(list.devices.is_empty());
+        assert_eq!(list.older_client_seen_on, None);
+        let guard = c.transport.last.lock().unwrap();
+        let req = guard.as_ref().expect("request captured");
+        assert_eq!(req.url, "https://api.example.test/v1/devices");
+    }
+
+    #[tokio::test]
+    async fn rename_device_is_a_signed_patch_of_the_name_on_the_device_path() {
+        let c = client(MockTransport::new(204, ""));
+
+        c.rename_device(a_device_id(), "calm heron")
+            .await
+            .expect("ok");
+
+        let guard = c.transport.last.lock().unwrap();
+        let req = guard.as_ref().expect("request captured");
+        assert_eq!(req.method, Method::Patch);
+        assert_eq!(
+            req.url,
+            format!(
+                "https://api.example.test/v1/devices/{}",
+                String::from(a_device_id())
+            )
+        );
+        assert_signed(req);
+        let sent: DeviceRename = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(sent.name, "calm heron");
+    }
+
+    #[tokio::test]
+    async fn revoke_device_is_a_signed_delete_on_the_device_path() {
+        let c = client(MockTransport::new(204, ""));
+
+        c.revoke_device(a_device_id()).await.expect("ok");
+
+        let guard = c.transport.last.lock().unwrap();
+        let req = guard.as_ref().expect("request captured");
+        assert_eq!(req.method, Method::Delete);
+        assert_eq!(
+            req.url,
+            format!(
+                "https://api.example.test/v1/devices/{}",
+                String::from(a_device_id())
+            )
+        );
+        assert_signed(req);
+        assert!(req.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn registering_a_revoked_device_is_the_typed_revocation() {
+        let c = client(MockTransport::new(403, r#"{"error":"device_revoked"}"#));
+        let registration = DeviceRegistration {
+            device_id: a_device_id(),
+            name: "brave otter".to_owned(),
+            platform: DevicePlatform::Linux,
+            app_version: "1.2.0".to_owned(),
+        };
+
+        let err = c
+            .register_device(&registration)
+            .await
+            .expect_err("a revoked device registers nothing");
+
+        assert!(matches!(err, ClientError::DeviceRevoked), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn issuance_for_an_unregistered_device_is_the_typed_refusal() {
+        let c = client(MockTransport::new(
+            403,
+            r#"{"error":"device_unregistered"}"#,
+        ));
+        let req = TokenIssueRequest {
+            epochs: Vec::new(),
+            device_id: Some(a_device_id()),
+        };
+
+        let err = c.issue_tokens(&req).await.expect_err("refused");
+
+        assert!(matches!(err, ClientError::DeviceUnregistered), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn issuance_for_a_revoked_device_is_the_typed_revocation() {
+        let c = client(MockTransport::new(403, r#"{"error":"device_revoked"}"#));
+        let req = TokenIssueRequest {
+            epochs: Vec::new(),
+            device_id: Some(a_device_id()),
+        };
+
+        let err = c.issue_tokens(&req).await.expect_err("refused");
+
+        assert!(matches!(err, ClientError::DeviceRevoked), "{err:?}");
     }
 }

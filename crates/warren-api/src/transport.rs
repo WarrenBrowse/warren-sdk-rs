@@ -11,6 +11,8 @@ pub enum Method {
     Post,
     /// `DELETE`.
     Delete,
+    /// `PATCH`.
+    Patch,
 }
 
 impl Method {
@@ -21,6 +23,7 @@ impl Method {
             Method::Get => "GET",
             Method::Post => "POST",
             Method::Delete => "DELETE",
+            Method::Patch => "PATCH",
         }
     }
 }
@@ -133,6 +136,7 @@ mod tests {
         assert_eq!(Method::Get.as_str(), "GET");
         assert_eq!(Method::Post.as_str(), "POST");
         assert_eq!(Method::Delete.as_str(), "DELETE");
+        assert_eq!(Method::Patch.as_str(), "PATCH");
     }
 
     #[test]

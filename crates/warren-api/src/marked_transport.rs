@@ -516,6 +516,7 @@ fn to_http_method(method: Method) -> http::Method {
         Method::Get => http::Method::GET,
         Method::Post => http::Method::POST,
         Method::Delete => http::Method::DELETE,
+        Method::Patch => http::Method::PATCH,
     }
 }
 
@@ -681,6 +682,7 @@ mod tests {
         assert_eq!(to_http_method(Method::Get), http::Method::GET);
         assert_eq!(to_http_method(Method::Post), http::Method::POST);
         assert_eq!(to_http_method(Method::Delete), http::Method::DELETE);
+        assert_eq!(to_http_method(Method::Patch), http::Method::PATCH);
     }
 
     // The socket mark is the security-critical unit. `SO_MARK` needs

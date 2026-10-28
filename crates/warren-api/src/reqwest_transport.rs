@@ -100,6 +100,7 @@ fn to_reqwest_method(method: Method) -> reqwest::Method {
         Method::Get => reqwest::Method::GET,
         Method::Post => reqwest::Method::POST,
         Method::Delete => reqwest::Method::DELETE,
+        Method::Patch => reqwest::Method::PATCH,
     }
 }
 
@@ -296,6 +297,7 @@ mod tests {
         assert_eq!(to_reqwest_method(Method::Get), reqwest::Method::GET);
         assert_eq!(to_reqwest_method(Method::Post), reqwest::Method::POST);
         assert_eq!(to_reqwest_method(Method::Delete), reqwest::Method::DELETE);
+        assert_eq!(to_reqwest_method(Method::Patch), reqwest::Method::PATCH);
     }
 
     #[tokio::test]
