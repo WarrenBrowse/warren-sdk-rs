@@ -114,6 +114,11 @@ pub enum FfiError {
     /// phrase.
     #[error("this device was disconnected from another device of the account")]
     DeviceRevoked,
+    /// The account already holds as many devices as it may, so this install
+    /// is not registered and is issued nothing until another device is
+    /// revoked: open the device list.
+    #[error("the account already has as many devices as it may")]
+    DeviceLimitReached,
     /// A device identifier argument is not 16 bytes of base64url without
     /// padding.
     #[error("invalid device id")]
@@ -537,8 +542,9 @@ pub struct FfiClientOptions {
 }
 
 /// One device of the account, as [`WarrenFfiClient::list_devices`] lists it.
-/// The name and identifier belong in the account's own UI, never in a log.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+/// The name and identifier belong in the account's own UI, never in a log:
+/// `Debug` renders neither.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiDevice {
     /// The install's identifier, base64url: what
     /// [`WarrenFfiClient::rename_device`] and
@@ -557,6 +563,16 @@ pub struct FfiDevice {
     pub last_seen_on: String,
     /// Whether it is this install.
     pub this_device: bool,
+}
+
+impl std::fmt::Debug for FfiDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FfiDevice")
+            .field("platform", &self.platform)
+            .field("app_version", &self.app_version)
+            .field("this_device", &self.this_device)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The account's devices ([`WarrenFfiClient::list_devices`]).
@@ -725,6 +741,11 @@ fn build_client_with_identity(
             .multihop_generation_store(Arc::new(mh_gen))
             .server_key_store(Arc::new(key_store))
             .token_rotation(warren_sdk::kept_token_rotation(&dir.join("token_rotation")));
+    }
+    if options.device_platform.is_none() && options.app_version.is_some() {
+        return Err(FfiError::Client {
+            message: "an app version registers a device only with a device platform".to_owned(),
+        });
     }
     if let Some(platform) = options.device_platform.as_deref() {
         let platform = parse_platform(platform)?;
@@ -926,6 +947,14 @@ impl WarrenFfiClient {
     #[must_use]
     pub fn device_revoked(&self) -> bool {
         self.inner.device_revoked()
+    }
+
+    /// Whether the last credential refresh found the account's device cap
+    /// reached: this install is not registered and is issued no session
+    /// token until another device is revoked. Open the device list.
+    #[must_use]
+    pub fn device_limit_reached(&self) -> bool {
+        self.inner.device_limit_reached()
     }
 
     /// The account's devices, this install's marked `this_device`.
@@ -1559,6 +1588,7 @@ fn map_client_error(e: ClientError) -> FfiError {
         },
         ClientError::ClockSkew { offset_secs } => FfiError::ClockSkew { offset_secs },
         ClientError::DeviceRevoked => FfiError::DeviceRevoked,
+        ClientError::DeviceLimitReached => FfiError::DeviceLimitReached,
         other => FfiError::Client {
             message: other.to_string(),
         },
@@ -1978,6 +2008,58 @@ mod tests {
             matches!(revoked, Err(FfiError::InvalidDeviceId)),
             "{revoked:?}"
         );
+    }
+
+    #[test]
+    fn the_device_cap_crosses_the_ffi_typed() {
+        let err = map_sdk_error(SdkError::Api(ClientError::DeviceLimitReached));
+
+        assert!(matches!(err, FfiError::DeviceLimitReached), "{err:?}");
+    }
+
+    #[test]
+    fn a_new_client_has_not_met_the_device_cap() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let client = device_client(dir.path(), "linux").expect("valid build");
+
+        assert!(!client.device_limit_reached());
+    }
+
+    #[test]
+    fn an_app_version_without_a_device_platform_is_refused() {
+        // The binding meant to register a device and named no platform.
+        let err = WarrenFfiClient::with_options(
+            generate_identity().mnemonic,
+            "https://api.example.test".to_owned(),
+            "ab".repeat(32),
+            FfiClientOptions {
+                app_version: Some("1.2.0".to_owned()),
+                ..FfiClientOptions::default()
+            },
+        )
+        .map(|_| ())
+        .unwrap_err();
+
+        assert!(matches!(err, FfiError::Client { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_listed_device_renders_neither_its_name_nor_its_whole_identifier() {
+        let device = FfiDevice {
+            device_id: String::from(warren_sdk::api::DeviceId::from_bytes([7; 16])),
+            name: "calm heron".to_owned(),
+            platform: "linux".to_owned(),
+            app_version: "1.2.0".to_owned(),
+            registered_on: "2026-10-01".to_owned(),
+            last_seen_on: "2026-10-28".to_owned(),
+            this_device: false,
+        };
+
+        let rendered = format!("{device:?}");
+
+        assert!(!rendered.contains("heron"), "{rendered}");
+        assert!(!rendered.contains(&device.device_id), "{rendered}");
     }
 
     #[test]

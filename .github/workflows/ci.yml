@@ -271,6 +271,7 @@ jobs:
           grep -q "async def rename_device" target/bindings/warren_sdk_ffi.py
           grep -q "async def revoke_device" target/bindings/warren_sdk_ffi.py
           grep -q "def device_revoked" target/bindings/warren_sdk_ffi.py
+          grep -q "def device_limit_reached" target/bindings/warren_sdk_ffi.py
           grep -q "def forget_device" target/bindings/warren_sdk_ffi.py
           grep -q "class FfiDeviceList" target/bindings/warren_sdk_ffi.py
 
