@@ -30,36 +30,49 @@ the pre-release `0.0.x` line.
   its account, the account lists its devices, renames them, and revokes one
   from another. `WarrenApiClient::register_device`, `list_devices(this)`,
   `rename_device(id, name)` and `revoke_device(id)` call `POST`, `GET`,
-  `PATCH` and `DELETE` on `/v1/devices`; a `403 {"error":"device_revoked"}`
+  `PATCH` and `DELETE` on `/v1/devices`. A `403 {"error":"device_revoked"}`
   or `{"error":"device_unregistered"}` answer to a registration, a device
   route or an issuance is `ClientError::DeviceRevoked` or
-  `ClientError::DeviceUnregistered`. `TokenManager::with_device` and
-  `PortEntitlementManager::with_device` name the device on every issue
-  request (`TokenIssueRequest::device_id`) and register it at the start of
-  every refresh, which is how a revocation reaches a device whose epochs are
-  all stocked within one refresh period. An issuer that still answers
-  `device_unregistered` gets one more registration and one more request; a
-  `device_revoked` answer drops the stock and ends the manager for good:
-  `device_revoked()` reads `true` and every later `refresh` returns the
-  revocation without a request. A backend without the registry answers the
-  registration `404` and keeps issuing. `set_device_name` carries a rename
-  into the next registration. The identity is `warren_api::DeviceIdentity`,
-  16 bytes from the OS CSPRNG and a two-word name (adjective and animal,
-  `device::DEVICE_NAME_ADJECTIVES` and `DEVICE_NAME_ANIMALS`, 40 words each),
-  drawn in the SDK so every client names devices alike; its `Debug` renders
-  no name and a two-byte prefix of the identifier.
-  `warren_sdk::kept_device_identity(path)`, `keep_device_name` and
-  `forget_device_identity` keep it next to the token rotation;
-  `WarrenClientBuilder::device(path, platform, app_version)` registers the
-  client with it, and `WarrenClient::device_id`, `device_revoked`,
-  `list_devices`, `rename_device` (which keeps a rename of this install for
-  its later registrations, or fails with `SdkError::DeviceStore`),
-  `revoke_device` and `forget_device` expose it. The FFI takes
+  `ClientError::DeviceUnregistered`, and a `409` to a registration past the
+  account's device cap is `ClientError::DeviceLimitReached`.
+  `TokenManager::with_device` and `PortEntitlementManager::with_device` name
+  the device on every issue request (`TokenIssueRequest::device_id`) and
+  register it at the start of every refresh, which is how a revocation
+  reaches a device whose epochs are all stocked within one refresh period.
+  An issuer that still answers `device_unregistered` gets one more
+  registration and one more request. A `device_revoked` answer drops the
+  stock, a batch in flight included, and ends the manager for good:
+  `device_revoked()` reads `true`, every later `refresh` returns the
+  revocation without a request, and no bundle is restored. The device cap
+  ends the pass before any issue request, until another device is revoked.
+  A backend without the registry answers the registration `404` and keeps
+  issuing. The registry keeps a known device's name, so `device_name()`
+  takes the name each registration answer carries (a rename made from
+  another device), and `set_device_name` gives a rename to the registration
+  that recreates a row the registry deleted. The identity is
+  `warren_api::DeviceIdentity`, 16 bytes from the OS CSPRNG and a two-word
+  name (adjective and animal, `device::DEVICE_NAME_ADJECTIVES` and
+  `DEVICE_NAME_ANIMALS`, 40 words each), drawn in the SDK so every client
+  names devices alike; its `Debug` renders no name and a two-byte prefix of
+  the identifier. `warren_sdk::kept_device_identity(path)`,
+  `keep_device_name` and `forget_device_identity` keep it next to the token
+  rotation; `WarrenClientBuilder::device(path, platform, app_version)`
+  registers the client with it, and `WarrenClient::device_id`,
+  `device_revoked`, `device_limit_reached`, `list_devices`, `rename_device`,
+  `revoke_device` and `forget_device` expose it. The name the registry
+  answers is kept in the identity file. A wallet's credential batches are
+  shared per device, so a client logged in again after a revocation is not
+  held back by the revoked one still alive in the process. A dial that finds
+  no token on a revoked device, or on one past the cap, fails with that
+  cause rather than `NoSessionToken`. The FFI takes
   `FfiClientOptions::device_platform` and `app_version` (with `state_dir`,
   where the identity is kept as `device`), and exports the same calls,
-  `FfiDeviceList`, `FfiDevice`, `FfiError::DeviceRevoked` and
-  `FfiError::InvalidDeviceId`. warren-bolthole registers its gateway as a
-  `linux` device kept in its state directory.
+  `FfiDeviceList`, `FfiDevice` (whose `Debug` renders neither name nor
+  identifier), `FfiError::DeviceRevoked`, `DeviceLimitReached` and
+  `InvalidDeviceId`. warren-bolthole registers its gateway as a `linux`
+  device kept in its state directory; once revoked it logs
+  `warren_headless::REVOKED_LINE`, forgets the identity and exits 2
+  (`Stop::DeviceRevoked`, `wait_for_revocation`).
 
 - Signed requests are stamped with the server's clock when the device's is
   off (forum topic 219: a Windows clock 91 s fast was refused `401` on every
