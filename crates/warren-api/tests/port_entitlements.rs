@@ -82,6 +82,8 @@ struct FakeIssuer {
     banned_body: Option<&'static str>,
     /// When set, `POST /v1/devices` answers `device_revoked`.
     device_revoked: bool,
+    /// The name each `POST /v1/devices` carried.
+    registered_names: Mutex<Vec<String>>,
     /// The `device_id` each issue request carried.
     issued_device_ids: Mutex<Vec<Option<DeviceId>>>,
     issue_calls: AtomicUsize,
@@ -106,6 +108,7 @@ impl FakeIssuer {
             fault,
             banned_body: None,
             device_revoked: false,
+            registered_names: Mutex::new(Vec::new()),
             issued_device_ids: Mutex::new(Vec::new()),
             issue_calls: AtomicUsize::new(0),
             last_paths: Mutex::new(Vec::new()),
@@ -193,6 +196,11 @@ impl HttpTransport for FakeIssuer {
             ));
         }
         if request.url.ends_with("/v1/devices") {
+            let registration: DeviceRegistration = serde_json::from_slice(&request.body).unwrap();
+            self.registered_names
+                .lock()
+                .unwrap()
+                .push(registration.name);
             return Ok(if self.device_revoked {
                 HttpResponse::new(403, br#"{"error":"device_revoked"}"#.to_vec())
             } else {
@@ -793,4 +801,18 @@ async fn a_revoked_device_is_told_and_presents_no_entitlement() {
     );
     assert!(m.device_revoked());
     assert_eq!(m.credential_for_slot(0, 100 * EPOCH_SECS), None);
+}
+
+#[tokio::test]
+async fn a_renamed_device_registers_under_its_new_name() {
+    let api = Arc::new(client(FakeIssuer::new(&[100])));
+    let m = manager_over(&api).with_device(this_device());
+
+    m.set_device_name("calm heron");
+    m.refresh_auto(100 * EPOCH_SECS).await.unwrap();
+
+    assert_eq!(
+        *api.transport().registered_names.lock().unwrap(),
+        vec!["calm heron".to_owned()]
+    );
 }

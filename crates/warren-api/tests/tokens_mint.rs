@@ -1369,3 +1369,24 @@ async fn a_revoked_device_stops_refreshing_and_holds_nothing_for_good() {
         "a revoked device asks the API nothing more"
     );
 }
+
+#[tokio::test]
+async fn a_renamed_device_registers_under_its_new_name_at_the_next_refresh() {
+    let api = std::sync::Arc::new(client(FakeIssuer::new(&[100])));
+    let manager = TokenManager::new(api.clone(), session_key()).with_device(this_device());
+    manager.refresh(100 * EPOCH_SECS).await.expect("refresh");
+
+    manager.set_device_name("calm heron");
+    manager.refresh(100 * EPOCH_SECS).await.expect("refresh");
+
+    assert_eq!(
+        api.transport()
+            .devices
+            .lock()
+            .unwrap()
+            .get(&this_device().device_id)
+            .map(|d| d.name.as_str()),
+        Some("calm heron"),
+        "a refresh that sent the old name would undo the rename"
+    );
+}

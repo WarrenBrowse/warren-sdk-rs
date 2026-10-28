@@ -653,7 +653,7 @@ pub struct TokenManager<T> {
     server_pubkey_pins: Vec<String>,
     /// The registered device this manager asks as ([`Self::with_device`]),
     /// kept whole so an issuer that does not know it yet can be told.
-    device: Option<DeviceRegistration>,
+    device: Option<Mutex<DeviceRegistration>>,
 }
 
 /// The serials held by the live sessions of one [`TokenManager`].
@@ -739,8 +739,25 @@ impl<T: HttpTransport> TokenManager<T> {
     /// dropped, and [`Self::device_revoked`] reads `true`.
     #[must_use]
     pub fn with_device(mut self, device: DeviceRegistration) -> Self {
-        self.device = Some(device);
+        self.device = Some(Mutex::new(device));
         self
+    }
+
+    /// Registers the device under `name` from the next [`Self::refresh`] on,
+    /// once the account renamed it (`WarrenApiClient::rename_device`): a
+    /// refresh that sent the old name would undo the rename. Does nothing for
+    /// a manager given no device.
+    pub fn set_device_name(&self, name: &str) {
+        if let Some(device) = &self.device {
+            name.clone_into(&mut device.lock().unwrap_or_else(PoisonError::into_inner).name);
+        }
+    }
+
+    /// The registration this manager sends, as it stands.
+    fn device(&self) -> Option<DeviceRegistration> {
+        self.device
+            .as_ref()
+            .map(|d| d.lock().unwrap_or_else(PoisonError::into_inner).clone())
     }
 
     /// Whether the device this manager asks as was revoked from another
@@ -764,16 +781,17 @@ impl<T: HttpTransport> TokenManager<T> {
         epoch: u64,
         registered: &mut bool,
     ) -> Result<Vec<MintedEpoch>, TokenClientError> {
-        let device_id = self.device.as_ref().map(|d| d.device_id);
+        let device = self.device();
+        let device_id = device.as_ref().map(|d| d.device_id);
         let minted =
             mint_as_device(&self.client, directory, &[epoch], &self.blinding, device_id).await;
-        let Some(device) = &self.device else {
+        let Some(device) = device else {
             return minted;
         };
         match minted {
             Err(TokenClientError::Api(ClientError::DeviceUnregistered)) if !*registered => {
                 *registered = true;
-                self.client.register_device(device).await?;
+                self.client.register_device(&device).await?;
                 mint_as_device(&self.client, directory, &[epoch], &self.blinding, device_id).await
             }
             other => other,
@@ -787,10 +805,10 @@ impl<T: HttpTransport> TokenManager<T> {
     /// the revocation is left to the issue requests: a backend without the
     /// registry answers 404 here and still issues.
     async fn register_device(&self) -> Result<(), TokenClientError> {
-        let Some(device) = &self.device else {
+        let Some(device) = self.device() else {
             return Ok(());
         };
-        match self.client.register_device(device).await {
+        match self.client.register_device(&device).await {
             Err(ClientError::DeviceRevoked) => {
                 self.revoke();
                 Err(ClientError::DeviceRevoked.into())
@@ -1739,6 +1757,11 @@ impl<T: HttpTransport> PortEntitlementManager<T> {
     pub fn with_device(mut self, device: DeviceRegistration) -> Self {
         self.inner = self.inner.with_device(device);
         self
+    }
+
+    /// [`TokenManager::set_device_name`].
+    pub fn set_device_name(&self, name: &str) {
+        self.inner.set_device_name(name);
     }
 
     /// Whether the device was revoked from another device of the account

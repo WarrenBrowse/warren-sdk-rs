@@ -11,6 +11,7 @@
 
 pub mod client;
 pub mod clock;
+pub mod device;
 pub mod dto;
 pub mod route_admission;
 pub mod token_blinding;
@@ -25,6 +26,7 @@ pub mod marked_transport;
 
 pub use client::{ClientError, WarrenApiClient};
 pub use clock::ServerClock;
+pub use device::DeviceIdentity;
 pub use dto::{
     AbuseCategory, AccountBan, AccountStandingResponse, AccountStrike, BanReasonCode,
     CampaignVoucherResponse, CheckApplePaymentRequest, CheckResponse, DEVICE_ID_LEN, DeviceId,
