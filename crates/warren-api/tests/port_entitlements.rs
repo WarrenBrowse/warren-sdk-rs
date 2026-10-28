@@ -21,8 +21,8 @@ use rand010::rngs::StdRng;
 use warren_api::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_api::{
     AttributionTag, BanReasonCode, BlindingKey, ClientError, CredentialClass, DeviceId,
-    DevicePlatform, DeviceRegistration, EntitlementEnvelope, PortEntitlementManager, PubkeyHex,
-    TokenClientError, TokenEpochResponse, TokenIssueRequest, TokenIssueResponse,
+    DevicePlatform, DeviceRegistration, DeviceView, EntitlementEnvelope, PortEntitlementManager,
+    PubkeyHex, TokenClientError, TokenEpochResponse, TokenIssueRequest, TokenIssueResponse,
     TokenIssuerDirectory, TokenIssuerKey, WarrenApiClient, mint_tokens,
 };
 use warren_contract::pf_attribution::{
@@ -82,6 +82,9 @@ struct FakeIssuer {
     banned_body: Option<&'static str>,
     /// When set, `POST /v1/devices` answers `device_revoked`.
     device_revoked: bool,
+    /// When set, `POST /v1/devices` answers the device under this name, as
+    /// the registry does once another device of the account renamed it.
+    registry_name: Option<&'static str>,
     /// The name each `POST /v1/devices` carried.
     registered_names: Mutex<Vec<String>>,
     /// The `device_id` each issue request carried.
@@ -108,6 +111,7 @@ impl FakeIssuer {
             fault,
             banned_body: None,
             device_revoked: false,
+            registry_name: None,
             registered_names: Mutex::new(Vec::new()),
             issued_device_ids: Mutex::new(Vec::new()),
             issue_calls: AtomicUsize::new(0),
@@ -203,6 +207,17 @@ impl HttpTransport for FakeIssuer {
                 .push(registration.name);
             return Ok(if self.device_revoked {
                 HttpResponse::new(403, br#"{"error":"device_revoked"}"#.to_vec())
+            } else if let Some(name) = self.registry_name {
+                let view = DeviceView {
+                    device_id: registration.device_id,
+                    name: name.to_owned(),
+                    platform: registration.platform,
+                    app_version: registration.app_version,
+                    registered_on: "2026-10-28".to_owned(),
+                    last_seen_on: "2026-10-28".to_owned(),
+                    this_device: true,
+                };
+                HttpResponse::new(200, serde_json::to_vec(&view).unwrap())
             } else {
                 HttpResponse::new(404, Vec::new())
             });
@@ -815,4 +830,15 @@ async fn a_renamed_device_registers_under_its_new_name() {
         *api.transport().registered_names.lock().unwrap(),
         vec!["calm heron".to_owned()]
     );
+}
+
+#[tokio::test]
+async fn a_name_given_from_another_device_is_taken_from_the_registration_answer() {
+    let mut issuer = FakeIssuer::new(&[100]);
+    issuer.registry_name = Some("calm heron");
+    let m = manager_over(&Arc::new(client(issuer))).with_device(this_device());
+
+    m.refresh_auto(100 * EPOCH_SECS).await.unwrap();
+
+    assert_eq!(m.device_name().as_deref(), Some("calm heron"));
 }

@@ -83,6 +83,14 @@ struct FakeIssuer {
     keys_calls: AtomicUsize,
     /// Every issue request body, as JSON, in order.
     issue_bodies: Mutex<Vec<serde_json::Value>>,
+    /// The name each `POST /v1/devices` carried, in order.
+    registered_names: Mutex<Vec<String>>,
+    /// When set, a registration of a device the registry does not know
+    /// answers 409, as warren-api does past the active-device cap.
+    device_limit_reached: AtomicBool,
+    /// When set, every issue call waits for a permit before it answers, so a
+    /// test can hold a refresh in flight.
+    issue_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 }
 
 impl FakeIssuer {
@@ -113,6 +121,9 @@ impl FakeIssuer {
             registry_absent: false,
             keys_calls: AtomicUsize::new(0),
             issue_bodies: Mutex::new(Vec::new()),
+            registered_names: Mutex::new(Vec::new()),
+            device_limit_reached: AtomicBool::new(false),
+            issue_gate: None,
         }
     }
 
@@ -134,6 +145,10 @@ impl FakeIssuer {
         if self.fail_register_once.swap(false, Ordering::SeqCst) {
             return HttpResponse::new(503, Vec::new());
         }
+        self.registered_names
+            .lock()
+            .unwrap()
+            .push(registration.name.clone());
         if self
             .revoked_devices
             .lock()
@@ -142,19 +157,30 @@ impl FakeIssuer {
         {
             return HttpResponse::new(403, br#"{"error":"device_revoked"}"#.to_vec());
         }
+        let mut devices = self.devices.lock().unwrap();
+        if !devices.contains_key(&registration.device_id)
+            && self.device_limit_reached.load(Ordering::SeqCst)
+        {
+            return HttpResponse::new(409, Vec::new());
+        }
+        // warren-api keeps a known device's name: a rename goes through
+        // PATCH, from whichever device of the account.
+        let kept = devices
+            .entry(registration.device_id)
+            .and_modify(|known| {
+                known.platform = registration.platform;
+                known.app_version.clone_from(&registration.app_version);
+            })
+            .or_insert(registration);
         let view = DeviceView {
-            device_id: registration.device_id,
-            name: registration.name.clone(),
-            platform: registration.platform,
-            app_version: registration.app_version.clone(),
+            device_id: kept.device_id,
+            name: kept.name.clone(),
+            platform: kept.platform,
+            app_version: kept.app_version.clone(),
             registered_on: "2026-10-28".to_owned(),
             last_seen_on: "2026-10-28".to_owned(),
             this_device: true,
         };
-        self.devices
-            .lock()
-            .unwrap()
-            .insert(registration.device_id, registration);
         HttpResponse::new(200, serde_json::to_vec(&view).unwrap())
     }
 
@@ -228,6 +254,9 @@ impl HttpTransport for FakeIssuer {
             // A connected-but-unavailable answer: a transient transport-class
             // failure the client must retry, not a definitive ledger refusal.
             return Ok(HttpResponse::new(503, Vec::new()));
+        }
+        if let Some(gate) = &self.issue_gate {
+            gate.acquire().await.unwrap().forget();
         }
         let req: TokenIssueRequest = serde_json::from_slice(&request.body).unwrap();
         if let Some(body) = self.device_refusal(req.device_id) {
@@ -1372,6 +1401,8 @@ async fn a_revoked_device_stops_refreshing_and_holds_nothing_for_good() {
 
 #[tokio::test]
 async fn a_renamed_device_registers_under_its_new_name_at_the_next_refresh() {
+    // The registry keeps a known device's name, but one that deleted the
+    // row (unseen for 90 days) takes the name the registration carries.
     let api = std::sync::Arc::new(client(FakeIssuer::new(&[100])));
     let manager = TokenManager::new(api.clone(), session_key()).with_device(this_device());
     manager.refresh(100 * EPOCH_SECS).await.expect("refresh");
@@ -1381,12 +1412,109 @@ async fn a_renamed_device_registers_under_its_new_name_at_the_next_refresh() {
 
     assert_eq!(
         api.transport()
-            .devices
+            .registered_names
             .lock()
             .unwrap()
-            .get(&this_device().device_id)
-            .map(|d| d.name.as_str()),
-        Some("calm heron"),
-        "a refresh that sent the old name would undo the rename"
+            .last()
+            .map(String::as_str),
+        Some("calm heron")
     );
+}
+
+#[tokio::test]
+async fn a_name_given_from_another_device_is_taken_from_the_registration_answer() {
+    let fake = FakeIssuer::new(&[100]);
+    fake.devices.lock().unwrap().insert(
+        this_device().device_id,
+        DeviceRegistration {
+            name: "calm heron".to_owned(),
+            ..this_device()
+        },
+    );
+    let api = std::sync::Arc::new(client(fake));
+    let manager = TokenManager::new(api.clone(), session_key()).with_device(this_device());
+    assert_eq!(manager.device_name().as_deref(), Some("brave otter"));
+
+    manager.refresh(100 * EPOCH_SECS).await.expect("refresh");
+
+    assert_eq!(manager.device_name().as_deref(), Some("calm heron"));
+}
+
+#[tokio::test]
+async fn a_device_past_the_account_limit_stops_the_pass_until_a_place_frees() {
+    let mut fake = FakeIssuer::new(&[100]);
+    fake.enforce_devices = true;
+    fake.device_limit_reached.store(true, Ordering::SeqCst);
+    let api = std::sync::Arc::new(client(fake));
+    let manager = TokenManager::new(api.clone(), session_key()).with_device(this_device());
+
+    let err = manager
+        .refresh(100 * EPOCH_SECS)
+        .await
+        .expect_err("the limit reaches the caller");
+
+    assert!(
+        matches!(err, TokenClientError::Api(ClientError::DeviceLimitReached)),
+        "{err:?}"
+    );
+    assert_eq!(
+        api.transport().issue_calls.load(Ordering::SeqCst),
+        0,
+        "an unregistered device asks for nothing it cannot be given"
+    );
+    api.transport()
+        .device_limit_reached
+        .store(false, Ordering::SeqCst);
+    manager
+        .refresh(100 * EPOCH_SECS)
+        .await
+        .expect("another device was revoked, a place is free");
+    assert_eq!(manager.available(100), QUOTA as usize);
+}
+
+#[tokio::test]
+async fn a_refresh_in_flight_when_the_device_is_revoked_stocks_nothing() {
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let mut fake = FakeIssuer::new(&[100]);
+    fake.issue_gate = Some(gate.clone());
+    let api = std::sync::Arc::new(client(fake));
+    let manager = std::sync::Arc::new(
+        TokenManager::new(api.clone(), session_key()).with_device(this_device()),
+    );
+    let in_flight = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.refresh(100 * EPOCH_SECS).await }
+    });
+    while api.transport().issue_bodies.lock().unwrap().is_empty() {
+        tokio::task::yield_now().await;
+    }
+    api.transport()
+        .revoked_devices
+        .lock()
+        .unwrap()
+        .insert(this_device().device_id);
+    let _ = manager.refresh(100 * EPOCH_SECS).await;
+    assert!(manager.device_revoked());
+
+    gate.add_permits(1);
+    let _ = in_flight.await.unwrap();
+
+    assert_eq!(manager.available(100), 0, "a revoked device holds nothing");
+}
+
+#[tokio::test]
+async fn a_revoked_manager_restores_no_bundle() {
+    let fake = FakeIssuer::new(&[100]);
+    fake.revoked_devices
+        .lock()
+        .unwrap()
+        .insert(this_device().device_id);
+    let manager = TokenManager::new(std::sync::Arc::new(client(fake)), session_key())
+        .with_device(this_device());
+    let _ = manager.refresh(100 * EPOCH_SECS).await;
+    let bundle = warren_api::PersistedTokens::from_json(&bundle_json(100, &[fake_token_bytes(4)]))
+        .expect("parse");
+
+    assert_eq!(manager.restore_persisted(&bundle), 0);
+    assert!(manager.take_current_stack(100 * EPOCH_SECS + 5).is_empty());
 }

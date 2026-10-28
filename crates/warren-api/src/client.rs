@@ -107,6 +107,12 @@ pub enum ClientError {
     /// ([`WarrenApiClient::register_device`]), then ask again.
     #[error("this device is not registered with the account")]
     DeviceUnregistered,
+    /// The account already holds as many active devices as the registry
+    /// takes (HTTP 409 on [`WarrenApiClient::register_device`]): this install
+    /// is not registered, so it is issued nothing until another device of the
+    /// account is revoked. The app opens the device list.
+    #[error("the account already has as many devices as it may")]
+    DeviceLimitReached,
 }
 
 /// Signed HTTP client for the Warren account API.
@@ -443,7 +449,8 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     /// # Errors
     ///
     /// See [`Self::register`]. A device revoked from another device of the
-    /// account is refused with [`ClientError::DeviceRevoked`].
+    /// account is refused with [`ClientError::DeviceRevoked`], and a new one
+    /// past the account's device cap with [`ClientError::DeviceLimitReached`].
     pub async fn register_device(
         &self,
         registration: &DeviceRegistration,
@@ -451,7 +458,10 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         let body = serialize(registration)?;
         self.send_signed_json(Method::Post, DEVICES_PATH, body)
             .await
-            .map_err(issuance_refusal)
+            .map_err(|err| match err {
+                ClientError::ServerStatus { status: 409, .. } => ClientError::DeviceLimitReached,
+                other => issuance_refusal(other),
+            })
     }
 
     /// Signed `GET /v1/devices`: the account's active devices, and the last
@@ -2396,6 +2406,24 @@ mod tests {
             .expect_err("a revoked device registers nothing");
 
         assert!(matches!(err, ClientError::DeviceRevoked), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn registering_past_the_account_device_cap_is_the_typed_refusal() {
+        let c = client(MockTransport::new(409, ""));
+        let registration = DeviceRegistration {
+            device_id: a_device_id(),
+            name: "brave otter".to_owned(),
+            platform: DevicePlatform::Linux,
+            app_version: "1.2.0".to_owned(),
+        };
+
+        let err = c
+            .register_device(&registration)
+            .await
+            .expect_err("the account is full");
+
+        assert!(matches!(err, ClientError::DeviceLimitReached), "{err:?}");
     }
 
     #[tokio::test]

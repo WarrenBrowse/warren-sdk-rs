@@ -88,7 +88,7 @@ marked-transport = [
 ]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "net", "io-util"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "sync"] }
 # A local TLS server that issues session tickets, for the reqwest transport's
 # no-resumption test.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

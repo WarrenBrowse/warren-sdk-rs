@@ -32,7 +32,8 @@ use zeroize::Zeroizing;
 
 use crate::client::{ClientError, WarrenApiClient};
 use crate::dto::{
-    DeviceId, DeviceRegistration, TokenEpochRequest, TokenIssueRequest, TokenIssuerDirectory,
+    DeviceId, DeviceRegistration, DeviceView, TokenEpochRequest, TokenIssueRequest,
+    TokenIssuerDirectory,
 };
 use crate::route_admission::RouteAdmission;
 use crate::token_blinding::BlindingKey;
@@ -573,8 +574,8 @@ fn route_admission_of(
 /// clock outside its window, a key it does not accept); an issuer whose
 /// attribution tags cannot pass the exit's checks; a token crate that no
 /// longer blinds in the derived order, which would leave every tick with no
-/// batch at all. A revoked device, and a device the issuer still does not
-/// know once it registered.
+/// batch at all. A revoked device, a device the issuer still does not know
+/// once it registered, and one the registry has no room for.
 fn answers_every_epoch_alike(err: &TokenClientError) -> bool {
     matches!(
         err,
@@ -584,6 +585,7 @@ fn answers_every_epoch_alike(err: &TokenClientError) -> bool {
                 | ClientError::ServerStatus { status: 401, .. }
                 | ClientError::DeviceRevoked
                 | ClientError::DeviceUnregistered
+                | ClientError::DeviceLimitReached
         ) | TokenClientError::BadAttributionKey
             | TokenClientError::AttributionTagCount { .. }
             | TokenClientError::AttributionTagEpoch { .. }
@@ -744,13 +746,30 @@ impl<T: HttpTransport> TokenManager<T> {
     }
 
     /// Registers the device under `name` from the next [`Self::refresh`] on,
-    /// once the account renamed it (`WarrenApiClient::rename_device`): a
-    /// refresh that sent the old name would undo the rename. Does nothing for
-    /// a manager given no device.
+    /// once the account renamed it (`WarrenApiClient::rename_device`). The
+    /// registry keeps a known device's name whatever a registration carries,
+    /// but a registry that deleted the row (a device unseen for 90 days)
+    /// takes the name the next registration carries. Does nothing for a
+    /// manager given no device.
     pub fn set_device_name(&self, name: &str) {
         if let Some(device) = &self.device {
             name.clone_into(&mut device.lock().unwrap_or_else(PoisonError::into_inner).name);
         }
+    }
+
+    /// The device's name as this manager last knew it: the one it was given,
+    /// a rename ([`Self::set_device_name`]), or the one the registry answered
+    /// a registration with, which carries a rename made from another device
+    /// of the account. `None` for a manager given no device. Keep it out of
+    /// every log.
+    #[must_use]
+    pub fn device_name(&self) -> Option<String> {
+        self.device().map(|d| d.name)
+    }
+
+    /// Takes the name the registry answered a registration with.
+    fn adopt(&self, view: &DeviceView) {
+        self.set_device_name(&view.name);
     }
 
     /// The registration this manager sends, as it stands.
@@ -791,7 +810,7 @@ impl<T: HttpTransport> TokenManager<T> {
         match minted {
             Err(TokenClientError::Api(ClientError::DeviceUnregistered)) if !*registered => {
                 *registered = true;
-                self.client.register_device(&device).await?;
+                self.adopt(&self.client.register_device(&device).await?);
                 mint_as_device(&self.client, directory, &[epoch], &self.blinding, device_id).await
             }
             other => other,
@@ -801,19 +820,25 @@ impl<T: HttpTransport> TokenManager<T> {
     /// Registers this manager's device at the start of a refresh pass. That is
     /// how a revocation reaches a device whose epochs are all stocked, within
     /// one refresh period rather than at the next epoch it mints, and it
-    /// keeps the registry's version and last-seen day current. Any answer but
-    /// the revocation is left to the issue requests: a backend without the
+    /// keeps the registry's version and last-seen day current. A device the
+    /// registry has no room for stops the pass: it is issued nothing. Any
+    /// other failure is left to the issue requests: a backend without the
     /// registry answers 404 here and still issues.
     async fn register_device(&self) -> Result<(), TokenClientError> {
         let Some(device) = self.device() else {
             return Ok(());
         };
         match self.client.register_device(&device).await {
+            Ok(view) => {
+                self.adopt(&view);
+                Ok(())
+            }
             Err(ClientError::DeviceRevoked) => {
                 self.revoke();
                 Err(ClientError::DeviceRevoked.into())
             }
-            _ => Ok(()),
+            Err(ClientError::DeviceLimitReached) => Err(ClientError::DeviceLimitReached.into()),
+            Err(_) => Ok(()),
         }
     }
 
@@ -906,8 +931,10 @@ impl<T: HttpTransport> TokenManager<T> {
     /// a batch's tags fail the checks (`BadAttributionKey`,
     /// `AttributionTag*`). For a manager given a device, also when the device
     /// was revoked (`ClientError::DeviceRevoked`, sticky, see
-    /// [`Self::with_device`]) or is still unknown once registered
-    /// (`ClientError::DeviceUnregistered`). The pass stops there, leaving
+    /// [`Self::with_device`]), is still unknown once registered
+    /// (`ClientError::DeviceUnregistered`), or finds the account's device cap
+    /// reached (`ClientError::DeviceLimitReached`, not sticky: the next pass
+    /// registers again). The pass stops there, leaving
     /// that epoch and the later ones unsettled, so the next tick asks again.
     /// Any other per-epoch mint refusal or transport error is swallowed.
     pub async fn refresh(&self, now_unix_secs: u64) -> Result<(), TokenClientError> {
@@ -953,7 +980,10 @@ impl<T: HttpTransport> TokenManager<T> {
                     // Two overlapping refreshes are both served the batch the
                     // wallet derives: stocking it twice would hold every
                     // serial twice.
-                    if st.minted.insert(epoch)
+                    // A revocation answered while this batch was in flight
+                    // wins: a revoked device holds nothing.
+                    if !st.device_revoked
+                        && st.minted.insert(epoch)
                         && let Some(batch) = batches.pop()
                     {
                         st.store.insert(batch);
@@ -1136,6 +1166,9 @@ impl<T: HttpTransport> TokenManager<T> {
             return 0;
         }
         let mut st = self.state.lock().expect("token manager mutex poisoned");
+        if st.device_revoked {
+            return 0;
+        }
         if st.epoch_secs.is_none() && bundle.epoch_secs > 0 {
             st.epoch_secs = Some(bundle.epoch_secs);
         }
@@ -1762,6 +1795,12 @@ impl<T: HttpTransport> PortEntitlementManager<T> {
     /// [`TokenManager::set_device_name`].
     pub fn set_device_name(&self, name: &str) {
         self.inner.set_device_name(name);
+    }
+
+    /// [`TokenManager::device_name`].
+    #[must_use]
+    pub fn device_name(&self) -> Option<String> {
+        self.inner.device_name()
     }
 
     /// Whether the device was revoked from another device of the account
