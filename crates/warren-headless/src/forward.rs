@@ -237,6 +237,23 @@ pub enum Stop {
     /// The supervisor stopped healing on a terminal verdict, with the cause it
     /// published (`None` if the state went terminal without one).
     Fatal(Option<FatalCause>),
+    /// The daemon's device was revoked from another device of its account
+    /// (warren-core doc 115): it forgets its device identity and stops.
+    DeviceRevoked,
+}
+
+/// What a revoked daemon says before it stops.
+pub const REVOKED_LINE: &str = "this device was disconnected from another device of its account: \
+     its device identity is forgotten, and connecting again takes the recovery phrase";
+
+/// Returns once `revoked` reads `true`, checking it every `every`. The
+/// credential refresh that learns a revocation runs on its own timer, so a
+/// check a fraction of its period adds little to how long a revoked daemon
+/// keeps running.
+pub async fn wait_for_revocation(revoked: impl Fn() -> bool, every: std::time::Duration) {
+    while !revoked() {
+        tokio::time::sleep(every).await;
+    }
 }
 
 /// Waits for a stop signal or a terminal supervisor failure.
@@ -281,6 +298,10 @@ pub async fn conclude<H: HookSink>(
         }
         Stop::Fatal(cause) => {
             log.error(&fatal_line(cause));
+            2
+        }
+        Stop::DeviceRevoked => {
+            log.error(REVOKED_LINE);
             2
         }
     };
@@ -731,6 +752,7 @@ mod tests {
         for (name, stop, want_code) in [
             ("signal", Stop::Signal, 0),
             ("fatal", Stop::Fatal(Some(FatalCause::NotAuthorized)), 2),
+            ("revoked", Stop::DeviceRevoked, 2),
         ] {
             let status = scratch(&format!("conclude-{name}"));
             hooks::write_status_file(&status, 49587)
@@ -807,6 +829,39 @@ mod tests {
             !line.contains("refused"),
             "no server refused anything, got: {line}"
         );
+    }
+
+    /// A revoked gateway must say so: no restart brings it back, and the
+    /// operator's fix is the recovery phrase, not the subscription.
+    #[test]
+    fn a_revocation_is_named_as_one() {
+        assert!(REVOKED_LINE.contains("disconnected from another device"));
+        assert!(REVOKED_LINE.contains("recovery phrase"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_revocation_ends_the_wait_at_the_next_check() {
+        let revoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting = tokio::spawn({
+            let revoked = revoked.clone();
+            async move {
+                wait_for_revocation(
+                    move || revoked.load(std::sync::atomic::Ordering::SeqCst),
+                    std::time::Duration::from_secs(60),
+                )
+                .await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a device in good standing keeps running"
+        );
+
+        revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+
+        assert!(waiting.is_finished());
     }
 
     /// The supervisor reaching `Failed` is the only thing that ends the daemon

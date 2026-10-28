@@ -77,9 +77,13 @@ const FIRST_PROOF_RETRY: Duration = Duration::from_millis(500);
 const REPROOF_RETRY_MIN: Duration = FIRST_PROOF_RETRY;
 const REPROOF_RETRY_MAX: Duration = Duration::from_secs(5);
 
+/// How often the daemon reads whether its device was revoked. The credential
+/// refresh that learns it runs every ten minutes.
+const REVOCATION_CHECK: Duration = Duration::from_secs(60);
+
 /// Runs the gateway until a signal or a terminal failure; returns the process
 /// exit code (0 clean shutdown, 1 startup failure, 2 a terminal control-plane
-/// refusal).
+/// refusal, a revoked device included).
 ///
 /// # Errors
 ///
@@ -246,14 +250,20 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
     let stop = {
         let stopping =
             warren_headless::forward::wait_for_stop(handle.watch_state(), || handle.last_fatal());
-        tokio::pin!(stopping);
+        let revoked = warren_headless::forward::wait_for_revocation(
+            || client.device_revoked(),
+            REVOCATION_CHECK,
+        );
+        tokio::pin!(stopping, revoked);
         loop {
             tokio::select! {
                 stop = &mut stopping => break stop,
+                () = &mut revoked => break warren_headless::forward::Stop::DeviceRevoked,
                 () = reload.recv() => reload_now(&env, &device).await,
             }
         }
     };
+    let revoked = matches!(stop, warren_headless::forward::Stop::DeviceRevoked);
 
     let granted = *port_rx.borrow();
     let code = warren_headless::forward::conclude(
@@ -286,6 +296,9 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
     device.close_gate();
     admin::forget_token(&env);
     handle.shutdown();
+    if revoked && client.forget_device().is_err() {
+        LOG.error("the revoked device identity could not be erased");
+    }
     Ok(code)
 }
 
