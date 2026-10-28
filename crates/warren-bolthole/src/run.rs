@@ -126,7 +126,13 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
         // exit hands it back its inner address.
         .token_rotation(warren_sdk::kept_token_rotation(
             &env.state_dir.join("token_rotation"),
-        ));
+        ))
+        // Listed in the account's devices under one identity across restarts.
+        .device(
+            env.state_dir.join("device"),
+            warren_sdk::api::DevicePlatform::Linux,
+            env!("CARGO_PKG_VERSION"),
+        );
     if env.ipv6 {
         builder = builder.request_ipv6();
     }
