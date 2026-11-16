@@ -187,14 +187,15 @@ impl<T: HttpTransport> WarrenApiClient<T> {
         &self.transport
     }
 
-    /// Unsigned `GET /v1/exits`. Returns the raw server-signed relay list JSON
-    /// (verify it with `warren_discovery::verify_signed_relay_list`).
+    /// Unsigned `GET /v2/exits`. Returns the raw server-signed relay list JSON
+    /// (verify it with `warren_discovery::verify_signed_relay_list`, which
+    /// accepts this v11 list): the v10 one plus each exit's fleet name.
     ///
     /// # Errors
     ///
     /// [`ClientError`] on transport failure or a non-2xx status.
     pub async fn list_exits(&self) -> Result<String, ClientError> {
-        let req = self.unsigned_request(Method::Get, "/v1/exits", Vec::new());
+        let req = self.unsigned_request(Method::Get, "/v2/exits", Vec::new());
         let resp = self.send(req).await?;
         String::from_utf8(resp.body).map_err(ClientError::ResponseEncoding)
     }
@@ -1200,6 +1201,9 @@ mod tests {
             header(req, HEADER_PUBKEY).is_none(),
             "list_exits must be unsigned"
         );
+        // The v11 list: the v10 one plus each exit's fleet name, which the
+        // clients show an exit by.
+        assert!(req.url.ends_with("/v2/exits"), "{}", req.url);
     }
 
     #[tokio::test]
@@ -1446,8 +1450,8 @@ mod tests {
         assert_eq!(body, r#"{"ok":true}"#);
         let attempts = c.transport.attempts.lock().unwrap();
         assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0].url, "https://api.example.test/v1/exits");
-        assert_eq!(attempts[1].url, "https://alt.example.test/v1/exits");
+        assert_eq!(attempts[0].url, "https://api.example.test/v2/exits");
+        assert_eq!(attempts[1].url, "https://alt.example.test/v2/exits");
         assert!(attempts[1].use_sni);
     }
 
@@ -1465,7 +1469,7 @@ mod tests {
         assert_eq!(attempts.len(), 3, "primary+SNI, alt+SNI, primary no-SNI");
         assert!(attempts[0].use_sni && attempts[1].use_sni);
         assert!(!attempts[2].use_sni);
-        assert_eq!(attempts[2].url, "https://api.example.test/v1/exits");
+        assert_eq!(attempts[2].url, "https://api.example.test/v2/exits");
     }
 
     #[tokio::test]
