@@ -9,7 +9,8 @@ use warren_discovery_core::{MULTIHOP_DIRECTORY_PATH_V1, MULTIHOP_DIRECTORY_PATH_
 use warren_identity::WarrenIdentity;
 
 use warren_contract::auth::SIGNATURE_WINDOW_SECS;
-use warren_contract::dto::AuthRefusal;
+use warren_contract::device_revocation::{self, DeviceRevocationError};
+use warren_contract::dto::{AuthRefusal, DeviceRevocation};
 
 use crate::clock::ServerClock;
 use crate::dto::{
@@ -97,11 +98,17 @@ pub enum ClientError {
     },
     /// The device the request named was revoked from another device of the
     /// account (HTTP 403 `{"error":"device_revoked"}`, warren-core doc 115):
-    /// on device registration and on credential issuance. The client stops,
-    /// disconnects and forgets its device identity; coming back takes the
-    /// recovery phrase.
+    /// on device registration and on credential issuance. The client stops
+    /// and disconnects. It erases its device identity only once
+    /// [`WarrenApiClient::verify_device_revocation`] accepts `revocation`:
+    /// a refusal the wallet did not sign proves nothing about who asked, so
+    /// the identity stays and the user is told.
     #[error("this device was disconnected from another device of the account")]
-    DeviceRevoked,
+    DeviceRevoked {
+        /// The wallet holder's signed statement the refusal carried. `None`
+        /// when it carried none, or one that does not parse.
+        revocation: Option<DeviceRevocation>,
+    },
     /// The device the issuance request named is not registered (HTTP 403
     /// `{"error":"device_unregistered"}`): register it
     /// ([`WarrenApiClient::register_device`]), then ask again.
@@ -510,14 +517,45 @@ impl<T: HttpTransport> WarrenApiClient<T> {
     /// device learns it at its next registration or issuance
     /// ([`ClientError::DeviceRevoked`]).
     ///
+    /// The body is the revocation signed with the wallet key, dated to the
+    /// UTC day of the server clock, as the API requires: it hands the
+    /// statement to the revoked device, which erases its identity only on one
+    /// its own wallet key verifies.
+    ///
     /// # Errors
     ///
     /// See [`Self::register`].
     pub async fn revoke_device(&self, id: DeviceId) -> Result<(), ClientError> {
-        self.send_signed(Method::Delete, &device_path(id), Vec::new())
+        let statement = device_revocation::sign(
+            &self.identity.signing_key(),
+            &id,
+            device_revocation::revocation_day(self.clock.stamp(now_secs()?)),
+        );
+        let body = serialize(&statement)?;
+        self.send_signed(Method::Delete, &device_path(id), body)
             .await
             .map(|_| ())
             .map_err(issuance_refusal)
+    }
+
+    /// Whether this wallet signed `revocation` for `device`, the device a
+    /// [`ClientError::DeviceRevoked`] refused. `Ok(())` is the only answer
+    /// on which the device may erase its identity; any error means it
+    /// disconnects and keeps it.
+    ///
+    /// # Errors
+    ///
+    /// [`DeviceRevocationError::Unsigned`] for no statement,
+    /// [`DeviceRevocationError::Malformed`] or
+    /// [`DeviceRevocationError::BadSignature`] for one this wallet did not
+    /// sign for `device`.
+    pub fn verify_device_revocation(
+        &self,
+        revocation: Option<&DeviceRevocation>,
+        device: DeviceId,
+    ) -> Result<(), DeviceRevocationError> {
+        let statement = revocation.ok_or(DeviceRevocationError::Unsigned)?;
+        device_revocation::verify(statement, &self.identity.verifying_key(), &device)
     }
 
     /// Signed `DELETE /v1/account`. Deletes the account's subscription.
@@ -888,10 +926,28 @@ fn issuance_refusal(err: ClientError) -> ClientError {
         return err;
     };
     match serde_json::from_str::<IssuanceRefusal>(body) {
-        Ok(IssuanceRefusal::DeviceRevoked) => ClientError::DeviceRevoked,
+        Ok(IssuanceRefusal::DeviceRevoked { revocation }) => {
+            ClientError::DeviceRevoked { revocation }
+        }
         Ok(IssuanceRefusal::DeviceUnregistered) => ClientError::DeviceUnregistered,
+        Err(_) if names_a_revocation(body) => ClientError::DeviceRevoked { revocation: None },
         _ => ban_refusal(err),
     }
+}
+
+/// Whether `body` refuses a revoked device whose statement does not parse:
+/// still a revocation, which disconnects the device, but one that can never
+/// let it erase anything.
+fn names_a_revocation(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(|error| error == "device_revoked")
+        })
+        .unwrap_or(false)
 }
 
 const DEVICES_PATH: &str = "/v1/devices";
@@ -2391,7 +2447,101 @@ mod tests {
             )
         );
         assert_signed(req);
-        assert!(req.body.is_empty());
+        let statement: DeviceRevocation = serde_json::from_slice(&req.body)
+            .expect("the revocation carries the wallet's signed statement");
+        assert_eq!(
+            warren_contract::device_revocation::verify(
+                &statement,
+                &WarrenIdentity::from_seed(&[0x11; 32]).verifying_key(),
+                &a_device_id(),
+            ),
+            Ok(()),
+            "the wallet key signs the revocation of exactly this device"
+        );
+        assert_eq!(
+            statement.revoked_at_unix_secs % warren_contract::device_revocation::DAY_SECS,
+            0,
+            "the API takes a revocation dated to its UTC day only"
+        );
+        let now = unix_secs_from(std::time::SystemTime::now()).expect("a clock");
+        assert!(
+            now - statement.revoked_at_unix_secs < warren_contract::device_revocation::DAY_SECS
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revocation_carrying_the_holders_statement_hands_it_over() {
+        let statement = warren_contract::device_revocation::sign(
+            &WarrenIdentity::from_seed(&[0x11; 32]).signing_key(),
+            &a_device_id(),
+            1_794_960_000,
+        );
+        let body =
+            serde_json::json!({ "error": "device_revoked", "revocation": statement }).to_string();
+        let c = client(MockTransport::new(403, &body));
+        let req = TokenIssueRequest {
+            epochs: Vec::new(),
+            device_id: Some(a_device_id()),
+        };
+
+        let err = c.issue_tokens(&req).await.expect_err("refused");
+
+        let ClientError::DeviceRevoked { revocation } = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(revocation, Some(statement));
+    }
+
+    #[tokio::test]
+    async fn a_revocation_whose_statement_does_not_parse_is_still_a_revocation() {
+        let c = client(MockTransport::new(
+            403,
+            r#"{"error":"device_revoked","revocation":{"signature_hex":5}}"#,
+        ));
+        let req = TokenIssueRequest {
+            epochs: Vec::new(),
+            device_id: Some(a_device_id()),
+        };
+
+        let err = c.issue_tokens(&req).await.expect_err("refused");
+
+        assert!(
+            matches!(err, ClientError::DeviceRevoked { revocation: None }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_revocation_verifies_only_for_this_wallet_and_the_named_device() {
+        let c = client(MockTransport::new(200, ""));
+        let statement = warren_contract::device_revocation::sign(
+            &WarrenIdentity::from_seed(&[0x11; 32]).signing_key(),
+            &a_device_id(),
+            1_794_960_000,
+        );
+        let sibling = DeviceId::from_bytes([0x5B; 16]);
+        let foreign = warren_contract::device_revocation::sign(
+            &WarrenIdentity::from_seed(&[0x22; 32]).signing_key(),
+            &a_device_id(),
+            1_794_960_000,
+        );
+
+        assert_eq!(
+            c.verify_device_revocation(Some(&statement), a_device_id()),
+            Ok(())
+        );
+        assert_eq!(
+            c.verify_device_revocation(Some(&statement), sibling),
+            Err(DeviceRevocationError::BadSignature)
+        );
+        assert_eq!(
+            c.verify_device_revocation(Some(&foreign), a_device_id()),
+            Err(DeviceRevocationError::BadSignature)
+        );
+        assert_eq!(
+            c.verify_device_revocation(None, a_device_id()),
+            Err(DeviceRevocationError::Unsigned)
+        );
     }
 
     #[tokio::test]
@@ -2409,7 +2559,10 @@ mod tests {
             .await
             .expect_err("a revoked device registers nothing");
 
-        assert!(matches!(err, ClientError::DeviceRevoked), "{err:?}");
+        assert!(
+            matches!(err, ClientError::DeviceRevoked { revocation: None }),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -2456,6 +2609,9 @@ mod tests {
 
         let err = c.issue_tokens(&req).await.expect_err("refused");
 
-        assert!(matches!(err, ClientError::DeviceRevoked), "{err:?}");
+        assert!(
+            matches!(err, ClientError::DeviceRevoked { revocation: None }),
+            "{err:?}"
+        );
     }
 }

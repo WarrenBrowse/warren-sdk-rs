@@ -238,13 +238,23 @@ pub enum Stop {
     /// published (`None` if the state went terminal without one).
     Fatal(Option<FatalCause>),
     /// The daemon's device was revoked from another device of its account
-    /// (warren-core doc 115): it forgets its device identity and stops.
-    DeviceRevoked,
+    /// (warren-core doc 115): it stops, and forgets its device identity only
+    /// when the wallet signed the revocation (`verified`).
+    DeviceRevoked {
+        /// Whether the wallet key signed the revocation of this device.
+        verified: bool,
+    },
 }
 
 /// What a revoked daemon says before it stops.
 pub const REVOKED_LINE: &str = "this device was disconnected from another device of its account: \
      its device identity is forgotten, and connecting again takes the recovery phrase";
+
+/// What a daemon refused as revoked says when the wallet did not sign the
+/// revocation: nothing proves the account holder asked, so it keeps its
+/// identity.
+pub const UNVERIFIED_REVOCATION_LINE: &str = "the API refused this device as disconnected, \
+     but the account's wallet did not sign that: the device identity is kept";
 
 /// Returns once `revoked` reads `true`, checking it every `every`. The
 /// credential refresh that learns a revocation runs on its own timer, so a
@@ -300,8 +310,12 @@ pub async fn conclude<H: HookSink>(
             log.error(&fatal_line(cause));
             2
         }
-        Stop::DeviceRevoked => {
+        Stop::DeviceRevoked { verified: true } => {
             log.error(REVOKED_LINE);
+            2
+        }
+        Stop::DeviceRevoked { verified: false } => {
+            log.error(UNVERIFIED_REVOCATION_LINE);
             2
         }
     };
@@ -757,7 +771,8 @@ mod tests {
         for (name, stop, want_code) in [
             ("signal", Stop::Signal, 0),
             ("fatal", Stop::Fatal(Some(FatalCause::NotAuthorized)), 2),
-            ("revoked", Stop::DeviceRevoked, 2),
+            ("revoked", Stop::DeviceRevoked { verified: true }, 2),
+            ("unverified", Stop::DeviceRevoked { verified: false }, 2),
         ] {
             let status = scratch(&format!("conclude-{name}"));
             hooks::write_status_file(&status, 49587)
@@ -858,6 +873,8 @@ mod tests {
     fn a_revocation_is_named_as_one() {
         assert!(REVOKED_LINE.contains("disconnected from another device"));
         assert!(REVOKED_LINE.contains("recovery phrase"));
+        assert!(UNVERIFIED_REVOCATION_LINE.contains("identity is kept"));
+        assert!(!UNVERIFIED_REVOCATION_LINE.contains("recovery phrase"));
     }
 
     #[tokio::test(start_paused = true)]

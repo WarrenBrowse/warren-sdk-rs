@@ -32,8 +32,8 @@ use zeroize::Zeroizing;
 
 use crate::client::{ClientError, WarrenApiClient};
 use crate::dto::{
-    DeviceId, DeviceRegistration, DeviceView, TokenEpochRequest, TokenIssueRequest,
-    TokenIssuerDirectory,
+    DeviceId, DeviceRegistration, DeviceRevocation, DeviceView, TokenEpochRequest,
+    TokenIssueRequest, TokenIssuerDirectory,
 };
 use crate::route_admission::RouteAdmission;
 use crate::token_blinding::BlindingKey;
@@ -583,7 +583,7 @@ fn answers_every_epoch_alike(err: &TokenClientError) -> bool {
             ClientError::Banned { .. }
                 | ClientError::ClockSkew { .. }
                 | ClientError::ServerStatus { status: 401, .. }
-                | ClientError::DeviceRevoked
+                | ClientError::DeviceRevoked { .. }
                 | ClientError::DeviceUnregistered
                 | ClientError::DeviceLimitReached
         ) | TokenClientError::BadAttributionKey
@@ -622,6 +622,12 @@ struct ManagerState {
     /// never cleared: the device was disconnected from another device of the
     /// account.
     device_revoked: bool,
+    /// The statement the revocation carried, handed back by every later
+    /// refresh.
+    revocation: Option<DeviceRevocation>,
+    /// Whether the wallet key signed the revocation of this device: the only
+    /// case in which the app may erase the device's identity.
+    revocation_verified: bool,
 }
 
 /// Keeps a [`TokenStore`] topped up and vends the per-session token stack the
@@ -720,6 +726,8 @@ impl<T: HttpTransport> TokenManager<T> {
                 issued_elsewhere: BTreeSet::new(),
                 route_admission: None,
                 device_revoked: false,
+                revocation: None,
+                revocation_verified: false,
             })),
             mint_horizon: None,
             live: Arc::default(),
@@ -781,13 +789,38 @@ impl<T: HttpTransport> TokenManager<T> {
 
     /// Whether the device this manager asks as was revoked from another
     /// device of the account ([`Self::with_device`]). Sticky: the app
-    /// disconnects and forgets the device's identity.
+    /// disconnects, and forgets the device's identity only when
+    /// [`Self::device_revocation_verified`] reads `true`.
     #[must_use]
     pub fn device_revoked(&self) -> bool {
         self.state
             .lock()
             .expect("token manager mutex poisoned")
             .device_revoked
+    }
+
+    /// Whether the revocation [`Self::device_revoked`] reports carried a
+    /// statement the wallet key signed for this device
+    /// ([`WarrenApiClient::verify_device_revocation`]). `false` for an
+    /// unsigned or forged one: the app then disconnects, keeps the identity
+    /// and tells the user.
+    #[must_use]
+    pub fn device_revocation_verified(&self) -> bool {
+        self.state
+            .lock()
+            .expect("token manager mutex poisoned")
+            .revocation_verified
+    }
+
+    /// The error every refresh of a revoked manager returns.
+    fn revoked_error(&self) -> TokenClientError {
+        let revocation = self
+            .state
+            .lock()
+            .expect("token manager mutex poisoned")
+            .revocation
+            .clone();
+        ClientError::DeviceRevoked { revocation }.into()
     }
 
     /// Mints `epoch` as this manager's device, registering it and asking
@@ -833,9 +866,9 @@ impl<T: HttpTransport> TokenManager<T> {
                 self.adopt(&view);
                 Ok(())
             }
-            Err(ClientError::DeviceRevoked) => {
-                self.revoke();
-                Err(ClientError::DeviceRevoked.into())
+            Err(ClientError::DeviceRevoked { revocation }) => {
+                self.revoke(revocation.as_ref());
+                Err(ClientError::DeviceRevoked { revocation }.into())
             }
             Err(ClientError::DeviceLimitReached) => Err(ClientError::DeviceLimitReached.into()),
             Err(_) => Ok(()),
@@ -843,11 +876,21 @@ impl<T: HttpTransport> TokenManager<T> {
     }
 
     /// Records a revocation: the stock goes with it, since a revoked device
-    /// presents nothing.
-    fn revoke(&self) {
+    /// presents nothing. A statement the wallet signed for this device marks
+    /// it verified; a later unsigned answer never takes that back.
+    fn revoke(&self, revocation: Option<&DeviceRevocation>) {
+        let verified = self.device().is_some_and(|d| {
+            self.client
+                .verify_device_revocation(revocation, d.device_id)
+                .is_ok()
+        });
         let mut st = self.state.lock().expect("token manager mutex poisoned");
         st.device_revoked = true;
         st.store = TokenStore::new();
+        if !st.revocation_verified {
+            st.revocation = revocation.cloned();
+            st.revocation_verified = verified;
+        }
     }
 
     /// Trusts `pins` (64-char hex Ed25519 keys, the API server keys the
@@ -939,7 +982,7 @@ impl<T: HttpTransport> TokenManager<T> {
     /// Any other per-epoch mint refusal or transport error is swallowed.
     pub async fn refresh(&self, now_unix_secs: u64) -> Result<(), TokenClientError> {
         if self.device_revoked() {
-            return Err(ClientError::DeviceRevoked.into());
+            return Err(self.revoked_error());
         }
         self.register_device().await?;
         let directory = self.client.token_keys_for(self.class()).await?;
@@ -1003,8 +1046,10 @@ impl<T: HttpTransport> TokenManager<T> {
                 // The failed epoch stays unsettled: a lifted ban mints at the
                 // next tick, and an epoch the issuer did record is settled
                 // then by its already_issued answer.
-                Err(e @ TokenClientError::Api(ClientError::DeviceRevoked)) => {
-                    self.revoke();
+                Err(e @ TokenClientError::Api(ClientError::DeviceRevoked { .. })) => {
+                    if let TokenClientError::Api(ClientError::DeviceRevoked { revocation }) = &e {
+                        self.revoke(revocation.as_ref());
+                    }
                     return Err(e);
                 }
                 Err(e) if answers_every_epoch_alike(&e) => return Err(e),
@@ -1809,6 +1854,12 @@ impl<T: HttpTransport> PortEntitlementManager<T> {
     #[must_use]
     pub fn device_revoked(&self) -> bool {
         self.inner.device_revoked()
+    }
+
+    /// [`TokenManager::device_revocation_verified`].
+    #[must_use]
+    pub fn device_revocation_verified(&self) -> bool {
+        self.inner.device_revocation_verified()
     }
 
     /// Tops the batch up, on the same coarse timer as session tokens.

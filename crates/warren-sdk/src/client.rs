@@ -492,6 +492,7 @@ impl WarrenClientBuilder {
             api,
             device,
             port_entitlements,
+            revoked_here: std::sync::atomic::AtomicBool::new(false),
             auth: crate::session_tokens::DialAuth {
                 signing,
                 tokens: session_tokens,
@@ -537,6 +538,9 @@ pub struct WarrenClient<T> {
     /// client starts presents one (warren-core doc 105). `None` for an
     /// identity that carries no seed and was handed no entitlement key.
     pub(crate) port_entitlements: Option<crate::entitlements::PortEntitlements>,
+    /// Set once this client revoked its own device, a logout asked for on
+    /// this install: its revocation needs no proof from the API.
+    pub(crate) revoked_here: std::sync::atomic::AtomicBool,
     /// The wallet key, the wallet's session tokens and the admission policy
     /// every tunnel of this client dials with.
     pub(crate) auth: crate::session_tokens::DialAuth,
@@ -619,9 +623,11 @@ impl<T: HttpTransport> WarrenClient<T> {
     /// Whether this install's device was revoked from another device of the
     /// account, as the wallet's last credential refresh learned (warren-core
     /// doc 115). Sticky: the credential managers ask nothing more. The app
-    /// disconnects, says "This device was disconnected from another device
-    /// of your account", and calls [`Self::forget_device`]; coming back
-    /// takes the recovery phrase.
+    /// disconnects. When [`Self::device_revocation_verified`] reads `true`
+    /// it says "This device was disconnected from another device of your
+    /// account" and calls [`Self::forget_device`], and coming back takes the
+    /// recovery phrase; otherwise it keeps the identity and says the
+    /// disconnection could not be confirmed.
     #[must_use]
     pub fn device_revoked(&self) -> bool {
         self.auth
@@ -632,6 +638,28 @@ impl<T: HttpTransport> WarrenClient<T> {
                 .port_entitlements
                 .as_ref()
                 .is_some_and(crate::entitlements::PortEntitlements::device_revoked)
+    }
+
+    /// Whether the revocation [`Self::device_revoked`] reports may erase this
+    /// install's identity: the wallet key signed it for this device, or this
+    /// client revoked its own device ([`Self::revoke_device`], a logout). A
+    /// revocation the API reports without that proof reads `false`: whoever
+    /// answers for the API could otherwise make every device erase itself.
+    #[must_use]
+    pub fn device_revocation_verified(&self) -> bool {
+        if !self.device_revoked() {
+            return false;
+        }
+        self.revoked_here.load(std::sync::atomic::Ordering::SeqCst)
+            || self
+                .auth
+                .tokens
+                .as_ref()
+                .is_some_and(crate::session_tokens::SessionTokens::device_revocation_verified)
+            || self
+                .port_entitlements
+                .as_ref()
+                .is_some_and(crate::entitlements::PortEntitlements::device_revocation_verified)
     }
 
     /// Whether the wallet's last credential refresh found the account's
@@ -688,7 +716,12 @@ impl<T: HttpTransport> WarrenClient<T> {
     ///
     /// [`SdkError::Api`] when the call fails.
     pub async fn revoke_device(&self, id: DeviceId) -> Result<(), SdkError> {
-        Ok(self.api.revoke_device(id).await?)
+        self.api.revoke_device(id).await?;
+        if self.device_id() == Some(id) {
+            self.revoked_here
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     /// Erases this install's kept device identity, once it was revoked or

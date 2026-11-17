@@ -32,8 +32,8 @@ pub use env::{
 };
 pub use forward::{
     ForwardConfig, ForwardEnv, ForwardProto, HookSink, REVOKED_LINE, RefusalWatch, ShellHooks,
-    Stop, apply_port_change, conclude, fatal_line, log_refusals, parse_forward,
-    retire_forward_state, wait_for_revocation, wait_for_stop,
+    Stop, UNVERIFIED_REVOCATION_LINE, apply_port_change, conclude, fatal_line, log_refusals,
+    parse_forward, retire_forward_state, wait_for_revocation, wait_for_stop,
 };
 pub use hardening::{disable_core_dumps, is_root};
 pub use health::{

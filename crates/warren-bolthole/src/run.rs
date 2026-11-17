@@ -258,12 +258,19 @@ pub async fn run(env: GatewayEnv) -> anyhow::Result<i32> {
         loop {
             tokio::select! {
                 stop = &mut stopping => break stop,
-                () = &mut revoked => break warren_headless::forward::Stop::DeviceRevoked,
+                () = &mut revoked => break warren_headless::forward::Stop::DeviceRevoked {
+                    verified: client.device_revocation_verified(),
+                },
                 () = reload.recv() => reload_now(&env, &device).await,
             }
         }
     };
-    let revoked = matches!(stop, warren_headless::forward::Stop::DeviceRevoked);
+    // Only a revocation the wallet signed erases the identity: an unsigned
+    // one proves nothing about who asked.
+    let revoked = matches!(
+        stop,
+        warren_headless::forward::Stop::DeviceRevoked { verified: true }
+    );
 
     let granted = *port_rx.borrow();
     let code = warren_headless::forward::conclude(

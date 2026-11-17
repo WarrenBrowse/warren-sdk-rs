@@ -30,8 +30,8 @@ pub use device::DeviceIdentity;
 pub use dto::{
     AbuseCategory, AccountBan, AccountStandingResponse, AccountStrike, BanReasonCode,
     CampaignVoucherResponse, CheckApplePaymentRequest, CheckResponse, DEVICE_ID_LEN, DeviceId,
-    DeviceListResponse, DevicePlatform, DeviceRegistration, DeviceRename, DeviceView,
-    IncidentExitDownRequest, IncidentPubkeyMismatchRequest, IncidentReason,
+    DeviceListResponse, DevicePlatform, DeviceRegistration, DeviceRename, DeviceRevocation,
+    DeviceView, IncidentExitDownRequest, IncidentPubkeyMismatchRequest, IncidentReason,
     InitApplePaymentResponse, IssuanceRefusal, MobilePaymentResponse, PubkeyHex, PubkeySs58,
     RegisterAccountRequest, RegisterAccountResponse, SessionCloseRequest, SessionOpenRequest,
     SessionOpenResponse, SessionRejectReason, SubscriptionResponse, TokenEpochRequest,
@@ -48,6 +48,8 @@ pub use tokens::{
     TokenClientError, TokenManager, TokenStore, current_epoch, mint_tokens,
 };
 pub use transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
+/// Why a revoked device must keep its identity (warren-core doc 115).
+pub use warren_contract::device_revocation::DeviceRevocationError;
 /// The port-forward attribution tag and the entitlement envelope a
 /// [`PortEntitlementManager`] slot presents (warren-core doc 105).
 pub use warren_contract::pf_attribution::{AttributionTag, EntitlementEnvelope};

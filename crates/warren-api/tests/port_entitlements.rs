@@ -811,7 +811,10 @@ async fn a_revoked_device_is_told_and_presents_no_entitlement() {
         .expect_err("the revocation reaches the caller");
 
     assert!(
-        matches!(err, TokenClientError::Api(ClientError::DeviceRevoked)),
+        matches!(
+            err,
+            TokenClientError::Api(ClientError::DeviceRevoked { .. })
+        ),
         "{err:?}"
     );
     assert!(m.device_revoked());

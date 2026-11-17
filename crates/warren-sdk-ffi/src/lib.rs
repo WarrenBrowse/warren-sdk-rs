@@ -947,12 +947,23 @@ impl WarrenFfiClient {
 
     /// Whether this install's device was revoked from another device of the
     /// account, as the last credential refresh learned (every 10 minutes and
-    /// at start). Sticky. When it reads `true`: disconnect, say "This device
+    /// at start). Sticky. When it reads `true`: disconnect. Then, only when
+    /// [`Self::device_revocation_verified`] reads `true`, say "This device
     /// was disconnected from another device of your account", call
-    /// [`Self::forget_device`], and ask for the recovery phrase again.
+    /// [`Self::forget_device`], and ask for the recovery phrase again;
+    /// otherwise keep the identity and say the disconnection could not be
+    /// confirmed.
     #[must_use]
     pub fn device_revoked(&self) -> bool {
         self.inner.device_revoked()
+    }
+
+    /// Whether the revocation [`Self::device_revoked`] reports was signed
+    /// by the wallet for this device, or asked for on this install: the only
+    /// case in which the app may forget the identity.
+    #[must_use]
+    pub fn device_revocation_verified(&self) -> bool {
+        self.inner.device_revocation_verified()
     }
 
     /// Whether the last credential refresh found the account's device cap
@@ -1594,7 +1605,7 @@ fn map_client_error(e: ClientError) -> FfiError {
             lapses_at_unix_secs,
         },
         ClientError::ClockSkew { offset_secs } => FfiError::ClockSkew { offset_secs },
-        ClientError::DeviceRevoked => FfiError::DeviceRevoked,
+        ClientError::DeviceRevoked { .. } => FfiError::DeviceRevoked,
         ClientError::DeviceLimitReached => FfiError::DeviceLimitReached,
         other => FfiError::Client {
             message: other.to_string(),
@@ -1921,6 +1932,7 @@ mod tests {
         let kept = warren_sdk::kept_device_identity(&dir.path().join("device"));
         assert_eq!(client.device_id(), Some(String::from(kept.device_id)));
         assert!(!client.device_revoked());
+        assert!(!client.device_revocation_verified());
     }
 
     #[test]
@@ -2071,7 +2083,9 @@ mod tests {
 
     #[test]
     fn a_device_revocation_crosses_the_ffi_typed() {
-        let err = map_sdk_error(SdkError::Api(ClientError::DeviceRevoked));
+        let err = map_sdk_error(SdkError::Api(ClientError::DeviceRevoked {
+            revocation: None,
+        }));
 
         assert!(matches!(err, FfiError::DeviceRevoked), "{err:?}");
     }

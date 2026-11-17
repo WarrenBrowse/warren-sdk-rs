@@ -48,6 +48,11 @@ trait EntitlementSource: Send + Sync {
     fn device_revoked(&self) -> bool {
         false
     }
+    /// Whether that revocation carried a statement the wallet signed for the
+    /// batch's device.
+    fn device_revocation_verified(&self) -> bool {
+        false
+    }
     /// Registers the batch's device under `name` from the next refresh on.
     fn set_device_name(&self, _name: &str) {}
     /// The batch's device name as the registry last answered it.
@@ -75,6 +80,10 @@ impl<T: HttpTransport + 'static> EntitlementSource for PortEntitlementManager<T>
 
     fn device_revoked(&self) -> bool {
         PortEntitlementManager::device_revoked(self)
+    }
+
+    fn device_revocation_verified(&self) -> bool {
+        PortEntitlementManager::device_revocation_verified(self)
     }
 
     fn set_device_name(&self, name: &str) {
@@ -303,6 +312,15 @@ impl PortEntitlements {
             .batch
             .get()
             .is_some_and(|batch| batch.source.device_revoked())
+    }
+
+    /// Whether that revocation carried a statement the wallet signed for
+    /// this device. Never opens the batch.
+    pub(crate) fn device_revocation_verified(&self) -> bool {
+        self.wallet
+            .batch
+            .get()
+            .is_some_and(|batch| batch.source.device_revocation_verified())
     }
 
     /// Registers the wallet's device under `name` from the batch's next

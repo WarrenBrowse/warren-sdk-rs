@@ -4571,6 +4571,76 @@ mod device_registry {
         let client = client(0x86, issuer_side, &path);
 
         wait_until("the revocation", || client.device_revoked()).await;
+        assert!(
+            !client.device_revocation_verified(),
+            "a revocation the wallet did not sign must not erase the identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revocation_the_wallet_signed_from_another_device_is_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        let id = kept_device_identity(&path).device_id;
+        let issuer_side = minting();
+        issuer_side.revoke_device_signed(
+            id,
+            warren_contract::device_revocation::sign(
+                &WarrenIdentity::from_seed(&[0x8C; 32]).signing_key(),
+                &id,
+                1_794_960_000,
+            ),
+        );
+
+        let client = client(0x8C, issuer_side, &path);
+
+        wait_until("the revocation", || client.device_revoked()).await;
+        assert!(client.device_revocation_verified());
+    }
+
+    #[tokio::test]
+    async fn a_revocation_another_wallet_signed_is_not_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        let id = kept_device_identity(&path).device_id;
+        let issuer_side = minting();
+        issuer_side.revoke_device_signed(
+            id,
+            warren_contract::device_revocation::sign(
+                &WarrenIdentity::from_seed(&[0x8F; 32]).signing_key(),
+                &id,
+                1_794_960_000,
+            ),
+        );
+
+        let client = client(0x8E, issuer_side, &path);
+
+        wait_until("the revocation", || client.device_revoked()).await;
+        assert!(!client.device_revocation_verified());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn revoking_this_device_is_a_logout_that_may_erase_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        let older_server = minting();
+        older_server.keep_no_statement();
+        let client = client(0x8D, older_server, &path);
+        let id = client.device_id().expect("a device");
+        wait_until("the registration", || issuer(&client).device(id).is_some()).await;
+
+        client.revoke_device(id).await.expect("logged out");
+        assert!(
+            !client.device_revocation_verified(),
+            "nothing is erased before the refresh reads the revocation"
+        );
+
+        // Paused time: the refresh period passes as soon as the test waits.
+        wait_within(Duration::from_secs(1300), "the revocation", || {
+            client.device_revoked()
+        })
+        .await;
+        assert!(client.device_revocation_verified());
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@
 //! `/v1/devices` registers, lists, renames and revokes, and a revoked device
 //! is refused its registration.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -22,9 +22,9 @@ use rand010::SeedableRng;
 use rand010::rngs::StdRng;
 use warren_api::transport::{HttpRequest, HttpResponse, HttpTransport, Method, TransportError};
 use warren_api::{
-    AttributionTag, DeviceId, DeviceListResponse, DeviceRegistration, DeviceRename, DeviceView,
-    PubkeyHex, TokenEpochResponse, TokenIssueRequest, TokenIssueResponse, TokenIssuerDirectory,
-    TokenIssuerKey,
+    AttributionTag, DeviceId, DeviceListResponse, DeviceRegistration, DeviceRename,
+    DeviceRevocation, DeviceView, PubkeyHex, TokenEpochResponse, TokenIssueRequest,
+    TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey,
 };
 use warren_contract::pf_attribution::{CIPHERTEXT_LEN, NONCE_LEN, TAG_VERSION, signing_preimage};
 use warrenguard_token::IssuerSecretKey;
@@ -46,9 +46,12 @@ pub struct FakeEntitlementIssuer {
     banned: AtomicBool,
     directory_fetches: AtomicUsize,
     devices: Mutex<BTreeMap<String, DeviceRegistration>>,
-    revoked_devices: Mutex<HashSet<DeviceId>>,
+    /// Each revoked device, with the statement its revocation carried.
+    revoked_devices: Mutex<HashMap<DeviceId, Option<DeviceRevocation>>>,
     registered_names: Mutex<Vec<String>>,
     device_limit_reached: AtomicBool,
+    /// Set to answer revocations as a server that keeps no statement does.
+    keeps_no_statement: AtomicBool,
 }
 
 impl FakeEntitlementIssuer {
@@ -75,9 +78,10 @@ impl FakeEntitlementIssuer {
             banned: AtomicBool::new(false),
             directory_fetches: AtomicUsize::new(0),
             devices: Mutex::new(BTreeMap::new()),
-            revoked_devices: Mutex::new(HashSet::new()),
+            revoked_devices: Mutex::new(HashMap::new()),
             registered_names: Mutex::new(Vec::new()),
             device_limit_reached: AtomicBool::new(false),
+            keeps_no_statement: AtomicBool::new(false),
         }
     }
 
@@ -112,13 +116,37 @@ impl FakeEntitlementIssuer {
         self.device_limit_reached.store(true, Ordering::SeqCst);
     }
 
-    /// Revokes `id`, as another device of the account does.
+    /// Drops the statement of every later `DELETE /v1/devices/{id}`, as a
+    /// server that predates signed revocations does: the revoked device is
+    /// refused with a bare `device_revoked`.
+    pub fn keep_no_statement(&self) {
+        self.keeps_no_statement.store(true, Ordering::SeqCst);
+    }
+
+    /// Revokes `id` without a signed statement, as a client that predates
+    /// it does: the revoked device is refused with a bare `device_revoked`.
     ///
     /// # Panics
     ///
     /// When a test panicked while holding the registry.
     pub fn revoke_device(&self, id: DeviceId) {
-        self.revoked_devices.lock().expect("registry").insert(id);
+        self.revoked_devices
+            .lock()
+            .expect("registry")
+            .insert(id, None);
+    }
+
+    /// Revokes `id` with `statement`, as another device of the account
+    /// signing its revocation does: the revoked device is refused with it.
+    ///
+    /// # Panics
+    ///
+    /// When a test panicked while holding the registry.
+    pub fn revoke_device_signed(&self, id: DeviceId, statement: DeviceRevocation) {
+        self.revoked_devices
+            .lock()
+            .expect("registry")
+            .insert(id, Some(statement));
     }
 
     /// Whether `id` was revoked.
@@ -128,7 +156,10 @@ impl FakeEntitlementIssuer {
     /// When a test panicked while holding the registry.
     #[must_use]
     pub fn is_revoked(&self, id: DeviceId) -> bool {
-        self.revoked_devices.lock().expect("registry").contains(&id)
+        self.revoked_devices
+            .lock()
+            .expect("registry")
+            .contains_key(&id)
     }
 
     fn devices_route(&self, request: &HttpRequest) -> HttpResponse {
@@ -144,8 +175,22 @@ impl FakeEntitlementIssuer {
                     .lock()
                     .expect("registry")
                     .push(registration.name.clone());
-                if self.is_revoked(registration.device_id) {
-                    return HttpResponse::new(403, br#"{"error":"device_revoked"}"#.to_vec());
+                if let Some(revocation) = self
+                    .revoked_devices
+                    .lock()
+                    .expect("registry")
+                    .get(&registration.device_id)
+                {
+                    let refusal = match revocation {
+                        Some(statement) => {
+                            serde_json::json!({ "error": "device_revoked", "revocation": statement })
+                        }
+                        None => serde_json::json!({ "error": "device_revoked" }),
+                    };
+                    return HttpResponse::new(
+                        403,
+                        serde_json::to_vec(&refusal).expect("serializes"),
+                    );
                 }
                 let mut devices = self.devices.lock().expect("registry");
                 let key = String::from(registration.device_id);
@@ -172,7 +217,7 @@ impl FakeEntitlementIssuer {
                     .lock()
                     .expect("registry")
                     .iter()
-                    .filter(|(_, d)| !revoked.contains(&d.device_id))
+                    .filter(|(_, d)| !revoked.contains_key(&d.device_id))
                     .map(|(id, d)| view_of(d, id == this))
                     .collect();
                 let list = DeviceListResponse {
@@ -193,7 +238,13 @@ impl FakeEntitlementIssuer {
             }
             (Method::Delete, Some(id)) => {
                 let id = DeviceId::try_from(id.to_owned()).expect("a device id");
-                self.revoke_device(id);
+                let statement = serde_json::from_slice(&request.body)
+                    .ok()
+                    .filter(|_| !self.keeps_no_statement.load(Ordering::SeqCst));
+                self.revoked_devices
+                    .lock()
+                    .expect("registry")
+                    .insert(id, statement);
                 HttpResponse::new(204, Vec::new())
             }
             _ => HttpResponse::new(405, Vec::new()),

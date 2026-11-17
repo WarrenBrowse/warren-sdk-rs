@@ -68,6 +68,11 @@ trait TokenBatch: Send + Sync {
     fn device_revoked(&self) -> bool {
         false
     }
+    /// Whether that revocation carried a statement the wallet signed for the
+    /// batch's device.
+    fn device_revocation_verified(&self) -> bool {
+        false
+    }
     /// Registers the batch's device under `name` from the next refresh on.
     fn set_device_name(&self, _name: &str) {}
     /// The batch's device name as the registry last answered it.
@@ -96,6 +101,10 @@ impl<T: HttpTransport + 'static> TokenBatch for TokenManager<T> {
 
     fn device_revoked(&self) -> bool {
         TokenManager::device_revoked(self)
+    }
+
+    fn device_revocation_verified(&self) -> bool {
+        TokenManager::device_revocation_verified(self)
     }
 
     fn set_device_name(&self, name: &str) {
@@ -317,6 +326,12 @@ impl SessionTokens {
         self.inner.batch.device_revoked()
     }
 
+    /// Whether that revocation carried a statement the wallet signed for
+    /// this device.
+    pub(crate) fn device_revocation_verified(&self) -> bool {
+        self.inner.batch.device_revocation_verified()
+    }
+
     /// Whether the last refresh found the account's device cap reached: this
     /// install is not registered and is issued nothing until another device
     /// of the account is revoked.
@@ -350,7 +365,9 @@ impl SessionTokens {
             return error;
         }
         if self.device_revoked() {
-            return crate::SdkError::Api(warren_api::ClientError::DeviceRevoked);
+            return crate::SdkError::Api(warren_api::ClientError::DeviceRevoked {
+                revocation: None,
+            });
         }
         if self.device_limit_reached() {
             return crate::SdkError::Api(warren_api::ClientError::DeviceLimitReached);
@@ -581,7 +598,9 @@ mod tests {
         }
 
         fn refresh(&self, _now: u64) -> RefreshFuture<'_> {
-            Box::pin(async { Err(warren_api::ClientError::DeviceRevoked.into()) })
+            Box::pin(async {
+                Err(warren_api::ClientError::DeviceRevoked { revocation: None }.into())
+            })
         }
 
         fn device_revoked(&self) -> bool {
@@ -602,7 +621,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                crate::SdkError::Api(warren_api::ClientError::DeviceRevoked)
+                crate::SdkError::Api(warren_api::ClientError::DeviceRevoked { .. })
             ),
             "an app must disconnect and forget a revoked device, not retry: got {err:?}"
         );

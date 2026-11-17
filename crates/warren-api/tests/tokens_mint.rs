@@ -17,9 +17,9 @@ use rand010::rngs::StdRng;
 use warren_api::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 use warren_api::{
     BanReasonCode, BlindingKey, ClientError, DeviceId, DevicePlatform, DeviceRegistration,
-    DeviceView, TokenClientError, TokenEpochResponse, TokenIssueRequest, TokenIssueResponse,
-    TokenIssuerDirectory, TokenIssuerKey, TokenManager, TokenStore, WarrenApiClient, current_epoch,
-    mint_tokens,
+    DeviceRevocation, DeviceView, TokenClientError, TokenEpochResponse, TokenIssueRequest,
+    TokenIssueResponse, TokenIssuerDirectory, TokenIssuerKey, TokenManager, TokenStore,
+    WarrenApiClient, current_epoch, mint_tokens,
 };
 use warren_identity::WarrenIdentity;
 use warrenguard_token::{IssuerSecretKey, TokenChallenge};
@@ -1342,10 +1342,77 @@ async fn an_issuance_answering_device_revoked_revokes_the_device() {
         .expect_err("the revocation reaches the caller");
 
     assert!(
-        matches!(err, TokenClientError::Api(ClientError::DeviceRevoked)),
+        matches!(
+            err,
+            TokenClientError::Api(ClientError::DeviceRevoked { revocation: None })
+        ),
         "{err:?}"
     );
     assert!(manager.device_revoked());
+    assert!(
+        !manager.device_revocation_verified(),
+        "an unsigned revocation disconnects but never lets the device erase itself"
+    );
+}
+
+/// A refusal of this device's issuance carrying `statement`.
+fn signed_refusal(statement: &DeviceRevocation) -> &'static str {
+    let body =
+        serde_json::json!({ "error": "device_revoked", "revocation": statement }).to_string();
+    Box::leak(body.into_boxed_str())
+}
+
+#[tokio::test]
+async fn a_revocation_this_wallet_signed_for_this_device_is_verified() {
+    let fake = FakeIssuer::new(&[100]);
+    let statement = warren_contract::device_revocation::sign(
+        &WarrenIdentity::from_seed(&WALLET_SEED).signing_key(),
+        &this_device().device_id,
+        1_794_960_000,
+    );
+    *fake.issue_refusal.lock().unwrap() = Some((403, signed_refusal(&statement)));
+    let api = std::sync::Arc::new(client(fake));
+    let manager = TokenManager::new(api.clone(), session_key()).with_device(this_device());
+
+    let err = manager
+        .refresh(100 * EPOCH_SECS)
+        .await
+        .expect_err("the revocation reaches the caller");
+
+    assert!(manager.device_revoked());
+    assert!(manager.device_revocation_verified());
+    let again = manager.refresh(101 * EPOCH_SECS).await;
+    assert!(
+        matches!(
+            (&err, &again),
+            (
+                TokenClientError::Api(ClientError::DeviceRevoked { revocation: Some(a) }),
+                Err(TokenClientError::Api(ClientError::DeviceRevoked { revocation: Some(b) })),
+            ) if *a == statement && *b == statement
+        ),
+        "{err:?} then {again:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_revocation_signed_for_another_device_is_not_verified() {
+    let fake = FakeIssuer::new(&[100]);
+    let statement = warren_contract::device_revocation::sign(
+        &WarrenIdentity::from_seed(&WALLET_SEED).signing_key(),
+        &DeviceId::from_bytes([0xEE; 16]),
+        1_794_960_000,
+    );
+    *fake.issue_refusal.lock().unwrap() = Some((403, signed_refusal(&statement)));
+    let api = std::sync::Arc::new(client(fake));
+    let manager = TokenManager::new(api.clone(), session_key()).with_device(this_device());
+
+    manager
+        .refresh(100 * EPOCH_SECS)
+        .await
+        .expect_err("the revocation reaches the caller");
+
+    assert!(manager.device_revoked());
+    assert!(!manager.device_revocation_verified());
 }
 
 #[tokio::test]
@@ -1371,7 +1438,10 @@ async fn a_revoked_device_stops_refreshing_and_holds_nothing_for_good() {
         .expect_err("the revocation reaches the caller");
 
     assert!(
-        matches!(err, TokenClientError::Api(ClientError::DeviceRevoked)),
+        matches!(
+            err,
+            TokenClientError::Api(ClientError::DeviceRevoked { .. })
+        ),
         "{err:?}"
     );
     assert!(manager.device_revoked());
@@ -1388,7 +1458,7 @@ async fn a_revoked_device_stops_refreshing_and_holds_nothing_for_good() {
     assert!(
         matches!(
             again,
-            Err(TokenClientError::Api(ClientError::DeviceRevoked))
+            Err(TokenClientError::Api(ClientError::DeviceRevoked { .. }))
         ),
         "the revocation is sticky: {again:?}"
     );
