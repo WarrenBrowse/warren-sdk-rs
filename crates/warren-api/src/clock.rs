@@ -126,6 +126,20 @@ impl ServerClock {
     pub fn stamp(&self, device_now: u64) -> u64 {
         corrected_timestamp(device_now, self.offset_secs())
     }
+
+    /// The corrected time now: what a dated tunnel setup carries, so an exit
+    /// sees the same time the API accepts (the engine's `SetupClock`).
+    #[must_use]
+    pub fn now(&self) -> u64 {
+        self.stamp(device_unix_now())
+    }
+}
+
+/// The device clock in Unix seconds, zero before the epoch.
+pub(crate) fn device_unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]
@@ -135,6 +149,19 @@ mod tests {
     /// 2023-11-14 22:13:20 UTC.
     const SERVER_NOW: u64 = 1_700_000_000;
     const SERVER_DATE: &str = "Tue, 14 Nov 2023 22:13:20 GMT";
+
+    #[test]
+    fn now_is_the_device_clock_corrected_by_the_last_answer() {
+        let clock = ServerClock::new();
+        let device_before = crate::clock::device_unix_now();
+        clock.observe_date(SERVER_DATE, device_before);
+
+        let now = clock.now();
+
+        let device_after = crate::clock::device_unix_now();
+        assert!(now >= clock.stamp(device_before) && now <= clock.stamp(device_after));
+        assert!(now.abs_diff(SERVER_NOW) <= device_after - device_before + 1);
+    }
 
     #[test]
     fn a_device_behind_the_server_signs_at_the_servers_clock() {
