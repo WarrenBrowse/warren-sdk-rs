@@ -183,6 +183,7 @@ impl Probe {
             on_dial_refused: None,
             on_path_rtt: None,
             session_token_provider: tokens,
+            setup_clock: None,
         }
     }
 

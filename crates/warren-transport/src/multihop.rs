@@ -261,6 +261,11 @@ fn setup_reply_refusal(opened: &[u8]) -> Result<(), SetupError> {
             Err(SetupError::TokenRejected(reason_code))
         }
         Ok(Some(WarrenControlMessage::IpExhausted)) => Err(SetupError::IpExhausted),
+        // A dated setup the exit refused: its clock check, a replay, or busy.
+        // The engine's retryability reads the code.
+        Ok(Some(WarrenControlMessage::SetupRefused { reason_code })) => {
+            Err(SetupError::SetupRefused(reason_code))
+        }
         // Request-type frames (v6 or v7) are client-to-exit only; a client
         // receiving one back is an unexpected reply. This client never asks for
         // a route, so a route answer is unexpected too, and a lease refresh
@@ -276,7 +281,11 @@ fn setup_reply_refusal(opened: &[u8]) -> Result<(), SetupError> {
             | WarrenControlMessage::RouteAnchorAck { .. }
             | WarrenControlMessage::RouteEnded { .. }
             | WarrenControlMessage::LeaseRefresh { .. }
-            | WarrenControlMessage::LeaseRefreshAck { .. },
+            | WarrenControlMessage::LeaseRefreshAck { .. }
+            | WarrenControlMessage::IpRequestDated { .. }
+            | WarrenControlMessage::IpRequestV7Dated { .. }
+            | WarrenControlMessage::IpRequestRouteDated { .. }
+            | WarrenControlMessage::SessionRekey { .. },
         ))
         | Ok(None) => Err(SetupError::UnexpectedReply),
         Err(e) => Err(SetupError::Control(e)),
@@ -287,6 +296,37 @@ fn setup_reply_refusal(opened: &[u8]) -> Result<(), SetupError> {
 mod setup_reply_tests {
     use super::*;
     use warren_wire::control::encode_control;
+
+    #[test]
+    fn a_clock_refusal_is_a_dated_setup_refusal_that_reselects() {
+        let reply = encode_control(&WarrenControlMessage::SetupRefused { reason_code: 1 }).unwrap();
+
+        let refusal = setup_reply_refusal(&reply).expect_err("a refusal is not an assignment");
+
+        assert!(matches!(refusal, SetupError::SetupRefused(1)));
+        assert_eq!(
+            MultihopError::Setup(refusal).retryability(),
+            crate::Retryability::RetryReselect
+        );
+    }
+
+    #[test]
+    fn a_dated_request_echoed_back_is_an_unexpected_reply() {
+        let reply = encode_control(&WarrenControlMessage::IpRequestDated {
+            prefer_ipv4: None,
+            client_pubkey: None,
+            wants_ipv6: false,
+            pop_sig: None,
+            wants_daita: false,
+            client_unix_secs: 0,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            setup_reply_refusal(&reply),
+            Err(SetupError::UnexpectedReply)
+        ));
+    }
 
     #[test]
     fn a_device_limit_refusal_is_its_own_fatal_setup_error() {
