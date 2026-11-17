@@ -38,8 +38,8 @@ fn tokens_led_by(fill: u8) -> SeenSetup {
     SeenSetup::DetailedTokens(vec![token(fill)])
 }
 
-/// The request a token dial sends plainly: a joining leg, or an exit that
-/// predates the detailed request.
+/// The request a token dial sends plainly: to an exit that predates the
+/// detailed request.
 fn tokens_plainly_led_by(fill: u8) -> SeenSetup {
     SeenSetup::Tokens(vec![token(fill)])
 }
@@ -301,8 +301,8 @@ async fn a_joining_leg_presents_the_token_its_session_was_admitted_on() {
 
     assert_eq!(
         exit.seen(),
-        [tokens_led_by(1), tokens_plainly_led_by(1)],
-        "a joining leg is never walked, so it asks plainly"
+        [tokens_led_by(1), tokens_led_by(1)],
+        "a joining leg presents its session's token, dated like every setup"
     );
     assert_eq!(admitted_token(&joined), Some(token(1)));
     drop(first);

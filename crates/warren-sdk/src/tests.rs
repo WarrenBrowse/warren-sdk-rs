@@ -2340,6 +2340,43 @@ async fn connect_multihop_against_a_fake_exit_assigns_ip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_dial_dates_its_setup_with_the_clock_the_api_corrected() {
+    // An exit refuses a setup time too far from its own, so a device whose
+    // clock the API had to correct must send the corrected time there too.
+    let exit_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let (addr, keys, seen) = warren_test_support::spawn_token_multihop_exit(exit_key).await;
+    let exit = fake_verified_exit(addr, &keys);
+    let client = test_client();
+    // 2026-01-01T00:00:00Z, read when this device believed it an hour later.
+    let server_then = 1_767_225_600;
+    client
+        .api
+        .server_clock()
+        .observe_date("Thu, 01 Jan 2026 00:00:00 GMT", server_then + 3600)
+        .expect("a valid Date header");
+    let device_before = device_now();
+
+    let sink = client.connect_multihop(&exit).await.expect("admitted");
+
+    let [Some(sent)] = seen.setup_times()[..] else {
+        panic!("one dated setup, got {:?}", seen.setup_times());
+    };
+    let behind = device_before.saturating_sub(sent);
+    assert!(
+        (3599..=3601).contains(&behind),
+        "the setup carries the API's clock, an hour behind this device: {behind}"
+    );
+    drop(sink);
+}
+
+fn device_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs()
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn arming_the_carrier_on_a_non_cover_exit_is_inert_and_still_connects() {
     // roster v10: an exit that advertises `tcp_fallback` but carries NO cover
     // domain must keep the RPK multihop dial (the carrier needs a cover-domain

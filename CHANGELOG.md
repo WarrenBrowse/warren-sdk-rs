@@ -26,6 +26,22 @@ the pre-release `0.0.x` line.
 
 ### Added
 
+- Bound session setup (warren-core doc 116): `MultihopClientTunnel` dates every
+  setup (`IpRequestDated` with the `/v3` proof of possession, or
+  `IpRequestV7Dated`) with the clock set by `with_setup_clock`, the device
+  clock otherwise, and `WarrenClient` dials with the clock its API calls are
+  corrected with (`ServerClock::now`). An exit that answers the dated request
+  with the plain `Rejected` predates it and is sent the legacy request from
+  then on; one marked so by an earlier dial that refuses the legacy request
+  is asked the dated one once more. A `SetupRefused` for a replay or a busy
+  exit reselects, and so does a clock refusal from one exit; once a second,
+  different exit refused the clock the dial fails with
+  `MultihopError::ClockSkew`, fatal with `FatalCause::ClockSkew`.
+  `ClockSkewWatch` holds the refusals across dials (one per process by
+  default, `with_clock_skew_watch` to give a tunnel its own) and an admitted
+  setup clears it. The FFI surfaces the cause as `FfiFatalCause::ClockSkew`,
+  declared last, and `warren-headless` tells the operator to set the date and
+  time to automatic.
 - Device registry (warren-core doc 115): an install registers as a device of
   its account, the account lists its devices, renames them, and revokes one
   from another. `WarrenApiClient::register_device`, `list_devices(this)`,

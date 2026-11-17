@@ -398,6 +398,10 @@ pub(crate) struct DialAuth {
     pub(crate) signing: warren_identity::ed25519_dalek::SigningKey,
     pub(crate) tokens: Option<SessionTokens>,
     pub(crate) admission: SessionAdmission,
+    /// The clock a dated setup carries: the one the client's API calls are
+    /// corrected with, so an exit sees the time the API accepts. `None`
+    /// dates setups with the device clock.
+    pub(crate) setup_clock: Option<warren_transport::SetupClock>,
 }
 
 impl DialAuth {
@@ -408,6 +412,7 @@ impl DialAuth {
             signing,
             tokens: None,
             admission: SessionAdmission::default(),
+            setup_clock: None,
         }
     }
 
@@ -421,8 +426,11 @@ impl DialAuth {
 
     /// A tunnel dialer carrying this admission.
     pub(crate) async fn tunnel(&self) -> MultihopClientTunnel {
-        let tunnel = MultihopClientTunnel::new(self.signing.clone())
+        let mut tunnel = MultihopClientTunnel::new(self.signing.clone())
             .with_session_admission(self.admission.clone());
+        if let Some(clock) = &self.setup_clock {
+            tunnel = tunnel.with_setup_clock(Arc::clone(clock));
+        }
         match &self.tokens {
             Some(tokens) => tunnel.with_session_tokens(tokens.source().await),
             None => tunnel,

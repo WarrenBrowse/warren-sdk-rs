@@ -380,6 +380,11 @@ pub fn fatal_line(cause: Option<FatalCause>) -> String {
                 unpin an entry country this network cannot reach"
             .to_owned();
     }
+    if cause == Some(FatalCause::ClockSkew) {
+        return "two exits refused this device's time for the session setup: the device clock \
+                is wrong. Not retrying: set the date and time to automatic, then start again"
+            .to_owned();
+    }
     let detail = match cause {
         Some(FatalCause::NotAuthorized) => {
             "the account is not authorized (no active subscription, or not enrolled at this exit)"
@@ -828,6 +833,22 @@ mod tests {
         assert!(
             !line.contains("refused"),
             "no server refused anything, got: {line}"
+        );
+    }
+
+    /// A device clock two exits refused is the device's to fix: the line
+    /// tells the operator to set the clock to automatic, never to look at the
+    /// subscription.
+    #[test]
+    fn a_device_clock_two_exits_refused_tells_the_operator_to_set_it_automatic() {
+        let line = fatal_line(Some(FatalCause::ClockSkew));
+        assert!(
+            line.contains("set the date and time to automatic"),
+            "the fix must be readable, got: {line}"
+        );
+        assert!(
+            !line.contains("account") && !line.contains("subscription"),
+            "the account is not at fault, got: {line}"
         );
     }
 

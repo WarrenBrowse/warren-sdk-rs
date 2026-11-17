@@ -179,6 +179,12 @@ pub enum FfiFatalCause {
     /// the fleet is at fault: the user changes network, or unpins an entry
     /// country the network cannot reach.
     NoReachableEntry,
+    /// Two different exits refused this device's time for the dated session
+    /// setup: the device clock is wrong. The host tells the user to set the
+    /// date and time to automatic, never to renew. Declared last so the
+    /// position, which the bindings carry as the variant's wire code, of every
+    /// earlier cause stays unchanged.
+    ClockSkew,
 }
 
 /// Receives connection-state transitions during [`WarrenFfiClient::start_proxy`].
@@ -1565,6 +1571,7 @@ fn map_fatal_cause(cause: FatalCause) -> FfiFatalCause {
         FatalCause::DeviceLimit => FfiFatalCause::DeviceLimit,
         FatalCause::PolicyRefused => FfiFatalCause::PolicyRefused,
         FatalCause::NoReachableEntry => FfiFatalCause::NoReachableEntry,
+        FatalCause::ClockSkew => FfiFatalCause::ClockSkew,
         _ => FfiFatalCause::PolicyRefused,
     }
 }
@@ -2644,6 +2651,10 @@ mod tests {
         assert_eq!(
             map_fatal_cause(FatalCause::NoReachableEntry),
             FfiFatalCause::NoReachableEntry
+        );
+        assert_eq!(
+            map_fatal_cause(FatalCause::ClockSkew),
+            FfiFatalCause::ClockSkew
         );
         // No two engine causes may collapse to the same FFI kind.
         assert_ne!(

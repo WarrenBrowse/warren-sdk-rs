@@ -175,10 +175,11 @@ fn exit_seal(
 }
 
 /// Spawns an in-process QUIC "exit" that speaks the real multihop handshake:
-/// it reads the HPKE-sealed setup frame (inner `IpRequest`) off a bidi stream,
-/// replies with a sealed `IpAssign` (tunnel IPv4 `10.66.0.2`, gateway
-/// `10.66.0.1`), then echoes every sealed data datagram back (opening the
-/// client frame and re-sealing the same IP packet in the reverse direction).
+/// it reads the HPKE-sealed setup frame (inner wallet request, dated or not)
+/// off a bidi stream, replies with a sealed `IpAssign` (tunnel IPv4
+/// `10.66.0.2`, gateway `10.66.0.1`), then echoes every sealed data datagram
+/// back (opening the client frame and re-sealing the same IP packet in the
+/// reverse direction).
 ///
 /// Returns the bound address and the exit's published keys. The exit-side HPKE
 /// is re-implemented independently of `warren-multihop`, so a green round-trip
@@ -224,14 +225,16 @@ pub async fn spawn_fake_multihop_exit(exit_key: SigningKey) -> (SocketAddr, Mult
 /// What a [`spawn_token_multihop_exit`] exit read from one setup request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeenSetup {
-    /// A v6 wallet-path `IpRequest`, and whether it named an account pubkey.
+    /// A wallet-path `IpRequest` or `IpRequestDated`, and whether it named an
+    /// account pubkey.
     Wallet {
         /// `client_pubkey` was present.
         names_pubkey: bool,
     },
     /// A v7 `IpRequestV7`, its tokens in presentation order.
     Tokens(Vec<SessionToken>),
-    /// A v7 `IpRequestV7Detailed`, its tokens in presentation order.
+    /// A v7 `IpRequestV7Detailed` or `IpRequestV7Dated` (the detailed request
+    /// with a time), its tokens in presentation order.
     DetailedTokens(Vec<SessionToken>),
 }
 
@@ -247,6 +250,19 @@ pub struct TokenExit {
     /// Set: the exit predates `IpRequestV7Detailed` and answers every one with
     /// the plain `Rejected`, as a deployed exit that cannot decode it does.
     predates_token_detail: Arc<std::sync::atomic::AtomicBool>,
+    /// Set: the exit predates the dated setup requests and answers every one
+    /// with the plain `Rejected`, as a deployed exit that cannot decode them
+    /// does.
+    predates_dated_setup: Arc<std::sync::atomic::AtomicBool>,
+    /// Set: the exit requires bound sessions and refuses every legacy
+    /// (undated) request the way its sender already reads as a policy one.
+    requires_bound: Arc<std::sync::atomic::AtomicBool>,
+    /// The `SetupRefused` code every dated request is answered with, if any.
+    dated_refusal: Arc<std::sync::Mutex<Option<u8>>>,
+    /// The time every setup request read carried, in arrival order: `None`
+    /// for a legacy request. A dated request the exit could not decode counts
+    /// too, unlike in [`TokenExit::seen`].
+    dated: Arc<std::sync::Mutex<Vec<Option<u64>>>>,
     /// Every `LeaseRefresh` datagram read, in arrival order: the token it
     /// carried, or `None` for the announcement.
     lease_requests: Arc<std::sync::Mutex<Vec<Option<SessionToken>>>>,
@@ -267,6 +283,10 @@ impl Default for TokenExit {
             invalid: Arc::default(),
             exhausted_for: Arc::default(),
             predates_token_detail: Arc::default(),
+            predates_dated_setup: Arc::default(),
+            requires_bound: Arc::default(),
+            dated_refusal: Arc::default(),
+            dated: Arc::default(),
             lease_requests: Arc::default(),
             lease_script: Arc::default(),
             downlink: tokio::sync::broadcast::channel(16).0,
@@ -280,6 +300,7 @@ enum TokenExitReply {
     Rejected,
     TokenRejected(TokenRejectCode),
     IpExhausted,
+    SetupRefused(u8),
 }
 
 impl TokenExit {
@@ -312,6 +333,37 @@ impl TokenExit {
     pub fn predate_token_detail(&self) {
         self.predates_token_detail
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// From now on, the exit answers every dated setup request with the plain
+    /// `Rejected`, as a deployed exit that predates them does.
+    pub fn predate_dated_setup(&self) {
+        self.predates_dated_setup
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// From now on, the exit decodes the dated setup requests (it was
+    /// upgraded) and refuses every legacy one, as an exit that requires bound
+    /// sessions does.
+    pub fn require_bound_sessions(&self) {
+        self.predates_dated_setup
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.requires_bound
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// From now on, the exit answers every dated setup request with the
+    /// sealed `SetupRefused` carrying `reason_code` (`1` the clock, `2` a
+    /// replay, `3` busy).
+    pub fn refuse_dated_setups(&self, reason_code: u8) {
+        *self.dated_refusal.lock().expect("dated-refusal lock") = Some(reason_code);
+    }
+
+    /// The time every setup request read so far carried, in arrival order:
+    /// `None` for a legacy request.
+    #[must_use]
+    pub fn setup_times(&self) -> Vec<Option<u64>> {
+        self.dated.lock().expect("dated-setup lock").clone()
     }
 
     /// The placement hint (`prefer_ipv4`) of every setup request read so far,
@@ -371,8 +423,30 @@ impl TokenExit {
 
     /// Records `request` and picks the answer.
     fn answer(&self, request: &WarrenControlMessage) -> TokenExitReply {
+        let dated_at = request.setup_unix_secs();
+        self.dated.lock().expect("dated-setup lock").push(dated_at);
+        let dated = dated_at.is_some();
+        // An exit that predates the detailed token request predates the dated
+        // requests too, which came later.
+        if dated
+            && (self
+                .predates_dated_setup
+                .load(std::sync::atomic::Ordering::Relaxed)
+                || self
+                    .predates_token_detail
+                    .load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return TokenExitReply::Rejected;
+        }
+        // A dated request reads as its legacy kind: a dated token request is
+        // answered as a detailed one.
         let (seen, placement, lead) = match request {
             WarrenControlMessage::IpRequest {
+                client_pubkey,
+                prefer_ipv4,
+                ..
+            }
+            | WarrenControlMessage::IpRequestDated {
                 client_pubkey,
                 prefer_ipv4,
                 ..
@@ -396,6 +470,11 @@ impl TokenExit {
                 session_tokens,
                 prefer_ipv4,
                 ..
+            }
+            | WarrenControlMessage::IpRequestV7Dated {
+                session_tokens,
+                prefer_ipv4,
+                ..
             } => (
                 SeenSetup::DetailedTokens(session_tokens.clone()),
                 *prefer_ipv4,
@@ -409,6 +488,23 @@ impl TokenExit {
             .lock()
             .expect("placement lock")
             .push(placement);
+        if !dated
+            && self
+                .requires_bound
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return if detailed {
+                TokenExitReply::TokenRejected(TokenRejectCode::Unspecified)
+            } else {
+                TokenExitReply::Rejected
+            };
+        }
+        if let (true, Some(code)) = (
+            dated,
+            *self.dated_refusal.lock().expect("dated-refusal lock"),
+        ) {
+            return TokenExitReply::SetupRefused(code);
+        }
         let Some(lead) = lead else {
             return TokenExitReply::Assign;
         };
@@ -463,11 +559,23 @@ impl TokenExit {
 pub async fn spawn_token_multihop_exit(
     exit_key: SigningKey,
 ) -> (SocketAddr, MultihopExitKeys, TokenExit) {
+    spawn_token_multihop_exit_with_id(exit_key, [0x11u8; EXIT_ID_LEN]).await
+}
+
+/// [`spawn_token_multihop_exit`] under the routing tag `exit_id`, for a test
+/// that needs two exits a client tells apart.
+///
+/// # Panics
+///
+/// Panics on any setup failure (test helper).
+pub async fn spawn_token_multihop_exit_with_id(
+    exit_key: SigningKey,
+    exit_id: [u8; EXIT_ID_LEN],
+) -> (SocketAddr, MultihopExitKeys, TokenExit) {
     let ed25519_pubkey = exit_key.verifying_key().to_bytes();
     let (recipient_priv, recipient_pub) =
         ExitKem::gen_keypair(&mut rand_core::UnwrapErr(rand_core::OsRng));
     let x25519_pubkey: [u8; 32] = recipient_pub.to_bytes().into();
-    let exit_id = [0x11u8; EXIT_ID_LEN];
 
     let cfg = make_server_config(&exit_key, default_crypto_provider(), &[ALPN_H3])
         .expect("server config");
@@ -503,7 +611,7 @@ pub async fn spawn_token_multihop_exit(
 }
 
 /// Serves ONE accepted multihop connection: reads the HPKE-sealed setup frame
-/// (inner `IpRequest`), replies with a sealed `IpAssign`, then echoes every
+/// (inner setup request), replies with a sealed `IpAssign`, then echoes every
 /// sealed data datagram back.
 ///
 /// `seen_addrs`, when wired, records the client source address quinn currently
@@ -552,10 +660,14 @@ async fn serve_echo_connection(
             reason_code: code.code(),
         }),
         Some(TokenExitReply::IpExhausted) => Some(WarrenControlMessage::IpExhausted),
+        Some(TokenExitReply::SetupRefused(reason_code)) => {
+            Some(WarrenControlMessage::SetupRefused { reason_code })
+        }
         Some(TokenExitReply::Assign) => None,
         None => match setup {
-            WarrenControlMessage::IpRequest { .. } => None,
-            other => panic!("expected an IpRequest, got {other:?}"),
+            WarrenControlMessage::IpRequest { .. }
+            | WarrenControlMessage::IpRequestDated { .. } => None,
+            other => panic!("expected a wallet request, got {other:?}"),
         },
     };
     if let Some(refusal) = refusal {

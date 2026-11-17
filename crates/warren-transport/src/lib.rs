@@ -31,9 +31,9 @@ pub use warrenguard_pump::idle_cover::{
 pub use daita_driver::{DaitaDriver, DaitaDriverHandle};
 pub use lease_refresh::LeaseRefreshSchedule;
 pub use multihop::{
-    Carrier, DrainAdvisory, MultihopClientTunnel, MultihopError, MultihopMetrics,
+    Carrier, ClockSkewWatch, DrainAdvisory, MultihopClientTunnel, MultihopError, MultihopMetrics,
     MultihopMetricsSnapshot, MultihopSession, PathQuality, RebindError, RebindPolicy, RekeyPolicy,
-    close_label,
+    SetupClock, close_label,
 };
 // The engine setup-failure type carried by `MultihopError::Setup`, re-exported so
 // a consumer can match on / construct the policy verdict (`Rejected`,

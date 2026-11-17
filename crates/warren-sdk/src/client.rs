@@ -487,6 +487,7 @@ impl WarrenClientBuilder {
                 device.clone(),
             )
         });
+        let setup_clock = setup_clock_of(&api);
         Ok(WarrenClient {
             api,
             device,
@@ -495,6 +496,7 @@ impl WarrenClientBuilder {
                 signing,
                 tokens: session_tokens,
                 admission: self.session_admission,
+                setup_clock: Some(setup_clock),
             },
             server_pubkey_pin: pin,
             multihop_root_pubkey_pins: self.multihop_root_pubkey_pins,
@@ -510,6 +512,13 @@ impl WarrenClientBuilder {
             stand_aside_api_base,
         })
     }
+}
+
+/// What a dated tunnel setup is stamped with: the clock `api` corrects its
+/// signed calls with, read at each setup.
+fn setup_clock_of<T: HttpTransport>(api: &WarrenApiClient<T>) -> warren_transport::SetupClock {
+    let clock = Arc::clone(api.server_clock());
+    Arc::new(move || clock.now())
 }
 
 /// The Warren client over the bundled reqwest transport: the type most apps use.

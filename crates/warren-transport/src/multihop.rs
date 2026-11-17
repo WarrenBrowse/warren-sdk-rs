@@ -12,11 +12,23 @@
 //!    relay's Ed25519 identity is pinned via the SNI (base32-encoded pubkey) and
 //!    the raw-public-key TLS verifier.
 //! 2. Open a reliable bidi stream and send the sealed setup frame, whose inner
-//!    plaintext is an [`IpRequest`](warren_wire::WarrenControlMessage) carrying
-//!    the account pubkey and a proof of possession over the session's
-//!    `encapsulated_key`. The exit replies with a sealed
-//!    [`IpAssign`](warren_wire::WarrenControlMessage) (or `Rejected` /
-//!    `IpExhausted`). In X.509 cover-domain mode, step 2 includes an in-band
+//!    plaintext is a dated setup request
+//!    ([`IpRequestDated`](warren_wire::WarrenControlMessage) with the account
+//!    pubkey and a proof of possession over the session's `encapsulated_key`
+//!    and the request's time, or `IpRequestV7Dated` with an anonymous token).
+//!    The time comes from the caller's clock
+//!    ([`MultihopClientTunnel::with_setup_clock`]); the exit binds the
+//!    connection to the keys it announces and refuses a setup frame copied on
+//!    the way. The exit replies with a sealed
+//!    [`IpAssign`](warren_wire::WarrenControlMessage), or a refusal:
+//!    `SetupRefused` for the clock (code 1), a replayed setup (2) or a busy
+//!    exit (3), `Rejected`, `TokenRejected`, `IpExhausted`. An exit that
+//!    predates the dated request answers it with the plain `Rejected`; the
+//!    tunnel then sends that exit the legacy request (`IpRequest` /
+//!    `IpRequestV7Detailed`) from then on. One exit refusing the clock
+//!    reselects, two different exits refusing it is
+//!    [`MultihopError::ClockSkew`] (see [`ClockSkewWatch`]). In X.509
+//!    cover-domain mode, step 2 includes an in-band
 //!    relay-identity proof exchange (see ADR-0004): after the setup frame is
 //!    sent, the client reads the relay's server-initiated bi stream carrying its
 //!    Ed25519 signature over the channel binding, and verifies it before reading
@@ -163,6 +175,13 @@ pub enum MultihopError {
     /// [`SessionAdmission::TokensOnly`]). Carries no token material.
     #[error("no usable session token: {0}")]
     NoSessionToken(NoSessionTokenCause),
+    /// Two different exits refused this device's time for the dated setup:
+    /// the device clock is wrong, and the user sets the date and time to
+    /// automatic. One exit refusing it stays a
+    /// [`SetupError::SetupRefused`] that reselects, since the wrong clock may
+    /// be that exit's (see [`ClockSkewWatch`]).
+    #[error("two exits refused this device's time; set the date and time to automatic")]
+    ClockSkew,
 }
 
 impl From<QuicDialError> for MultihopError {
@@ -203,6 +222,9 @@ impl MultihopError {
             // which the caller reports rather than retries in silence.
             MultihopError::NoSessionToken(NoSessionTokenCause::AllInUse) => {
                 Retryability::Fatal(warrenguard_transport::FatalCause::DeviceLimit)
+            }
+            MultihopError::ClockSkew => {
+                Retryability::Fatal(warrenguard_transport::FatalCause::ClockSkew)
             }
             // Whatever its code: the node that closed during setup has read the
             // exit id, and on a two-hop circuit it is the entry relay, whose
@@ -484,12 +506,66 @@ fn map_engine_err(e: EngineMultihopError) -> MultihopError {
     }
 }
 
+/// The wall clock, in Unix seconds, a dated setup carries: the engine's
+/// [`SetupClock`](warrenguard_transport::supervisor::SetupClock). A caller that
+/// corrects its signed API calls from the server's clock hands the same source
+/// here (`ServerClock::now` in `warren-api`), so an exit sees the time the API
+/// accepts.
+pub use warrenguard_transport::supervisor::SetupClock;
+
+/// The clock refusals the tunnels sharing it met, across their dials: one
+/// exit refusing a dated setup for its time may be that exit's clock, a
+/// second, different exit refusing it means the device's is wrong (the
+/// engine's [`ClockSkewTally`](warrenguard_multihop::ClockSkewTally)). An
+/// admitted setup clears it.
+///
+/// Every tunnel shares [`Self::process`] unless given its own, because a
+/// supervisor builds a fresh tunnel for every redial and the refusals must
+/// outlive each one. Holds exit identifiers only, never rendered.
+#[derive(Clone, Default)]
+pub struct ClockSkewWatch(Arc<std::sync::Mutex<warrenguard_multihop::ClockSkewTally>>);
+
+impl ClockSkewWatch {
+    /// A watch that has recorded no refusal.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The watch every tunnel of this process shares by default.
+    #[must_use]
+    pub fn process() -> Self {
+        static PROCESS: std::sync::LazyLock<ClockSkewWatch> =
+            std::sync::LazyLock::new(ClockSkewWatch::new);
+        PROCESS.clone()
+    }
+
+    /// Records that `exit` refused a setup for its time, and returns the
+    /// verdict: a reselect while one exit refused it, fatal once a second,
+    /// different exit did.
+    fn record(&self, exit: [u8; EXIT_ID_LEN]) -> warrenguard_transport::Retryability {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(ExitId::from_bytes(exit))
+    }
+
+    /// A setup was admitted: the clock was good enough for that exit.
+    fn admitted(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admitted();
+    }
+}
+
 /// Builder/dialer for a multihop client tunnel.
 pub struct MultihopClientTunnel {
     /// Account signing key: signs the multi-hop setup proof of possession.
     /// Since protocol v5 it is NOT a TLS identity (the relay->exit dial is
     /// anonymous at the TLS layer); the client is authenticated to the exit
-    /// solely by the PoP carried in the sealed `IpRequest`.
+    /// solely by the PoP carried in the sealed wallet request (`IpRequestDated`,
+    /// or `IpRequest` at an exit that predates it).
     signing_key: SigningKey,
     bind_local_ip: Option<SocketAddr>,
     auto_local_ip: bool,
@@ -524,7 +600,7 @@ pub struct MultihopClientTunnel {
     /// the engine's own client consult. `None` keeps the historical
     /// single-address dial. Set via [`Self::with_alt_endpoint`].
     alt_endpoint: Option<SocketAddr>,
-    /// Advertises DAITA support in the sealed setup (`IpRequest.wants_daita`):
+    /// Advertises DAITA support in the sealed setup request (`wants_daita`):
     /// the exit then samples a machine and returns it in
     /// `IpAssign.daita_spec` (the negotiated model shared with the app). Off
     /// by default; when unset the exit MUST NOT grant a spec, keeping its
@@ -555,6 +631,21 @@ pub struct MultihopClientTunnel {
     /// they predate it, so this tunnel's later token setups there send
     /// `IpRequestV7`.
     exits_predating_token_detail: std::sync::Mutex<std::collections::HashSet<[u8; EXIT_ID_LEN]>>,
+    /// Exits that answered a dated setup with the plain `Rejected`: they
+    /// predate session binding, so this tunnel's later setups there send the
+    /// legacy request.
+    exits_predating_dated_setup: std::sync::Mutex<std::collections::HashSet<[u8; EXIT_ID_LEN]>>,
+    /// Exits whose mark in `exits_predating_dated_setup` was cleared once
+    /// because they refused the legacy request: never cleared twice, so an
+    /// exit that really predates the dated request and refuses the account
+    /// is not asked in a loop.
+    exits_retried_dated_setup: std::sync::Mutex<std::collections::HashSet<[u8; EXIT_ID_LEN]>>,
+    /// The clock a dated setup carries. `None` reads the device clock. Set
+    /// via [`Self::with_setup_clock`].
+    setup_clock: Option<SetupClock>,
+    /// Where a clock refusal is counted. Set via
+    /// [`Self::with_clock_skew_watch`].
+    clock_skew: ClockSkewWatch,
 }
 
 /// What a bonded leg repeats of the session it joins.
@@ -586,7 +677,28 @@ impl MultihopClientTunnel {
             join: None,
             lease_schedule: LeaseRefreshSchedule::PRODUCTION,
             exits_predating_token_detail: std::sync::Mutex::default(),
+            exits_predating_dated_setup: std::sync::Mutex::default(),
+            exits_retried_dated_setup: std::sync::Mutex::default(),
+            setup_clock: None,
+            clock_skew: ClockSkewWatch::process(),
         }
+    }
+
+    /// Dates every setup with `clock` instead of the device clock. An exit
+    /// refuses a time too far from its own, so a caller that corrects its API
+    /// calls from the server's clock passes the same corrected source.
+    #[must_use]
+    pub fn with_setup_clock(mut self, clock: SetupClock) -> Self {
+        self.setup_clock = Some(clock);
+        self
+    }
+
+    /// Counts this tunnel's clock refusals in `watch` instead of
+    /// [`ClockSkewWatch::process`].
+    #[must_use]
+    pub fn with_clock_skew_watch(mut self, watch: ClockSkewWatch) -> Self {
+        self.clock_skew = watch;
+        self
     }
 
     /// Presents anonymous v7 tokens from `source` instead of the wallet: the
@@ -798,10 +910,17 @@ impl MultihopClientTunnel {
     /// # Errors
     ///
     /// See [`MultihopError`]. In particular [`MultihopError::Setup`] wraps a
-    /// policy rejection ([`SetupError::Rejected`]) or pool exhaustion
-    /// ([`SetupError::IpExhausted`]), and [`MultihopError::RelayIdentity`] means
-    /// the relay's in-band identity proof was absent, malformed, or signed by the
-    /// wrong key (X.509 cover-domain mode only).
+    /// policy rejection ([`SetupError::Rejected`], or
+    /// [`SetupError::SetupRefused`] with code 0), a refusal of the dated setup
+    /// that reselects ([`SetupError::SetupRefused`]: the clock, a replay, a
+    /// busy exit) or pool exhaustion ([`SetupError::IpExhausted`]);
+    /// [`MultihopError::ClockSkew`] means a second, different exit refused this
+    /// device's time; and [`MultihopError::RelayIdentity`] means the relay's
+    /// in-band identity proof was absent, malformed, or signed by the wrong key
+    /// (X.509 cover-domain mode only).
+    ///
+    /// An exit that predates the dated setup costs one extra handshake the
+    /// first time this tunnel dials it.
     ///
     /// With session tokens ([`Self::with_session_tokens`]) the dial may take
     /// several handshakes, one per token the exit refuses;
@@ -943,14 +1062,93 @@ impl MultihopClientTunnel {
         }
     }
 
-    /// One dial and one setup exchange, presenting `token` or, without one,
-    /// the wallet, with `placement` as the session-placement hint.
+    /// One setup presenting `token` or, without one, the wallet, with
+    /// `placement` as the session-placement hint: the dated request, or the
+    /// legacy request of `kind` at an exit that showed it predates the dated
+    /// one. A clock refusal is counted in this tunnel's [`ClockSkewWatch`].
     async fn connect_once(
         &self,
         target: &Target,
         token: Option<&SessionToken>,
         placement: Option<Ipv4Addr>,
         kind: TokenRequestKind,
+    ) -> Result<MultihopSession, MultihopError> {
+        let exit_id = target.exit_id;
+        let mut marked_here = false;
+        let result = loop {
+            if !self.predates_dated_setup(&exit_id) {
+                let dated = SetupRequest::Dated(self.setup_unix_secs());
+                match self.dial_and_set_up(target, token, placement, dated).await {
+                    // An exit that decodes the dated request never answers it
+                    // with the plain `Rejected`: this one refused it unread.
+                    Err(MultihopError::Setup(SetupError::Rejected)) => {
+                        lock(&self.exits_predating_dated_setup).insert(exit_id);
+                        marked_here = true;
+                    }
+                    other => break other,
+                }
+            }
+            let legacy = self
+                .dial_and_set_up(target, token, placement, SetupRequest::Legacy(kind))
+                .await;
+            // A mark from an earlier dial may predate an upgrade: an exit
+            // that now requires bound sessions refuses the legacy request the
+            // way its sender reads as the account's or the token's. Ask it
+            // the dated request once more before believing that refusal.
+            if !marked_here
+                && refused_as_bound_only(&legacy, token.is_some())
+                && lock(&self.exits_retried_dated_setup).insert(exit_id)
+            {
+                lock(&self.exits_predating_dated_setup).remove(&exit_id);
+                continue;
+            }
+            break legacy;
+        };
+        self.judge_clock(exit_id, result)
+    }
+
+    fn predates_dated_setup(&self, exit_id: &[u8; EXIT_ID_LEN]) -> bool {
+        lock(&self.exits_predating_dated_setup).contains(exit_id)
+    }
+
+    /// The time a dated setup carries now.
+    fn setup_unix_secs(&self) -> u64 {
+        self.setup_clock
+            .as_ref()
+            .map_or_else(warrenguard_config::unix_now, |clock| clock())
+    }
+
+    /// Applies the clock rule to the outcome of a setup at `exit_id`: an
+    /// admitted setup clears the earlier refusals, and a clock refusal turns
+    /// into [`MultihopError::ClockSkew`] once a second, different exit made
+    /// one. Every other outcome keeps the engine's verdict.
+    fn judge_clock(
+        &self,
+        exit_id: [u8; EXIT_ID_LEN],
+        result: Result<MultihopSession, MultihopError>,
+    ) -> Result<MultihopSession, MultihopError> {
+        match &result {
+            Ok(_) => self.clock_skew.admitted(),
+            Err(MultihopError::Setup(SetupError::SetupRefused(code)))
+                if warrenguard_multihop::SetupRefusalCode::from_code(*code)
+                    == warrenguard_multihop::SetupRefusalCode::ClockSkew
+                    && self.clock_skew.record(exit_id).is_fatal() =>
+            {
+                return Err(MultihopError::ClockSkew);
+            }
+            Err(_) => {}
+        }
+        result
+    }
+
+    /// One dial and one setup exchange sending `request`, presenting `token`
+    /// or, without one, the wallet.
+    async fn dial_and_set_up(
+        &self,
+        target: &Target,
+        token: Option<&SessionToken>,
+        placement: Option<Ipv4Addr>,
+        request: SetupRequest,
     ) -> Result<MultihopSession, MultihopError> {
         let Target {
             exit_pubkey,
@@ -1119,17 +1317,33 @@ impl MultihopClientTunnel {
         // would do with it.
         let presented = token.map(std::slice::from_ref);
         let identity = presented.is_none().then_some(&self.signing_key);
-        let opened = inner
-            .setup_over_stream_with_token_request(
-                identity,
-                self.wants_ipv6,
-                self.daita_support,
-                presented,
-                placement,
-                kind,
-            )
-            .await
-            .map_err(map_engine_err)?;
+        let opened = match request {
+            SetupRequest::Dated(client_unix_secs) => {
+                inner
+                    .setup_over_stream_dated(
+                        identity,
+                        self.wants_ipv6,
+                        self.daita_support,
+                        presented,
+                        placement,
+                        client_unix_secs,
+                    )
+                    .await
+            }
+            SetupRequest::Legacy(kind) => {
+                inner
+                    .setup_over_stream_with_token_request(
+                        identity,
+                        self.wants_ipv6,
+                        self.daita_support,
+                        presented,
+                        placement,
+                        kind,
+                    )
+                    .await
+            }
+        }
+        .map_err(map_engine_err)?;
 
         // `setup_over_stream` succeeds once the reply authenticates, regardless
         // of which control message it carries (a `Rejected` / `IpExhausted`
@@ -1465,6 +1679,41 @@ struct Target {
     exit_x25519: [u8; 32],
     exit_id: [u8; EXIT_ID_LEN],
     exit_addr: SocketAddr,
+}
+
+/// Which setup request one dial sends.
+#[derive(Clone, Copy)]
+enum SetupRequest {
+    /// The dated request, carrying this time (Unix seconds): the exit binds
+    /// the connection to the keys it announces.
+    Dated(u64),
+    /// The legacy request of this kind, for an exit that predates the dated
+    /// one.
+    Legacy(TokenRequestKind),
+}
+
+/// Whether a legacy setup was refused the way an exit that requires bound
+/// sessions refuses every legacy request: the plain `Rejected` to a wallet
+/// request, or the unexplained `TokenRejected` to a detailed token request. A
+/// plain `Rejected` to a token request is excluded: an exit that predates the
+/// detailed refusal answers that way about one token, and the walk reads it.
+fn refused_as_bound_only(result: &Result<MultihopSession, MultihopError>, token: bool) -> bool {
+    match result {
+        Err(MultihopError::Setup(SetupError::Rejected)) => !token,
+        Err(MultihopError::Setup(SetupError::TokenRejected(code))) => {
+            warren_wire::TokenRejectCode::from_code(*code)
+                == warren_wire::TokenRejectCode::Unspecified
+        }
+        _ => false,
+    }
+}
+
+/// A lock on one of the tunnel's per-exit memories; a poisoned one still
+/// holds a usable set.
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl MultihopSession {
