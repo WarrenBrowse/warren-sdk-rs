@@ -4,16 +4,25 @@
 #   proxy-vX.Y.Z       prod  -> assets warren-proxy-<ver>-...,      image :<ver> + :latest
 #   proxy-beta-vX.Y.Z  beta  -> assets warren-proxy-beta-<ver>-..., image :beta-<ver> + :beta
 #
-# Artifacts: static musl binaries for linux x86_64 (ubuntu-24.04) and linux
-# aarch64 (natively on ubuntu-24.04-arm), a published GitHub release with
-# SHA256SUMS, and the multi-arch image ghcr.io/warrenbrowse/warren-proxy. Every
-# job runs on a GitHub-hosted runner.
+# Artifacts: static musl binaries for linux x86_64 and aarch64, native binaries
+# for macOS arm64, macOS x86_64 and Windows x86_64, a published GitHub release
+# with SHA256SUMS, and the multi-arch image ghcr.io/warrenbrowse/warren-proxy.
+# The Linux, Windows and publish jobs run on GitHub-hosted runners (aarch64
+# natively on ubuntu-24.04-arm), the macOS lanes on the self-hosted macOS
+# runners.
 #
 # A tag publishes only when its commit is on main and that commit already has a
 # green CI run, so the release inherits the four gates.
 #
-# workflow_dispatch builds the binaries as run artifacts without publishing
-# anything (a dry run of the matrix).
+# workflow_dispatch builds and packages every lane as run artifacts without
+# publishing anything (a dry run of the matrix).
+#
+# The static check is `readelf -d` (no NEEDED entry), never `ldd`: ldd is the
+# dynamic loader, and the musl one answers a valid static binary with
+# `Not a valid dynamic program`, which reads as a failure. A static-pie has a
+# dynamic section but no NEEDED entry, a plain static binary has no dynamic
+# section at all, and a dynamically linked one lists NEEDED, so the NEEDED test
+# tells the three apart wherever the check runs.
 
 name: release-proxy
 
@@ -137,18 +146,38 @@ jobs:
           echo "building $channel $version (publish=$publish)"
 
   build:
-    name: Build ${{ matrix.arch }}-musl
+    name: Build ${{ matrix.lane }}
     needs: resolve
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
+          - lane: linux-x86_64-musl
             target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
-          - arch: aarch64
+            asset_os: linux-x86_64-musl
+            # A wedged cargo prints nothing and waits forever; `timeout` is the
+            # only thing that ends it. Sized off the emulated self-hosted pool
+            # these lanes used to run on (a 43-minute cold build of the sibling
+            # gateway); a hosted runner builds natively in minutes, so the
+            # limit only ever fires on a real wedge. GNU coreutils is a
+            # Linux-lane assumption: macOS has no `timeout`.
+            wedge_timeout: 70m
+          - lane: linux-aarch64-musl
             target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+            asset_os: linux-aarch64-musl
+            wedge_timeout: 70m
+          - lane: macos-aarch64
+            target: aarch64-apple-darwin
+            runner: [self-hosted, macOS, ARM64]
+            asset_os: macos-aarch64
+            wedge_timeout: ""
+          - lane: macos-x86_64
+            target: x86_64-apple-darwin
+            runner: [self-hosted, macOS, ARM64]
+            asset_os: macos-x86_64
+            wedge_timeout: ""
     runs-on: ${{ matrix.runner }}
     # Sized so the retry wrapper always outlives its own worst case and the
     # failure carries its diagnosis rather than GitHub's: two invocations
@@ -168,38 +197,57 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        shell: bash
         run: |
           set -euo pipefail
           if ! command -v musl-gcc >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends musl-tools
           fi
-      - name: Build static binary
+      - name: Build, test and package
+        shell: bash
         env:
           WARREN_PRODUCT_ENV: ${{ needs.resolve.outputs.channel }}
           CARGO_TARGET: ${{ matrix.target }}
+          ASSET_OS: ${{ matrix.asset_os }}
+          WEDGE_TIMEOUT: ${{ matrix.wedge_timeout }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          ENV_TAG: ${{ needs.resolve.outputs.env_tag }}
           # musl-gcc builds the C bits (ring). Both vars are target-scoped,
           # so the one not matching this matrix leg is inert.
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
         run: |
           set -euo pipefail
-          BIN="target/$CARGO_TARGET/release/warren-proxy"
+          # Every lane compiles into a tree that starts empty and that no
+          # other job writes to. A hosted runner is a fresh VM; the macOS
+          # runner instances keep their directories and share one $HOME, so a
+          # tree kept there across runs would be the one a run on another ref
+          # is compiling into, and this lane could package that run's binary.
+          # RUNNER_TEMP belongs to a single runner instance, which runs one
+          # job at a time.
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/warren-proxy-target"
+          rm -rf "$CARGO_TARGET_DIR" out staging
+          BIN="$CARGO_TARGET_DIR/$CARGO_TARGET/release/warren-proxy"
           # A rustc that cannot be SPAWNED, one killed mid-compile, and a
           # wedged cargo are the three runner failures this pipeline sees; the
           # classifier retries those and fails anything else on the first
           # attempt (scripts/ci/run-with-runner-retry.sh), which also backs off
           # before retrying into the window it was trying to escape.
-          #
-          # 70m was sized off the emulated self-hosted pool these lanes used
-          # to run on (a 43-minute cold build of the sibling gateway); a hosted
-          # runner builds natively in minutes, so it only ever fires on a real
-          # wedge. Two attempts, not three, because a retry here can cost a
-          # full wedge timeout and three would put this job's ceiling out of
-          # reach of any reasonable number.
           cargo_ci() {
-            WARREN_RETRY_ATTEMPTS=2 \
-              bash scripts/ci/run-with-runner-retry.sh timeout -k 60s 70m "$@"
+            if [ -n "$WEDGE_TIMEOUT" ]; then
+              # Two attempts on a lane whose retry can cost a full wedge
+              # timeout: three would put the job's own ceiling out of reach of
+              # any reasonable number, and a lane killed by that ceiling
+              # reports GitHub's message instead of the wrapper's diagnosis.
+              # The cheap signatures (a rustc that never spawned, a tool that
+              # vanished) fail in seconds and lose nothing by it.
+              WARREN_RETRY_ATTEMPTS=2 \
+                bash scripts/ci/run-with-runner-retry.sh timeout -k 60s "$WEDGE_TIMEOUT" "$@"
+            else
+              bash scripts/ci/run-with-runner-retry.sh "$@"
+            fi
           }
           cargo_ci cargo build --locked --release -p warren-proxy --target "$CARGO_TARGET"
           # A tag can be cut on any commit, so nothing else in this pipeline
@@ -210,33 +258,80 @@ jobs:
           if [ ! -x "$BIN" ]; then
             echo "cargo reported success but produced no binary at $BIN"; exit 1
           fi
-          # ldd is the dynamic loader, not a static check: the musl one answers
-          # a valid static binary with `Not a valid dynamic program`, which
-          # matches neither accepted string and fails the release. What tells
-          # the three shapes apart is the NEEDED entry, absent from a plain
-          # static binary and from a static-pie, present in a dynamic one.
-          if command -v readelf > /dev/null 2>&1; then
-            if readelf -d "$BIN" | grep -q NEEDED; then
-              echo "binary is dynamically linked:"; readelf -d "$BIN"; exit 1
-            fi
-          elif command -v file > /dev/null 2>&1; then
-            file -b "$BIN" | grep -qE 'static-pie linked|statically linked' || {
-              echo "binary is not static: $(file -b "$BIN")"; exit 1
-            }
-          else
-            echo "no readelf and no file on this runner: cannot verify the binary is static"; exit 1
-          fi
-          mkdir -p dist
-          cp "$BIN" dist/warren-proxy
+          # Header of this file: ldd is not a static check, a NEEDED entry is.
+          case "$CARGO_TARGET" in
+            *-musl)
+              if command -v readelf >/dev/null 2>&1; then
+                if readelf -d "$BIN" | grep -q NEEDED; then
+                  echo "binary is dynamically linked:"; readelf -d "$BIN"; exit 1
+                fi
+              elif command -v file >/dev/null 2>&1; then
+                file -b "$BIN" | grep -qE 'static-pie linked|statically linked' || {
+                  echo "binary is not static: $(file -b "$BIN")"; exit 1
+                }
+              else
+                echo "no readelf and no file on this runner: cannot verify the binary is static"; exit 1
+              fi
+              ;;
+          esac
+          # An artifact nobody can start is worth catching here rather than on
+          # a user's machine, and `--version` needs no account and no listener.
+          # Printed, so the log of every run names the build its archive holds.
+          "$BIN" --version
+          name="warren-proxy${ENV_TAG}-${VERSION}-${ASSET_OS}"
+          mkdir -p out staging
+          cp "$BIN" staging/warren-proxy
+          tar -C staging -czf "out/${name}.tar.gz" warren-proxy
+          ls -l out
       - uses: actions/upload-artifact@v4
         with:
-          name: warren-proxy-${{ matrix.arch }}
-          path: dist/warren-proxy
+          name: warren-proxy-${{ matrix.lane }}
+          path: out/*
+          if-no-files-found: error
+
+  build-windows:
+    name: Build windows-x86_64
+    needs: resolve
+    # Built, tested and packaged by scripts/ci/windows/proxy-windows.sh, every
+    # Git Bash step under scripts/ci/windows/watchdog.sh, and handed to publish
+    # under the artifact name the matrix lanes use.
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      WARREN_SHA: ${{ github.sha }}
+      WARREN_CHANNEL: ${{ needs.resolve.outputs.channel }}
+      WARREN_VERSION: ${{ needs.resolve.outputs.version }}
+      WARREN_ENV_TAG: ${{ needs.resolve.outputs.env_tag }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: git config --global core.longpaths true
+      - uses: actions/checkout@v4
+      - run: bash scripts/ci/windows/watchdog.sh bash scripts/ci/windows/proxy-windows.sh prepare
+      - run: bash scripts/ci/windows/watchdog.sh bash scripts/ci/windows/proxy-windows.sh build
+      - run: bash scripts/ci/windows/watchdog.sh bash scripts/ci/windows/proxy-windows.sh package
+      # Only what the packaging step listed in its checksums goes out, and the
+      # list itself stays behind: publish writes the release's own SHA256SUMS.
+      - name: Verify the packaged outputs
+        run: |
+          set -euo pipefail
+          cd ci-out
+          sha256sum -c SHA256SUMS
+          for f in *; do
+            [ "$f" = SHA256SUMS ] || grep -q " \*\?$f\$" SHA256SUMS || { echo "::error::not in SHA256SUMS: $f"; exit 1; }
+          done
+          rm SHA256SUMS
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: warren-proxy-windows-x86_64
+          path: ci-out/*
           if-no-files-found: error
 
   publish:
     name: Publish release and image
-    needs: [resolve, build]
+    needs: [resolve, build, build-windows]
     if: needs.resolve.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -244,30 +339,30 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: warren-proxy-x86_64
-          path: dist/amd64
-      - uses: actions/download-artifact@v4
-        with:
-          name: warren-proxy-aarch64
-          path: dist/arm64
-      - name: Package release assets
-        id: package
+          # Every lane packaged its own asset with its final name, so this job
+          # only collects them: no lane's packaging waits for the release to be
+          # cut to be exercised, and the dry run covers it too.
+          path: staging
+      - name: Collect assets and checksums
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
           ENV_TAG: ${{ needs.resolve.outputs.env_tag }}
         run: |
           set -euo pipefail
-          mkdir -p out
-          for pair in "amd64 x86_64" "arm64 aarch64"; do
-            set -- $pair
-            chmod 755 "dist/$1/warren-proxy"
-            name="warren-proxy${ENV_TAG}-${VERSION}-linux-$2-musl"
-            tar -C "dist/$1" -czf "out/${name}.tar.gz" warren-proxy
-          done
+          mkdir -p out dist/amd64 dist/arm64
+          find staging -type f -exec mv {} out/ \;
           # No `./` prefix: `sha256sum -c` is run from wherever the assets were
-          # downloaded, and the prefix makes every entry a path that has to match.
-          (cd out && sha256sum -- *.tar.gz > SHA256SUMS)
-          ls -l out
+          # downloaded, and the prefix makes every entry a path that has to
+          # match. Written outside `out` first, so the file can never end up
+          # listing itself.
+          (cd out && sha256sum -- *) > SHA256SUMS
+          mv SHA256SUMS out/
+          # The image is the same binaries the release ships, unpacked from the
+          # assets rather than rebuilt.
+          tar -C dist/amd64 -xzf "out/warren-proxy${ENV_TAG}-${VERSION}-linux-x86_64-musl.tar.gz"
+          tar -C dist/arm64 -xzf "out/warren-proxy${ENV_TAG}-${VERSION}-linux-aarch64-musl.tar.gz"
+          chmod 755 dist/amd64/warren-proxy dist/arm64/warren-proxy
+          ls -l out dist/amd64 dist/arm64
       # The image is pushed BEFORE the release is created. A release is the
       # announcement, and its notes point at the image: publishing it first and
       # then failing on the push (a transient GHCR denial, a QEMU/buildx setup
@@ -327,7 +422,7 @@ jobs:
             gh release create "$TAG" out/* \
               --repo "$GITHUB_REPOSITORY" \
               --title "warren-proxy ${CHANNEL} ${VERSION}" \
-              --notes "Static musl builds of the headless warren-proxy daemon (${CHANNEL} channel). See crates/warren-proxy/README.md for the env contract." \
+              --notes "Builds of the headless warren-proxy daemon (${CHANNEL} channel): static musl for Linux x86_64 and aarch64, native for macOS arm64, macOS x86_64 and Windows x86_64. See crates/warren-proxy/README.md for the env contract." \
               $prerelease
           fi
       - name: Check the image is reachable without a GitHub account

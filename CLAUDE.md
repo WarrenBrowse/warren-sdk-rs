@@ -70,9 +70,10 @@ grep -E 'warrenguard\.git.*\brev = "' Cargo.toml | grep -v "rev = \"${rev}\"" ||
 
 Linux and Windows jobs run on GitHub-hosted runners, on pinned labels
 (`ubuntu-24.04`, `ubuntu-24.04-arm`, `windows-2025`); the macOS legs run on the
-self-hosted macOS ARM64 runners. The Windows jobs (ci.yml `windows`,
-release-bolthole.yml `build-windows`) run `scripts/ci/windows/*.sh` in Git
-Bash, each step under `scripts/ci/windows/watchdog.sh` (the logic of
+self-hosted macOS ARM64 runners. The Windows jobs (ci.yml `windows`, and
+`build-windows` of release-bolthole.yml and of release-proxy.yml) run
+`scripts/ci/windows/*.sh` in Git Bash, each step under
+`scripts/ci/windows/watchdog.sh` (the logic of
 warren-app's copy), which `test-watchdog.sh` enforces over the workflow files.
 `Swatinem/rust-cache` is only for hosted jobs: ci.yml's header records why it
 must never go on a self-hosted macOS job.

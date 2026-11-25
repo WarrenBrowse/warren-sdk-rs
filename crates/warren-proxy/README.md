@@ -14,6 +14,30 @@ privileged full-VPN image (`ghcr.io/warrenbrowse/warren-vpn`, kill switch,
 netns ownership) is the sibling for the gluetun-style `network_mode:
 "service:..."` pattern.
 
+## Release artifacts
+
+A release is one tag of this repository, `proxy-beta-vX.Y.Z` for the beta
+channel and `proxy-vX.Y.Z` for prod, published by
+`.github/workflows/release-proxy.yml` as a GitHub release:
+
+| asset | platform |
+|---|---|
+| `warren-proxy-beta-<version>-linux-x86_64-musl.tar.gz` | Linux x86_64, static musl |
+| `warren-proxy-beta-<version>-linux-aarch64-musl.tar.gz` | Linux aarch64, static musl |
+| `warren-proxy-beta-<version>-macos-aarch64.tar.gz` | macOS arm64 |
+| `warren-proxy-beta-<version>-macos-x86_64.tar.gz` | macOS x86_64 |
+| `warren-proxy-beta-<version>-windows-x86_64.zip` | Windows x86_64 (`warren-proxy.exe`) |
+| `SHA256SUMS` | one line per archive, for `sha256sum -c` |
+
+A prod release drops the `-beta` infix. Each archive holds the one binary, and
+the channel is compiled in: a beta build talks to the beta control plane unless
+`WARREN_API_URL` says otherwise. The same run pushes the container image
+`ghcr.io/warrenbrowse/warren-proxy` (`linux/amd64` and `linux/arm64`), made of
+the two Linux binaries of that release.
+
+Release 0.1.0 carries the two Linux archives only. The macOS and Windows
+archives are built from the release that follows it.
+
 ## Commands
 
 ```

@@ -154,9 +154,20 @@ fi
 
 # The guard only protects the steps that go through it: every workflow line
 # that runs one of the Windows entry points must run it under watchdog.sh.
+# Every script of this directory is an entry point, save the guard, its test
+# and the environment the entry points source, so a lane added later is held
+# to the rule without a list somebody has to remember.
 root="$here"
 while [ "$root" != / ] && [ ! -d "$root/.github/workflows" ]; do root="$(dirname "$root")"; done
-entry='scripts/ci/windows/(windows-ci|bolthole-windows)\.sh'
+names=""
+for script in "$here"/*.sh; do
+    name="$(basename "$script" .sh)"
+    case "$name" in
+        watchdog | test-watchdog | windows-env) ;;
+        *) names="${names:+$names|}$name" ;;
+    esac
+done
+entry="scripts/ci/windows/($names)\\.sh"
 cat "$root"/.github/workflows/*.yml | grep -v '^[[:space:]]*#' | grep -E "$entry" > "$tmp/steps" || true
 steps="$(wc -l < "$tmp/steps" | tr -d ' ')"
 unguarded="$(grep -vc 'scripts/ci/windows/watchdog\.sh ' "$tmp/steps")"
