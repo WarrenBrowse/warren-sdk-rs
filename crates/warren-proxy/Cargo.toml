@@ -4,7 +4,7 @@ description = "Headless Warren proxy daemon: a supervised SOCKS5/HTTP CONNECT tu
 # Its own version series: this binary is released on its own tag
 # (`proxy-v*`), and the release pipeline refuses a tag whose version
 # differs from this line.
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
